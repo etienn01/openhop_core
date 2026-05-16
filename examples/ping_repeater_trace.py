@@ -17,7 +17,7 @@ Features:
 import asyncio
 import random
 
-from common import create_mesh_node, print_packet_info
+from common import create_mesh_node, print_packet_info, RADIO_TYPES
 
 from pymc_core.protocol.constants import PAYLOAD_TYPE_TRACE
 from pymc_core.protocol.packet_builder import PacketBuilder
@@ -86,7 +86,7 @@ def main():
     parser = argparse.ArgumentParser(description="Ping a repeater using trace packets")
     parser.add_argument(
         "--radio-type",
-        choices=["waveshare", "uconsole", "meshadv-mini", "kiss-tnc", "kiss-modem"],
+        choices=RADIO_TYPES,
         default="waveshare",
         help="Radio hardware type (default: waveshare)",
     )

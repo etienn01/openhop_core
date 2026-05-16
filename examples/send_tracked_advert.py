@@ -12,7 +12,7 @@ this is a very basic example and not how you should do it in real code!
 import asyncio
 import time
 
-from common import create_mesh_node, print_packet_info
+from common import create_mesh_node, print_packet_info, RADIO_TYPES
 
 from pymc_core.protocol.constants import (
     ADVERT_FLAG_HAS_LOCATION,
@@ -93,7 +93,7 @@ def main():
     parser = argparse.ArgumentParser(description="Send a location-tracked advertisement")
     parser.add_argument(
         "--radio-type",
-        choices=["waveshare", "uconsole", "meshadv-mini", "kiss-tnc", "kiss-modem", "ch341"],
+        choices=RADIO_TYPES,
         default="waveshare",
         help="Radio hardware type (default: waveshare)",
     )

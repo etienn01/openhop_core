@@ -347,8 +347,8 @@ class CH341Async:
                 return self._gpio_set_direction_impl(pin, is_output)
 
     def _gpio_set_direction_impl(self, pin: int, is_output: bool):
-        if pin < 0 or pin > 7:
-            raise ValueError(f"GPIO pin must be 0-7, got {pin}")
+        if pin < 0 or pin > 15:
+            raise ValueError(f"GPIO pin must be 0-15, got {pin}")
 
         if pin > 5 and is_output:
             raise ValueError(f"GPIO pin {pin} only supports input mode (pins 6-7 are input-only)")
@@ -372,8 +372,8 @@ class CH341Async:
             self._operation_lock.release()
 
     def _gpio_get_impl(self, pin: int) -> bool:
-        if pin < 0 or pin > 7:
-            raise ValueError(f"GPIO pin must be 0-7, got {pin}")
+        if pin < 0 or pin > 15:
+            raise ValueError(f"GPIO pin must be 0-15, got {pin}")
 
         GPIO_READ_BYTES = 6
         GPIO_READ_TIMEOUT_MS = 200
@@ -388,7 +388,10 @@ class CH341Async:
         except Exception as e:
             raise CH341Error(f"GPIO read IN failed: {e}") from e
 
-        return bool(data[0] & (1 << pin))
+        if pin < 8:
+            return bool(data[0] & (1 << pin))
+        else:
+            return bool(data[1] & (1 << (pin - 8)))
 
     def __enter__(self):
         return self

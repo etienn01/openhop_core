@@ -8,7 +8,7 @@ and encryption to another node in the mesh network.
 
 import asyncio
 
-from common import create_mesh_node, print_packet_info
+from common import create_mesh_node, print_packet_info, RADIO_TYPES
 
 from pymc_core.protocol import Packet
 from pymc_core.protocol.packet_builder import PacketBuilder
@@ -78,7 +78,7 @@ def main():
     parser = argparse.ArgumentParser(description="Send a text message to the mesh network")
     parser.add_argument(
         "--radio-type",
-        choices=["waveshare", "uconsole", "meshadv-mini", "kiss-tnc", "kiss-modem"],
+        choices=RADIO_TYPES,
         default="waveshare",
         help="Radio hardware type (default: waveshare)",
     )
