@@ -503,6 +503,64 @@ class TestProtocolResponseHandler:
         assert callback_calls[0][1] == path_len_byte  # encoded byte, not raw count
         assert callback_calls[0][2] == path_bytes  # all 4 bytes of path data
 
+    @pytest.mark.asyncio
+    async def test_login_path_return_learns_path_without_waiter(self):
+        """Zero-hop login PATH-return must trigger path learning + reciprocal PATH
+        even with no stats/telemetry waiter registered (Fix B).
+
+        During login no response callback exists yet, so the old guard dropped the
+        PATH-return before path learning could run, leaving out_path_len == -1 and
+        forcing the follow-up stats REQ to flood. The PATH branch must always decrypt
+        so _update_contact_path + reciprocal PATH run (firmware onContactPathRecv)."""
+        from pymc_core.companion.contact_store import ContactStore
+        from pymc_core.companion.models import Contact
+
+        local_identity = LocalIdentity()  # companion
+        server_identity = LocalIdentity()  # firmware repeater
+        server_pubkey = server_identity.get_public_key()
+        contacts = ContactStore(5)
+        contacts.add(Contact(public_key=server_pubkey, name="Repeater"))
+        handler = ProtocolResponseHandler(MagicMock(), local_identity, contacts)
+
+        # Login state: no response waiter and no binary callback registered.
+        injector = AsyncMock()
+        handler.set_packet_injector(injector)
+        path_updates = []
+
+        async def on_path_updated(pub, path_len, path_bytes_arg):
+            path_updates.append((pub, path_len, path_bytes_arg))
+
+        handler.set_contact_path_updated_callback(on_path_updated)
+
+        # Firmware zero-hop login reply: 13-byte login response embedded in a
+        # flood PATH-return with an empty (0-hop) path.
+        reply = bytearray(13)
+        struct.pack_into("<I", reply, 0, 1234)  # timestamp
+        reply[4] = 0x00  # RESP_SERVER_LOGIN_OK
+        client_hash = local_identity.get_public_key()[0]
+        server_hash = server_pubkey[0]
+        secret = Identity(server_pubkey).calc_shared_secret(local_identity.get_private_key())
+        pkt = PacketBuilder.create_path_return(
+            dest_hash=client_hash,
+            src_hash=server_hash,
+            secret=secret,
+            path=[],
+            extra_type=PAYLOAD_TYPE_RESPONSE,
+            extra=bytes(reply),
+        )
+        assert pkt.is_route_flood()
+
+        await handler(pkt)
+
+        # Path learned as zero-hop direct (out_path_len == 0).
+        assert len(path_updates) == 1
+        assert path_updates[0][0] == server_pubkey
+        assert path_updates[0][1] == 0
+        learned = contacts.get_by_key(server_pubkey)
+        assert learned.out_path_len == 0
+        # Reciprocal PATH sent back so the repeater learns its route to us.
+        injector.assert_awaited_once()
+
 
 class TestProtocolRequestHandler:
     """Tests for ProtocolRequestHandler._build_response (firmware-consistent)."""
@@ -788,9 +846,7 @@ class TestLoginServerHandler:
 
         # Calculate shared secret (client side)
         server_id = Identity(server_pubkey)
-        shared_secret = server_id.calc_shared_secret(
-            self.client_identity_local.get_private_key()
-        )
+        shared_secret = server_id.calc_shared_secret(self.client_identity_local.get_private_key())
         aes_key = shared_secret[:16]
 
         # Repeater format plaintext: timestamp(4) + password + null
@@ -857,7 +913,7 @@ class TestLoginServerHandler:
 
     @pytest.mark.asyncio
     async def test_direct_login_sends_response_datagram(self):
-        """Direct login → RESPONSE datagram via flood (matches C++ sendFlood(createDatagram) path)."""
+        """Direct login: RESPONSE datagram via flood (C++ sendFlood/createDatagram)."""
         pkt = self._build_login_packet(password="admin123", route_type="direct")
         await self.handler(pkt)
 
@@ -881,11 +937,8 @@ class TestLoginServerHandler:
         response_pkt, _ = self.sent_packets[0]
 
         # Decrypt the PATH payload to verify inner structure
-        server_pubkey = self.server_identity.get_public_key()
         client_id = Identity(self.client_identity_local.get_public_key())
-        shared_secret = client_id.calc_shared_secret(
-            self.server_identity.get_private_key()
-        )
+        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
         aes_key = shared_secret[:16]
 
         # PATH payload: dest_hash(1) + src_hash(1) + mac_and_ciphertext
@@ -969,9 +1022,7 @@ class TestLoginServerHandler:
 
         # Decrypt and verify is_admin field
         client_id = Identity(self.client_identity_local.get_public_key())
-        shared_secret = client_id.calc_shared_secret(
-            self.server_identity.get_private_key()
-        )
+        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
         aes_key = shared_secret[:16]
         encrypted_part = bytes(response_pkt.payload[2:])
         plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_part)
@@ -999,9 +1050,7 @@ class TestLoginServerHandler:
     async def test_flood_login_with_path_includes_path_in_response(self):
         """Flood login with path hashes → PATH response includes those hashes."""
         path_hashes = [0xAA, 0xBB]
-        pkt = self._build_login_packet(
-            password="admin123", route_type="flood", path=path_hashes
-        )
+        pkt = self._build_login_packet(password="admin123", route_type="flood", path=path_hashes)
         # path_len encodes hash size and count: (hash_size-1)<<6 | count
         # For 1-byte hashes with 2 hops: (0<<6) | 2 = 2
         pkt.path_len = 2
@@ -1014,9 +1063,7 @@ class TestLoginServerHandler:
 
         # Decrypt and verify path is included
         client_id = Identity(self.client_identity_local.get_public_key())
-        shared_secret = client_id.calc_shared_secret(
-            self.server_identity.get_private_key()
-        )
+        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
         aes_key = shared_secret[:16]
         encrypted_part = bytes(response_pkt.payload[2:])
         plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_part)

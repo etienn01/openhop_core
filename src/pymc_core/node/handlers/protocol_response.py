@@ -229,8 +229,16 @@ class ProtocolResponseHandler:
                     f"({route_label}, {len(pkt.payload)}B)"
                 )
 
-            # Proceed if we have a callback for this source or the binary (path-discovery) callback
-            if src_hash not in self._response_callbacks and self._binary_response_callback is None:
+            # Proceed if we have a callback for this source or the binary (path-discovery)
+            # callback. PATH packets always proceed regardless of waiters so that the
+            # firmware-equivalent path learning in _decrypt_protocol_response
+            # (_update_contact_path + reciprocal PATH) runs for the login PATH-return,
+            # which arrives before any stats/telemetry waiter is registered.
+            if (
+                src_hash not in self._response_callbacks
+                and self._binary_response_callback is None
+                and pkt_type != PAYLOAD_TYPE_PATH
+            ):
                 return
 
             # Try to decrypt the response
@@ -360,17 +368,34 @@ class ProtocolResponseHandler:
         """
         try:
             if not PathUtils.is_valid_path_len(path_len_byte):
+                self._log(
+                    f"[PATHDIAG] _update_contact_path REJECT src=0x{src_hash:02X}: "
+                    f"invalid path_len_byte=0x{path_len_byte:02X}"
+                )
                 return False
             path_byte_len = PathUtils.get_path_byte_len(path_len_byte)
             out_path_bytes = bytes(decrypted[1 : 1 + path_byte_len])
+            self._log(
+                f"[PATHDIAG] _update_contact_path src=0x{src_hash:02X} "
+                f"path_len_byte=0x{path_len_byte:02X} "
+                f"hops={PathUtils.get_path_hash_count(path_len_byte)} "
+                f"hash_size={PathUtils.get_path_hash_size(path_len_byte)} "
+                f"byte_len={path_byte_len} out_path={out_path_bytes.hex() or '(empty)'}"
+            )
             contact_obj = self._contact_book.get_by_key(contact_pubkey)
             if contact_obj is not None:
+                prev_len = getattr(contact_obj, "out_path_len", None)
                 contact_obj.out_path_len = path_len_byte
                 contact_obj.out_path = out_path_bytes
                 self._contact_book.update(contact_obj)
                 self._log(
                     f"[ProtocolResponse] Updated out_path for 0x{src_hash:02X}: "
                     f"path_len={path_len_byte}"
+                )
+                self._log(
+                    f"[PATHDIAG] contact 0x{src_hash:02X} out_path_len "
+                    f"{prev_len} -> {path_len_byte} "
+                    f"(hops {PathUtils.get_path_hash_count(path_len_byte)})"
                 )
                 return True
             else:
@@ -444,6 +469,12 @@ class ProtocolResponseHandler:
                 f"[ProtocolResponse] Sending reciprocal PATH to 0x{src_hash:02X} "
                 f"via DIRECT (out_path_len={path_len_byte}, in_path_len={len(in_path)})"
             )
+            self._log(
+                f"[PATHDIAG] reciprocal -> 0x{src_hash:02X} route=DIRECT "
+                f"routing_path={out_path_bytes.hex() or '(empty)'} "
+                f"embedded_in_path={bytes(in_path).hex() or '(empty)'} "
+                f"path_len_byte=0x{path_len_byte:02X}"
+            )
         except Exception as e:
             self._log(f"[ProtocolResponse] Failed to send reciprocal PATH: {e}")
 
@@ -496,6 +527,15 @@ class ProtocolResponseHandler:
             # Determine the actual response data based on packet type.
             response_data = decrypted
             if pkt_type == PAYLOAD_TYPE_PATH:
+                outer_path = bytes(pkt.path[: pkt.get_path_byte_len()]) if pkt.path_len else b""
+                self._log(
+                    f"[PATHDIAG] PATH rx src=0x{src_hash:02X} "
+                    f"route={'FLOOD' if pkt.is_route_flood() else 'DIRECT'} "
+                    f"outer_path_len=0x{pkt.path_len:02X} "
+                    f"outer_hops={pkt.get_path_hash_count()} "
+                    f"outer_path={outer_path.hex() or '(empty)'} "
+                    f"inner_path_len_byte=0x{(decrypted[0] if decrypted else 0):02X}"
+                )
                 if len(decrypted) >= 2:
                     path_len_byte = decrypted[0]
                     path_byte_len = PathUtils.get_path_byte_len(path_len_byte)

@@ -813,7 +813,19 @@ class CompanionBase(ABC):
         """
         contact = self.get_contact_by_key(pub)
         if contact is None:
+            logger.debug(
+                "[PATHDIAG] _on_contact_path_updated: no contact for pub=%s (ignored)",
+                pub[:4].hex(),
+            )
             return  # Firmware does not send PATH for non-contacts
+        logger.debug(
+            "[PATHDIAG] _on_contact_path_updated pub=%s name=%s path_len=0x%02X " "hops=%s path=%s",
+            pub[:4].hex(),
+            getattr(contact, "name", "?"),
+            path_len & 0xFF,
+            PathUtils.get_path_hash_count(path_len) if path_len > 0 else 0,
+            path_bytes.hex() if isinstance(path_bytes, (bytes, bytearray)) else str(path_bytes),
+        )
         contact.out_path_len = path_len
         contact.out_path = path_bytes
         self.contacts.update(contact)
@@ -1570,10 +1582,23 @@ class CompanionBase(ABC):
                 contact=proxy, local_identity=self._identity, password=password
             )
             self._apply_path_hash_mode(pkt)
+            logger.debug(
+                "[PATHDIAG] login -> 0x%02X (%s) route=%s out_path_len=%s; "
+                "listening for reply (password stored, callback set)",
+                dest_hash,
+                contact.name,
+                "FLOOD" if pkt.is_route_flood() else "DIRECT",
+                getattr(proxy, "out_path_len", -1),
+            )
             await self._send_packet(pkt, wait_for_ack=False)
             try:
                 await asyncio.wait_for(login_event.wait(), timeout=10.0)
             except asyncio.TimeoutError:
+                logger.debug(
+                    "[PATHDIAG] login to 0x%02X TIMEOUT after 10s — no decryptable "
+                    "login response arrived (still listening until now)",
+                    dest_hash,
+                )
                 return {"success": False, "reason": "Login response timeout"}
             data = login_result["data"]
             return {
@@ -1619,6 +1644,16 @@ class CompanionBase(ABC):
         intermediate repeaters due to transport-code region filtering.
         """
         out_path_len = getattr(proxy, "out_path_len", -1)
+        out_path = getattr(proxy, "out_path", b"") or b""
+        out_path_hex = out_path.hex() if isinstance(out_path, (bytes, bytearray)) else str(out_path)
+        logger.debug(
+            "[PATHDIAG] %s pre-send: out_path_len=%s (0x%02X) hops=%s out_path=%s",
+            request_type,
+            out_path_len,
+            out_path_len & 0xFF,
+            PathUtils.get_path_hash_count(out_path_len) if out_path_len > 0 else 0,
+            out_path_hex or "(empty)",
+        )
         if out_path_len > 0:
             hop_count = PathUtils.get_path_hash_count(out_path_len)
             propagation_delay = hop_count * 0.5  # e.g. 3 hops → 1.5s
@@ -1651,6 +1686,14 @@ class CompanionBase(ABC):
                 data=b"",
             )
             self._apply_path_hash_mode(pkt)
+            logger.debug(
+                "[PATHDIAG] stats REQ built: route=%s path_len=0x%02X path=%s "
+                "(contact out_path_len=%s)",
+                "FLOOD" if pkt.is_route_flood() else "DIRECT",
+                pkt.path_len & 0xFF,
+                (bytes(pkt.path[: pkt.get_path_byte_len()]).hex() if pkt.path_len else "(empty)"),
+                getattr(proxy, "out_path_len", -1),
+            )
             await self._send_packet(pkt, wait_for_ack=False)
             result = await waiter.wait(timeout)
             return {

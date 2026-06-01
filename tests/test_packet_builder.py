@@ -328,3 +328,55 @@ def test_create_anon_request_unknown_path_is_flood():
     contact = _make_contact(other, out_path=b"", out_path_len=-1)
     pkt, _ = PacketBuilder.create_anon_request(contact, local, bytes([0x01, 0x00]))
     assert pkt.is_route_flood()
+
+
+def test_create_protocol_request_zero_hop_is_direct():
+    """out_path_len == 0 (zero-hop direct neighbour, empty path) must route DIRECT.
+
+    After login establishes the path, stats/telemetry requests must use sendDirect
+    so the firmware repeater answers directly instead of flooding (matches firmware
+    BaseChatMesh::sendRequest and create_anon_request)."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = _make_contact(other, out_path=b"", out_path_len=0)
+    pkt, _ = PacketBuilder.create_protocol_request(contact, local, 0x01, b"")
+    assert pkt.is_route_direct()
+    assert not pkt.is_route_flood()
+    # Zero-hop direct packet carries an empty path (firmware sendDirect(pkt, path, 0)).
+    assert pkt.path_len == 0
+
+
+def test_create_protocol_request_unknown_path_is_flood():
+    """out_path_len == -1 (unknown) must route FLOOD."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = _make_contact(other, out_path=b"", out_path_len=-1)
+    pkt, _ = PacketBuilder.create_protocol_request(contact, local, 0x01, b"")
+    assert pkt.is_route_flood()
+
+
+def test_get_timestamp_is_strictly_monotonic_within_same_second():
+    """Back-to-back tags must strictly increase even within one wall-clock second.
+
+    Firmware repeaters drop a REQ/login whose timestamp is not strictly greater
+    than the client's last stored timestamp (replay guard). Mirrors firmware
+    getCurrentTimeUnique so a login + immediate stats request don't collide and
+    get silently ignored."""
+    ts = [PacketBuilder._get_timestamp() for _ in range(5)]
+    assert ts == sorted(ts)
+    assert len(set(ts)) == 5  # all unique
+    assert all(b == a + 1 or b > a for a, b in zip(ts, ts[1:]))
+
+
+def test_login_then_stats_tags_strictly_increase():
+    """A login followed immediately by a stats request must carry strictly
+    increasing timestamps so the firmware repeater accepts the stats REQ."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = _make_contact(other, out_path=b"", out_path_len=0)
+    login_pkt = PacketBuilder.create_login_packet(
+        contact=contact, local_identity=local, password="x"
+    )
+    _, stats_ts = PacketBuilder.create_protocol_request(contact, local, 0x01, b"")
+    login_ts = int.from_bytes(_decrypt_anon(login_pkt, local, other)[:4], "little")
+    assert stats_ts > login_ts
