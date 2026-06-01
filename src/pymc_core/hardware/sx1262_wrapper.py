@@ -517,6 +517,7 @@ class SX1262Radio(LoRaRadio):
                             if not self._tx_lock.locked():
                                 try:
                                     self.lora.request(self.lora.RX_CONTINUOUS)
+                                    self.lora.clearIrqStatus(0xFFFF)
                                     await asyncio.sleep(self.RADIO_TIMING_DELAY)
                                     logger.debug(
                                         f"[RX] Restored RX continuous mode after IRQ 0x{irqStat:04X}"
