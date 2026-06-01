@@ -80,6 +80,31 @@ from .stats_collector import StatsCollector
 
 logger = logging.getLogger("CompanionBase")
 
+
+def _fmt_path(out_path_len: int, out_path: Any) -> str:
+    """Format a contact's out_path for [PATHDIAG] logs without ambiguity.
+
+    ``out_path_len`` is the firmware-encoded path_len byte, not a hop count:
+    the top 2 bits are (hash_size - 1) and the low 6 bits are the hop count.
+    E.g. 0x42 == hash_size 2, 2 hops -> 4 path bytes. Render the decoded form
+    plus the path as hex so the byte value is never misread as a hop count.
+    """
+    if out_path_len is None or out_path_len < 0:
+        return "unknown (out_path_len=-1, flood)"
+    if isinstance(out_path, (bytes, bytearray)):
+        path_hex = bytes(out_path).hex()
+    elif isinstance(out_path, (list, tuple)):
+        path_hex = bytes(int(b) & 0xFF for b in out_path).hex()
+    else:
+        path_hex = str(out_path)
+    return (
+        f"path_len_byte=0x{out_path_len & 0xFF:02X} "
+        f"(hash_size={PathUtils.get_path_hash_size(out_path_len)}, "
+        f"hops={PathUtils.get_path_hash_count(out_path_len)}) "
+        f"path={path_hex or '(empty)'}"
+    )
+
+
 PUSH_CALLBACK_KEYS = [
     "message_received",
     "channel_message_received",
@@ -819,12 +844,10 @@ class CompanionBase(ABC):
             )
             return  # Firmware does not send PATH for non-contacts
         logger.debug(
-            "[PATHDIAG] _on_contact_path_updated pub=%s name=%s path_len=0x%02X " "hops=%s path=%s",
+            "[PATHDIAG] _on_contact_path_updated pub=%s name=%s %s",
             pub[:4].hex(),
             getattr(contact, "name", "?"),
-            path_len & 0xFF,
-            PathUtils.get_path_hash_count(path_len) if path_len > 0 else 0,
-            path_bytes.hex() if isinstance(path_bytes, (bytes, bytearray)) else str(path_bytes),
+            _fmt_path(path_len, path_bytes),
         )
         contact.out_path_len = path_len
         contact.out_path = path_bytes
@@ -1645,14 +1668,10 @@ class CompanionBase(ABC):
         """
         out_path_len = getattr(proxy, "out_path_len", -1)
         out_path = getattr(proxy, "out_path", b"") or b""
-        out_path_hex = out_path.hex() if isinstance(out_path, (bytes, bytearray)) else str(out_path)
         logger.debug(
-            "[PATHDIAG] %s pre-send: out_path_len=%s (0x%02X) hops=%s out_path=%s",
+            "[PATHDIAG] %s pre-send: %s",
             request_type,
-            out_path_len,
-            out_path_len & 0xFF,
-            PathUtils.get_path_hash_count(out_path_len) if out_path_len > 0 else 0,
-            out_path_hex or "(empty)",
+            _fmt_path(out_path_len, out_path),
         )
         if out_path_len > 0:
             hop_count = PathUtils.get_path_hash_count(out_path_len)
@@ -1687,12 +1706,11 @@ class CompanionBase(ABC):
             )
             self._apply_path_hash_mode(pkt)
             logger.debug(
-                "[PATHDIAG] stats REQ built: route=%s path_len=0x%02X path=%s "
-                "(contact out_path_len=%s)",
+                "[PATHDIAG] stats REQ built: route=%s path_len_byte=0x%02X " "(hops=%s) path=%s",
                 "FLOOD" if pkt.is_route_flood() else "DIRECT",
                 pkt.path_len & 0xFF,
+                pkt.get_path_hash_count() if pkt.path_len else 0,
                 (bytes(pkt.path[: pkt.get_path_byte_len()]).hex() if pkt.path_len else "(empty)"),
-                getattr(proxy, "out_path_len", -1),
             )
             await self._send_packet(pkt, wait_for_ack=False)
             result = await waiter.wait(timeout)
