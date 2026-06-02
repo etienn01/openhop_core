@@ -77,8 +77,34 @@ from .message_queue import MessageQueue
 from .models import AdvertPath, Channel, Contact, NodePrefs, QueuedMessage, SentResult
 from .path_cache import PathCache
 from .stats_collector import StatsCollector
+from .timing import DEFAULT_MAX_ATTEMPTS, response_timeout_ms
 
 logger = logging.getLogger("CompanionBase")
+
+
+def _fmt_path(out_path_len: int, out_path: Any) -> str:
+    """Format a contact's out_path for [PATHDIAG] logs without ambiguity.
+
+    ``out_path_len`` is the firmware-encoded path_len byte, not a hop count:
+    the top 2 bits are (hash_size - 1) and the low 6 bits are the hop count.
+    E.g. 0x42 == hash_size 2, 2 hops -> 4 path bytes. Render the decoded form
+    plus the path as hex so the byte value is never misread as a hop count.
+    """
+    if out_path_len is None or out_path_len < 0:
+        return "unknown (out_path_len=-1, flood)"
+    if isinstance(out_path, (bytes, bytearray)):
+        path_hex = bytes(out_path).hex()
+    elif isinstance(out_path, (list, tuple)):
+        path_hex = bytes(int(b) & 0xFF for b in out_path).hex()
+    else:
+        path_hex = str(out_path)
+    return (
+        f"path_len_byte=0x{out_path_len & 0xFF:02X} "
+        f"(hash_size={PathUtils.get_path_hash_size(out_path_len)}, "
+        f"hops={PathUtils.get_path_hash_count(out_path_len)}) "
+        f"path={path_hex or '(empty)'}"
+    )
+
 
 PUSH_CALLBACK_KEYS = [
     "message_received",
@@ -813,7 +839,17 @@ class CompanionBase(ABC):
         """
         contact = self.get_contact_by_key(pub)
         if contact is None:
+            logger.debug(
+                "[PATHDIAG] _on_contact_path_updated: no contact for pub=%s (ignored)",
+                pub[:4].hex(),
+            )
             return  # Firmware does not send PATH for non-contacts
+        logger.debug(
+            "[PATHDIAG] _on_contact_path_updated pub=%s name=%s %s",
+            pub[:4].hex(),
+            getattr(contact, "name", "?"),
+            _fmt_path(path_len, path_bytes),
+        )
         contact.out_path_len = path_len
         contact.out_path = path_bytes
         self.contacts.update(contact)
@@ -908,12 +944,25 @@ class CompanionBase(ABC):
         tag_hex = tag_bytes.hex()
         info = self._pending_binary_requests.pop(tag_hex, None)
         if not info:
-            # Skip log for small payloads (e.g. login response handled elsewhere)
-            if len(response_data) >= 20:
-                logger.debug(f"Binary response for unknown tag {tag_hex}")
+            # A decryptable response arrived but no request is waiting for this tag.
+            # This is the signature of "response arrived but we already timed out"
+            # (or a tag mismatch); distinct from "no response arrived at all".
+            logger.debug(
+                "[PATHDIAG] anon/binary response UNMATCHED tag=%s (%dB) — no pending "
+                "request (arrived after timeout, or tag mismatch). pending=%s",
+                tag_hex,
+                len(response_data),
+                list(self._pending_binary_requests.keys()),
+            )
             await self._fire_callbacks("binary_response", tag_bytes, response_data)
             return
         request_type = info["request_type"]
+        logger.debug(
+            "[PATHDIAG] anon/binary response MATCHED tag=%s type=%s (%dB)",
+            tag_hex,
+            request_type,
+            len(response_data),
+        )
         pubkey_prefix = info.get("pubkey_prefix", "")
         context = info.get("context", {})
         parsed = None
@@ -1148,26 +1197,36 @@ class CompanionBase(ABC):
             return SentResult(success=False)
         request_type = PROTOCOL_CODE_ANON_REQ
         req_payload = data  # no random tag; timestamp provides uniqueness
+        # The first byte is the ANON_REQ_TYPE_* sub-type (e.g. REGIONS/OWNER);
+        # record it so the response can be parsed by sub-type rather than being
+        # mistaken for a binary REQ_TYPE_GET_OWNER_INFO (both use code 0x07).
+        anon_sub_type = req_payload[0] if len(req_payload) >= 1 else None
         self.cleanup_expired_binary_requests()
         try:
-            pkt, timestamp = PacketBuilder.create_protocol_request(
+            pkt, timestamp = PacketBuilder.create_anon_request(
                 contact=proxy,
                 local_identity=self._identity,
-                protocol_code=PROTOCOL_CODE_ANON_REQ,
-                data=req_payload,
+                req_data=req_payload,
             )
             # Use the timestamp as the tag — matches what the repeater echoes back
             tag_int = timestamp
             tag_bytes = tag_int.to_bytes(4, "little")
             tag_hex = tag_bytes.hex()
+            self._apply_flood_scope(pkt)
+            self._apply_path_hash_mode(pkt)
+            # Adaptive timeout (firmware calcFlood/DirectTimeoutMillisFor). This is
+            # fire-and-forget: the response arrives async via the binary-response
+            # push, and the client retries on this timeout hint — the same model
+            # firmware uses for anon/discovery (it returns est_timeout and the host
+            # app re-issues). A short adaptive hint => fast client-driven retry.
+            timeout_s = self._response_timeout_s(pkt, proxy)
             self.register_binary_request(
                 tag_hex,
                 request_type=request_type,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=max(timeout_seconds, timeout_s * DEFAULT_MAX_ATTEMPTS),
                 pubkey_prefix=pub_key[:6].hex(),
+                context={"anon_sub_type": anon_sub_type},
             )
-            self._apply_flood_scope(pkt)
-            self._apply_path_hash_mode(pkt)
             success = await self._send_packet(pkt, wait_for_ack=False)
         except Exception as e:
             logger.error(f"Anon request send error: {e}")
@@ -1179,9 +1238,11 @@ class CompanionBase(ABC):
             return SentResult(success=False)
         return SentResult(
             success=True,
-            is_flood=contact.out_path_len <= 0,
+            # Direct (incl. zero-hop, out_path_len == 0) when the path is known;
+            # flood only when the out_path is unknown (-1). Mirrors create_anon_request.
+            is_flood=contact.out_path_len < 0,
             expected_ack=tag_int,
-            timeout_ms=DEFAULT_RESPONSE_TIMEOUT_MS,
+            timeout_ms=int(timeout_s * 1000),
         )
 
     async def send_path_discovery(self, pub_key: bytes) -> bool:
@@ -1446,6 +1507,43 @@ class CompanionBase(ABC):
             logger.error(f"Error sending raw data direct: {e}")
             return SentResult(success=False)
 
+    async def send_raw_packet(self, priority: int, packet_bytes: bytes) -> bool:
+        """Inject a fully-formed on-air packet for transmission (CMD_SEND_RAW_PACKET).
+
+        Mirrors firmware ``MyMesh.cpp`` ``CMD_SEND_RAW_PACKET``: parse the raw
+        on-air bytes into a :class:`Packet` (``tryParsePacket``) and enqueue it
+        for TX (``sendPacket``).  ``packet_bytes`` is the complete wire packet
+        (header, optional transport codes, path, payload) as produced by
+        :meth:`Packet.write_to`; it is sent verbatim, with no encryption,
+        contact lookup, flood-scope, or path-hash-mode rewriting.
+
+        The ``priority`` argument is accepted for protocol compatibility but is
+        currently ignored: the bridge's low-level send path
+        (:meth:`_send_packet`) does not expose a prioritized TX queue.
+
+        Returns True if the packet parsed and was handed off for transmission,
+        False on parse failure or send error (the frame_server handler maps
+        False to ``ERR_CODE_TABLE_FULL``).
+        """
+        try:
+            pkt = Packet()
+            if not pkt.read_from(bytes(packet_bytes)):
+                return False
+        except Exception as e:
+            logger.warning(f"send_raw_packet: failed to parse packet: {e}")
+            return False
+        try:
+            success = await self._send_packet(pkt, wait_for_ack=False)
+            if success:
+                self.stats.record_tx(is_flood=False)
+            else:
+                self.stats.record_tx_error()
+            return success
+        except Exception as e:
+            logger.error(f"Error sending raw packet: {e}")
+            self.stats.record_tx_error()
+            return False
+
     async def send_trace_path(
         self,
         pub_key: bytes,
@@ -1523,14 +1621,42 @@ class CompanionBase(ABC):
 
         login_handler.set_login_callback(_login_cb)
         try:
-            pkt = PacketBuilder.create_login_packet(
-                contact=proxy, local_identity=self._identity, password=password
-            )
-            self._apply_path_hash_mode(pkt)
-            await self._send_packet(pkt, wait_for_ack=False)
-            try:
-                await asyncio.wait_for(login_event.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
+            # The login callback fires on any decryptable login response from this
+            # repeater (keyed by password/dest_hash, not by tag), so we can resend
+            # a freshly-built login packet each attempt and a single event resolves
+            # whichever attempt's reply arrives. Each attempt waits one adaptive
+            # timeout (firmware cadence) instead of a single fixed 10s wait.
+            for attempt in range(DEFAULT_MAX_ATTEMPTS):
+                pkt = PacketBuilder.create_login_packet(
+                    contact=proxy, local_identity=self._identity, password=password
+                )
+                self._apply_path_hash_mode(pkt)
+                timeout_s = self._response_timeout_s(pkt, proxy)
+                logger.debug(
+                    "[PATHDIAG] login -> 0x%02X (%s) route=%s attempt=%d/%d "
+                    "timeout=%.1fs out_path_len=%s; listening for reply",
+                    dest_hash,
+                    contact.name,
+                    "FLOOD" if pkt.is_route_flood() else "DIRECT",
+                    attempt + 1,
+                    DEFAULT_MAX_ATTEMPTS,
+                    timeout_s,
+                    getattr(proxy, "out_path_len", -1),
+                )
+                await self._send_packet(pkt, wait_for_ack=False)
+                try:
+                    await asyncio.wait_for(login_event.wait(), timeout=timeout_s)
+                    break  # got a response
+                except asyncio.TimeoutError:
+                    logger.debug(
+                        "[PATHDIAG] login to 0x%02X attempt %d/%d TIMEOUT after %.1fs — "
+                        "no decryptable login response arrived",
+                        dest_hash,
+                        attempt + 1,
+                        DEFAULT_MAX_ATTEMPTS,
+                        timeout_s,
+                    )
+            if not login_event.is_set():
                 return {"success": False, "reason": "Login response timeout"}
             data = login_result["data"]
             return {
@@ -1566,24 +1692,39 @@ class CompanionBase(ABC):
             logger.error(f"Logout error: {e}")
             return False
 
-    async def _wait_for_path_propagation(self, proxy: Any, request_type: str) -> None:
-        """Wait for reciprocal PATH to propagate through the mesh for multi-hop contacts.
+    def _response_timeout_s(self, pkt: Packet, proxy: Any) -> float:
+        """Adaptive response timeout (seconds) for a request packet.
 
-        After login, pyMC sends a reciprocal PATH so the remote repeater learns
-        the return route.  Each mesh hop adds ~500ms (airtime + processing).
-        Without this delay, the first REQ may arrive before the reciprocal PATH,
-        causing the remote to fall back to sendFlood() — which gets dropped by
-        intermediate repeaters due to transport-code region filtering.
+        Mirrors firmware calcFloodTimeoutMillisFor / calcDirectTimeoutMillisFor
+        using the radio's SF/BW/CR and the packet's on-air length, so a lost
+        round-trip is retried on a ~3s cadence instead of a fixed 10-15s wait.
+        """
+        try:
+            out_path_len = getattr(proxy, "out_path_len", -1)
+            ms = response_timeout_ms(
+                raw_length=pkt.get_raw_length(),
+                is_flood=pkt.is_route_flood(),
+                out_path_len=out_path_len,
+                sf=int(getattr(self.prefs, "spreading_factor", 10)),
+                bw_hz=int(getattr(self.prefs, "bandwidth_hz", 250000)),
+                cr=int(getattr(self.prefs, "coding_rate", 5)),
+            )
+            return ms / 1000.0
+        except Exception:
+            return 5.0  # safe fallback
+
+    async def _wait_for_path_propagation(self, proxy: Any, request_type: str) -> None:
+        """Log the pre-send path; no longer sleeps.
+
+        Firmware sends the request immediately and relies on the reciprocal PATH
+        (which pyMC already sends at login time, see ProtocolResponseHandler).
+        The previous 0.5s/hop sleep added up to ~1.5s+ of latency per request for
+        multi-hop contacts with no reliability benefit and has been removed; the
+        adaptive timeout + internal resend now handle a lost first attempt.
         """
         out_path_len = getattr(proxy, "out_path_len", -1)
-        if out_path_len > 0:
-            hop_count = PathUtils.get_path_hash_count(out_path_len)
-            propagation_delay = hop_count * 0.5  # e.g. 3 hops → 1.5s
-            logger.debug(
-                f"Multi-hop {request_type}: waiting {propagation_delay:.1f}s for "
-                f"reciprocal PATH propagation ({hop_count} hops)"
-            )
-            await asyncio.sleep(propagation_delay)
+        out_path = getattr(proxy, "out_path", b"") or b""
+        logger.debug("[PATHDIAG] %s pre-send: %s", request_type, _fmt_path(out_path_len, out_path))
 
     async def send_status_request(self, pub_key: bytes, timeout: float = 15.0) -> dict:
         """Send a protocol request for repeater status/stats."""
@@ -1601,15 +1742,39 @@ class CompanionBase(ABC):
         proto_handler.set_response_callback(contact_hash, waiter.callback)
         try:
             await self._wait_for_path_propagation(proxy, "stats request")
-            pkt, _ = PacketBuilder.create_protocol_request(
-                contact=proxy,
-                local_identity=self._identity,
-                protocol_code=REQ_TYPE_GET_STATUS,
-                data=b"",
-            )
-            self._apply_path_hash_mode(pkt)
-            await self._send_packet(pkt, wait_for_ack=False)
-            result = await waiter.wait(timeout)
+            # Status responses resolve the waiter by contact_hash (not tag), so a
+            # fresh REQ each attempt is fine and dodges the repeater's flood dedup.
+            # Each attempt waits one adaptive timeout (firmware cadence); a late
+            # reply that lands between attempts resolves the waiter immediately.
+            result: dict = {"timeout": True}
+            for attempt in range(DEFAULT_MAX_ATTEMPTS):
+                pkt, _ = PacketBuilder.create_protocol_request(
+                    contact=proxy,
+                    local_identity=self._identity,
+                    protocol_code=REQ_TYPE_GET_STATUS,
+                    data=b"",
+                )
+                self._apply_path_hash_mode(pkt)
+                timeout_s = self._response_timeout_s(pkt, proxy)
+                logger.debug(
+                    "[PATHDIAG] stats REQ: route=%s attempt=%d/%d timeout=%.1fs "
+                    "path_len_byte=0x%02X (hops=%s) path=%s",
+                    "FLOOD" if pkt.is_route_flood() else "DIRECT",
+                    attempt + 1,
+                    DEFAULT_MAX_ATTEMPTS,
+                    timeout_s,
+                    pkt.path_len & 0xFF,
+                    pkt.get_path_hash_count() if pkt.path_len else 0,
+                    (
+                        bytes(pkt.path[: pkt.get_path_byte_len()]).hex()
+                        if pkt.path_len
+                        else "(empty)"
+                    ),
+                )
+                await self._send_packet(pkt, wait_for_ack=False)
+                result = await waiter.wait(timeout_s)
+                if not result.get("timeout"):
+                    break
             return {
                 "success": result.get("success", False),
                 "repeater": contact.name,
@@ -1649,15 +1814,20 @@ class CompanionBase(ABC):
             inv = PacketBuilder._compute_inverse_perm_mask(
                 want_base, want_location, want_environment
             )
-            pkt, _ = PacketBuilder.create_protocol_request(
-                contact=proxy,
-                local_identity=self._identity,
-                protocol_code=REQ_TYPE_GET_TELEMETRY_DATA,
-                data=bytes([inv]),
-            )
-            self._apply_path_hash_mode(pkt)
-            await self._send_packet(pkt, wait_for_ack=False)
-            result = await waiter.wait(timeout)
+            result: dict = {"timeout": True}
+            for attempt in range(DEFAULT_MAX_ATTEMPTS):
+                pkt, _ = PacketBuilder.create_protocol_request(
+                    contact=proxy,
+                    local_identity=self._identity,
+                    protocol_code=REQ_TYPE_GET_TELEMETRY_DATA,
+                    data=bytes([inv]),
+                )
+                self._apply_path_hash_mode(pkt)
+                timeout_s = self._response_timeout_s(pkt, proxy)
+                await self._send_packet(pkt, wait_for_ack=False)
+                result = await waiter.wait(timeout_s)
+                if not result.get("timeout"):
+                    break
             telemetry_data = dict(result.get("parsed", {}))
             raw_bytes = telemetry_data.get("raw_bytes", b"")
             if raw_bytes and len(pub_key) >= 6:
@@ -1704,15 +1874,20 @@ class CompanionBase(ABC):
         waiter = ResponseWaiter()
         proto_handler.set_response_callback(contact_hash, waiter.callback)
         try:
-            pkt, _ = PacketBuilder.create_protocol_request(
-                contact=proxy,
-                local_identity=self._identity,
-                protocol_code=protocol_code,
-                data=data,
-            )
-            self._apply_path_hash_mode(pkt)
-            await self._send_packet(pkt, wait_for_ack=False)
-            result = await waiter.wait(10.0)
+            result: dict = {"timeout": True}
+            for _attempt in range(DEFAULT_MAX_ATTEMPTS):
+                pkt, _ = PacketBuilder.create_protocol_request(
+                    contact=proxy,
+                    local_identity=self._identity,
+                    protocol_code=protocol_code,
+                    data=data,
+                )
+                self._apply_path_hash_mode(pkt)
+                timeout_s = self._response_timeout_s(pkt, proxy)
+                await self._send_packet(pkt, wait_for_ack=False)
+                result = await waiter.wait(timeout_s)
+                if not result.get("timeout"):
+                    break
             return {
                 "success": result.get("success", False),
                 "response": result.get("text"),
@@ -1993,7 +2168,9 @@ class CompanionBase(ABC):
             else:
                 secret = secret[:32]
             try:
-                plaintext = CryptoUtils.mac_then_decrypt(hashlib.sha256(secret).digest(), secret, cipher_mac + ciphertext)
+                plaintext = CryptoUtils.mac_then_decrypt(
+                    hashlib.sha256(secret).digest(), secret, cipher_mac + ciphertext
+                )
             except Exception:
                 plaintext = None
             if plaintext is not None:
@@ -2009,7 +2186,11 @@ class CompanionBase(ABC):
         blob = bytes(plaintext[3 : 3 + data_len])
 
         route_type = packet.get_route_type()
-        path_len = packet.path_len if route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD) else 0xFF
+        path_len = (
+            packet.path_len
+            if route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD)
+            else 0xFF
+        )
         snr = packet.get_snr() if hasattr(packet, "get_snr") else getattr(packet, "_snr", 0.0)
         rssi = packet.rssi if hasattr(packet, "rssi") else getattr(packet, "_rssi", 0)
         queued = QueuedMessage(

@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import struct
+import threading
 import time
 from typing import Any, Optional, Sequence, Union
 
@@ -58,6 +59,11 @@ class PacketBuilder:
     headers, encryption, and routing information for reliable mesh communication.
     """
 
+    # Monotonic timestamp state (mirrors firmware getCurrentTimeUnique).  Shared
+    # across all packet types so every request/login tag is strictly increasing.
+    _last_unique_timestamp: int = 0
+    _timestamp_lock = threading.Lock()
+
     @staticmethod
     def _hash_byte(pubkey: bytes) -> int:
         """Compute hash byte from public key for packet addressing."""
@@ -89,8 +95,23 @@ class PacketBuilder:
 
     @staticmethod
     def _get_timestamp() -> int:
-        """Get current timestamp for packet timing."""
-        return int(time.time())
+        """Get a strictly-increasing timestamp (epoch seconds) for packet tags.
+
+        Mirrors firmware ``RTCClock::getCurrentTimeUnique`` (MeshCore.h): returns
+        the current epoch second, but if called more than once within the same
+        second it bumps by 1 so every request carries a unique, strictly-greater
+        tag.  Firmware repeaters drop a REQ/login whose timestamp is not strictly
+        greater than the client's last stored timestamp (replay guard), so two
+        whole-second ``time.time()`` values from back-to-back requests (e.g. a
+        login immediately followed by a stats request) would collide and the
+        second packet would be silently ignored.
+        """
+        with PacketBuilder._timestamp_lock:
+            t = int(time.time())
+            if t <= PacketBuilder._last_unique_timestamp:
+                t = PacketBuilder._last_unique_timestamp + 1
+            PacketBuilder._last_unique_timestamp = t
+            return t
 
     @staticmethod
     def _calc_shared_secret_and_key(
@@ -441,6 +462,68 @@ class PacketBuilder:
         pkt.path_len = 0
         pkt.path = bytearray()
         return pkt
+
+    @staticmethod
+    def create_anon_request(
+        contact: Any,
+        local_identity: LocalIdentity,
+        req_data: bytes = b"",
+        timestamp: Optional[int] = None,
+    ) -> tuple[Packet, int]:
+        """Create a PAYLOAD_TYPE_ANON_REQ packet for an anonymous request.
+
+        Unlike ``create_protocol_request`` (which builds a PAYLOAD_TYPE_REQ and
+        relies on the recipient already knowing the sender), this emits a true
+        anonymous request: ``dest_hash(1) + sender_pubkey(32) + cipher`` under a
+        PAYLOAD_TYPE_ANON_REQ header. The decrypted plaintext is
+        ``timestamp(4) + req_data`` with ``req_data`` passed through verbatim
+        (e.g. ``[ANON_REQ_TYPE_REGIONS][reply_path_byte][reply_path...]``); no
+        protocol/sub-type byte is prepended.
+
+        Routing mirrors firmware ``BaseChatMesh::sendAnonReq``: direct when the
+        out_path is known (``out_path_len >= 0``, including ``0`` for a zero-hop
+        direct neighbour) and flood when unknown (``-1``). The firmware regions
+        handler only answers ``isRouteDirect()`` packets, so zero-hop discovery
+        requires direct routing.
+
+        Returns:
+            tuple: (packet, timestamp) - the packet and the timestamp used as the
+            request tag (echoed back by the responder).
+        """
+        if timestamp is None:
+            timestamp = PacketBuilder._get_timestamp()
+
+        plaintext = PacketBuilder._pack_timestamp_data(timestamp, req_data)
+
+        contact_pubkey = bytes.fromhex(contact.public_key)
+        shared_secret, aes_key = PacketBuilder._calc_shared_secret_and_key(contact, local_identity)
+        cipher = PacketBuilder._encrypt_payload(aes_key, shared_secret, plaintext)
+        dest_hash = PacketBuilder._hash_byte(contact_pubkey)
+        payload = bytearray([dest_hash]) + local_identity.get_public_key() + cipher
+
+        out_path_len = getattr(contact, "out_path_len", -1)
+        out_path = getattr(contact, "out_path", b"") or b""
+        # Direct (incl. zero-hop, out_path_len == 0) when the path is known;
+        # flood only when the out_path is unknown (-1 / OUT_PATH_UNKNOWN).
+        route_type = "direct" if out_path_len >= 0 else "flood"
+
+        header = PacketBuilder._create_header(PAYLOAD_TYPE_ANON_REQ, route_type)
+        packet = PacketBuilder._create_packet(header, payload)
+        packet.path_len = 0
+        packet.path = bytearray()
+
+        if route_type == "direct" and len(out_path) > 0:
+            path_bytes = out_path[:MAX_PATH_SIZE]
+            encoded_len = None
+            if PathUtils.is_valid_path_len(out_path_len) and PathUtils.get_path_byte_len(
+                out_path_len
+            ) <= len(path_bytes):
+                encoded_len = out_path_len
+            elif len(path_bytes) == 64:
+                path_bytes = path_bytes[:63]
+            packet.set_path(path_bytes, encoded_len)
+
+        return packet, timestamp
 
     @staticmethod
     def create_login_packet(contact: Any, local_identity: LocalIdentity, password: str) -> Packet:
@@ -902,10 +985,11 @@ class PacketBuilder:
 
         out_path_len = getattr(contact, "out_path_len", -1)
         out_path = getattr(contact, "out_path", b"") or b""
-        if out_path_len <= 0 or not out_path:
-            route_type = "flood"
-        else:
-            route_type = "direct"
+        # Direct (incl. zero-hop, out_path_len == 0 with an empty path) when the
+        # path is known; flood only when the out_path is unknown (-1). Mirrors
+        # create_anon_request and firmware sendRequest (OUT_PATH_UNKNOWN -> flood,
+        # else sendDirect, which works with a 0-length path).
+        route_type = "direct" if out_path_len >= 0 else "flood"
 
         header = PacketBuilder._create_header(PAYLOAD_TYPE_REQ, route_type)
         packet = PacketBuilder._create_packet(header, payload)

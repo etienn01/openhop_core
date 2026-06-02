@@ -269,6 +269,10 @@ class CompanionRadio(CompanionBase):
             dispatcher.protocol_response_handler.set_contact_path_updated_callback(
                 self._on_contact_path_updated
             )
+            # Wire the TX path so the handler can send reciprocal PATH packets
+            # (firmware onContactPathRecv behaviour). Without this the remote
+            # repeater never learns its route back to us and floods every reply.
+            dispatcher.protocol_response_handler.set_packet_injector(self._send_packet)
 
     async def _on_packet_received(self, pkt: Any) -> None:
         route_type = pkt.get_route_type()
