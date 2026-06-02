@@ -375,3 +375,61 @@ class TestCompanionRadioBinaryAndRepeater:
         out = await comp.send_repeater_command(b"\x00" * 32, "status")
         assert out["success"] is False
         assert "not found" in out["reason"].lower()
+
+
+@pytest.mark.asyncio
+class TestCompanionLoginRetry:
+    """send_login resends on a lost round-trip and succeeds on a later attempt."""
+
+    async def test_login_resends_then_succeeds(self, monkeypatch):
+        radio = MockRadio()
+        comp = CompanionRadio(radio, LocalIdentity())
+        contact = _make_peer_contact("Rpt")
+        comp.contacts.add(contact)
+
+        # Tiny per-attempt timeout so the test doesn't actually wait seconds.
+        monkeypatch.setattr(comp, "_response_timeout_s", lambda pkt, proxy: 0.05)
+
+        handler = comp._get_login_response_handler()
+        captured = {}
+        orig_set = handler.set_login_callback
+        monkeypatch.setattr(
+            handler, "set_login_callback", lambda cb: (captured.__setitem__("cb", cb), orig_set(cb))
+        )
+
+        calls = {"n": 0}
+
+        async def fake_send(pkt, wait_for_ack=False):
+            calls["n"] += 1
+            # First attempt is "lost"; reply only on the second attempt.
+            if calls["n"] == 2 and captured.get("cb"):
+                captured["cb"](True, {"timestamp": 1, "is_admin": False})
+            return True
+
+        monkeypatch.setattr(comp, "_send_packet", fake_send)
+
+        result = await comp.send_login(contact.public_key, "pw")
+        assert result["success"] is True
+        assert calls["n"] == 2  # resent exactly once before success
+
+    async def test_login_all_attempts_timeout(self, monkeypatch):
+        radio = MockRadio()
+        comp = CompanionRadio(radio, LocalIdentity())
+        contact = _make_peer_contact("Rpt")
+        comp.contacts.add(contact)
+        monkeypatch.setattr(comp, "_response_timeout_s", lambda pkt, proxy: 0.02)
+
+        calls = {"n": 0}
+
+        async def fake_send(pkt, wait_for_ack=False):
+            calls["n"] += 1
+            return True  # never reply
+
+        monkeypatch.setattr(comp, "_send_packet", fake_send)
+
+        from pymc_core.companion.timing import DEFAULT_MAX_ATTEMPTS
+
+        result = await comp.send_login(contact.public_key, "pw")
+        assert result["success"] is False
+        assert "timeout" in result["reason"].lower()
+        assert calls["n"] == DEFAULT_MAX_ATTEMPTS  # tried the full budget
