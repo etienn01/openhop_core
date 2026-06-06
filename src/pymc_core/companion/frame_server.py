@@ -23,6 +23,7 @@ from ..protocol import CryptoUtils
 from ..protocol.packet_utils import PathUtils
 from .constants import (
     ADV_TYPE_CHAT,
+    ADV_TYPE_NONE,
     CMD_ADD_UPDATE_CONTACT,
     CMD_APP_START,
     CMD_DEVICE_QUERY,
@@ -349,6 +350,18 @@ class CompanionFrameServer:
         Default returns ``None``."""
         return None
 
+    async def _maybe_persist_contact(self, contact) -> None:
+        """Dispatch to :meth:`_persist_contact`, skipping transient/anon entries.
+
+        Transient contacts (ADV_TYPE_NONE) created for non-contact anon requests
+        are never persisted, mirroring the firmware save_filter. The guard lives
+        here rather than in _persist_contact so it still applies when a subclass
+        overrides the persistence hook (e.g. the repeater's SQLite upsert).
+        """
+        if getattr(contact, "adv_type", None) == ADV_TYPE_NONE:
+            return
+        await self._persist_contact(contact)
+
     async def _persist_contact(self, contact) -> None:
         """Hook: persist a single contact.  Default is a no-op.
 
@@ -425,7 +438,7 @@ class CompanionFrameServer:
             except Exception as e:
                 logger.exception("advert_received callback error: %s", e)
             try:
-                await self._persist_contact(contact)
+                await self._maybe_persist_contact(contact)
             except Exception as e:
                 logger.warning("Persist contact after advert failed: %s", e)
 
@@ -442,7 +455,7 @@ class CompanionFrameServer:
                 return
             _write_push(bytes([PUSH_CODE_PATH_UPDATED]) + contact.public_key[:32])
             try:
-                await self._persist_contact(contact)
+                await self._maybe_persist_contact(contact)
             except Exception as e:
                 logger.warning("Persist contact after path update failed: %s", e)
 

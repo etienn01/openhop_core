@@ -955,3 +955,22 @@ async def test_cmd_send_anon_req_success_writes_sent():
     assert frames[0][0] == RESP_CODE_SENT
     assert frames[0][1] == 0  # not flood
     assert struct.unpack("<I", frames[0][2:6])[0] == 0x11223344
+
+
+@pytest.mark.asyncio
+async def test_maybe_persist_contact_skips_transient():
+    """_maybe_persist_contact guards transient (ADV_TYPE_NONE) entries even when a
+    subclass overrides _persist_contact (e.g. the repeater's SQLite upsert)."""
+    from types import SimpleNamespace
+
+    server = CompanionFrameServer(object(), "hash", port=0)
+    persisted = []
+    server._persist_contact = AsyncMock(side_effect=lambda c: persisted.append(c))
+
+    await server._maybe_persist_contact(SimpleNamespace(adv_type=0))  # ADV_TYPE_NONE
+    assert persisted == []  # skipped
+    server._persist_contact.assert_not_called()
+
+    real = SimpleNamespace(adv_type=1)  # ADV_TYPE_CHAT
+    await server._maybe_persist_contact(real)
+    assert persisted == [real]  # persisted
