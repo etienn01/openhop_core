@@ -1231,7 +1231,9 @@ class CompanionFrameServer:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         if not result.success:
-            self._write_err(ERR_CODE_NOT_FOUND)
+            # FW PR #2672: anon req no longer returns NOT_FOUND. Both "couldn't add
+            # transient contact" and "send failed" map to ERR_CODE_TABLE_FULL.
+            self._write_err(ERR_CODE_TABLE_FULL)
             return
         tag = result.expected_ack if result.expected_ack is not None else 0
         timeout_ms = result.timeout_ms if result.timeout_ms is not None else 10000
@@ -1384,7 +1386,14 @@ class CompanionFrameServer:
                     + text_bytes
                 )
             return (
-                bytes([RESP_CODE_CHANNEL_MSG_RECV, msg.channel_idx, path_len_byte, txt_type])
+                bytes(
+                    [
+                        RESP_CODE_CHANNEL_MSG_RECV,
+                        msg.channel_idx,
+                        path_len_byte,
+                        txt_type,
+                    ]
+                )
                 + struct.pack("<I", msg.timestamp)
                 + text_bytes
             )
@@ -1461,7 +1470,10 @@ class CompanionFrameServer:
         stats_data = result.get("stats", {})
         raw_bytes = stats_data.get("raw_bytes", b"")
         if not raw_bytes:
-            logger.debug("Status response had no raw_bytes for %s; no push sent", pubkey[:6].hex())
+            logger.debug(
+                "Status response had no raw_bytes for %s; no push sent",
+                pubkey[:6].hex(),
+            )
             return
         self._write_frame(bytes([PUSH_CODE_STATUS_RESPONSE, 0]) + pubkey[:6] + raw_bytes)
 
@@ -1490,7 +1502,8 @@ class CompanionFrameServer:
         raw_bytes = telem_data.get("raw_bytes", b"")
         if not raw_bytes:
             logger.debug(
-                "Telemetry response had no raw_bytes for %s; no push sent", pubkey[:6].hex()
+                "Telemetry response had no raw_bytes for %s; no push sent",
+                pubkey[:6].hex(),
             )
             return
         self._write_frame(bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + pubkey[:6] + raw_bytes)

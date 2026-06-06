@@ -905,8 +905,53 @@ def test_parse_binary_response_anon_not_mistaken_for_owner_info():
     assert "owner_info" not in parsed
 
 
-def test_device_info_reports_firmware_ver_code_12():
-    """Companion advertises FIRMWARE_VER_CODE 12 to match the firmware dev branch."""
+def test_device_info_reports_firmware_ver_code_13():
+    """Companion advertises FIRMWARE_VER_CODE 13 (PR #2672 non-contact anon requests)."""
     from pymc_core.companion.constants import FIRMWARE_VER_CODE
 
-    assert FIRMWARE_VER_CODE == 12
+    assert FIRMWARE_VER_CODE == 13
+
+
+class _MockBridgeAnonReq:
+    """Minimal bridge for CMD_SEND_ANON_REQ tests."""
+
+    def __init__(self, result: SentResult):
+        self._result = result
+        self.calls = []
+
+    async def send_anon_req(self, pub_key: bytes, data: bytes):
+        self.calls.append((pub_key, data))
+        return self._result
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_anon_req_failure_writes_table_full():
+    """PR #2672: anon-req failure maps to ERR_CODE_TABLE_FULL, not NOT_FOUND."""
+    bridge = _MockBridgeAnonReq(SentResult(success=False))
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_err = Mock()
+    server._write_frame = Mock()
+    await server._cmd_send_anon_req(b"\x01" * 32 + b"\x07")
+    assert len(bridge.calls) == 1
+    server._write_err.assert_called_once_with(ERR_CODE_TABLE_FULL)
+    server._write_frame.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_anon_req_success_writes_sent():
+    """Successful anon req emits a RESP_CODE_SENT frame (direct => flood byte 0)."""
+    from pymc_core.companion.constants import RESP_CODE_SENT
+
+    bridge = _MockBridgeAnonReq(
+        SentResult(success=True, is_flood=False, expected_ack=0x11223344, timeout_ms=4000)
+    )
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    frames = []
+    server._write_frame = Mock(side_effect=lambda f: frames.append(f))
+    server._write_err = Mock()
+    await server._cmd_send_anon_req(b"\x02" * 32 + b"\x07")
+    server._write_err.assert_not_called()
+    assert len(frames) == 1
+    assert frames[0][0] == RESP_CODE_SENT
+    assert frames[0][1] == 0  # not flood
+    assert struct.unpack("<I", frames[0][2:6])[0] == 0x11223344

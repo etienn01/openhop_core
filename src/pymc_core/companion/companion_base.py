@@ -47,6 +47,7 @@ from ..protocol.transport_keys import calc_transport_code, get_auto_key_for
 from .channel_store import ChannelStore
 from .constants import (
     ADV_TYPE_CHAT,
+    ADV_TYPE_NONE,
     ADV_TYPE_REPEATER,
     ADV_TYPE_ROOM,
     ADV_TYPE_SENSOR,
@@ -286,8 +287,13 @@ class CompanionBase(ABC):
     # -------------------------------------------------------------------------
 
     def get_contacts(self, since: int = 0) -> list[Contact]:
-        """Return all contacts, optionally filtered by modification time."""
-        return self.contacts.get_all(since=since)
+        """Return all contacts, optionally filtered by modification time.
+
+        Transient/anon contacts (ADV_TYPE_NONE) created for non-contact anon
+        requests are excluded — they are never synced to the app, mirroring the
+        firmware contacts iterator in MyMesh::checkSerialInterface.
+        """
+        return [c for c in self.contacts.get_all(since=since) if c.adv_type != ADV_TYPE_NONE]
 
     def get_contact_by_key(self, pub_key: bytes) -> Optional[Contact]:
         """Look up a contact by its full 32-byte public key."""
@@ -970,7 +976,10 @@ class CompanionBase(ABC):
             from . import binary_parsing
 
             parsed = binary_parsing.parse_binary_response(
-                request_type, response_data, pubkey_prefix=pubkey_prefix, context=context
+                request_type,
+                response_data,
+                pubkey_prefix=pubkey_prefix,
+                context=context,
             )
         except Exception as e:
             logger.debug(f"Binary response parse for type {request_type}: {e}")
@@ -1191,8 +1200,22 @@ class CompanionBase(ABC):
         """
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
-            return SentResult(success=False)
-        proxy = self.contacts.get_by_name(contact.name)
+            # FIRMWARE_VER_CODE 13+ (PR #2672): allow non-contact anon requests by
+            # creating a transient zero-hop contact. Mirrors firmware sendAnonReq:
+            # out_path_len=0 => direct zero-hop, type=ADV_TYPE_NONE (unknown).
+            contact = Contact(
+                public_key=pub_key,
+                name="",
+                adv_type=ADV_TYPE_NONE,
+                out_path_len=0,
+                out_path=b"",
+                lastmod=int(time.time()),
+            )
+            if not self.contacts.add_transient(contact):
+                return SentResult(success=False)
+        # Resolve the proxy by key (anon contacts have an empty name, which
+        # get_by_name would mis-match against any other empty-named contact).
+        proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
             return SentResult(success=False)
         request_type = PROTOCOL_CODE_ANON_REQ
@@ -1724,7 +1747,11 @@ class CompanionBase(ABC):
         """
         out_path_len = getattr(proxy, "out_path_len", -1)
         out_path = getattr(proxy, "out_path", b"") or b""
-        logger.debug("[PATHDIAG] %s pre-send: %s", request_type, _fmt_path(out_path_len, out_path))
+        logger.debug(
+            "[PATHDIAG] %s pre-send: %s",
+            request_type,
+            _fmt_path(out_path_len, out_path),
+        )
 
     async def send_status_request(self, pub_key: bytes, timeout: float = 15.0) -> dict:
         """Send a protocol request for repeater status/stats."""

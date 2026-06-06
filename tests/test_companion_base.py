@@ -145,7 +145,7 @@ class TestApplyPathHashMode:
         pkt = Packet()
         pkt.header = 0x06
         # 3 hops with 1-byte hashes
-        pkt.set_path(b"\xAA\xBB\xCC")
+        pkt.set_path(b"\xaa\xbb\xcc")
         pkt.payload = bytearray(b"test")
         pkt.payload_len = 4
 
@@ -267,6 +267,45 @@ async def test_share_contact_replays_remote_pubkey_zero_hop():
     assert len(out.path) == 0
 
 
+@pytest.mark.asyncio
+async def test_send_anon_req_to_non_contact_creates_transient_and_sends_direct():
+    """PR #2672: anon req to an unknown pubkey creates a zero-hop transient contact."""
+    remote = LocalIdentity()
+    sent = []
+
+    async def _capture(pkt, wait_for_ack=False):
+        sent.append(pkt)
+        return True
+
+    bridge = CompanionBridge(LocalIdentity(), _capture)
+    pub_key = remote.get_public_key()
+    assert bridge.contacts.get_by_key(pub_key) is None
+
+    result = await bridge.send_anon_req(pub_key, b"\x07")
+
+    assert result.success is True
+    assert result.is_flood is False  # zero-hop direct, not flood
+    assert len(sent) == 1
+    # Transient contact recorded with ADV_TYPE_NONE, zero-hop direct path...
+    transient = bridge.contacts.get_by_key(pub_key)
+    assert transient is not None
+    assert transient.adv_type == 0
+    assert transient.out_path_len == 0
+    # ...but excluded from the app-facing contact sync and from persistence.
+    assert all(c.public_key != pub_key for c in bridge.get_contacts())
+    assert all(d["public_key"] != pub_key.hex() for d in bridge.contacts.to_dicts())
+
+
+@pytest.mark.asyncio
+async def test_send_anon_req_returns_failure_when_anon_pool_full():
+    """When add_transient fails the request reports failure (-> ERR_CODE_TABLE_FULL)."""
+    bridge = CompanionBridge(LocalIdentity(), lambda *a, **k: None)
+    pub_key = LocalIdentity().get_public_key()
+    bridge.contacts.add_transient = lambda c: False  # simulate full anon pool
+    result = await bridge.send_anon_req(pub_key, b"\x07")
+    assert result.success is False
+
+
 def test_apply_flood_scope_uses_default_scope_when_transient_unset():
     """Persisted default scope key applies transport flooding when transient scope is unset."""
     bridge = _make_bridge(path_hash_mode=0)
@@ -299,7 +338,7 @@ async def test_group_data_packet_is_queued_for_sync():
     assert bridge.set_channel(0, "Public", b"\x11" * 32)
 
     ch = bridge.get_channel(0)
-    plaintext = b"\x34\x12\x02\xAA\xBB"  # data_type=0x1234, len=2, payload=AABB
+    plaintext = b"\x34\x12\x02\xaa\xbb"  # data_type=0x1234, len=2, payload=AABB
     pkt = PacketBuilder.create_group_data_packet(
         PAYLOAD_TYPE_GRP_DATA,
         channel_hash=hashlib.sha256(ch.secret).digest()[0],
@@ -314,4 +353,4 @@ async def test_group_data_packet_is_queued_for_sync():
     assert queued.is_channel is True
     assert queued.channel_idx == 0
     assert queued.channel_data_type == 0x1234
-    assert queued.channel_data_payload == b"\xAA\xBB"
+    assert queued.channel_data_payload == b"\xaa\xbb"
