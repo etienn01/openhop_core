@@ -22,6 +22,7 @@ from pymc_core.protocol.constants import (
     PAYLOAD_TYPE_GRP_DATA,
     PAYLOAD_TYPE_TRACE,
     ROUTE_TYPE_DIRECT,
+    ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
 from pymc_core.protocol.utils import determine_contact_type_from_flags, get_contact_type_name
@@ -323,6 +324,46 @@ def test_apply_flood_scope_uses_default_scope_when_transient_unset():
     bridge._apply_flood_scope(pkt)
     assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
     assert pkt.transport_codes[0] != 0
+
+
+def _make_flood_pkt() -> Packet:
+    pkt = Packet()
+    pkt.header = (PAYLOAD_TYPE_TRACE << 2) | 0x01  # route type FLOOD
+    pkt.path_len = 0
+    pkt.path = bytearray()
+    pkt.payload = bytearray(b"abc")
+    pkt.payload_len = 3
+    return pkt
+
+
+def test_set_flood_unscoped_overrides_default_scope_one_shot():
+    """FW #2492: explicit unscoped forces a plain flood, bypassing the default scope."""
+    bridge = _make_bridge(path_hash_mode=0)
+    assert bridge.set_default_flood_scope("region1", bytes(range(16))) is True
+
+    bridge.set_flood_unscoped()
+    pkt = _make_flood_pkt()
+    bridge._apply_flood_scope(pkt)
+    # Stays a plain flood — no transport scoping applied.
+    assert pkt.get_route_type() == ROUTE_TYPE_FLOOD
+    assert pkt.transport_codes[0] == 0
+
+    # One-shot: the next flood falls back to the default scope.
+    pkt2 = _make_flood_pkt()
+    bridge._apply_flood_scope(pkt2)
+    assert pkt2.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+    assert pkt2.transport_codes[0] != 0
+
+
+def test_set_flood_scope_cancels_pending_unscoped():
+    """Setting/resetting a scope clears a pending explicit-unscoped request."""
+    bridge = _make_bridge(path_hash_mode=0)
+    assert bridge.set_default_flood_scope("region1", bytes(range(16))) is True
+    bridge.set_flood_unscoped()
+    bridge.set_flood_scope(None)  # cancels the unscoped request
+    pkt = _make_flood_pkt()
+    bridge._apply_flood_scope(pkt)
+    assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
 
 
 @pytest.mark.asyncio

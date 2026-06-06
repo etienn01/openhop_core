@@ -974,3 +974,41 @@ async def test_maybe_persist_contact_skips_transient():
     real = SimpleNamespace(adv_type=1)  # ADV_TYPE_CHAT
     await server._maybe_persist_contact(real)
     assert persisted == [real]  # persisted
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_flood_scope_dispatches_mode_byte():
+    """CMD_SET_FLOOD_SCOPE_KEY: mode 1 -> unscoped, mode 0 -> set/reset scope (FW #2492)."""
+    bridge = Mock()
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+
+    # mode 1 (v12+): force unscoped
+    await server._cmd_set_flood_scope(bytes([0x01]))
+    bridge.set_flood_unscoped.assert_called_once()
+    bridge.set_flood_scope.assert_not_called()
+
+    # mode 0 with a 16-byte key: set scope override (key from data[1:17])
+    bridge.reset_mock()
+    key = bytes(range(16))
+    await server._cmd_set_flood_scope(bytes([0x00]) + key)
+    bridge.set_flood_scope.assert_called_once_with(key)
+    bridge.set_flood_unscoped.assert_not_called()
+
+    # mode 0, short: reset scope
+    bridge.reset_mock()
+    await server._cmd_set_flood_scope(bytes([0x00]))
+    bridge.set_flood_scope.assert_called_once_with(None)
+
+
+def test_max_frame_size_is_176():
+    """Companion frame size tracks firmware PR #2022 (172 -> 176)."""
+    from pymc_core.companion.constants import (
+        MAX_CHANNEL_DATA_LENGTH,
+        MAX_FRAME_SIZE,
+        MAX_PAYLOAD_SIZE,
+    )
+
+    assert MAX_FRAME_SIZE == 176
+    assert MAX_PAYLOAD_SIZE == 173
+    assert MAX_CHANNEL_DATA_LENGTH == 167

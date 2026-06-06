@@ -1782,13 +1782,20 @@ class CompanionFrameServer:
         self._write_ok() if ok else self._write_err(ERR_CODE_NOT_FOUND)
 
     async def _cmd_set_flood_scope(self, data: bytes) -> None:
-        """Delegate flood scope to the bridge.
+        """Delegate flood scope to the bridge (CMD_SET_FLOOD_SCOPE_KEY).
 
-        Wire format after cmd byte is stripped: [reserved=0x00 (1)] [key (16)]
-        The firmware (MyMesh.cpp) uses cmd_frame[2] as key start, skipping the
-        reserved byte at cmd_frame[1].  We mirror that by using data[1:17].
+        Wire format after the cmd byte is stripped: [mode (1)] [key (16)].
+        The firmware (MyMesh.cpp:1909) treats data[0] as a mode selector:
+          * mode 0: set the scope override key (data[1:17]) when present, else
+            reset the override; cancels any pending explicit-unscoped request.
+          * mode 1 (FIRMWARE_VER_CODE 12+, PR #2492): force the next flood to be
+            unscoped, ignoring the configured default scope.
+        Older apps always sent mode 0, so this is backward compatible.
         """
-        if len(data) >= 17:
+        mode = data[0] if len(data) >= 1 else 0
+        if mode == 1:
+            self.bridge.set_flood_unscoped()
+        elif len(data) >= 17:
             self.bridge.set_flood_scope(data[1:17])
         else:
             self.bridge.set_flood_scope(None)

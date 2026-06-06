@@ -8,7 +8,8 @@ from enum import IntEnum
 # ---------------------------------------------------------------------------
 # ADV Types (contact/node classification)
 # ---------------------------------------------------------------------------
-ADV_TYPE_NONE = 0  # transient/anon contact (non-contact request), never persisted/synced
+# transient/anon contact (non-contact request), never persisted/synced
+ADV_TYPE_NONE = 0
 ADV_TYPE_CHAT = 1
 ADV_TYPE_REPEATER = 2
 ADV_TYPE_ROOM = 3
@@ -252,7 +253,8 @@ FRAME_OUTBOUND_PREFIX = 0x3E  # '>'
 FRAME_INBOUND_PREFIX = 0x3C  # '<'
 # Match firmware: writeFrame() refuses to send if len > MAX_FRAME_SIZE; BLE MTU
 # is set to this (e.g. BLEDevice::setMTU(MAX_FRAME_SIZE)). Frame = prefix(1) + len(2) + payload.
-MAX_FRAME_SIZE = 172
+# 176 since MeshCore PR #2022 (+4 over the old 172 for region-scoping transport codes).
+MAX_FRAME_SIZE = 176
 MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE - 3  # max bytes after prefix + 2-byte length
 # Firmware companion command parser uses MAX_FRAME_SIZE - 9 for channel binary payloads.
 MAX_CHANNEL_DATA_LENGTH = MAX_FRAME_SIZE - 9

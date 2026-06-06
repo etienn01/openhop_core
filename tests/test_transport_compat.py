@@ -151,14 +151,14 @@ class TestFirmwareCompatibility:
 class TestCmdSetFloodScopeWireFormat:
     """Verify the CMD_SET_FLOOD_SCOPE byte-extraction matches the firmware wire format.
 
-    Firmware (MyMesh.cpp:1775-1779):
+    Firmware (MyMesh.cpp:1909):
         cmd_frame[0] = CMD_SET_FLOOD_SCOPE
-        cmd_frame[1] = 0x00  (reserved, must be 0)
-        cmd_frame[2..17] = 16-byte key   (len >= 2+16 = 18 total)
+        cmd_frame[1] = mode  (0 = scope override/reset; 1 = explicit unscoped, v12+)
+        cmd_frame[2..17] = 16-byte key for mode 0   (len >= 2+16 = 18 total)
 
     frame_server._handle_cmd strips payload[0] (cmd byte) before calling the handler,
-    so the handler receives data = [reserved=0x00] + [key(16)] = 17 bytes.
-    The correct slice is data[1:17], NOT data[:16].
+    so the handler receives data = [mode] + [key(16)] = 17 bytes for a mode-0 set.
+    The correct key slice is data[1:17], NOT data[:16].
     """
 
     def test_key_slice_skips_reserved_byte(self):

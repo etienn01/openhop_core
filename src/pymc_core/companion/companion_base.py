@@ -220,6 +220,9 @@ class CompanionBase(ABC):
         self._custom_vars: dict[str, str] = {}
         self._sign_buffer: Optional[bytearray] = None
         self._flood_transport_key: Optional[bytes] = None
+        # One-shot "force unscoped flood" flag (FW PR #2492 / FIRMWARE_VER_CODE 12+):
+        # when set, the next flood ignores the default scope and floods unscoped.
+        self._flood_unscoped: bool = False
         self._time_offset: float = 0.0
 
         self._event_service = EventService()
@@ -580,11 +583,24 @@ class CompanionBase(ABC):
     # -------------------------------------------------------------------------
 
     def set_flood_scope(self, transport_key: Optional[bytes] = None) -> None:
-        """Set or clear the flood transport key for scoped flooding."""
+        """Set or clear the flood transport key for scoped flooding.
+
+        Also cancels any pending explicit-unscoped request (firmware sets
+        ``send_unscoped = false`` whenever a scope override is set or reset).
+        """
         if transport_key and len(transport_key) >= 16:
             self._flood_transport_key = transport_key[:16]
         else:
             self._flood_transport_key = None
+        self._flood_unscoped = False
+
+    def set_flood_unscoped(self) -> None:
+        """Force the next flood to be unscoped, bypassing the default scope.
+
+        Mirrors firmware CMD_SET_FLOOD_SCOPE_KEY mode 1 (FW PR #2492): a one-shot
+        flag consumed by the next flood-routed packet in _apply_flood_scope.
+        """
+        self._flood_unscoped = True
 
     def set_default_flood_scope(
         self,
@@ -646,12 +662,18 @@ class CompanionBase(ABC):
 
         Matches firmware ``sendFloodScoped()`` in ``BaseChatMesh.cpp``.
         """
-        effective_key = self._resolve_flood_transport_key()
-        if effective_key is None:
-            return
         route_type = pkt.get_route_type()
         if route_type != ROUTE_TYPE_FLOOD:
             return  # only scope flood packets, not direct
+        if self._flood_unscoped:
+            # App explicitly requested unscoped (FW #2492): leave as plain flood,
+            # ignoring any default scope. One-shot — consumed here, as firmware
+            # resets send_unscoped after each flood.
+            self._flood_unscoped = False
+            return
+        effective_key = self._resolve_flood_transport_key()
+        if effective_key is None:
+            return
         code = calc_transport_code(effective_key, pkt)
         pkt.transport_codes[0] = code
         pkt.transport_codes[1] = 0  # reserved for home region (firmware TODO)
