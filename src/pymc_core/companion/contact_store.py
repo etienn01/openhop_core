@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Iterable, Iterator, Optional, Tuple
 
-from .constants import DEFAULT_MAX_CONTACTS
+from .constants import ADV_TYPE_NONE, DEFAULT_MAX_CONTACTS, MAX_ANON_CONTACTS
 from .models import Contact
 
 
@@ -89,6 +89,14 @@ class ContactStore:
                 return proxy
         return None
 
+    def get_proxy_by_key(self, public_key: bytes) -> Optional[ContactProxy]:
+        """Lookup the ContactProxy by full 32-byte public key.
+
+        Preferred over get_by_name for transient/anon contacts, whose name is
+        empty and would otherwise collide with any other empty-named contact.
+        """
+        return self._proxies.get(public_key)
+
     # ------------------------------------------------------------------
     # Companion radio CRUD operations
     # ------------------------------------------------------------------
@@ -118,7 +126,13 @@ class ContactStore:
             oldest_key: Optional[bytes] = None
             oldest_lastmod = 0xFFFFFFFF
             for key, c in self._contacts.items():
-                if (c.flags & 0x01) == 0 and c.lastmod < oldest_lastmod:
+                # Exclude transient/anon entries: real contacts never evict an
+                # anon slot, mirroring firmware allocateContactSlot (non-transient).
+                if (
+                    (c.flags & 0x01) == 0
+                    and c.adv_type != ADV_TYPE_NONE
+                    and c.lastmod < oldest_lastmod
+                ):
                     oldest_lastmod = c.lastmod
                     oldest_key = key
             if oldest_key is None:
@@ -131,6 +145,25 @@ class ContactStore:
         self._contacts[contact.public_key] = contact
         self._proxies[contact.public_key] = ContactProxy(contact)
         return True, None
+
+    def add_transient(self, contact: Contact) -> bool:
+        """Add a transient (ADV_TYPE_NONE) anon-request contact.
+
+        Mirrors firmware allocateContactSlot(transient_only=True): the anon pool
+        is capped at MAX_ANON_CONTACTS, reusing the oldest transient slot (by
+        lastmod) when full. Real contacts are never evicted.
+
+        Returns True on success, False only if the call is somehow misused.
+        """
+        if contact.public_key in self._contacts:
+            return self.update(contact)
+        anon_keys = [k for k, c in self._contacts.items() if c.adv_type == ADV_TYPE_NONE]
+        if len(anon_keys) >= MAX_ANON_CONTACTS:
+            oldest_key = min(anon_keys, key=lambda k: self._contacts[k].lastmod)
+            self.remove(oldest_key)
+        self._contacts[contact.public_key] = contact
+        self._proxies[contact.public_key] = ContactProxy(contact)
+        return True
 
     def update(self, contact: Contact) -> bool:
         """Update an existing contact. Returns False if not found."""
@@ -252,6 +285,9 @@ class ContactStore:
         """Export all contacts as a list of plain dicts for serialization."""
         result = []
         for c in self._contacts.values():
+            # Transient/anon entries are never persisted (firmware save_filter).
+            if c.adv_type == ADV_TYPE_NONE:
+                continue
             result.append(
                 {
                     "public_key": c.public_key.hex(),

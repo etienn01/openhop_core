@@ -8,10 +8,16 @@ from enum import IntEnum
 # ---------------------------------------------------------------------------
 # ADV Types (contact/node classification)
 # ---------------------------------------------------------------------------
+# transient/anon contact (non-contact request), never persisted/synced
+ADV_TYPE_NONE = 0
 ADV_TYPE_CHAT = 1
 ADV_TYPE_REPEATER = 2
 ADV_TYPE_ROOM = 3
 ADV_TYPE_SENSOR = 4
+
+# Max number of transient (ADV_TYPE_NONE) anon-request contacts kept at once.
+# Mirrors firmware MAX_ANON_CONTACTS (BaseChatMesh.h).
+MAX_ANON_CONTACTS = 8
 
 # ---------------------------------------------------------------------------
 # Text Types
@@ -110,7 +116,9 @@ MAX_PENDING_ACK_CRCS = 64
 # 11+ adds channel binary datagrams and default flood scope commands.
 # 12+ matches the MeshCore dev-branch companion (v1.15.x/1.16.0 family): adds
 #     CMD_GET_ALLOWED_REPEAT_FREQ and CMD_SEND_RAW_PACKET.
-FIRMWARE_VER_CODE = 12
+# 13+ (MeshCore PR #2672, v1.16.0): non-contact CMD_SEND_ANON_REQ — the device
+#     creates a transient zero-hop contact for a pubkey not already in contacts.
+FIRMWARE_VER_CODE = 13
 
 # ---------------------------------------------------------------------------
 # Commands (app -> radio)
@@ -245,7 +253,8 @@ FRAME_OUTBOUND_PREFIX = 0x3E  # '>'
 FRAME_INBOUND_PREFIX = 0x3C  # '<'
 # Match firmware: writeFrame() refuses to send if len > MAX_FRAME_SIZE; BLE MTU
 # is set to this (e.g. BLEDevice::setMTU(MAX_FRAME_SIZE)). Frame = prefix(1) + len(2) + payload.
-MAX_FRAME_SIZE = 172
+# 176 since MeshCore PR #2022 (+4 over the old 172 for region-scoping transport codes).
+MAX_FRAME_SIZE = 176
 MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE - 3  # max bytes after prefix + 2-byte length
 # Firmware companion command parser uses MAX_FRAME_SIZE - 9 for channel binary payloads.
 MAX_CHANNEL_DATA_LENGTH = MAX_FRAME_SIZE - 9

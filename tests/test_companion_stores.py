@@ -222,6 +222,56 @@ class TestContactStore:
         assert store.get_by_key_prefix(b"\x11\x22\x33").name == "Prefix"
         assert store.get_by_key_prefix(b"\xff\xff") is None
 
+    # --- Transient/anon contacts (ADV_TYPE_NONE, PR #2672) ---
+
+    def _anon(self, b: int, lastmod: int = 0) -> Contact:
+        return Contact(
+            public_key=bytes([b]) * 32,
+            name="",
+            adv_type=0,
+            out_path_len=0,
+            lastmod=lastmod,
+        )
+
+    def test_add_transient_basic(self):
+        store = ContactStore(max_contacts=5)
+        assert store.add_transient(self._anon(1)) is True
+        assert store.get_by_key(b"\x01" * 32) is not None
+
+    def test_add_transient_pool_capped_reuses_oldest(self):
+        from pymc_core.companion.constants import MAX_ANON_CONTACTS
+
+        store = ContactStore(max_contacts=1000)
+        for i in range(MAX_ANON_CONTACTS):
+            store.add_transient(self._anon(i + 1, lastmod=i + 1))
+        assert store.get_count() == MAX_ANON_CONTACTS
+        # Oldest (lastmod=1, key 0x01) should be evicted by the 9th.
+        store.add_transient(self._anon(99, lastmod=100))
+        assert store.get_count() == MAX_ANON_CONTACTS
+        assert store.get_by_key(b"\x01" * 32) is None
+        assert store.get_by_key(b"\x63" * 32) is not None  # 0x63 == 99
+
+    def test_to_dicts_excludes_transient(self):
+        store = ContactStore(max_contacts=5)
+        store.add(Contact(public_key=b"\xaa" * 32, name="Real", adv_type=1))
+        store.add_transient(self._anon(2))
+        dicts = store.to_dicts()
+        assert len(dicts) == 1
+        assert dicts[0]["name"] == "Real"
+
+    def test_add_or_overwrite_never_evicts_for_or_via_anon(self):
+        # A full store of real contacts plus an anon entry: overwrite must replace
+        # a real non-favourite, never the anon slot, and never be blocked by it.
+        store = ContactStore(max_contacts=2)
+        store.add(Contact(public_key=b"\x01" * 32, name="A", adv_type=1, lastmod=10))
+        store.add_transient(self._anon(2, lastmod=1))  # oldest overall, but anon
+        ok, overwritten = store.add_or_overwrite(
+            Contact(public_key=b"\x03" * 32, name="C", adv_type=1, lastmod=50)
+        )
+        assert ok is True
+        assert overwritten == b"\x01" * 32  # the real contact, not the anon slot
+        assert store.get_by_key(b"\x02" * 32) is not None  # anon untouched
+
 
 # ---------------------------------------------------------------------------
 # ChannelStore
