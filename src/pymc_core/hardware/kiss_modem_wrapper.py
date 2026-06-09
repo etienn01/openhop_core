@@ -55,6 +55,10 @@ KISS_FESC = 0xDB  # Frame Escape
 KISS_TFEND = 0xDC  # Transposed Frame End
 KISS_TFESC = 0xDD  # Transposed Frame Escape
 
+# Bytes forms of the delimiters, for C-level bytes.find() scanning in the bulk decoder.
+_KISS_FEND_B = bytes([KISS_FEND])
+_KISS_FESC_B = bytes([KISS_FESC])
+
 # Standard KISS type bytes (port in bits 7-4, command in bits 3-0)
 CMD_DATA = 0x00  # Data frame (raw packet)
 KISS_CMD_TXDELAY = 0x01  # Transmitter keyup delay in 10ms units (firmware default 50 = 500ms)
@@ -195,6 +199,10 @@ RX_BUFFER_SIZE = 1024
 TX_BUFFER_SIZE = 1024
 DEFAULT_BAUDRATE = 115200
 DEFAULT_TIMEOUT = 1.0
+# The RX worker uses a short blocking read so it sleeps in the kernel (releasing the GIL)
+# instead of busy-polling, while still checking stop_event promptly on shutdown. The actual
+# port timeout is min(this, self.timeout) so a caller-supplied lower timeout still wins.
+RX_READ_TIMEOUT_S = 0.1
 RESPONSE_TIMEOUT = 5.0  # Timeout for command responses
 # Extra margin added to estimated airtime when waiting for a DATA TX_DONE, so a long
 # transmit (e.g. a high-SF flood advert) is not cut short by the flat command timeout.
@@ -489,7 +497,9 @@ class KissModemWrapper(LoRaRadio):
             self.serial_conn = serial.Serial(
                 port=self.port,
                 baudrate=self.baudrate,
-                timeout=self.timeout,
+                # Sole reader is _rx_worker, which does a short blocking read; cap the port
+                # timeout so it releases the GIL while idle yet stays shutdown-responsive.
+                timeout=min(self.timeout, RX_READ_TIMEOUT_S),
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
@@ -1797,6 +1807,89 @@ class KissModemWrapper(LoRaRadio):
                 else:
                     self.rx_frame_buffer.append(byte)
 
+    def _decode_kiss(self, data: bytes) -> None:
+        """Bulk KISS decoder used by the RX worker.
+
+        Behaviorally identical to feeding each byte through ``_decode_kiss_byte`` (which
+        the unit tests still exercise), but copies runs of plain bytes with C-level
+        ``bytes.find``/slicing and only does per-byte work at FEND/FESC delimiters. This
+        slashes Python-level work — and therefore GIL hold time — under bursty traffic, so
+        the reader keeps draining the port instead of letting backpressure reach the modem.
+
+        Frame state (in_frame / escaped / rx_frame_buffer) persists on self across calls,
+        so frames that span multiple read chunks decode correctly.
+        """
+        n = len(data)
+        if n == 0:
+            return
+
+        buf = self.rx_frame_buffer  # bytearray, mutated in place
+        in_frame = self.in_frame
+        escaped = self.escaped
+        i = 0
+
+        while i < n:
+            if escaped:
+                b = data[i]
+                i += 1
+                escaped = False
+                # Mirrors _decode_kiss_byte: escaped bytes are appended without a size check
+                if b == KISS_TFEND:
+                    buf.append(KISS_FEND)
+                elif b == KISS_TFESC:
+                    buf.append(KISS_FESC)
+                else:
+                    self.stats["frame_errors"] += 1
+                    logger.warning(f"Invalid KISS escape sequence: 0x{b:02X}")
+                    buf.clear()
+                    in_frame = False
+                continue
+
+            # Scan to the next delimiter; everything in between is plain frame data.
+            fend = data.find(_KISS_FEND_B, i)
+            fesc = data.find(_KISS_FESC_B, i)
+            if fend == -1:
+                nxt = fesc
+            elif fesc == -1:
+                nxt = fend
+            else:
+                nxt = fend if fend < fesc else fesc
+
+            run_end = n if nxt == -1 else nxt
+            if run_end > i and in_frame:
+                run = data[i:run_end]
+                # Honor the MAX_FRAME_SIZE resync rule from _decode_kiss_byte: fill to the
+                # cap, then the next plain byte triggers a resync (lost-FEND protection).
+                space = MAX_FRAME_SIZE - len(buf)
+                if len(run) <= space:
+                    buf += run
+                else:
+                    if space > 0:
+                        buf += run[:space]
+                    self.stats["frame_errors"] += 1
+                    logger.warning("KISS frame exceeded max size (%d), resyncing", MAX_FRAME_SIZE)
+                    buf.clear()
+                    in_frame = False
+
+            if nxt == -1:
+                break
+
+            i = run_end
+            b = data[i]
+            i += 1
+            if b == KISS_FEND:
+                if in_frame and len(buf) > 0:
+                    self._process_received_frame()
+                buf.clear()
+                in_frame = True
+                escaped = False
+            else:  # KISS_FESC
+                if in_frame:
+                    escaped = True
+
+        self.in_frame = in_frame
+        self.escaped = escaped
+
     def _dispatch_rx_callback(self, data: bytes, rssi: int, snr: float) -> None:
         """
         Dispatch RX callback without blocking the RX thread.
@@ -1950,14 +2043,19 @@ class KissModemWrapper(LoRaRadio):
             and self.serial_conn.is_open
         ):
             try:
-                if self.serial_conn and self.serial_conn.in_waiting > 0:
-                    data = self.serial_conn.read(self.serial_conn.in_waiting)
-
-                    for byte in data:
-                        self._decode_kiss_byte(byte)
-
-                else:
-                    threading.Event().wait(0.01)
+                conn = self.serial_conn
+                if conn is None:
+                    break
+                # Blocking read of >=1 byte: sleeps in the kernel (releasing the GIL) until
+                # data or the port timeout, instead of busy-polling. On wake, drain whatever
+                # else has arrived and bulk-decode it in one pass.
+                chunk = conn.read(1)
+                if not chunk:
+                    continue  # timeout with no data; loop re-checks stop_event
+                pending = conn.in_waiting
+                if pending:
+                    chunk += conn.read(pending)
+                self._decode_kiss(chunk)
 
             except Exception as e:
                 if self.is_connected:

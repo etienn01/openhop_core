@@ -2012,3 +2012,111 @@ class TestKissDataTxSingleFlight:
 
         assert modem.send_frame_and_wait(b"AA", timeout=2.0) is False
         modem.send_frame.assert_not_called()
+
+
+class TestBulkDecodeEquivalence:
+    """The bulk _decode_kiss() must be byte-for-byte equivalent to _decode_kiss_byte(),
+    including across arbitrary read-chunk boundaries (escape/frame state spans chunks)."""
+
+    @staticmethod
+    def _kiss_encode(type_byte, payload):
+        out = bytearray([KISS_FEND, type_byte])
+        for b in payload:
+            if b == KISS_FEND:
+                out += bytes([KISS_FESC, KISS_TFEND])
+            elif b == KISS_FESC:
+                out += bytes([KISS_FESC, KISS_TFESC])
+            else:
+                out.append(b)
+        out.append(KISS_FEND)
+        return bytes(out)
+
+    @staticmethod
+    def _new_modem():
+        m = KissModemWrapper(port="/dev/null", auto_configure=False)
+        m.is_connected = True
+        frames = []
+        m.on_frame_received = lambda data: frames.append(data)
+        return m, frames
+
+    def _run_single(self, stream):
+        m, frames = self._new_modem()
+        for byte in stream:
+            m._decode_kiss_byte(byte)
+        return frames, m.stats["frame_errors"]
+
+    def _run_bulk(self, stream, chunk_sizes):
+        m, frames = self._new_modem()
+        idx = 0
+        for size in chunk_sizes:
+            m._decode_kiss(stream[idx : idx + size])
+            idx += size
+        if idx < len(stream):
+            m._decode_kiss(stream[idx:])
+        return frames, m.stats["frame_errors"]
+
+    def _assert_equiv(self, stream, chunk_sizes):
+        exp_frames, exp_errors = self._run_single(stream)
+        got_frames, got_errors = self._run_bulk(stream, chunk_sizes)
+        assert got_frames == exp_frames
+        assert got_errors == exp_errors
+
+    def test_escape_split_across_chunk_boundary(self):
+        # DATA payload = escaped FEND; split the stream right between FESC and TFEND
+        stream = self._kiss_encode(CMD_DATA, bytes([0xC0])) + self._kiss_encode(
+            KISS_CMD_SETHARDWARE, bytes([HW_RESP_RX_META, 0x10, 0xB0])
+        )
+        fesc_pos = stream.index(KISS_FESC)
+        self._assert_equiv(stream, [fesc_pos + 1])  # chunk ends just after FESC
+
+    def test_oversize_frame_resync(self):
+        # A frame with a lost FEND exceeds MAX_FRAME_SIZE, then a valid pair follows.
+        from pymc_core.hardware.kiss_modem_wrapper import MAX_FRAME_SIZE
+
+        runaway = bytes([KISS_FEND, CMD_DATA]) + bytes(MAX_FRAME_SIZE + 50)  # no closing FEND
+        valid = self._kiss_encode(CMD_DATA, b"\x01\x02") + self._kiss_encode(
+            KISS_CMD_SETHARDWARE, bytes([HW_RESP_RX_META, 0x10, 0xB0])
+        )
+        stream = runaway + valid
+        self._assert_equiv(stream, [1] * len(stream))  # byte-at-a-time chunks
+        self._assert_equiv(stream, [len(stream)])  # whole thing at once
+        self._assert_equiv(stream, [7, 600, 50])  # split through the oversize region
+
+    def test_invalid_escape_sequence(self):
+        # FESC followed by a non-transpose byte -> frame error + resync, then a valid pair.
+        bad = bytes([KISS_FEND, CMD_DATA, KISS_FESC, 0x42, 0x99, KISS_FEND])
+        valid = self._kiss_encode(CMD_DATA, b"\x07") + self._kiss_encode(
+            KISS_CMD_SETHARDWARE, bytes([HW_RESP_RX_META, 0x10, 0xB0])
+        )
+        stream = bad + valid
+        self._assert_equiv(stream, [len(stream)])
+        self._assert_equiv(stream, [3, 1, 2, len(stream)])
+
+    def test_fuzz_random_streams_and_chunkings(self):
+        import random
+
+        for seed in range(60):
+            rng = random.Random(seed)
+            stream = bytearray()
+            for _ in range(rng.randint(1, 8)):
+                payload_len = rng.randint(1, 40)
+                payload = bytes(rng.randint(0, 255) for _ in range(payload_len))
+                stream += self._kiss_encode(CMD_DATA, payload)
+                snr = rng.randint(0, 255)
+                rssi = rng.randint(0, 255)
+                stream += self._kiss_encode(
+                    KISS_CMD_SETHARDWARE, bytes([HW_RESP_RX_META, snr, rssi])
+                )
+            # Inject occasional stray delimiters / leading noise between frames
+            if seed % 3 == 0:
+                stream = bytes([KISS_FEND, KISS_FEND]) + bytes(stream)
+            stream = bytes(stream)
+
+            # Random chunk boundaries
+            chunks = []
+            remaining = len(stream)
+            while remaining > 0:
+                size = rng.randint(1, max(1, remaining // 2 or 1))
+                chunks.append(size)
+                remaining -= size
+            self._assert_equiv(stream, chunks)
