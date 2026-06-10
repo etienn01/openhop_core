@@ -880,6 +880,13 @@ class KissModemWrapper(LoRaRadio):
                 self.modem_identity = identity_resp[1]
                 logger.info(f"Modem identity: {self.modem_identity.hex()[:16]}...")
 
+            # Get device name. Diagnostic firmwares append crash info here (e.g. the
+            # F103 KISS modem reports "HF#n pc=... cfsr=..." after a HardFault reboot),
+            # so logging it on every (re)connect surfaces those records automatically.
+            device_name = self.get_device_name()
+            if device_name:
+                logger.info(f"Modem device: {device_name}")
+
         except Exception as e:
             logger.warning(f"Failed to query modem info: {e}")
 
