@@ -19,6 +19,10 @@ KISS_FESC = 0xDB  # Frame Escape
 KISS_TFEND = 0xDC  # Transposed Frame End
 KISS_TFESC = 0xDD  # Transposed Frame Escape
 
+# Bytes forms of the delimiters, for C-level bytes.find() scanning in the bulk decoder.
+_KISS_FEND_B = bytes([KISS_FEND])
+_KISS_FESC_B = bytes([KISS_FESC])
+
 # KISS Command Masks
 KISS_MASK_PORT = 0xF0
 KISS_MASK_CMD = 0x0F
@@ -39,6 +43,9 @@ RX_BUFFER_SIZE = 1024
 TX_BUFFER_SIZE = 1024
 DEFAULT_BAUDRATE = 115200
 DEFAULT_TIMEOUT = 1.0
+# RX worker uses a short blocking read so it sleeps in the kernel (releasing the GIL)
+# instead of busy-polling. Actual port timeout is min(this, self.timeout).
+RX_READ_TIMEOUT_S = 0.1
 
 logger = logging.getLogger("KissSerialWrapper")
 
@@ -135,7 +142,9 @@ class KissSerialWrapper(LoRaRadio):
             self.serial_conn = serial.Serial(
                 port=self.port,
                 baudrate=self.baudrate,
-                timeout=self.timeout,
+                # Sole reader is _rx_worker (short blocking read); cap the port timeout so it
+                # releases the GIL while idle yet stays shutdown-responsive.
+                timeout=min(self.timeout, RX_READ_TIMEOUT_S),
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
@@ -617,6 +626,71 @@ class KissSerialWrapper(LoRaRadio):
             if self.in_frame:
                 self.rx_frame_buffer.append(byte)
 
+    def _decode_kiss(self, data: bytes) -> None:
+        """Bulk KISS decoder used by the RX worker.
+
+        Behaviorally identical to feeding each byte through ``_decode_kiss_byte``, but
+        copies runs of plain bytes with C-level ``bytes.find``/slicing and only does
+        per-byte work at FEND/FESC. This cuts Python-level work (and GIL hold time) under
+        bursty traffic so the reader keeps draining the port. Frame state persists on self
+        across calls, so frames spanning multiple read chunks decode correctly.
+        """
+        n = len(data)
+        if n == 0:
+            return
+
+        buf = self.rx_frame_buffer  # bytearray, mutated in place
+        in_frame = self.in_frame
+        escaped = self.escaped
+        i = 0
+
+        while i < n:
+            if escaped:
+                b = data[i]
+                i += 1
+                escaped = False
+                if b == KISS_TFEND:
+                    buf.append(KISS_FEND)
+                elif b == KISS_TFESC:
+                    buf.append(KISS_FESC)
+                else:
+                    # Mirrors _decode_kiss_byte: count + log, but do NOT clear/resync
+                    self.stats["frame_errors"] += 1
+                    logger.warning(f"Invalid KISS escape sequence: 0x{b:02X}")
+                continue
+
+            fend = data.find(_KISS_FEND_B, i)
+            fesc = data.find(_KISS_FESC_B, i)
+            if fend == -1:
+                nxt = fesc
+            elif fesc == -1:
+                nxt = fend
+            else:
+                nxt = fend if fend < fesc else fesc
+
+            run_end = n if nxt == -1 else nxt
+            if run_end > i and in_frame:
+                buf += data[i:run_end]  # this decoder applies no MAX_FRAME_SIZE cap
+
+            if nxt == -1:
+                break
+
+            i = run_end
+            b = data[i]
+            i += 1
+            if b == KISS_FEND:
+                if in_frame and len(buf) > 1:
+                    self._process_received_frame()
+                buf.clear()
+                in_frame = True
+                escaped = False
+            else:  # KISS_FESC
+                if in_frame:
+                    escaped = True
+
+        self.in_frame = in_frame
+        self.escaped = escaped
+
     def _process_received_frame(self):
         """Process a complete received KISS frame"""
         if len(self.rx_frame_buffer) < 1:
@@ -651,17 +725,19 @@ class KissSerialWrapper(LoRaRadio):
         """Background thread for receiving data"""
         while not self.stop_event.is_set() and self.is_connected:
             try:
-                if self.serial_conn and self.serial_conn.in_waiting > 0:
-                    # Read available bytes
-                    data = self.serial_conn.read(self.serial_conn.in_waiting)
-
-                    # Process each byte through KISS decoder
-                    for byte in data:
-                        self._decode_kiss_byte(byte)
-
-                else:
-                    # Short sleep when no data available
-                    threading.Event().wait(0.01)
+                conn = self.serial_conn
+                if conn is None:
+                    break
+                # Blocking read of >=1 byte: sleeps in the kernel (releasing the GIL) until
+                # data or the port timeout, instead of busy-polling. Then drain whatever else
+                # arrived and bulk-decode it in one pass.
+                chunk = conn.read(1)
+                if not chunk:
+                    continue  # timeout with no data; loop re-checks stop_event
+                pending = conn.in_waiting
+                if pending:
+                    chunk += conn.read(pending)
+                self._decode_kiss(chunk)
 
             except Exception as e:
                 if self.is_connected:  # Only log if we expect to be connected
