@@ -284,6 +284,17 @@ class CompanionBridge(CompanionBase):
     def _get_text_handler(self) -> Any:
         return self._text_handler_ref
 
+    def set_other_params(
+        self,
+        manual_add: int,
+        telemetry_modes: int,
+        advert_loc_policy: int,
+        multi_acks: int,
+    ) -> None:
+        """Set other params and sync the multi_acks pref to the text handler."""
+        super().set_other_params(manual_add, telemetry_modes, advert_loc_policy, multi_acks)
+        self._apply_multi_acks_pref()
+
     def _get_group_text_handler(self):
         """Return the group text handler for name sync."""
         return self._handlers.get(PAYLOAD_TYPE_GRP_TXT)
@@ -330,6 +341,7 @@ class CompanionBridge(CompanionBase):
 
     async def start(self) -> None:
         self._running = True
+        self._apply_multi_acks_pref()
         logger.info(
             f"CompanionBridge started: name={self.prefs.node_name}, "
             f"key={self._identity.get_public_key().hex()[:16]}..."

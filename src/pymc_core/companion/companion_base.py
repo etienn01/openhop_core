@@ -1066,6 +1066,12 @@ class CompanionBase(ABC):
         """Return the text message handler, or ``None``."""
         return None
 
+    def _apply_multi_acks_pref(self) -> None:
+        """Push the current ``multi_acks`` pref into the text handler (best-effort)."""
+        th = self._get_text_handler()
+        if th is not None and hasattr(th, "set_multi_acks"):
+            th.set_multi_acks(getattr(self.prefs, "multi_acks", 0))
+
     # -------------------------------------------------------------------------
     # Unified TX methods (shared between Radio and Bridge)
     # -------------------------------------------------------------------------

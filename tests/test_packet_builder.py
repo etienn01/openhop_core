@@ -62,6 +62,48 @@ def test_create_ack_from_bytes_wraps_raw_payload():
     pkt = PacketBuilder.create_ack_from_bytes(raw)
     assert pkt.get_payload_type() == PAYLOAD_TYPE_ACK
     assert bytes(pkt.payload) == raw
+    # path-less by default
+    assert pkt.path_len == 0
+
+
+def test_create_ack_from_bytes_with_path():
+    """create_ack_from_bytes routes the ACK along a given out_path."""
+    raw = bytes([0x78, 0x56, 0x34, 0x12, 0x00, 0xAB])
+    out_path = bytes([0x11, 0x22])
+    out_path_len = PathUtils.encode_path_len(1, 2)
+    pkt = PacketBuilder.create_ack_from_bytes(raw, path=out_path, path_len_encoded=out_path_len)
+    assert pkt.get_payload_type() == PAYLOAD_TYPE_ACK
+    assert bytes(pkt.payload) == raw
+    assert bytes(pkt.path) == out_path
+    assert pkt.path_len == out_path_len
+
+
+def test_create_multi_ack_layout():
+    """create_multi_ack mirrors firmware createMultiAck byte layout."""
+    from pymc_core.protocol.constants import PAYLOAD_TYPE_MULTIPART
+
+    ack = bytes([0x78, 0x56, 0x34, 0x12, 0x07, 0xAB])
+    pkt = PacketBuilder.create_multi_ack(ack, remaining=1)
+    assert pkt.get_payload_type() == PAYLOAD_TYPE_MULTIPART
+    assert pkt.payload[0] == ((1 << 4) | PAYLOAD_TYPE_ACK)
+    assert bytes(pkt.payload[1:]) == ack
+    assert int.from_bytes(pkt.payload[1:5], "little") == 0x12345678
+
+    # remaining counter occupies the upper nibble
+    pkt3 = PacketBuilder.create_multi_ack(ack, remaining=3)
+    assert pkt3.payload[0] == ((3 << 4) | PAYLOAD_TYPE_ACK)
+
+
+def test_create_multi_ack_with_path():
+    """create_multi_ack carries the routing path for direct forwarding."""
+    ack = bytes([0x78, 0x56, 0x34, 0x12])
+    out_path = bytes([0x11, 0x22])
+    out_path_len = PathUtils.encode_path_len(1, 2)
+    pkt = PacketBuilder.create_multi_ack(
+        ack, remaining=1, path=out_path, path_len_encoded=out_path_len
+    )
+    assert bytes(pkt.path) == out_path
+    assert pkt.path_len == out_path_len
 
 
 def test_packet_builder_create_advert():

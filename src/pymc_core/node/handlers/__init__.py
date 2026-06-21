@@ -9,6 +9,7 @@ from .base import BaseHandler
 from .control import ControlHandler
 from .group_text import GroupTextHandler
 from .login_response import AnonReqResponseHandler, LoginResponseHandler
+from .multipart import MultipartAckHandler
 from .path import PathHandler
 from .protocol_request import ProtocolRequestHandler
 from .protocol_response import ProtocolResponseHandler
@@ -23,6 +24,7 @@ __all__ = [
     "TextMessageHandler",
     "AdvertHandler",
     "AckHandler",
+    "MultipartAckHandler",
     "PathHandler",
     "GroupTextHandler",
     "LoginResponseHandler",

@@ -24,6 +24,7 @@ from .constants import (
     PAYLOAD_TYPE_CONTROL,
     PAYLOAD_TYPE_GRP_DATA,
     PAYLOAD_TYPE_GRP_TXT,
+    PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_PATH,
     PAYLOAD_TYPE_RAW_CUSTOM,
     PAYLOAD_TYPE_REQ,
@@ -287,15 +288,64 @@ class PacketBuilder:
         return digest[:4] + bytes([ext_attempt & 0xFF]) + last_byte
 
     @staticmethod
-    def create_ack_from_bytes(ack_bytes: bytes) -> Packet:
+    def create_ack_from_bytes(
+        ack_bytes: bytes,
+        path: Optional[Sequence[int]] = None,
+        path_len_encoded: Optional[int] = None,
+    ) -> Packet:
         """
         Wrap raw ACK bytes into a PAYLOAD_TYPE_ACK packet.
 
         Mirror of firmware ``Mesh::createAck(const uint8_t* ack, uint8_t len)`` which simply
         copies the raw ACK bytes into the packet payload.
+
+        Args:
+            ack_bytes: Raw ACK payload bytes.
+            path: Optional routing path (one byte per hop) to send the ACK directly along
+                a known ``out_path`` (mirrors firmware ``sendDirect``). When omitted the
+                ACK is a path-less direct packet.
+            path_len_encoded: Optional pre-encoded path_len byte (for 2/3-byte hashes).
         """
-        header = PacketBuilder._create_header(PAYLOAD_TYPE_ACK)
-        return PacketBuilder._create_packet(header, bytes(ack_bytes))
+        has_path = bool(path)
+        header = PacketBuilder._create_header(
+            PAYLOAD_TYPE_ACK, route_type="direct", has_routing_path=has_path
+        )
+        pkt = PacketBuilder._create_packet(header, bytes(ack_bytes))
+        if has_path:
+            pkt.set_path(bytes(path), path_len_encoded)
+        return pkt
+
+    @staticmethod
+    def create_multi_ack(
+        ack_bytes: bytes,
+        remaining: int = 1,
+        path: Optional[Sequence[int]] = None,
+        path_len_encoded: Optional[int] = None,
+    ) -> Packet:
+        """
+        Wrap raw ACK bytes into a PAYLOAD_TYPE_MULTIPART packet ("multi-ack").
+
+        Mirror of firmware ``Mesh::createMultiAck(ack, len, remaining)``: the payload is a
+        one-byte header ``(remaining << 4) | PAYLOAD_TYPE_ACK`` followed by the raw ACK
+        bytes. Intermediate repeaters forward this packet and extract the embedded ACK
+        early, improving delivery-confirmation reliability on multi-hop direct routes.
+
+        Args:
+            ack_bytes: Raw ACK payload bytes (embedded after the wrapper byte).
+            remaining: Number of additional multi-acks still to be sent in the sequence
+                (encoded in the upper nibble of the wrapper byte).
+            path: Optional routing path to send directly along a known ``out_path``.
+            path_len_encoded: Optional pre-encoded path_len byte (for 2/3-byte hashes).
+        """
+        has_path = bool(path)
+        header = PacketBuilder._create_header(
+            PAYLOAD_TYPE_MULTIPART, route_type="direct", has_routing_path=has_path
+        )
+        payload = bytes([((remaining & 0x0F) << 4) | PAYLOAD_TYPE_ACK]) + bytes(ack_bytes)
+        pkt = PacketBuilder._create_packet(header, payload)
+        if has_path:
+            pkt.set_path(bytes(path), path_len_encoded)
+        return pkt
 
     @staticmethod
     def create_self_advert(

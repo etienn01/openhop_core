@@ -8,6 +8,7 @@ from pymc_core.protocol import Packet
 from pymc_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
+    PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_TRACE,
     PAYLOAD_TYPE_TXT_MSG,
     ROUTE_TYPE_DIRECT,
@@ -176,6 +177,27 @@ class TestDispatcherInitialization:
 
         assert 100 in dispatcher._handlers
         assert dispatcher._handlers[100] == mock_handler
+
+    @pytest.mark.asyncio
+    async def test_multipart_ack_releases_waiting_send(self, dispatcher):
+        """A received MULTIPART ack is routed into _register_ack_received and releases a
+        waiting send, just like a discrete ACK."""
+        dispatcher.register_default_handlers(
+            contacts=None, local_identity=dispatcher.local_identity, event_service=None
+        )
+        assert PAYLOAD_TYPE_MULTIPART in dispatcher._handlers
+
+        crc = 0x12345678
+        evt = asyncio.Event()
+        dispatcher._waiting_acks[crc] = evt
+
+        # wrapper byte (remaining=1, inner=ACK) + 4-byte CRC (little-endian 0x12345678)
+        payload = bytes([(1 << 4) | PAYLOAD_TYPE_ACK]) + b"\x78\x56\x34\x12"
+        data = create_test_packet(PAYLOAD_TYPE_MULTIPART, payload)
+        await dispatcher._process_received_packet(data)
+
+        assert evt.is_set()
+        assert crc not in dispatcher._waiting_acks
 
 
 class TestDispatcherPacketProcessing:

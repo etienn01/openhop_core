@@ -23,6 +23,7 @@ from .handlers import (
     AckHandler,
     AnonReqResponseHandler,
     ControlHandler,
+    MultipartAckHandler,
     TraceHandler,
     create_core_handlers,
 )
@@ -179,6 +180,11 @@ class Dispatcher:
         ack_handler = AckHandler(self._log, self)
         ack_handler.set_ack_received_callback(self._register_ack_received)
         self.register_handler(AckHandler.payload_type(), ack_handler)
+
+        # --- Multi-ack handler: extract the embedded ACK from MULTIPART packets ---
+        multipart_ack_handler = MultipartAckHandler(self._log)
+        multipart_ack_handler.set_ack_received_callback(self._register_ack_received)
+        self.register_handler(MultipartAckHandler.payload_type(), multipart_ack_handler)
 
         # --- Core handlers via shared factory ---
         core = create_core_handlers(

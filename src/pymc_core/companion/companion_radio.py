@@ -126,6 +126,7 @@ class CompanionRadio(CompanionBase):
             return
         self._running = True
         self.node.dispatcher.set_default_path_hash_mode(self.prefs.path_hash_mode)
+        self._apply_multi_acks_pref()
         self._dispatcher_task = asyncio.create_task(self.node.start())
         logger.info(
             f"CompanionRadio started: name={self.prefs.node_name}, "
@@ -170,6 +171,17 @@ class CompanionRadio(CompanionBase):
         """Set path hash mode and sync to dispatcher default."""
         super().set_path_hash_mode(mode)
         self.node.dispatcher.set_default_path_hash_mode(self.prefs.path_hash_mode)
+
+    def set_other_params(
+        self,
+        manual_add: int,
+        telemetry_modes: int,
+        advert_loc_policy: int,
+        multi_acks: int,
+    ) -> None:
+        """Set other params and sync the multi_acks pref to the text handler."""
+        super().set_other_params(manual_add, telemetry_modes, advert_loc_policy, multi_acks)
+        self._apply_multi_acks_pref()
 
     # -------------------------------------------------------------------------
     # Device Configuration (overrides for radio hardware)
