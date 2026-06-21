@@ -1164,7 +1164,10 @@ class CompanionBase(ABC):
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
             return SentResult(success=False)
-        proxy = self.contacts.get_by_name(contact.name)
+        # Resolve by exact public key, not name: two contacts can share a name
+        # (e.g. a re-keyed node) and get_by_name returns the first match, which
+        # would encrypt/route to the wrong key.
+        proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
             return SentResult(success=False)
         request_type = data[0] if len(data) >= 1 else 0
@@ -1304,7 +1307,10 @@ class CompanionBase(ABC):
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
             return SentResult(success=False)
-        proxy = self.contacts.get_by_name(contact.name)
+        # Resolve by exact public key, not name: two contacts can share a name
+        # (e.g. a re-keyed node) and get_by_name returns the first match, which
+        # would encrypt/route to the wrong key.
+        proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
             return SentResult(success=False)
         tag_int = random.randint(0, 0xFFFFFFFF)
@@ -1364,7 +1370,10 @@ class CompanionBase(ABC):
         if not contact:
             logger.warning(f"Contact not found for key {pub_key.hex()[:12]}...")
             return SentResult(success=False)
-        proxy = self.contacts.get_by_name(contact.name)
+        # Resolve by exact public key, not name: two contacts can share a name
+        # (e.g. a re-keyed node) and get_by_name returns the first match, which
+        # would encrypt/route to the wrong key.
+        proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
             return SentResult(success=False)
         try:
@@ -1505,7 +1514,10 @@ class CompanionBase(ABC):
         contact = self.contacts.get_by_key(dest_key)
         if not contact:
             return SentResult(success=False)
-        proxy = self.contacts.get_by_name(contact.name)
+        # Resolve the proxy by the exact public key, not by name: two contacts can
+        # share a name (e.g. a node that re-keyed) and get_by_name returns the first
+        # match, which would encrypt/route to the wrong key.
+        proxy = self.contacts.get_proxy_by_key(dest_key)
         if not proxy:
             return SentResult(success=False)
         try:
@@ -1648,7 +1660,10 @@ class CompanionBase(ABC):
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
             return {"success": False, "reason": "Contact not found"}
-        proxy = self.contacts.get_by_name(contact.name)
+        # Resolve by exact public key, not name: two contacts can share a name
+        # (e.g. a re-keyed node) and get_by_name returns the first match, which
+        # would encrypt/route to the wrong key.
+        proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
             return {"success": False, "reason": "Contact not found"}
         login_handler = self._get_login_response_handler()
@@ -1780,7 +1795,10 @@ class CompanionBase(ABC):
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
             return {"success": False, "reason": "Contact not found"}
-        proxy = self.contacts.get_by_name(contact.name)
+        # Resolve by exact public key, not name: two contacts can share a name
+        # (e.g. a re-keyed node) and get_by_name returns the first match, which
+        # would encrypt/route to the wrong key.
+        proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
             return {"success": False, "reason": "Contact not found"}
         proto_handler = self._get_protocol_response_handler()
@@ -1849,7 +1867,10 @@ class CompanionBase(ABC):
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
             return {"success": False, "reason": "Contact not found"}
-        proxy = self.contacts.get_by_name(contact.name)
+        # Resolve by exact public key, not name: two contacts can share a name
+        # (e.g. a re-keyed node) and get_by_name returns the first match, which
+        # would encrypt/route to the wrong key.
+        proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
             return {"success": False, "reason": "Contact not found"}
         proto_handler = self._get_protocol_response_handler()
@@ -1913,7 +1934,10 @@ class CompanionBase(ABC):
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
             return {"success": False, "reason": "Contact not found"}
-        proxy = self.contacts.get_by_name(contact.name)
+        # Resolve by exact public key, not name: two contacts can share a name
+        # (e.g. a re-keyed node) and get_by_name returns the first match, which
+        # would encrypt/route to the wrong key.
+        proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
             return {"success": False, "reason": "Contact not found"}
         proto_handler = self._get_protocol_response_handler()
@@ -1956,7 +1980,10 @@ class CompanionBase(ABC):
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
             return {"success": False, "reason": "Contact not found"}
-        proxy = self.contacts.get_by_name(contact.name)
+        # Resolve by exact public key, not name: two contacts can share a name
+        # (e.g. a re-keyed node) and get_by_name returns the first match, which
+        # would encrypt/route to the wrong key.
+        proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
             return {"success": False, "reason": "Contact not found"}
         text_handler = self._get_text_handler()

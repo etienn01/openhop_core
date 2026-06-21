@@ -13,7 +13,7 @@ from pymc_core.companion.constants import (
     ADV_TYPE_SENSOR,
 )
 from pymc_core.companion.models import Contact
-from pymc_core.protocol import LocalIdentity, Packet, PacketBuilder
+from pymc_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
 from pymc_core.protocol.constants import (
     ADVERT_FLAG_IS_CHAT_NODE,
     ADVERT_FLAG_IS_REPEATER,
@@ -395,3 +395,149 @@ async def test_group_data_packet_is_queued_for_sync():
     assert queued.channel_idx == 0
     assert queued.channel_data_type == 0x1234
     assert queued.channel_data_payload == b"\xaa\xbb"
+
+
+# ---------------------------------------------------------------------------
+# Same-name contact disambiguation (re-keyed node regression)
+# ---------------------------------------------------------------------------
+#
+# Regression for: a node that re-keys (e.g. a device that corrupts its memory and
+# is re-imported with a new public key) leaves two contacts with the *same name*
+# but different public keys in the store. Outbound sends must address the contact
+# the caller actually asked for (by public key), never the first one that happens
+# to share the name. Previously send_* resolved the proxy via get_by_name(), so
+# every DM to the new key was encrypted and routed to the old key.
+
+
+def _identity_with_distinct_first_byte(taken: set[int]) -> LocalIdentity:
+    """Generate a LocalIdentity whose public-key first byte (the on-wire dest hash)
+    is not already in ``taken``, so the two contacts are distinguishable by hash."""
+    for _ in range(1000):
+        idn = LocalIdentity()
+        first = idn.get_public_key()[0]
+        if first not in taken:
+            taken.add(first)
+            return idn
+    raise RuntimeError("could not generate a distinct-first-byte identity")
+
+
+def _decrypt_dm(pkt: Packet, sender_pubkey: bytes, recipient: LocalIdentity) -> bytes:
+    """Decrypt a direct TXT_MSG payload as the intended recipient would.
+
+    Mirrors TextMessageHandler: payload is [dest_hash, src_hash] + cipher, decrypted
+    with ECDH(sender_pub, recipient_priv). Raises if the HMAC is invalid (i.e. the
+    packet was encrypted to a different key).
+    """
+    payload = bytes(pkt.payload)[2:]
+    ss = Identity(sender_pubkey).calc_shared_secret(recipient.get_private_key())
+    return CryptoUtils.mac_then_decrypt(ss[:16], ss, payload)
+
+
+@pytest.mark.asyncio
+async def test_send_text_addresses_exact_key_when_names_collide():
+    """DM to the new key of a re-keyed contact must encrypt/route to that key,
+    not to an older same-named contact inserted earlier."""
+    sent: list[Packet] = []
+
+    async def _capture(pkt, wait_for_ack=False):
+        sent.append(pkt)
+        return True
+
+    bridge = CompanionBridge(LocalIdentity(), _capture, node_name="Local")
+    sender_pub = bridge._identity.get_public_key()
+
+    taken: set[int] = {sender_pub[0]}
+    old = _identity_with_distinct_first_byte(taken)  # corrupted/old "Cheddar"
+    new = _identity_with_distinct_first_byte(taken)  # re-imported "Cheddar"
+
+    # Insert the OLD contact first so a name lookup would return it (the bug).
+    # Give each a distinct direct out_path so routing is observable too.
+    assert bridge.contacts.add(
+        Contact(
+            public_key=old.get_public_key(),
+            name="Cheddar",
+            adv_type=ADV_TYPE_CHAT,
+            out_path_len=2,
+            out_path=b"\x11\x22",
+            lastmod=1,
+        )
+    )
+    assert bridge.contacts.add(
+        Contact(
+            public_key=new.get_public_key(),
+            name="Cheddar",
+            adv_type=ADV_TYPE_CHAT,
+            out_path_len=1,
+            out_path=b"\x99",
+            lastmod=2,
+        )
+    )
+    # Precondition: a name lookup is ambiguous and returns the OLD contact.
+    assert bridge.contacts.get_by_name("Cheddar").public_key == old.get_public_key().hex()
+
+    result = await bridge.send_text_message(
+        new.get_public_key(), "hello cheddar", wait_for_ack=False
+    )
+    assert result.success is True
+    assert len(sent) == 1
+    pkt = sent[0]
+
+    # Addressed to the NEW contact: dest hash byte and routing path both match it.
+    assert pkt.payload[0] == new.get_public_key()[0]
+    assert bytes(pkt.path) == b"\x99"
+
+    # Encrypted to the NEW key: the new recipient can decrypt, the old one cannot.
+    decrypted = _decrypt_dm(pkt, sender_pub, new)
+    assert b"hello cheddar" in decrypted
+    with pytest.raises(Exception):
+        _decrypt_dm(pkt, sender_pub, old)
+
+
+@pytest.mark.asyncio
+async def test_send_text_to_old_key_still_addresses_old_key():
+    """The symmetric case: addressing the older same-named contact still works."""
+    sent: list[Packet] = []
+
+    async def _capture(pkt, wait_for_ack=False):
+        sent.append(pkt)
+        return True
+
+    bridge = CompanionBridge(LocalIdentity(), _capture, node_name="Local")
+    sender_pub = bridge._identity.get_public_key()
+
+    taken = {sender_pub[0]}
+    old = _identity_with_distinct_first_byte(taken)
+    new = _identity_with_distinct_first_byte(taken)
+
+    assert bridge.contacts.add(
+        Contact(
+            public_key=old.get_public_key(),
+            name="Cheddar",
+            adv_type=ADV_TYPE_CHAT,
+            out_path_len=2,
+            out_path=b"\x11\x22",
+            lastmod=1,
+        )
+    )
+    assert bridge.contacts.add(
+        Contact(
+            public_key=new.get_public_key(),
+            name="Cheddar",
+            adv_type=ADV_TYPE_CHAT,
+            out_path_len=1,
+            out_path=b"\x99",
+            lastmod=2,
+        )
+    )
+
+    result = await bridge.send_text_message(
+        old.get_public_key(), "for the old one", wait_for_ack=False
+    )
+    assert result.success is True
+    pkt = sent[0]
+
+    assert pkt.payload[0] == old.get_public_key()[0]
+    assert bytes(pkt.path) == b"\x11\x22"
+    assert b"for the old one" in _decrypt_dm(pkt, sender_pub, old)
+    with pytest.raises(Exception):
+        _decrypt_dm(pkt, sender_pub, new)
