@@ -26,6 +26,42 @@ def test_packet_builder_create_ack():
 
     assert ack_packet is not None
     assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
+    # Firmware-compatible ACKs are 6 bytes: 4-byte hash + ext-attempt + random byte
+    assert len(ack_packet.payload) == 6
+
+
+def test_calc_text_ack_hash_matches_firmware_layout():
+    """calc_text_ack_hash[:4] == sha256(timestamp || flags || text || pubkey)[:4]."""
+    import struct
+
+    identity = LocalIdentity()
+    pubkey = identity.get_public_key()
+    timestamp = 1234567890
+    flags_byte = 0x00  # TXT_TYPE_PLAIN, attempt 0
+    text = b"hello world"
+
+    frag1 = struct.pack("<I", timestamp) + bytes([flags_byte]) + text
+    expected_hash4 = CryptoUtils.sha256(frag1 + pubkey)[:4]
+
+    ack = PacketBuilder.calc_text_ack_hash(
+        pubkey, timestamp, flags_byte, text, ext_attempt=2, randomize=False
+    )
+    assert len(ack) == 6
+    assert ack[:4] == expected_hash4
+    assert ack[4] == 2  # ext-attempt byte
+    assert ack[5] == 0  # randomize=False → deterministic zero
+
+    # Randomized output keeps the same first 5 bytes, only the 6th differs
+    rand = PacketBuilder.calc_text_ack_hash(pubkey, timestamp, flags_byte, text, ext_attempt=2)
+    assert rand[:5] == ack[:5]
+
+
+def test_create_ack_from_bytes_wraps_raw_payload():
+    """create_ack_from_bytes copies raw bytes into an ACK packet payload."""
+    raw = bytes([0x78, 0x56, 0x34, 0x12, 0x00, 0xAB])
+    pkt = PacketBuilder.create_ack_from_bytes(raw)
+    assert pkt.get_payload_type() == PAYLOAD_TYPE_ACK
+    assert bytes(pkt.payload) == raw
 
 
 def test_packet_builder_create_advert():

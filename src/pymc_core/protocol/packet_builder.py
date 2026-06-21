@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import os
 import struct
 import threading
 import time
@@ -244,11 +245,57 @@ class PacketBuilder:
             if isinstance(text, str)
             else bytes(text).strip(b"\x00")
         )
-        temp = PacketBuilder._pack_timestamp_data(timestamp, attempt, text_bytes)
-        digest = CryptoUtils.sha256(temp + pubkey)
+        ack_hash = PacketBuilder.calc_text_ack_hash(pubkey, timestamp, attempt, text_bytes)
+        return PacketBuilder.create_ack_from_bytes(ack_hash)
 
+    @staticmethod
+    def calc_text_ack_hash(
+        pubkey: bytes,
+        timestamp: int,
+        flags_byte: int,
+        text: Union[str, bytes, memoryview],
+        ext_attempt: int = 0,
+        randomize: bool = True,
+    ) -> bytes:
+        """
+        Compute the firmware-compatible 6-byte ACK hash for a plain text message.
+
+        Mirrors MeshCore ``BaseChatMesh::onPeerDataRecv`` (TXT_TYPE_PLAIN): the ACK is
+        ``sha256(timestamp || flags_byte || text || pubkey)[:4]`` followed by an
+        extended-attempt byte and a random byte. Only the first 4 bytes are matched by
+        the sender; bytes 4-5 exist solely to give each emitted ACK packet a unique
+        packet hash (so mesh dedup never drops a legitimate ACK).
+
+        Args:
+            pubkey: 32-byte public key of the message sender.
+            timestamp: Unix timestamp from the original message.
+            flags_byte: The original message's full flags byte (``(txt_type << 2) | attempt``).
+                For TXT_TYPE_PLAIN this equals the attempt number.
+            text: Message text (without the null terminator).
+            ext_attempt: Extended-attempt byte (the byte after the text's null terminator
+                in the decrypted payload); 0 for normal messages.
+            randomize: When True the 6th byte is random (firmware behaviour); set False for
+                deterministic output in tests.
+
+        Returns:
+            bytes: 6-byte ACK hash.
+        """
+        text_bytes = text.encode("utf-8") if isinstance(text, str) else bytes(text)
+        temp = PacketBuilder._pack_timestamp_data(timestamp, flags_byte & 0xFF, text_bytes)
+        digest = CryptoUtils.sha256(temp + pubkey)
+        last_byte = os.urandom(1) if randomize else b"\x00"
+        return digest[:4] + bytes([ext_attempt & 0xFF]) + last_byte
+
+    @staticmethod
+    def create_ack_from_bytes(ack_bytes: bytes) -> Packet:
+        """
+        Wrap raw ACK bytes into a PAYLOAD_TYPE_ACK packet.
+
+        Mirror of firmware ``Mesh::createAck(const uint8_t* ack, uint8_t len)`` which simply
+        copies the raw ACK bytes into the packet payload.
+        """
         header = PacketBuilder._create_header(PAYLOAD_TYPE_ACK)
-        return PacketBuilder._create_packet(header, digest[:4])
+        return PacketBuilder._create_packet(header, bytes(ack_bytes))
 
     @staticmethod
     def create_self_advert(

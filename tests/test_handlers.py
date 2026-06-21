@@ -120,6 +120,17 @@ class TestAckHandler:
         self.log_fn.assert_called()
 
     @pytest.mark.asyncio
+    async def test_process_discrete_ack_six_bytes(self):
+        """Firmware emits 6-byte ACKs (hash + ext-attempt + random); match first 4 bytes."""
+        packet = Packet()
+        # 4-byte CRC 0x12345678 followed by an ext-attempt byte and a random byte
+        packet.payload = bytearray(b"\x78\x56\x34\x12\x02\xAB")
+
+        crc = await self.handler.process_discrete_ack(packet)
+        assert crc == 0x12345678
+        self.log_fn.assert_called()
+
+    @pytest.mark.asyncio
     async def test_call_discrete_ack(self):
         """Test calling ACK handler with discrete ACK packet."""
         # Create packet with 4-byte CRC payload
@@ -178,6 +189,47 @@ class TestTextMessageHandler:
 
         # Should return early without processing
         self.log_fn.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_direct_ack_roundtrip_matches_sender_crc(self):
+        """Receiver-emitted ACK[:4] equals the sender's expected ack_crc (firmware parity)."""
+        import asyncio
+
+        from pymc_core.protocol.packet_builder import PacketBuilder
+
+        sender = LocalIdentity()
+        receiver = self.local_identity  # handler's identity
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        # Sender composes a DIRECT DM addressed to the receiver
+        receiver_contact = _SendContact(receiver.get_public_key().hex())
+        packet, ack_crc = PacketBuilder.create_text_message(
+            receiver_contact, sender, "hello round trip", attempt=0, message_type="direct"
+        )
+
+        # Receiver knows the sender as a contact (32-byte pubkey)
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        ]
+
+        await self.handler(packet)
+
+        # ACK is emitted after a delay via a background task; poll for it.
+        for _ in range(80):
+            if self.send_packet_fn.called:
+                break
+            await asyncio.sleep(0.05)
+
+        assert self.send_packet_fn.called
+        ack_packet = self.send_packet_fn.call_args.args[0]
+        assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
+        assert len(ack_packet.payload) == 6
+        assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
 
 
 # Advert Handler Tests

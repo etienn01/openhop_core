@@ -90,7 +90,6 @@ class TextMessageHandler(BaseHandler):
         # Extract fields from decrypted data
         timestamp = decrypted[:4]  # First 4 bytes are the timestamp
         flags = decrypted[4]  # 5th byte contains flags
-        attempt = flags & 0x03  # Last 2 bits are the attempt number
         txt_type = (flags >> 2) & 0x3F  # Upper 6 bits are txt_type
         message_body = decrypted[5:]  # Rest is the message content
 
@@ -113,15 +112,21 @@ class TextMessageHandler(BaseHandler):
         send_ack = txt_type == TXT_TYPE_PLAIN
 
         if send_ack:
+            # Compute the firmware-compatible 6-byte ACK hash once (same value for both
+            # DIRECT and FLOOD responses). Mirror MeshCore BaseChatMesh::onPeerDataRecv:
+            # the hash covers timestamp || flags_byte || text (C-string, no null), and the
+            # extended-attempt byte is the byte *after* the text's null terminator.
+            nul = message_body.find(b"\x00")
+            text_len = nul if nul >= 0 else len(message_body)
+            text_bytes = message_body[:text_len]
+            ext_attempt = message_body[text_len + 1] if (text_len + 1) < len(message_body) else 0
+            ack_hash = PacketBuilder.calc_text_ack_hash(
+                pubkey, timestamp_int, flags, text_bytes, ext_attempt
+            )
+
             # Create appropriate ACK response
             if is_flood:
-                # FLOOD messages use PATH ACK responses with ACK hash in extra payload
-                text_bytes = message_body.rstrip(b"\x00")
-
-                # Calculate ACK hash using standard method (same as DIRECT messages)
-                pack_data = PacketBuilder._pack_timestamp_data(timestamp_int, attempt, text_bytes)
-                ack_hash = CryptoUtils.sha256(pack_data + pubkey)[:4]
-
+                # FLOOD messages use PATH ACK responses with the ACK hash in extra payload
                 # Create PATH ACK response
                 incoming_path = list(packet.path if hasattr(packet, "path") else [])
                 path_len_encoded = (
@@ -152,12 +157,7 @@ class TextMessageHandler(BaseHandler):
 
             else:
                 # DIRECT messages use discrete ACK packets
-                ack_packet = PacketBuilder.create_ack(
-                    pubkey=pubkey,
-                    timestamp=timestamp_int,
-                    attempt=attempt,
-                    text=message_body.rstrip(b"\x00"),
-                )
+                ack_packet = PacketBuilder.create_ack_from_bytes(ack_hash)
 
                 packet_len = len(ack_packet.write_to())
                 ack_airtime = PacketTimingUtils.estimate_airtime_ms(packet_len, self.radio_config)

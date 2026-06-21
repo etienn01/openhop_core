@@ -47,12 +47,14 @@ class AckHandler(BaseHandler):
         self.log(f"Processing discrete ACK: payload_len={len(packet.payload)}")
         self.log(f"ACK payload (hex): {packet.payload.hex().upper()}")
 
-        if len(packet.payload) != 4:
-            self.log(f"Invalid ACK length: {len(packet.payload)} bytes (expected 4)")
+        if len(packet.payload) < 4:
+            self.log(f"Invalid ACK length: {len(packet.payload)} bytes (expected >= 4)")
             return None
 
-        # Extract CRC checksum (4 bytes, little endian per protocol spec)
-        crc = int.from_bytes(packet.payload, "little")
+        # Extract CRC checksum from the first 4 bytes (little endian per protocol spec).
+        # Firmware emits 6-byte ACKs for plain DMs (4-byte hash + ext-attempt + random byte);
+        # only the first 4 bytes are matched against the expected ACK.
+        crc = int.from_bytes(packet.payload[:4], "little")
         self.log(f"Discrete ACK received: CRC={crc:08X}")
         return crc
 
