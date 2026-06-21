@@ -292,6 +292,7 @@ class PacketBuilder:
         ack_bytes: bytes,
         path: Optional[Sequence[int]] = None,
         path_len_encoded: Optional[int] = None,
+        route_type: str = "direct",
     ) -> Packet:
         """
         Wrap raw ACK bytes into a PAYLOAD_TYPE_ACK packet.
@@ -303,12 +304,16 @@ class PacketBuilder:
             ack_bytes: Raw ACK payload bytes.
             path: Optional routing path (one byte per hop) to send the ACK directly along
                 a known ``out_path`` (mirrors firmware ``sendDirect``). When omitted the
-                ACK is a path-less direct packet.
+                ACK is a path-less packet.
             path_len_encoded: Optional pre-encoded path_len byte (for 2/3-byte hashes).
+            route_type: ``"direct"`` (default) or ``"flood"``. Use ``"flood"`` when the
+                reverse path is unknown so the ACK can propagate without a path (mirrors
+                firmware ``sendAckTo`` falling back to ``sendFloodScoped``). The dispatcher
+                applies flood scope to flood-routed packets at send time.
         """
         has_path = bool(path)
         header = PacketBuilder._create_header(
-            PAYLOAD_TYPE_ACK, route_type="direct", has_routing_path=has_path
+            PAYLOAD_TYPE_ACK, route_type=route_type, has_routing_path=has_path
         )
         pkt = PacketBuilder._create_packet(header, bytes(ack_bytes))
         if has_path:

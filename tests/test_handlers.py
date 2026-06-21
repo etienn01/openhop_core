@@ -327,6 +327,37 @@ class TestTextMessageHandler:
         assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
 
     @pytest.mark.asyncio
+    async def test_direct_unknown_path_floods_ack(self):
+        """With an unknown reverse out_path, the ACK is flood-routed (not path-less direct)."""
+        sender = LocalIdentity()
+        receiver = self.local_identity
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        receiver_contact = _SendContact(receiver.get_public_key().hex())
+        packet, ack_crc = PacketBuilder.create_text_message(
+            receiver_contact, sender, "no reverse path", attempt=0, message_type="direct"
+        )
+        # Sender is a known contact but with an UNKNOWN out_path back to it.
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        ]
+
+        await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert self.send_packet_fn.call_count == 1
+        ack_packet = self.send_packet_fn.call_args_list[0].args[0]
+        assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
+        assert (ack_packet.header & 0x03) == ROUTE_TYPE_FLOOD  # flooded, not direct
+        assert ack_packet.path_len == 0  # no path
+        assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
+
+    @pytest.mark.asyncio
     async def test_direct_multi_ack_emits_multipart_then_ack(self):
         """With multi_acks on and a known path, a MULTIPART fires before the normal ACK."""
         self.handler.set_multi_acks(1)

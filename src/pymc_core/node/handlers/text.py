@@ -66,7 +66,8 @@ class TextMessageHandler(BaseHandler):
         - DIRECT with a known out_path: the ACK routed along that path, plus (when
           ``multi_acks`` is enabled) a multi-ack emitted ~300ms earlier so repeaters can
           forward the embedded ACK.
-        - DIRECT with unknown out_path: a path-less discrete ACK.
+        - DIRECT with unknown out_path: a flood-routed discrete ACK (so it can reach the
+          sender without a known reverse path).
         """
         # The firmware-compatible 6-byte ACK hash is the same for every response. The hash
         # covers timestamp || flags_byte || text (C-string, no null); the extended-attempt
@@ -112,10 +113,13 @@ class TextMessageHandler(BaseHandler):
         )
 
         if not has_known_path:
-            # out_path unknown: path-less discrete ACK
-            ack_packet = PacketBuilder.create_ack_from_bytes(ack_hash)
-            delay_ms = PacketTimingUtils.calc_direct_timeout_ms(airtime(ack_packet), 0)
-            self.log(f"DIRECT ACK timing - delay:{delay_ms:.1f}ms")
+            # out_path unknown: flood the discrete ACK so it can reach the sender without a
+            # known reverse path (mirrors firmware sendAckTo OUT_PATH_UNKNOWN -> sendFloodScoped;
+            # a path-less direct ACK would not be relayed past direct neighbours). The
+            # dispatcher applies flood scope at send time.
+            ack_packet = PacketBuilder.create_ack_from_bytes(ack_hash, route_type="flood")
+            delay_ms = PacketTimingUtils.calc_flood_timeout_ms(airtime(ack_packet))
+            self.log(f"FLOOD ACK timing (no out_path) - delay:{delay_ms:.1f}ms")
             return [(ack_packet, delay_ms / 1000.0)]
 
         out_path = bytes(out_path_raw)
