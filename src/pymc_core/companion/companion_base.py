@@ -2098,8 +2098,14 @@ class CompanionBase(ABC):
                         contact, inbound_path, path_len_encoded=path_len_encoded
                     )
                     if applied is not None:
+                        # Stored (existing or newly auto-added): persist + app contact update.
                         await self._fire_callbacks("advert_received", applied)
-                await self._fire_callbacks("node_discovered", data)
+                    # Firmware parity (BaseChatMesh::onAdvertRecv -> onDiscoveredContact):
+                    # notify the client for *every* valid advert (stored or not). The frame
+                    # layer decides full NEW_ADVERT vs short ADVERT by whether the contact
+                    # ended up in the store.
+                    disc_contact = applied if applied is not None else contact
+                    await self._fire_callbacks("node_discovered", disc_contact)
             elif event_type == MeshEvents.TELEMETRY_UPDATED:
                 await self._fire_callbacks("telemetry_response", data)
         except Exception as e:

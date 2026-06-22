@@ -420,7 +420,24 @@ class CompanionFrameServer:
             )
             _write_push(data)
 
+        async def _push_advert_frames(contact: Contact, *, is_new: bool) -> None:
+            """Push the advert frame for a contact, mirroring firmware onDiscoveredContact:
+            the full NEW_ADVERT when the contact was not stored (``is_new``), otherwise the
+            short ADVERT (pubkey only) for a stored contact.
+            """
+            pubkey = contact.public_key
+            if not isinstance(pubkey, bytes) or len(pubkey) < 32:
+                return
+            short, full = await asyncio.to_thread(_build_advert_push_frames, contact)
+            if is_new:
+                if full is not None:
+                    _write_push(full)
+            else:
+                _write_push(short)
+
         async def on_advert_received(contact):
+            """Stored advert: persist the contact. The client frame push is handled by
+            on_node_discovered (firmware onDiscoveredContact)."""
             try:
                 if not isinstance(contact, Contact):
                     logger.warning(
@@ -428,19 +445,28 @@ class CompanionFrameServer:
                         type(contact).__name__,
                     )
                     contact = Contact.from_dict(contact) if isinstance(contact, dict) else contact
-                pubkey = contact.public_key
-                if not isinstance(pubkey, bytes) or len(pubkey) < 32:
-                    return
-                short, full = await asyncio.to_thread(_build_advert_push_frames, contact)
-                _write_push(short)
-                if full is not None:
-                    _write_push(full)
-            except Exception as e:
-                logger.exception("advert_received callback error: %s", e)
-            try:
                 await self._maybe_persist_contact(contact)
             except Exception as e:
-                logger.warning("Persist contact after advert failed: %s", e)
+                logger.exception("advert_received callback error: %s", e)
+
+        async def on_node_discovered(contact_or_data):
+            """Firmware onDiscoveredContact: fires for every valid advert. Pushes the full
+            NEW_ADVERT when the contact was not stored, else the short ADVERT for a stored
+            contact. "Stored" is determined by whether the contact is in the contact book
+            (the advert pipeline has already applied any auto-add by this point)."""
+            try:
+                if isinstance(contact_or_data, Contact):
+                    contact = contact_or_data
+                elif isinstance(contact_or_data, dict):
+                    contact = Contact.from_dict(contact_or_data, now=int(time.time()))
+                else:
+                    return
+                if not contact.name:
+                    return
+                is_new = self.bridge.contacts.get_by_key(contact.public_key) is None
+                await _push_advert_frames(contact, is_new=is_new)
+            except Exception as e:
+                logger.exception("node_discovered callback error: %s", e)
 
         async def on_contact_path_updated(contact):
             # Defense-in-depth: only push PATH and persist for known contacts
@@ -562,6 +588,7 @@ class CompanionFrameServer:
         self.bridge.on_channel_data_received(on_channel_data_received)
         self.bridge.on_send_confirmed(on_send_confirmed)
         self.bridge.on_advert_received(on_advert_received)
+        self.bridge.on_node_discovered(on_node_discovered)
         self.bridge.on_contact_path_updated(on_contact_path_updated)
         self.bridge.on_binary_response(on_binary_response)
         self.bridge.on_path_discovery_response(on_path_discovery_response)

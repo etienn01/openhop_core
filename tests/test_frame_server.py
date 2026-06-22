@@ -100,6 +100,91 @@ def test_build_advert_push_frames_out_path_len_negative_becomes_0xff():
     assert full[35] == 0xFF
 
 
+@pytest.mark.asyncio
+async def test_node_discovered_pushes_new_advert_when_auto_add_filtered():
+    """Chat node filtered by selective auto-add still pushes NEW_ADVERT to client."""
+    from unittest.mock import AsyncMock
+
+    from pymc_core.companion.companion_bridge import CompanionBridge
+    from pymc_core.companion.constants import AUTOADD_REPEATER
+    from pymc_core.node.events import MeshEvents
+    from pymc_core.protocol import LocalIdentity
+
+    injector = AsyncMock(return_value=True)
+    bridge = CompanionBridge(LocalIdentity(), injector)
+    bridge.prefs.manual_add_contacts = 1
+    bridge.prefs.autoadd_config = AUTOADD_REPEATER
+
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=256)
+    server._setup_push_callbacks()
+
+    peer = LocalIdentity()
+    event_data = {
+        "public_key": peer.get_public_key().hex(),
+        "name": "Meshcore_Jetson_Node",
+        "contact_type": 1,
+        "lat": 0.0,
+        "lon": 0.0,
+        "advert_timestamp": 1000,
+        "timestamp": 1000,
+        "snr": 12.5,
+        "rssi": -38,
+    }
+    await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event_data)
+
+    assert bridge.contacts.get_count() == 0
+    assert server._write_queue.qsize() == 1
+    frame = server._write_queue.get_nowait()
+    # Queued frames carry a 3-byte outbound header (FRAME_OUTBOUND_PREFIX + uint16 length)
+    # prepended by _enqueue_frame; the push code and payload start after it.
+    data = frame[3:]
+    assert data[0] == PUSH_CODE_NEW_ADVERT
+    name_offset = 1 + 32 + 3 + MAX_PATH_SIZE
+    name_b = data[name_offset : name_offset + 32]
+    assert name_b.startswith(b"Meshcore_Jetson_Node")
+
+
+@pytest.mark.asyncio
+async def test_node_discovered_pushes_short_advert_for_stored_contact():
+    """A stored (auto-added) contact's advert pushes the short ADVERT only, mirroring
+    firmware onDiscoveredContact(is_new=false)."""
+    from unittest.mock import AsyncMock
+
+    from pymc_core.companion.companion_bridge import CompanionBridge
+    from pymc_core.node.events import MeshEvents
+    from pymc_core.protocol import LocalIdentity
+
+    injector = AsyncMock(return_value=True)
+    bridge = CompanionBridge(LocalIdentity(), injector)
+    bridge.prefs.manual_add_contacts = 0  # auto-add all types
+
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=256)
+    server._setup_push_callbacks()
+
+    peer = LocalIdentity()
+    event_data = {
+        "public_key": peer.get_public_key().hex(),
+        "name": "StoredNode",
+        "contact_type": 1,
+        "lat": 0.0,
+        "lon": 0.0,
+        "advert_timestamp": 1000,
+        "timestamp": 1000,
+        "snr": 12.5,
+        "rssi": -38,
+    }
+    await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event_data)
+
+    assert bridge.contacts.get_count() == 1  # stored
+    assert server._write_queue.qsize() == 1
+    frame = server._write_queue.get_nowait()
+    data = frame[3:]  # strip the 3-byte outbound header
+    assert data[0] == PUSH_CODE_ADVERT  # short frame only (no full NEW_ADVERT)
+    assert len(data) == 1 + PUB_KEY_SIZE
+
+
 def test_build_advert_push_frames_name_truncated_to_32_bytes():
     """Long name is truncated to 32 bytes in full frame."""
     pubkey = bytes(range(32))

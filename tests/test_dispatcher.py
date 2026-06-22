@@ -511,19 +511,41 @@ class TestDispatcherSendPacket:
         assert result is False
 
     def test_own_packet_detection(self, dispatcher):
-        """Test detection of own packets."""
-        # Create packet with our own address as source
+        """Test detection of own packets (TXT uses payload[1] as src hash)."""
         our_hash = dispatcher.local_identity.get_public_key()[0]
         payload = bytes([0, our_hash]) + b"test"  # dest_hash=0, src_hash=our_hash
         packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, payload)
 
-        # Parse the packet to check
         packet = Packet()
         packet.read_from(packet_data)
 
-        # Should detect as own packet
-        is_own = packet.payload[1] == our_hash
-        assert is_own
+        assert dispatcher._is_own_packet(packet) is True
+
+    def test_own_advert_uses_payload_first_byte(self, dispatcher):
+        """ADVERT packets carry pubkey at payload[0]; must not use payload[1]."""
+        our_hash = dispatcher.local_identity.get_public_key()[0]
+        # Second pubkey byte matches our_hash but first byte does not — must not drop.
+        other_pubkey = bytes([our_hash ^ 0xFF]) + bytes([our_hash]) + bytes(30)
+        packet = Packet()
+        packet.header = (1 << 6) | (PAYLOAD_TYPE_ADVERT << 2)
+        packet.payload = bytearray(other_pubkey + b"\x00" * 40)
+        packet.payload_len = len(packet.payload)
+        packet.path_len = 0
+
+        assert packet.payload[1] == our_hash
+        assert packet.payload[0] != our_hash
+        assert dispatcher._is_own_packet(packet) is False
+
+    def test_own_advert_detected_by_first_pubkey_byte(self, dispatcher):
+        """Own advert: payload[0] equals our pubkey hash."""
+        our_pubkey = dispatcher.local_identity.get_public_key()
+        packet = Packet()
+        packet.header = (1 << 6) | (PAYLOAD_TYPE_ADVERT << 2)
+        packet.payload = bytearray(our_pubkey + b"\x00" * 40)
+        packet.payload_len = len(packet.payload)
+        packet.path_len = 0
+
+        assert dispatcher._is_own_packet(packet) is True
 
 
 class TestDispatcherCallbacks:
