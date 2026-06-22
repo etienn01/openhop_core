@@ -1357,6 +1357,7 @@ class CompanionBase(ABC):
         txt_type: int = TXT_TYPE_PLAIN,
         attempt: int = 1,
         wait_for_ack: bool = True,
+        timestamp: Optional[int] = None,
     ) -> SentResult:
         """Send a direct text message to a contact.
 
@@ -1386,6 +1387,7 @@ class CompanionBase(ABC):
                 attempt=attempt,
                 message_type=msg_type,
                 txt_type=txt_type,
+                timestamp=timestamp,
             )
             self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)

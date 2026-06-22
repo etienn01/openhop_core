@@ -133,6 +133,7 @@ from .constants import (
     STATS_TYPE_CORE,
     STATS_TYPE_PACKETS,
     STATS_TYPE_RADIO,
+    TXT_TYPE_CLI_DATA,
 )
 from .models import Contact, QueuedMessage
 
@@ -1115,6 +1116,14 @@ class CompanionFrameServer:
             return
         txt_type = data[0]
         attempt = data[1]
+        # data[2:6] = host-supplied msg_timestamp (LE uint32). Used as-is for plain DMs so
+        # retries of the same message share a stable timestamp (mirrors firmware sendMessage).
+        # For CLI_DATA — or when the host omits it (0) — mint a fresh timestamp instead,
+        # matching firmware which overrides CLI_DATA with the RTC to avoid replay protection.
+        host_timestamp = int.from_bytes(data[2:6], "little")
+        use_timestamp = (
+            None if (txt_type == TXT_TYPE_CLI_DATA or host_timestamp == 0) else host_timestamp
+        )
         pubkey_prefix = data[6:12]
         text = data[12:].decode("utf-8", errors="replace").rstrip("\x00")
         contact = self.bridge.contacts.get_by_key_prefix(pubkey_prefix)
@@ -1127,7 +1136,12 @@ class CompanionFrameServer:
             else bytes.fromhex(contact.public_key)
         )
         result = await self.bridge.send_text_message(
-            pubkey, text, txt_type=txt_type, attempt=attempt + 1, wait_for_ack=False
+            pubkey,
+            text,
+            txt_type=txt_type,
+            attempt=attempt,
+            wait_for_ack=False,
+            timestamp=use_timestamp,
         )
         if result.success:
             ack = result.expected_ack or 0

@@ -1012,3 +1012,68 @@ def test_max_frame_size_is_176():
     assert MAX_FRAME_SIZE == 176
     assert MAX_PAYLOAD_SIZE == 173
     assert MAX_CHANNEL_DATA_LENGTH == 167
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_txt_msg_threads_host_timestamp():
+    """Plain DM: the host-supplied msg_timestamp (data[2:6]) is passed through verbatim so
+    retries share a stable timestamp (mirrors firmware sendMessage)."""
+    from unittest.mock import AsyncMock
+
+    from pymc_core.companion.companion_bridge import CompanionBridge
+    from pymc_core.companion.constants import TXT_TYPE_CLI_DATA, TXT_TYPE_PLAIN
+    from pymc_core.companion.models import Contact, SentResult
+    from pymc_core.protocol import LocalIdentity
+
+    bridge = CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+    peer = LocalIdentity()
+    pubkey = peer.get_public_key()
+    bridge.contacts.add(Contact(public_key=pubkey, name="Peer"))
+    bridge.send_text_message = AsyncMock(
+        return_value=SentResult(
+            success=True, is_flood=False, expected_ack=0x11223344, timeout_ms=5000
+        )
+    )
+
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=256)
+
+    host_ts = 1700000000
+    # data: txt_type(1) + attempt(1) + msg_timestamp(4, LE) + pubkey_prefix(6) + text
+    data = bytes([TXT_TYPE_PLAIN, 0]) + struct.pack("<I", host_ts) + pubkey[:6] + b"hello"
+    await server._cmd_send_txt_msg(data)
+
+    bridge.send_text_message.assert_awaited_once()
+    assert bridge.send_text_message.call_args.kwargs["timestamp"] == host_ts
+
+    # CLI_DATA mints a fresh timestamp (timestamp=None), matching firmware's RTC override.
+    bridge.send_text_message.reset_mock()
+    data_cli = bytes([TXT_TYPE_CLI_DATA, 0]) + struct.pack("<I", host_ts) + pubkey[:6] + b"cmd"
+    await server._cmd_send_txt_msg(data_cli)
+    assert bridge.send_text_message.call_args.kwargs["timestamp"] is None
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_txt_msg_zero_host_timestamp_mints_fresh():
+    """A zero/omitted host timestamp falls back to a fresh timestamp (timestamp=None)."""
+    from unittest.mock import AsyncMock
+
+    from pymc_core.companion.companion_bridge import CompanionBridge
+    from pymc_core.companion.constants import TXT_TYPE_PLAIN
+    from pymc_core.companion.models import Contact, SentResult
+    from pymc_core.protocol import LocalIdentity
+
+    bridge = CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+    peer = LocalIdentity()
+    pubkey = peer.get_public_key()
+    bridge.contacts.add(Contact(public_key=pubkey, name="Peer"))
+    bridge.send_text_message = AsyncMock(
+        return_value=SentResult(success=True, is_flood=False, expected_ack=0, timeout_ms=5000)
+    )
+
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=256)
+
+    data = bytes([TXT_TYPE_PLAIN, 0]) + struct.pack("<I", 0) + pubkey[:6] + b"hi"
+    await server._cmd_send_txt_msg(data)
+    assert bridge.send_text_message.call_args.kwargs["timestamp"] is None

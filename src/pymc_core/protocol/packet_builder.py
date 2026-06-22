@@ -826,6 +826,7 @@ class PacketBuilder:
         message_type: str = "direct",
         out_path: Optional[list] = None,
         txt_type: int = 0,
+        timestamp: Optional[int] = None,
     ) -> tuple[Packet, int]:
         """
         Create a secure text message with encryption and CRC validation.
@@ -843,6 +844,11 @@ class PacketBuilder:
             txt_type: Text type in upper 6 bits of the flags byte (0=PLAIN, 1=CLI_DATA, …),
                 combined with attempt as ``(txt_type << 2) | (attempt & 3)``. Matches MeshCore
                 ``TXT_TYPE_*`` so repeaters skip delivery ACK for CLI_DATA.
+            timestamp: Optional message timestamp. When provided (e.g. the host-supplied
+                ``msg_timestamp`` from CMD_SEND_TXT_MSG), it is used as-is so that retries
+                of the same message share a stable timestamp — mirroring firmware
+                ``sendMessage``, which uses the app timestamp for plain DMs. When None a
+                fresh strictly-increasing timestamp is generated.
 
         Returns:
             tuple: (packet, crc) - The encrypted packet and CRC for ACK verification.
@@ -861,7 +867,7 @@ class PacketBuilder:
         attempt &= 0x03
         txt_type &= 0x3F
         flags_byte = (txt_type << 2) | attempt
-        timestamp = PacketBuilder._get_timestamp()
+        timestamp = timestamp if timestamp is not None else PacketBuilder._get_timestamp()
 
         # Use  timestamp+data packing
         plaintext = PacketBuilder._pack_timestamp_data(timestamp, flags_byte, message, b"\x00")
