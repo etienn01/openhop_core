@@ -11,6 +11,7 @@ from pymc_core.node.handlers import (
     BaseHandler,
     GroupTextHandler,
     LoginResponseHandler,
+    MultipartAckHandler,
     PathHandler,
     ProtocolRequestHandler,
     ProtocolResponseHandler,
@@ -23,6 +24,7 @@ from pymc_core.protocol.constants import (
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_ANON_REQ,
     PAYLOAD_TYPE_GRP_TXT,
+    PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_PATH,
     PAYLOAD_TYPE_REQ,
     PAYLOAD_TYPE_RESPONSE,
@@ -34,6 +36,7 @@ from pymc_core.protocol.constants import (
     SIGNATURE_SIZE,
     TIMESTAMP_SIZE,
 )
+from pymc_core.protocol.packet_utils import PathUtils
 
 
 # Mock classes for testing
@@ -120,6 +123,17 @@ class TestAckHandler:
         self.log_fn.assert_called()
 
     @pytest.mark.asyncio
+    async def test_process_discrete_ack_six_bytes(self):
+        """Firmware emits 6-byte ACKs (hash + ext-attempt + random); match first 4 bytes."""
+        packet = Packet()
+        # 4-byte CRC 0x12345678 followed by an ext-attempt byte and a random byte
+        packet.payload = bytearray(b"\x78\x56\x34\x12\x02\xAB")
+
+        crc = await self.handler.process_discrete_ack(packet)
+        assert crc == 0x12345678
+        self.log_fn.assert_called()
+
+    @pytest.mark.asyncio
     async def test_call_discrete_ack(self):
         """Test calling ACK handler with discrete ACK packet."""
         # Create packet with 4-byte CRC payload
@@ -135,6 +149,47 @@ class TestAckHandler:
 
 
 # Text Message Handler Tests
+class TestMultipartAckHandler:
+    def setup_method(self):
+        self.log_fn = MagicMock()
+        self.callback = AsyncMock()
+        self.handler = MultipartAckHandler(self.log_fn)
+        self.handler.set_ack_received_callback(self.callback)
+
+    def test_payload_type(self):
+        assert MultipartAckHandler.payload_type() == PAYLOAD_TYPE_MULTIPART
+
+    @pytest.mark.asyncio
+    async def test_extracts_embedded_ack(self):
+        """A MULTIPART ACK notifies the callback with the embedded 4-byte CRC."""
+        packet = Packet()
+        # wrapper byte (remaining=1, inner=ACK) + 4-byte CRC + extra bytes
+        packet.payload = bytearray(
+            bytes([(1 << 4) | PAYLOAD_TYPE_ACK]) + b"\x78\x56\x34\x12\x00\xAB"
+        )
+
+        await self.handler(packet)
+        self.callback.assert_awaited_once_with(0x12345678)
+
+    @pytest.mark.asyncio
+    async def test_too_short_ignored(self):
+        """Payload without a full embedded CRC notifies nothing."""
+        packet = Packet()
+        packet.payload = bytearray(bytes([(1 << 4) | PAYLOAD_TYPE_ACK]) + b"\x12\x34")
+
+        await self.handler(packet)
+        self.callback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_ack_inner_type_ignored(self):
+        """A MULTIPART whose inner type is not ACK notifies nothing."""
+        packet = Packet()
+        packet.payload = bytearray(bytes([(1 << 4) | 0x02]) + b"\x78\x56\x34\x12")
+
+        await self.handler(packet)
+        self.callback.assert_not_awaited()
+
+
 class TestTextMessageHandler:
     def setup_method(self):
         self.local_identity = LocalIdentity()
@@ -178,6 +233,153 @@ class TestTextMessageHandler:
 
         # Should return early without processing
         self.log_fn.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_direct_ack_roundtrip_matches_sender_crc(self):
+        """Receiver-emitted ACK[:4] equals the sender's expected ack_crc (firmware parity)."""
+        import asyncio
+
+        from pymc_core.protocol.packet_builder import PacketBuilder
+
+        sender = LocalIdentity()
+        receiver = self.local_identity  # handler's identity
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        # Sender composes a DIRECT DM addressed to the receiver
+        receiver_contact = _SendContact(receiver.get_public_key().hex())
+        packet, ack_crc = PacketBuilder.create_text_message(
+            receiver_contact, sender, "hello round trip", attempt=0, message_type="direct"
+        )
+
+        # Receiver knows the sender as a contact (32-byte pubkey)
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        ]
+
+        await self.handler(packet)
+
+        # ACK is emitted after a delay via a background task; poll for it.
+        for _ in range(80):
+            if self.send_packet_fn.called:
+                break
+            await asyncio.sleep(0.05)
+
+        assert self.send_packet_fn.called
+        ack_packet = self.send_packet_fn.call_args.args[0]
+        assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
+        assert len(ack_packet.payload) == 6
+        assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
+
+    def _make_direct_dm_with_path(self, text="multi ack route"):
+        """Build a direct DM addressed to the handler, with the sender registered as a
+        contact that has a known multi-hop out_path. Returns (packet, ack_crc, out_path,
+        out_path_len)."""
+        sender = LocalIdentity()
+        receiver = self.local_identity
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        receiver_contact = _SendContact(receiver.get_public_key().hex())
+        packet, ack_crc = PacketBuilder.create_text_message(
+            receiver_contact, sender, text, attempt=0, message_type="direct"
+        )
+
+        # Sender contact known to the receiver, with a 2-hop out_path
+        out_path = bytes([0x11, 0x22])
+        out_path_len = PathUtils.encode_path_len(1, 2)
+        contact = MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        contact.out_path = out_path
+        contact.out_path_len = out_path_len
+        self.contacts.contacts = [contact]
+        return packet, ack_crc, out_path, out_path_len
+
+    async def _wait_for_sends(self, count):
+        import asyncio
+
+        for _ in range(120):
+            if self.send_packet_fn.call_count >= count:
+                break
+            await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
+    async def test_direct_known_path_routes_ack(self):
+        """With a known out_path and multi_acks off, the ACK is routed along the path."""
+        self.handler.set_multi_acks(0)
+        packet, ack_crc, out_path, out_path_len = self._make_direct_dm_with_path()
+
+        await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert self.send_packet_fn.call_count == 1
+        ack_packet = self.send_packet_fn.call_args_list[0].args[0]
+        assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
+        assert bytes(ack_packet.path) == out_path
+        assert ack_packet.path_len == out_path_len
+        assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
+
+    @pytest.mark.asyncio
+    async def test_direct_unknown_path_floods_ack(self):
+        """With an unknown reverse out_path, the ACK is flood-routed (not path-less direct)."""
+        sender = LocalIdentity()
+        receiver = self.local_identity
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        receiver_contact = _SendContact(receiver.get_public_key().hex())
+        packet, ack_crc = PacketBuilder.create_text_message(
+            receiver_contact, sender, "no reverse path", attempt=0, message_type="direct"
+        )
+        # Sender is a known contact but with an UNKNOWN out_path back to it.
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        ]
+
+        await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert self.send_packet_fn.call_count == 1
+        ack_packet = self.send_packet_fn.call_args_list[0].args[0]
+        assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
+        assert (ack_packet.header & 0x03) == ROUTE_TYPE_FLOOD  # flooded, not direct
+        assert ack_packet.path_len == 0  # no path
+        assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
+
+    @pytest.mark.asyncio
+    async def test_direct_multi_ack_emits_multipart_then_ack(self):
+        """With multi_acks on and a known path, a MULTIPART fires before the normal ACK."""
+        self.handler.set_multi_acks(1)
+        packet, ack_crc, out_path, out_path_len = self._make_direct_dm_with_path()
+
+        await self.handler(packet)
+        await self._wait_for_sends(2)
+
+        assert self.send_packet_fn.call_count == 2
+        first = self.send_packet_fn.call_args_list[0].args[0]
+        second = self.send_packet_fn.call_args_list[1].args[0]
+
+        # multipart is staggered earlier, so it is sent first
+        assert first.get_payload_type() == PAYLOAD_TYPE_MULTIPART
+        assert second.get_payload_type() == PAYLOAD_TYPE_ACK
+
+        # both carry the out_path and the same embedded CRC
+        assert bytes(first.path) == out_path and first.path_len == out_path_len
+        assert bytes(second.path) == out_path and second.path_len == out_path_len
+        assert (first.payload[0] & 0x0F) == PAYLOAD_TYPE_ACK
+        assert int.from_bytes(first.payload[1:5], "little") == ack_crc
+        assert int.from_bytes(second.payload[:4], "little") == ack_crc
 
 
 # Advert Handler Tests

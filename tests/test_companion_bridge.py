@@ -68,6 +68,19 @@ class TestCompanionBridgeInit:
         )
         assert bridge._handlers is not None
 
+    def test_set_other_params_propagates_multi_acks(self):
+        """set_other_params pushes the multi_acks pref into the text handler."""
+        bridge = CompanionBridge(LocalIdentity(), MockPacketInjector(), node_name="Test")
+        text_handler = bridge._get_text_handler()
+        assert text_handler is not None
+
+        bridge.set_other_params(manual_add=0, telemetry_modes=0, advert_loc_policy=0, multi_acks=1)
+        assert bridge.prefs.multi_acks == 1
+        assert text_handler.multi_acks == 1
+
+        bridge.set_other_params(manual_add=0, telemetry_modes=0, advert_loc_policy=0, multi_acks=0)
+        assert text_handler.multi_acks == 0
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle
