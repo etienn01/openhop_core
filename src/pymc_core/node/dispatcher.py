@@ -262,19 +262,24 @@ class Dispatcher:
 
     def _is_own_packet(self, pkt: Packet) -> bool:
         """Check if this packet came from us by comparing the source hash."""
-        if not self.local_identity or len(pkt.payload) < 2:
+        if not self.local_identity or not pkt.payload:
             return False
 
-        # Get our public key hash (first byte)
         our_pubkey = self.local_identity.get_public_key()
         our_hash = our_pubkey[0] if len(our_pubkey) > 0 else 0
 
-        # Compare with src_hash in payload[1]
-        src_hash = pkt.payload[1]
-        is_own = src_hash == our_hash
+        ptype = pkt.get_payload_type()
+        if ptype == PAYLOAD_TYPE_ADVERT:
+            if len(pkt.payload) < 1:
+                return False
+            is_own = pkt.payload[0] == our_hash
+        else:
+            if len(pkt.payload) < 2:
+                return False
+            is_own = pkt.payload[1] == our_hash
 
         if is_own:
-            self._log(f"Own packet detected: src_hash={src_hash:02X}, our_hash={our_hash:02X}")
+            self._log(f"Own packet detected: our_hash={our_hash:02X}")
 
         return is_own
 

@@ -598,8 +598,8 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         node_discovered_calls = []
         advert_received_calls = []
 
-        def on_node(data):
-            node_discovered_calls.append(data)
+        def on_node(contact):
+            node_discovered_calls.append(contact)
 
         def on_advert(c):
             advert_received_calls.append(c)
@@ -610,7 +610,8 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         assert bridge.contacts.get_count() == 0
         assert len(advert_received_calls) == 0
         assert len(node_discovered_calls) == 1
-        assert node_discovered_calls[0]["name"] == "RepeaterNode"
+        assert node_discovered_calls[0].name == "RepeaterNode"
+        assert isinstance(node_discovered_calls[0], Contact)
 
     async def test_node_discovered_event_path_adds_contact_and_fires_advert_received(self):
         """Event path with optional inbound_path: store updated, advert_received fired once."""
@@ -644,6 +645,34 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event_data)
         assert bridge.contacts.get_count() == 1
         assert len(advert_received_calls) == 2
+
+    async def test_stored_contact_fires_both_advert_received_and_node_discovered(self):
+        """Firmware parity (onDiscoveredContact fires for every advert): a stored contact
+        fires advert_received (persist) AND node_discovered (client frame push)."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        peer = LocalIdentity()
+        event_data = {
+            "public_key": peer.get_public_key().hex(),
+            "name": "StoredNode",
+            "contact_type": ADV_TYPE_CHAT,
+            "lat": 0.0,
+            "lon": 0.0,
+            "advert_timestamp": 1000,
+            "timestamp": 1000,
+            "snr": 0.0,
+            "rssi": 0,
+        }
+        node_discovered_calls = []
+        advert_received_calls = []
+
+        bridge.on_node_discovered(lambda c: node_discovered_calls.append(c))
+        bridge.on_advert_received(lambda c: advert_received_calls.append(c))
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event_data)
+        assert bridge.contacts.get_count() == 1
+        assert len(advert_received_calls) == 1
+        assert len(node_discovered_calls) == 1
+        assert node_discovered_calls[0].name == "StoredNode"
 
 
 # ---------------------------------------------------------------------------
