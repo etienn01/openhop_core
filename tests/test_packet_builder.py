@@ -458,3 +458,43 @@ def test_login_then_stats_tags_strictly_increase():
     _, stats_ts = PacketBuilder.create_protocol_request(contact, local, 0x01, b"")
     login_ts = int.from_bytes(_decrypt_anon(login_pkt, local, other)[:4], "little")
     assert stats_ts > login_ts
+
+
+def test_create_text_message_uses_explicit_timestamp():
+    """An explicit timestamp is used verbatim (the host msg_timestamp), so retries of the
+    same message keep a stable timestamp — mirroring firmware sendMessage."""
+    import struct
+
+    sender = LocalIdentity()
+    recipient = LocalIdentity()
+    contact = _make_contact(recipient)
+    ts = 1700000000
+    attempt = 2
+    text = "retry me"
+
+    _, crc = PacketBuilder.create_text_message(
+        contact, sender, text, attempt=attempt, message_type="direct", timestamp=ts
+    )
+    flags_byte = attempt & 0x03
+    expected = int.from_bytes(
+        CryptoUtils.sha256(
+            struct.pack("<I", ts)
+            + bytes([flags_byte])
+            + text.encode("utf-8")
+            + sender.get_public_key()
+        )[:4],
+        "little",
+    )
+    assert crc == expected
+
+    # Same timestamp + attempt + text => identical ACK CRC (stable retry identity).
+    _, crc2 = PacketBuilder.create_text_message(
+        contact, sender, text, attempt=attempt, message_type="direct", timestamp=ts
+    )
+    assert crc2 == crc
+
+    # No explicit timestamp => a fresh one is minted => different CRC.
+    _, crc3 = PacketBuilder.create_text_message(
+        contact, sender, text, attempt=attempt, message_type="direct"
+    )
+    assert crc3 != crc
