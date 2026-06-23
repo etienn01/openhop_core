@@ -8,7 +8,11 @@ import struct
 from typing import Callable, Optional
 
 from pymc_core.protocol import PacketBuilder
-from pymc_core.protocol.constants import MAX_PATH_SIZE, PAYLOAD_TYPE_REQ, PAYLOAD_TYPE_RESPONSE
+from pymc_core.protocol.constants import (
+    MAX_PATH_SIZE,
+    PAYLOAD_TYPE_REQ,
+    PAYLOAD_TYPE_RESPONSE,
+)
 from pymc_core.protocol.crypto import CryptoUtils
 from pymc_core.protocol.packet_utils import PathUtils
 
@@ -43,6 +47,7 @@ class ProtocolRequestHandler:
         local_identity,
         contacts,
         get_client_fn: Optional[Callable] = None,
+        get_clients_fn: Optional[Callable] = None,
         request_handlers: Optional[dict] = None,
         log_fn: Optional[Callable] = None,
     ):
@@ -59,6 +64,7 @@ class ProtocolRequestHandler:
         self.local_identity = local_identity
         self.contacts = contacts
         self.get_client_fn = get_client_fn
+        self.get_clients_fn = get_clients_fn
         self.request_handlers = request_handlers or {}
         self.log = log_fn if log_fn else lambda msg: None
 
@@ -86,28 +92,42 @@ class ProtocolRequestHandler:
 
             self.log(f"Processing REQ from 0x{src_hash:02X}")
 
-            # Get client info
-            client = self._get_client(src_hash)
-            if not client:
+            # Resolve client by trying all same-hash candidates until decrypt succeeds.
+            clients = self._get_clients(src_hash)
+            if not clients:
                 self.log(f"REQ from unknown client 0x{src_hash:02X}")
-                return None
-
-            # Get shared secret
-            shared_secret = self._get_shared_secret(client)
-            if not shared_secret:
-                self.log(f"No shared secret for client 0x{src_hash:02X}")
                 return None
 
             # Decrypt request
             encrypted_data = packet.payload[2:]
-            aes_key = shared_secret[:16]
+            client = None
+            shared_secret = None
+            plaintext = None
+            decrypt_attempted = 0
+            for candidate in clients:
+                candidate_secret = self._get_shared_secret(candidate)
+                if not candidate_secret:
+                    continue
+                decrypt_attempted += 1
+                try:
+                    candidate_plaintext = CryptoUtils.mac_then_decrypt(
+                        candidate_secret[:16], candidate_secret, bytes(encrypted_data)
+                    )
+                except Exception:
+                    continue
+                client = candidate
+                shared_secret = candidate_secret
+                plaintext = candidate_plaintext
+                break
 
-            try:
-                plaintext = CryptoUtils.mac_then_decrypt(
-                    aes_key, shared_secret, bytes(encrypted_data)
-                )
-            except Exception as e:
-                self.log(f"Failed to decrypt REQ: {e}")
+            if client is None or shared_secret is None or plaintext is None:
+                if decrypt_attempted == 0:
+                    self.log(f"No shared secret for client 0x{src_hash:02X}")
+                else:
+                    self.log(
+                        f"Failed to decrypt REQ for all {decrypt_attempted} candidate(s) "
+                        f"with src hash 0x{src_hash:02X}"
+                    )
                 return None
 
             # Parse request
@@ -122,10 +142,14 @@ class ProtocolRequestHandler:
             self.log(f"REQ type=0x{req_type:02X}, timestamp={timestamp}")
 
             # Handle request
-            response_data = await self._handle_request(client, timestamp, req_type, req_data)
+            response_data = await self._handle_request(
+                client, timestamp, req_type, req_data
+            )
 
             if response_data:
-                return self._build_response(packet, client, response_data, shared_secret)
+                return self._build_response(
+                    packet, client, response_data, shared_secret
+                )
 
             return None
 
@@ -133,12 +157,22 @@ class ProtocolRequestHandler:
             self.log(f"Error processing REQ: {e}")
             return None
 
-    def _get_client(self, src_hash: int):
-        """Get client info by source hash."""
+    def _get_clients(self, src_hash: int):
+        """Get all client candidates by source hash."""
+        if self.get_clients_fn:
+            clients = self.get_clients_fn(src_hash)
+            if clients is None:
+                return []
+            if isinstance(clients, (list, tuple)):
+                return [c for c in clients if c is not None]
+            return [clients]
+
         if self.get_client_fn:
-            return self.get_client_fn(src_hash)
+            client = self.get_client_fn(src_hash)
+            return [client] if client is not None else []
 
         # Fallback: search in contacts
+        matches = []
         if hasattr(self.contacts, "contacts"):
             for contact in self.contacts.contacts:
                 if hasattr(contact, "public_key"):
@@ -148,9 +182,9 @@ class ProtocolRequestHandler:
                         else contact.public_key
                     )
                     if pk[0] == src_hash:
-                        return contact
+                        matches.append(contact)
 
-        return None
+        return matches
 
     def _get_shared_secret(self, client):
         """Get shared secret for client."""
@@ -170,7 +204,9 @@ class ProtocolRequestHandler:
 
         return None
 
-    async def _handle_request(self, client, timestamp: int, req_type: int, req_data: bytes):
+    async def _handle_request(
+        self, client, timestamp: int, req_type: int, req_data: bytes
+    ):
         """
         Handle request and generate response.
 
@@ -201,7 +237,9 @@ class ProtocolRequestHandler:
         self.log(f"No handler for request type 0x{req_type:02X}")
         return None
 
-    def _build_response(self, original_packet, client, response_data: bytes, shared_secret: bytes):
+    def _build_response(
+        self, original_packet, client, response_data: bytes, shared_secret: bytes
+    ):
         """
         Build RESPONSE packet to send back to client.
 
@@ -236,7 +274,9 @@ class ProtocolRequestHandler:
                 raw_path = getattr(original_packet, "path", None) or b""
                 path_list = list(raw_path[:path_byte_len]) if path_byte_len else []
                 path_len_encoded_arg = (
-                    path_len_byte if PathUtils.is_valid_path_len(path_len_byte) else None
+                    path_len_byte
+                    if PathUtils.is_valid_path_len(path_len_byte)
+                    else None
                 )
                 reply_packet = PacketBuilder.create_path_return(
                     dest_hash=client_hash,
