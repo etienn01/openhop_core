@@ -1300,6 +1300,10 @@ class TestRaceConditionSimulations:
             )
             # Prevent stale wakeups from reusing the previous CRC IRQ status.
             radio._last_irq_status = IRQ_NONE
+            await _wait_condition(
+                lambda: not radio._is_receiving_packet and not radio._rx_done_event.is_set(),
+                timeout=1.0,
+            )
 
         radio._initialized = False
         task.cancel()
