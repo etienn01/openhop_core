@@ -1285,7 +1285,6 @@ class TestRaceConditionSimulations:
         must yield a counter increment of exactly 3.
         """
         radio.crc_error_count = 0
-        radio.set_rx_callback(lambda _: None)
         task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
 
         expected = 0
