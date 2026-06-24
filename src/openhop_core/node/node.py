@@ -60,7 +60,9 @@ class MeshNode:
         self.event_service = event_service  # App can inject event service
 
         # Node name should be provided by app
-        self.node_name = config.get("node", {}).get("name", "unknown") if config else "unknown"
+        self.node_name = (
+            config.get("node", {}).get("name", "unknown") if config else "unknown"
+        )
         self.radio_config = config.get("radio", {}) if config else {}
 
         self.logger = logger or logging.getLogger("MeshNode")
@@ -69,7 +71,9 @@ class MeshNode:
         # App-injected analysis components
         self.packet_filter = None
 
-        self.dispatcher = Dispatcher(radio, log_fn=self.log.info, packet_filter=self.packet_filter)
+        self.dispatcher = Dispatcher(
+            radio, log_fn=self.log.info, packet_filter=self.packet_filter
+        )
 
         # Set contact book for decryption
         self.dispatcher.set_contact_book(self.contacts)
@@ -105,13 +109,17 @@ class MeshNode:
     # Transport
     # -------------------------------------------------------------------------
 
-    async def send_packet(self, pkt: Any, *, wait_for_ack: bool = False, **kwargs) -> bool:
+    async def send_packet(
+        self, pkt: Any, *, wait_for_ack: bool = False, **kwargs
+    ) -> bool:
         """Send a raw packet via the dispatcher.
 
         This is the single transport entry point.  All message-building and
         response-waiting logic lives in the companion layer.
         """
-        return await self.dispatcher.send_packet(pkt, wait_for_ack=wait_for_ack, **kwargs)
+        return await self.dispatcher.send_packet(
+            pkt, wait_for_ack=wait_for_ack, **kwargs
+        )
 
     # -------------------------------------------------------------------------
     # Event service propagation
@@ -150,7 +158,9 @@ class MeshNode:
             self.event = asyncio.Event()
             self.data = {"success": False, "text": None, "parsed": {}}
 
-        def callback(self, success: bool, text: str, parsed_data: Optional[dict] = None):
+        def callback(
+            self, success: bool, text: str, parsed_data: Optional[dict] = None
+        ):
             """Standard callback for response handlers."""
             self.data["success"] = success
             self.data["text"] = text
