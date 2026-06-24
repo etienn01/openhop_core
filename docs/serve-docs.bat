@@ -1,7 +1,7 @@
 @echo off
 REM Build and serve MkDocs documentation locally (Windows)
 
-echo Building and serving pyMC_Core documentation...
+echo Building and serving openHop Core documentation...
 echo ============================================
 echo.
 

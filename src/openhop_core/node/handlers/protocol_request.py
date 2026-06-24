@@ -7,14 +7,14 @@ Handles REQ packets and sends RESPONSE packets with requested data.
 import struct
 from typing import Callable, Optional
 
-from pymc_core.protocol import PacketBuilder
-from pymc_core.protocol.constants import (
+from openhop_core.protocol import PacketBuilder
+from openhop_core.protocol.constants import (
     MAX_PATH_SIZE,
     PAYLOAD_TYPE_REQ,
     PAYLOAD_TYPE_RESPONSE,
 )
-from pymc_core.protocol.crypto import CryptoUtils
-from pymc_core.protocol.packet_utils import PathUtils
+from openhop_core.protocol.crypto import CryptoUtils
+from openhop_core.protocol.packet_utils import PathUtils
 
 # Request type codes (matching C++ implementation)
 REQ_TYPE_GET_STATUS = 0x01
@@ -197,7 +197,7 @@ class ProtocolRequestHandler:
                 if isinstance(client.public_key, str)
                 else client.public_key
             )
-            from pymc_core.protocol.identity import Identity
+            from openhop_core.protocol.identity import Identity
 
             identity = Identity(pk)
             return identity.calc_shared_secret(self.local_identity.get_private_key())
@@ -248,7 +248,7 @@ class ProtocolRequestHandler:
         """
         try:
             # Get client identity
-            from pymc_core.protocol.identity import Identity
+            from openhop_core.protocol.identity import Identity
 
             if hasattr(client, "id") and hasattr(client.id, "get_public_key"):
                 client_identity = client.id

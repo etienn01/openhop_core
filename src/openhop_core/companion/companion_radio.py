@@ -38,8 +38,8 @@ class CompanionRadio(CompanionBase):
 
     Example:
         ```python
-        from pymc_core import CompanionRadio, LocalIdentity
-        from pymc_core.hardware import KissModemWrapper
+        from openhop_core import CompanionRadio, LocalIdentity
+        from openhop_core.hardware import KissModemWrapper
 
         radio = KissModemWrapper("/dev/ttyUSB0")
         radio.connect()

@@ -4,12 +4,12 @@ import asyncio
 
 import pytest
 
-from pymc_core.companion import CompanionBridge
-from pymc_core.companion.constants import ADV_TYPE_CHAT, AUTOADD_CHAT
-from pymc_core.companion.models import Contact
-from pymc_core.node.events import MeshEvents
-from pymc_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
-from pymc_core.protocol.constants import (
+from openhop_core.companion import CompanionBridge
+from openhop_core.companion.constants import ADV_TYPE_CHAT, AUTOADD_CHAT
+from openhop_core.companion.models import Contact
+from openhop_core.node.events import MeshEvents
+from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
+from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_PATH,
@@ -18,7 +18,7 @@ from pymc_core.protocol.constants import (
     PAYLOAD_TYPE_TXT_MSG,
     ROUTE_TYPE_FLOOD,
 )
-from pymc_core.protocol.packet_utils import PathUtils
+from openhop_core.protocol.packet_utils import PathUtils
 
 
 def _make_peer_contact(name: str) -> Contact:

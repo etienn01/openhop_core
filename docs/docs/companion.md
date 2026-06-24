@@ -1,6 +1,6 @@
 # Companion Module
 
-The companion module provides a high-level Python interface to the MeshCore companion radio protocol. It manages contacts, messaging, channels, advertisements, path routing, telemetry, cryptographic signing, and device configuration on top of pyMC_core's `MeshNode`.
+The companion module provides a high-level Python interface to the MeshCore companion radio protocol. It manages contacts, messaging, channels, advertisements, path routing, telemetry, cryptographic signing, and device configuration on top of openhop-core's `MeshNode`.
 
 Three main classes are provided:
 
@@ -53,9 +53,9 @@ CompanionBase (ABC)
 ## Installation
 
 ```bash
-pip install pymc_core            # core only
-pip install pymc_core[hardware]  # SX1262 direct radio support
-pip install pymc_core[all]       # everything
+pip install openhop-core            # core only
+pip install openhop-core[hardware]  # SX1262 direct radio support
+pip install openhop-core[all]       # everything
 ```
 
 ---
@@ -68,8 +68,8 @@ pip install pymc_core[all]       # everything
 
 ```python
 import asyncio
-from pymc_core import LocalIdentity
-from pymc_core.companion import (
+from openhop_core import LocalIdentity
+from openhop_core.companion import (
     CompanionRadio,
     ADV_TYPE_CHAT,
     STATS_TYPE_PACKETS,
@@ -77,7 +77,7 @@ from pymc_core.companion import (
 
 async def main():
     # --- Setup ---
-    from pymc_core.hardware import KissModemWrapper
+    from openhop_core.hardware import KissModemWrapper
 
     radio = KissModemWrapper("/dev/ttyUSB0")
     radio.connect()
@@ -179,12 +179,12 @@ await companion.advertise(flood=True)       # broadcast presence
 await companion.share_contact(pub_key)      # share a contact via direct advert
 ```
 
-**Share contact (firmware parity):** MeshCore replays the **last received raw ADVERT** for that contact (`getBlobByKey` + `sendZeroHop`), not a newly signed advert from the companion identity. pyMC_core stores the wire bytes on each contact when an advert is heard (`Contact.last_advert_packet`) and `share_contact()` returns `False` if no blob exists (e.g. contact was only added manually and never advertised on-air).
+**Share contact (firmware parity):** MeshCore replays the **last received raw ADVERT** for that contact (`getBlobByKey` + `sendZeroHop`), not a newly signed advert from the companion identity. openhop-core stores the wire bytes on each contact when an advert is heard (`Contact.last_advert_packet`) and `share_contact()` returns `False` if no blob exists (e.g. contact was only added manually and never advertised on-air).
 
 ### Contact Management
 
 ```python
-from pymc_core.companion import Contact
+from openhop_core.companion import Contact
 
 # List / lookup
 contacts = companion.get_contacts(since=0)
@@ -215,7 +215,7 @@ ok     = companion.import_contact(blob)      # bool
 ### Channel Management
 
 ```python
-from pymc_core.companion import Channel
+from openhop_core.companion import Channel
 
 companion.set_channel(0, name="General", secret=b"shared_secret_key_here__________")
 ch = companion.get_channel(0)   # -> Channel | None
@@ -307,7 +307,7 @@ config = companion.get_autoadd_config()                   # -> int bitmask
 companion.set_autoadd_config(AUTOADD_CHAT | AUTOADD_REPEATER)
 
 # Location sharing in adverts
-from pymc_core.companion import ADVERT_LOC_SHARE
+from openhop_core.companion import ADVERT_LOC_SHARE
 companion.set_other_params(
     manual_add=0,
     telemetry_modes=0,
@@ -331,7 +331,7 @@ Constrain flood packets to a specific region using transport key scoping.
 Nodes outside the region will ignore scoped flood packets.
 
 ```python
-from pymc_core.protocol.transport_keys import get_auto_key_for
+from openhop_core.protocol.transport_keys import get_auto_key_for
 
 # Set region by name (auto-derives transport key via SHA-256)
 companion.set_flood_region("usa")       # '#' prefix added automatically
@@ -350,7 +350,7 @@ For MeshCore v1.15 parity, the frame protocol also supports a persisted default 
 - `CMD_SET_DEFAULT_FLOOD_SCOPE` (`63`) stores `name(31)` + `key(16)`
 - `CMD_GET_DEFAULT_FLOOD_SCOPE` (`64`) returns the stored value (or empty if unset)
 
-pyMC_core resolves effective flood scope as:
+openhop-core resolves effective flood scope as:
 
 1. transient key set by `CMD_SET_FLOOD_SCOPE` / `set_flood_scope()`
 2. otherwise persisted default key (if configured)
@@ -363,7 +363,7 @@ are unaffected.
 ### Firmware v1.15 Note (nRF BLE DFU)
 
 MeshCore v1.15 may expose Nordic DFU service on the normal nRF companion BLE stack.
-This does not change pyMC_core TCP frame protocol behavior, but BLE clients should not
+This does not change openhop-core TCP frame protocol behavior, but BLE clients should not
 assume only UART service is present on companion devices.
 
 ### Cryptographic Signing
@@ -377,7 +377,7 @@ signature = companion.sign_finish()        # -> 64-byte Ed25519 signature
 ### Statistics
 
 ```python
-from pymc_core.companion import STATS_TYPE_CORE, STATS_TYPE_RADIO, STATS_TYPE_PACKETS
+from openhop_core.companion import STATS_TYPE_CORE, STATS_TYPE_RADIO, STATS_TYPE_PACKETS
 
 stats = companion.get_stats(STATS_TYPE_CORE)
 # {'uptime': 3600, 'queue_len': 2, 'contacts_count': 15, 'channels_count': 3}
@@ -409,8 +409,8 @@ stats = companion.get_stats(STATS_TYPE_PACKETS)
 
 ```python
 import asyncio
-from pymc_core import LocalIdentity
-from pymc_core.companion import CompanionBridge, ADV_TYPE_CHAT
+from openhop_core import LocalIdentity
+from openhop_core.companion import CompanionBridge, ADV_TYPE_CHAT
 
 async def main():
     identity = LocalIdentity()
@@ -509,7 +509,7 @@ Then both local and OTA deliveries share the same packet hash and companion-side
 Example injector with serialize-once local delivery to another bridge:
 
 ```python
-from pymc_core.protocol import Packet
+from openhop_core.protocol import Packet
 
 async def packet_injector(pkt, wait_for_ack=False):
     raw = pkt.write_to()  # after any in-place changes (e.g. flood scope)
@@ -541,8 +541,8 @@ Maximum frame size: 172 bytes (matches firmware; BLE MTU).
 ### Quick Start
 
 ```python
-from pymc_core import LocalIdentity
-from pymc_core.companion import CompanionBridge, CompanionFrameServer
+from openhop_core import LocalIdentity
+from openhop_core.companion import CompanionBridge, CompanionFrameServer
 
 identity = LocalIdentity()
 bridge = CompanionBridge(identity=identity, packet_injector=my_injector)
@@ -1099,7 +1099,7 @@ MAX_PATH_SIZE               = 64
 
 ## Unimplemented MeshCore Companion Features
 
-The following protocol-level features from the MeshCore companion radio firmware (`examples/companion_radio/`) are **not yet implemented** in pyMC_core. CMD_SEND_RAW_DATA (25) and PUSH_CODE_RAW_DATA (0x84) for raw custom packets are implemented.
+The following protocol-level features from the MeshCore companion radio firmware (`examples/companion_radio/`) are **not yet implemented** in openhop-core. CMD_SEND_RAW_DATA (25) and PUSH_CODE_RAW_DATA (0x84) for raw custom packets are implemented.
 
 | Feature | Firmware Reference | Description |
 |---|---|---|

@@ -56,7 +56,7 @@ class KissSerialWrapper(LoRaRadio):
 
     Provides full-duplex KISS protocol communication over serial port.
     Handles frame encoding/decoding, buffering, and configuration commands.
-    Implements the LoRaRadio interface for PyMC Core compatibility.
+    Implements the LoRaRadio interface for openHop Core compatibility.
     """
 
     def __init__(

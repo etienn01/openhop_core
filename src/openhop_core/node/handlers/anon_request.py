@@ -29,7 +29,7 @@ from .base import BaseHandler
 from .login_server import LoginServerHandler
 
 # Anonymous-request sub-types (first byte of an ANON_REQ payload after the
-# 4-byte timestamp). Mirrors ``pymc_core.companion.constants`` but defined here
+# 4-byte timestamp). Mirrors ``openhop_core.companion.constants`` but defined here
 # to avoid a circular import (the companion package imports node.handlers).
 ANON_REQ_TYPE_REGIONS = 0x01
 ANON_REQ_TYPE_OWNER = 0x02

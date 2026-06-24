@@ -16,7 +16,7 @@ import struct
 
 import pytest
 
-from pymc_core.hardware.protocol_constants import (
+from openhop_core.hardware.protocol_constants import (
     CMD_PING,
     CMD_TX_REQUEST,
     PROTO_SYNC,

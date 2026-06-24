@@ -1,12 +1,12 @@
 # API Reference
 
-This section provides detailed API documentation for pyMC_Core.
+This section provides detailed API documentation for openHop Core.
 
 ## Core Modules
 
 ### MeshNode
 
-::: pymc_core.node.MeshNode
+::: openhop_core.node.MeshNode
     handler: python
     options:
       show_root_heading: true
@@ -15,7 +15,7 @@ This section provides detailed API documentation for pyMC_Core.
 
 ### Packet
 
-::: pymc_core.protocol.Packet
+::: openhop_core.protocol.Packet
     handler: python
     options:
       show_root_heading: true
@@ -23,7 +23,7 @@ This section provides detailed API documentation for pyMC_Core.
 
 ### LocalIdentity
 
-::: pymc_core.protocol.LocalIdentity
+::: openhop_core.protocol.LocalIdentity
     handler: python
     options:
       show_root_heading: true
@@ -33,7 +33,7 @@ This section provides detailed API documentation for pyMC_Core.
 
 ### PacketBuilder
 
-::: pymc_core.protocol.PacketBuilder
+::: openhop_core.protocol.PacketBuilder
     handler: python
     options:
       show_root_heading: true
@@ -41,7 +41,7 @@ This section provides detailed API documentation for pyMC_Core.
 
 ### PacketFilter
 
-::: pymc_core.protocol.PacketFilter
+::: openhop_core.protocol.PacketFilter
     handler: python
     options:
       show_root_heading: true
@@ -51,7 +51,7 @@ This section provides detailed API documentation for pyMC_Core.
 
 ### LoRaRadio (Base)
 
-::: pymc_core.hardware.base.LoRaRadio
+::: openhop_core.hardware.base.LoRaRadio
     handler: python
     options:
       show_root_heading: true
@@ -59,7 +59,7 @@ This section provides detailed API documentation for pyMC_Core.
 
 ### SX1262Radio
 
-::: pymc_core.hardware.sx1262_wrapper.SX1262Radio
+::: openhop_core.hardware.sx1262_wrapper.SX1262Radio
     handler: python
     options:
       show_root_heading: true
@@ -67,7 +67,7 @@ This section provides detailed API documentation for pyMC_Core.
 
 ### WsRadio
 
-::: pymc_core.hardware.wsradio.WsRadio
+::: openhop_core.hardware.wsradio.WsRadio
     handler: python
     options:
       show_root_heading: true
@@ -75,7 +75,7 @@ This section provides detailed API documentation for pyMC_Core.
 
 ## Constants
 
-::: pymc_core.protocol.constants
+::: openhop_core.protocol.constants
     handler: python
     options:
       show_root_heading: true

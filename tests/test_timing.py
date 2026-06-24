@@ -2,8 +2,8 @@
 
 import math
 
-from pymc_core.companion import timing
-from pymc_core.protocol.packet_utils import PathUtils
+from openhop_core.companion import timing
+from openhop_core.protocol.packet_utils import PathUtils
 
 
 def test_estimate_airtime_matches_semtech_formula():

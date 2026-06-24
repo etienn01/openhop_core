@@ -14,8 +14,8 @@ the algorithm is correct.  If not, there is a firmware-compatibility bug.
 
 from __future__ import annotations
 
-from pymc_core.protocol import Packet
-from pymc_core.protocol.transport_keys import calc_transport_code, get_auto_key_for
+from openhop_core.protocol import Packet
+from openhop_core.protocol.transport_keys import calc_transport_code, get_auto_key_for
 
 # Raw GRP_TXT packet bytes captured from a firmware companion radio, region #nl-li.
 # Packet structure (TRANSPORT_FLOOD, path_len=0):

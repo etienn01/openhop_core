@@ -14,12 +14,12 @@ import time
 
 from common import create_mesh_node, print_packet_info
 
-from pymc_core.protocol.constants import (
+from openhop_core.protocol.constants import (
     ADVERT_FLAG_HAS_LOCATION,
     ADVERT_FLAG_IS_CHAT_NODE,
     PAYLOAD_TYPE_ADVERT,
 )
-from pymc_core.protocol.packet_builder import PacketBuilder
+from openhop_core.protocol.packet_builder import PacketBuilder
 
 # Global counter for repeats
 repeat_count = 0

@@ -424,7 +424,7 @@ class PacketBuilder:
 
         Example:
             ```python
-            from pymc_core.protocol.identity import LocalIdentity
+            from openhop_core.protocol.identity import LocalIdentity
             identity = LocalIdentity()
             packet = PacketBuilder.create_advert(identity, "MyNode", 37.7749, -122.4194)
             packet.get_payload_type()
@@ -507,7 +507,7 @@ class PacketBuilder:
 
         Example:
             ```python
-            from pymc_core.protocol.identity import Identity, LocalIdentity
+            from openhop_core.protocol.identity import Identity, LocalIdentity
             dest = Identity(bytes(32))
             local = LocalIdentity()
             secret = bytes(32)
@@ -716,7 +716,7 @@ class PacketBuilder:
         Example:
             ```python
             channels = [{"name": "general", "secret": "secret123"}]
-            from pymc_core.protocol.identity import LocalIdentity
+            from openhop_core.protocol.identity import LocalIdentity
             identity = LocalIdentity()
             packet = PacketBuilder.create_group_datagram(
                 "general", identity, "Hello group!", "Alice", channels)
@@ -957,7 +957,7 @@ class PacketBuilder:
 
         Example:
             ```python
-            from pymc_core.protocol.identity import LocalIdentity
+            from openhop_core.protocol.identity import LocalIdentity
             identity = LocalIdentity()
             contact = type('Contact', (), {'public_key': '00'*32, 'out_path': []})()
             packet, crc = PacketBuilder.create_text_message(
@@ -1071,7 +1071,7 @@ class PacketBuilder:
 
         Example:
             ```python
-            from pymc_core.protocol.identity import LocalIdentity
+            from openhop_core.protocol.identity import LocalIdentity
             identity = LocalIdentity()
             contact = type('Contact', (), {'public_key': '00'*32})()
             packet, ts = PacketBuilder.create_protocol_request(
@@ -1186,7 +1186,7 @@ class PacketBuilder:
 
         Example:
             ```python
-            from pymc_core.protocol.identity import LocalIdentity
+            from openhop_core.protocol.identity import LocalIdentity
             identity = LocalIdentity()
             contact = type('Contact', (), {'public_key': '00'*32})()
             packet, ts = PacketBuilder.create_telem_request(

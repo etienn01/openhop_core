@@ -1,6 +1,6 @@
-from pymc_core import LocalIdentity
-from pymc_core.protocol import CryptoUtils
-from pymc_core.protocol.constants import (
+from openhop_core import LocalIdentity
+from openhop_core.protocol import CryptoUtils
+from openhop_core.protocol.constants import (
     MAX_PACKET_PAYLOAD,
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
@@ -8,10 +8,10 @@ from pymc_core.protocol.constants import (
     PAYLOAD_TYPE_PATH,
     PAYLOAD_TYPE_RAW_CUSTOM,
 )
-from pymc_core.protocol.identity import Identity
-from pymc_core.protocol.packet import Packet
-from pymc_core.protocol.packet_builder import PacketBuilder
-from pymc_core.protocol.packet_utils import PathUtils
+from openhop_core.protocol.identity import Identity
+from openhop_core.protocol.packet import Packet
+from openhop_core.protocol.packet_builder import PacketBuilder
+from openhop_core.protocol.packet_utils import PathUtils
 
 
 # PacketBuilder tests
@@ -80,7 +80,7 @@ def test_create_ack_from_bytes_with_path():
 
 def test_create_multi_ack_layout():
     """create_multi_ack mirrors firmware createMultiAck byte layout."""
-    from pymc_core.protocol.constants import PAYLOAD_TYPE_MULTIPART
+    from openhop_core.protocol.constants import PAYLOAD_TYPE_MULTIPART
 
     ack = bytes([0x78, 0x56, 0x34, 0x12, 0x07, 0xAB])
     pkt = PacketBuilder.create_multi_ack(ack, remaining=1)

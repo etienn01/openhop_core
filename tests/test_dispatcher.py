@@ -3,9 +3,9 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from pymc_core.node.dispatcher import Dispatcher, DispatcherState
-from pymc_core.protocol import Packet
-from pymc_core.protocol.constants import (
+from openhop_core.node.dispatcher import Dispatcher, DispatcherState
+from openhop_core.protocol import Packet
+from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_MULTIPART,
@@ -14,8 +14,8 @@ from pymc_core.protocol.constants import (
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
 )
-from pymc_core.protocol.packet_filter import PacketFilter
-from pymc_core.protocol.packet_utils import PathUtils
+from openhop_core.protocol.packet_filter import PacketFilter
+from openhop_core.protocol.packet_utils import PathUtils
 
 
 def create_test_packet(payload_type: int, payload: bytes) -> bytes:
@@ -388,7 +388,7 @@ class TestDispatcherSendPacket:
     @pytest.mark.asyncio
     async def test_default_path_hash_mode_applied_to_flood_packet(self, dispatcher):
         """When path_hash_mode is set, flood packets with 0 hops get path_len bits 6-7 set."""
-        from pymc_core.protocol.constants import PH_TYPE_SHIFT
+        from openhop_core.protocol.constants import PH_TYPE_SHIFT
 
         dispatcher.set_default_path_hash_mode(1)  # 2-byte hashes
         pkt = Packet()
@@ -408,7 +408,7 @@ class TestDispatcherSendPacket:
     @pytest.mark.asyncio
     async def test_path_hash_mode_not_overwritten_when_companion_applied(self, dispatcher):
         """Packet with _path_hash_mode_applied is not overwritten by dispatcher default."""
-        from pymc_core.protocol.constants import PH_TYPE_SHIFT
+        from openhop_core.protocol.constants import PH_TYPE_SHIFT
 
         dispatcher.set_default_path_hash_mode(2)  # 3-byte
         pkt = Packet()
@@ -429,7 +429,7 @@ class TestDispatcherSendPacket:
     @pytest.mark.asyncio
     async def test_trace_flood_rejected(self, dispatcher):
         """TRACE payload with flood route is rejected; send_packet returns False and no TX."""
-        from pymc_core.protocol.constants import PH_TYPE_SHIFT
+        from openhop_core.protocol.constants import PH_TYPE_SHIFT
 
         pkt = Packet()
         pkt.header = (1 << 6) | (PAYLOAD_TYPE_TRACE << PH_TYPE_SHIFT) | ROUTE_TYPE_FLOOD
@@ -446,7 +446,7 @@ class TestDispatcherSendPacket:
     @pytest.mark.asyncio
     async def test_trace_direct_still_sends(self, dispatcher):
         """TRACE with direct route is still sent (no regression)."""
-        from pymc_core.protocol.constants import PH_TYPE_SHIFT
+        from openhop_core.protocol.constants import PH_TYPE_SHIFT
 
         pkt = Packet()
         pkt.header = (1 << 6) | (PAYLOAD_TYPE_TRACE << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
@@ -726,8 +726,8 @@ class TestDispatcherMaintenance:
         to_thread_mock = AsyncMock(return_value=True)
 
         with (
-            patch("pymc_core.node.dispatcher.asyncio.sleep", side_effect=fake_sleep),
-            patch("pymc_core.node.dispatcher.asyncio.to_thread", to_thread_mock),
+            patch("openhop_core.node.dispatcher.asyncio.sleep", side_effect=fake_sleep),
+            patch("openhop_core.node.dispatcher.asyncio.to_thread", to_thread_mock),
         ):
             with pytest.raises(asyncio.CancelledError):
                 await dispatcher.run_forever()

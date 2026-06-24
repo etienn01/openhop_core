@@ -2,8 +2,8 @@ import struct
 
 import pytest
 
-from pymc_core.protocol.constants import MAX_PACKET_PAYLOAD, MAX_PATH_SIZE
-from pymc_core.protocol.packet_utils import (
+from openhop_core.protocol.constants import MAX_PACKET_PAYLOAD, MAX_PATH_SIZE
+from openhop_core.protocol.packet_utils import (
     PacketDataUtils,
     PacketHashingUtils,
     PacketValidationUtils,

@@ -1,9 +1,9 @@
 """
-PyMC_Core - A Python MeshCore library with SPI LoRa radio support
+openHop Core - A Python MeshCore library with SPI LoRa radio support
 Clean, simple API for building mesh network applications.
 """
 
-__version__ = "1.0.14"
+__version__ = "1.1.1"
 
 # Core mesh functionality
 from .node.node import MeshNode

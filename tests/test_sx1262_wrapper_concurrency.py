@@ -142,7 +142,7 @@ def _make_mock_gpio() -> MagicMock:
 @pytest.fixture(autouse=True)
 def _reset_singleton():
     """Ensure the singleton is clean before and after every test."""
-    from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+    from openhop_core.hardware.sx1262_wrapper import SX1262Radio
     SX1262Radio._active_instance = None
     yield
     SX1262Radio._active_instance = None
@@ -168,10 +168,10 @@ async def radio(mock_lora, mock_gpio):
     Setting radio_timing_delay=0.0 eliminates hardware sleep delays in send().
     """
     with (
-        patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-        patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+        patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+        patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
     ):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
         r = SX1262Radio(radio_timing_delay=0.0)
 
     r.lora             = mock_lora
@@ -877,7 +877,7 @@ class TestStateManagement:
         mock_lora.end.assert_called_once()
 
     def test_cleanup_removes_active_singleton(self, radio):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
         SX1262Radio._active_instance = radio
         radio.cleanup()
         assert SX1262Radio._active_instance is None
@@ -887,11 +887,11 @@ class TestStateManagement:
         radio.cleanup()  # must not raise
 
     def test_new_instance_cleans_up_previous_instance(self, mock_gpio):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             first = SX1262Radio(radio_timing_delay=0.0)
             first._initialized = True
@@ -903,11 +903,11 @@ class TestStateManagement:
         assert first._initialized is False  # first was cleaned up by second's __init__
 
     def test_get_instance_returns_existing_without_creating(self, radio):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
         SX1262Radio._active_instance = radio
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager") as gm_patch,
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager") as gm_patch,
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             instance = SX1262Radio.get_instance()
         assert instance is radio
@@ -1383,11 +1383,11 @@ class TestBeginInitSequence:
     """begin() must initialise correctly and handle failure modes."""
 
     async def test_begin_succeeds_with_mocked_hardware(self, mock_lora, mock_gpio):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             r = SX1262Radio(radio_timing_delay=0.0)
             result = r.begin()
@@ -1397,11 +1397,11 @@ class TestBeginInitSequence:
     async def test_begin_returns_false_when_standby_not_reached(self, mock_lora, mock_gpio):
         """Busy check never clears after reset → standby fails → return False."""
         mock_lora.busyCheck.return_value = True
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             r = SX1262Radio(radio_timing_delay=0.0)
             result = r.begin()
@@ -1410,11 +1410,11 @@ class TestBeginInitSequence:
     async def test_begin_raises_when_irq_pin_setup_fails(self, mock_lora, mock_gpio):
         """Failure to set up the IRQ interrupt pin must raise RuntimeError."""
         mock_gpio.setup_interrupt_pin.return_value = None
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             r = SX1262Radio(radio_timing_delay=0.0)
             with pytest.raises(RuntimeError):
@@ -1426,11 +1426,11 @@ class TestBeginInitSequence:
         mock_lora.reset.assert_not_called()
 
     async def test_begin_configures_rx_continuous_at_end(self, mock_lora, mock_gpio):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             r = SX1262Radio(radio_timing_delay=0.0)
             r.begin()
@@ -1438,11 +1438,11 @@ class TestBeginInitSequence:
 
     async def test_begin_uses_image_calibration_for_frequency_band(self, mock_lora, mock_gpio):
         """900 MHz band must use CAL_IMG_902/928 constants."""
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             r = SX1262Radio(frequency=915_000_000, radio_timing_delay=0.0)
             r.begin()
@@ -1858,15 +1858,15 @@ class TestFIFOCorruptionRace:
 class TestCoverageGapBranches:
     def test_constructor_handles_previous_instance_cleanup_error(self, mock_gpio, caplog):
         import logging
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         previous = MagicMock()
         previous.cleanup.side_effect = RuntimeError("cleanup failed")
         SX1262Radio._active_instance = previous
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
             caplog.at_level(logging.ERROR, logger="SX1262_wrapper"),
         ):
             _ = SX1262Radio(radio_timing_delay=0.0)
@@ -1874,12 +1874,12 @@ class TestCoverageGapBranches:
         assert any("Error cleaning up previous instance" in r.message for r in caplog.records)
 
     def test_constructor_uses_existing_gpio_manager(self, mock_gpio):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         with (
-            patch("pymc_core.hardware.lora.LoRaRF.SX126x._gpio_manager", mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager") as gp_patch,
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager") as set_patch,
+            patch("openhop_core.hardware.lora.LoRaRF.SX126x._gpio_manager", mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager") as gp_patch,
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager") as set_patch,
         ):
             radio = SX1262Radio(radio_timing_delay=0.0)
 
@@ -2062,12 +2062,12 @@ class TestCoverageGapBranches:
 
 class TestBeginBranchCoverage:
     def test_begin_sets_manual_cs_pin_when_configured(self, mock_lora, mock_gpio):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             radio = SX1262Radio(cs_pin=21, radio_timing_delay=0.0)
             assert radio.begin() is True
@@ -2076,7 +2076,7 @@ class TestBeginBranchCoverage:
 
     def test_begin_logs_warnings_for_output_pin_setup_failures(self, mock_lora, mock_gpio, caplog):
         import logging
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         failing_pins = {6, 26, 23, 24, 30}
 
@@ -2086,9 +2086,9 @@ class TestBeginBranchCoverage:
         mock_gpio.setup_output_pin.side_effect = _setup_output_pin
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
             caplog.at_level(logging.WARNING, logger="SX1262_wrapper"),
         ):
             radio = SX1262Radio(
@@ -2112,12 +2112,12 @@ class TestBeginBranchCoverage:
             assert any(msg in r.message for r in caplog.records)
 
     def test_begin_maps_invalid_tcxo_voltage_to_closest_value(self, mock_lora, mock_gpio):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             radio = SX1262Radio(use_dio3_tcxo=True, dio3_tcxo_voltage=2.6, radio_timing_delay=0.0)
             assert radio.begin() is True
@@ -2126,14 +2126,14 @@ class TestBeginBranchCoverage:
 
     def test_begin_custom_cad_threshold_write_failure_is_non_fatal(self, mock_lora, mock_gpio, caplog):
         import logging
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         mock_lora.setCadParams.side_effect = RuntimeError("cad params failed")
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
             caplog.at_level(logging.WARNING, logger="SX1262_wrapper"),
         ):
             radio = SX1262Radio(radio_timing_delay=0.0)
@@ -2144,12 +2144,12 @@ class TestBeginBranchCoverage:
         assert any("Failed to write CAD thresholds" in r.message for r in caplog.records)
 
     def test_begin_custom_cad_threshold_write_success(self, mock_lora, mock_gpio):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             radio = SX1262Radio(radio_timing_delay=0.0)
             radio._custom_cad_peak = 12
@@ -2161,16 +2161,16 @@ class TestBeginBranchCoverage:
 
     def test_begin_polling_start_exception_is_non_fatal(self, mock_lora, mock_gpio, caplog):
         import logging
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         irq_pin_obj = MagicMock()
         irq_pin_obj.start_polling.side_effect = RuntimeError("poll failed")
         mock_gpio._pins = {16: irq_pin_obj}
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
             caplog.at_level(logging.WARNING, logger="SX1262_wrapper"),
         ):
             radio = SX1262Radio(radio_timing_delay=0.0)
@@ -2179,27 +2179,27 @@ class TestBeginBranchCoverage:
         assert any("Failed to start IRQ polling" in r.message for r in caplog.records)
 
     def test_begin_returns_true_without_running_loop_for_rx_task_start(self, mock_lora, mock_gpio):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             radio = SX1262Radio(radio_timing_delay=0.0)
             assert radio.begin() is True
             assert not hasattr(radio, "_rx_irq_task")
 
     async def test_begin_uses_already_running_rx_irq_task(self, mock_lora, mock_gpio):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         existing_task = MagicMock()
         existing_task.done.return_value = False
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             radio = SX1262Radio(radio_timing_delay=0.0)
             radio._rx_irq_task = existing_task
@@ -2209,13 +2209,13 @@ class TestBeginBranchCoverage:
 
     async def test_begin_rx_task_start_exception_is_non_fatal(self, mock_lora, mock_gpio, caplog):
         import logging
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
-            patch("pymc_core.hardware.sx1262_wrapper.asyncio.get_running_loop", side_effect=ValueError("loop boom")),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.asyncio.get_running_loop", side_effect=ValueError("loop boom")),
             caplog.at_level(logging.WARNING, logger="SX1262_wrapper"),
         ):
             radio = SX1262Radio(radio_timing_delay=0.0)
@@ -2233,12 +2233,12 @@ class TestBeginBranchCoverage:
         ],
     )
     def test_begin_frequency_band_calibration_paths(self, mock_lora, mock_gpio, freq, cal_min, cal_max):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             radio = SX1262Radio(frequency=freq, radio_timing_delay=0.0)
             assert radio.begin() is True
@@ -2248,19 +2248,19 @@ class TestBeginBranchCoverage:
 
 class TestFactoryAndSingletonPaths:
     def test_get_instance_constructs_when_singleton_missing(self, mock_gpio):
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         SX1262Radio._active_instance = None
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
         ):
             instance = SX1262Radio.get_instance(radio_timing_delay=0.0)
 
         assert isinstance(instance, SX1262Radio)
 
     def test_create_sx1262_radio_returns_instance_on_success(self):
-        from pymc_core.hardware import sx1262_wrapper as module
+        from openhop_core.hardware import sx1262_wrapper as module
 
         fake_radio = MagicMock()
         fake_radio.begin.return_value = True
@@ -2271,7 +2271,7 @@ class TestFactoryAndSingletonPaths:
         assert created is fake_radio
 
     def test_create_sx1262_radio_raises_when_begin_fails(self):
-        from pymc_core.hardware import sx1262_wrapper as module
+        from openhop_core.hardware import sx1262_wrapper as module
 
         fake_radio = MagicMock()
         fake_radio.begin.return_value = False
@@ -2305,7 +2305,7 @@ class TestCoverageSecondPass:
 
         radio._rx_irq_task = None
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.asyncio.get_running_loop", side_effect=ValueError("boom")),
+            patch("openhop_core.hardware.sx1262_wrapper.asyncio.get_running_loop", side_effect=ValueError("boom")),
             caplog.at_level(logging.WARNING, logger="SX1262_wrapper"),
         ):
             radio.set_rx_callback(lambda _pkt: None)
@@ -2451,8 +2451,8 @@ class TestCoverageSecondPass:
             radio._initialized = False
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.asyncio.wait_for", side_effect=_boom_wait_for),
-            patch("pymc_core.hardware.sx1262_wrapper.asyncio.sleep", side_effect=_fast_sleep),
+            patch("openhop_core.hardware.sx1262_wrapper.asyncio.wait_for", side_effect=_boom_wait_for),
+            patch("openhop_core.hardware.sx1262_wrapper.asyncio.sleep", side_effect=_fast_sleep),
         ):
             await radio._rx_irq_background_task()
 
@@ -2482,16 +2482,16 @@ class TestCoverageSecondPass:
 
     def test_begin_covers_success_pin_setup_paths_and_info_logs(self, mock_lora, mock_gpio, caplog):
         import logging
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         irq_pin_obj = MagicMock()
         irq_pin_obj.start_polling = MagicMock()
         mock_gpio._pins = {16: irq_pin_obj}
 
         with (
-            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
-            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
-            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("openhop_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
             caplog.at_level(logging.INFO, logger="SX1262_wrapper"),
         ):
             radio = SX1262Radio(

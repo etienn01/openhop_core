@@ -1,17 +1,17 @@
 """
-USB LoRa Radio Driver for pymc_core
+USB LoRa Radio Driver for openhop_core
 
 Implements the LoRaRadio interface using a pymc_usb modem connected via
 USB-CDC. The modem acts as a "dumb" SX1262 transceiver — all MeshCore
-protocol logic runs on the host in pymc_core.
+protocol logic runs on the host in openhop_core.
 
-Drop-in replacement for SX1262Radio in pymc_core's hardware layer.
+Drop-in replacement for SX1262Radio in openhop_core's hardware layer.
 
 Default sync word is 0x12 (MeshCore private syncword), matching the
 firmware default — change only if the deployment uses a custom value.
 
 Usage:
-    from pymc_core.hardware.usb_radio import USBLoRaRadio
+    from openhop_core.hardware.usb_radio import USBLoRaRadio
 
     radio = USBLoRaRadio(
         port="/dev/ttyACM0",
@@ -39,23 +39,42 @@ from typing import Callable, Optional
 import serial
 
 from .protocol_constants import (
-    PROTO_SYNC,
+    CMD_CAD_PARAMS_RESP,
+    CMD_CAD_REQUEST,
+    CMD_CAD_RESP,
+    CMD_CONFIG_RESP,
+    CMD_ERROR,
+    CMD_GET_VERSION,
+    CMD_GET_WIFI,
+    CMD_NOISE_REQ,
+    CMD_NOISE_RESP,
+    CMD_PING,
+    CMD_PONG,
+    CMD_RX_PACKET,
+    CMD_RX_START,
+    CMD_RX_STARTED,
+    CMD_SET_CAD_PARAMS,
+    CMD_SET_CONFIG,
+    CMD_SET_WIFI,
+    CMD_STATUS_REQ,
+    CMD_STATUS_RESP,
+    CMD_TX_DONE,
+    CMD_TX_FAIL,
+    CMD_TX_REQUEST,
+    CMD_VERSION_RESP,
+    CMD_WIFI_RESET,
+    CMD_WIFI_STATUS,
     MAX_LORA_PAYLOAD,
-    CMD_TX_REQUEST, CMD_SET_CONFIG,
-    CMD_STATUS_REQ, CMD_NOISE_REQ,
-    CMD_CAD_REQUEST, CMD_RX_START, CMD_SET_CAD_PARAMS,
-    CMD_SET_WIFI, CMD_WIFI_RESET,
-    CMD_GET_WIFI, CMD_GET_VERSION, CMD_PING,
-    CMD_TX_DONE, CMD_TX_FAIL, CMD_RX_PACKET,
-    CMD_CONFIG_RESP, CMD_STATUS_RESP, CMD_NOISE_RESP,
-    CMD_CAD_RESP, CMD_RX_STARTED, CMD_CAD_PARAMS_RESP,
-    CMD_WIFI_STATUS, CMD_VERSION_RESP,
-    CMD_ERROR, CMD_PONG,
-    WIFI_MODE_OFFLINE, WIFI_MODE_STA_CONNECTING,
-    WIFI_MODE_STA_CONNECTED, WIFI_MODE_AP_CONFIG,
+    PROTO_SYNC,
     RADIO_CONFIG_FMT,
-    STATUS_RESP_FMT, STATUS_RESP_SIZE,
-    crc16_ccitt, build_frame,
+    STATUS_RESP_FMT,
+    STATUS_RESP_SIZE,
+    WIFI_MODE_AP_CONFIG,
+    WIFI_MODE_OFFLINE,
+    WIFI_MODE_STA_CONNECTED,
+    WIFI_MODE_STA_CONNECTING,
+    build_frame,
+    crc16_ccitt,
 )
 
 logger = logging.getLogger("USBLoRaRadio")
@@ -63,16 +82,19 @@ logger = logging.getLogger("USBLoRaRadio")
 
 # Import LoRaRadio base conditionally — allows standalone testing
 try:
-    from pymc_core.hardware.base import LoRaRadio
+    from openhop_core.hardware.base import LoRaRadio
+
     _HAS_BASE = True
 except ImportError:
     _HAS_BASE = False
 
 # Define the class with or without the ABC base
 if _HAS_BASE:
+
     class _RadioBase(LoRaRadio):
         pass
 else:
+
     class _RadioBase:
         pass
 
@@ -153,8 +175,8 @@ class USBLoRaRadio(_RadioBase):
         self.crc_error_count = 0
 
         logger.info(
-            f"USBLoRaRadio configured: port={port}, freq={frequency/1e6:.1f}MHz, "
-            f"sf={spreading_factor}, bw={bandwidth/1000:.0f}kHz, "
+            f"USBLoRaRadio configured: port={port}, freq={frequency / 1e6:.1f}MHz, "
+            f"sf={spreading_factor}, bw={bandwidth / 1000:.0f}kHz, "
             f"power={tx_power}dBm, syncword=0x{sync_word:04X}"
         )
 
@@ -244,27 +266,21 @@ class USBLoRaRadio(_RadioBase):
                     try:
                         channel_busy = await self._perform_cad(timeout=1.0)
                         if not channel_busy:
-                            logger.debug(
-                                f"CAD clear after {attempt + 1} attempt(s)"
-                            )
+                            logger.debug(f"CAD clear after {attempt + 1} attempt(s)")
                             break
                         else:
                             logger.debug("CAD busy — channel activity detected")
                             if attempt < self.lbt_max_attempts - 1:
                                 base_delay = random.randint(50, 200)
-                                backoff_ms = min(
-                                    base_delay * (2 ** attempt), 5000
-                                )
+                                backoff_ms = min(base_delay * (2**attempt), 5000)
                                 lbt_backoff_delays.append(float(backoff_ms))
                                 logger.debug(
                                     f"CAD backoff {backoff_ms}ms "
-                                    f"(attempt {attempt+1}/{self.lbt_max_attempts})"
+                                    f"(attempt {attempt + 1}/{self.lbt_max_attempts})"
                                 )
                                 await asyncio.sleep(backoff_ms / 1000.0)
                             else:
-                                logger.warning(
-                                    "CAD max attempts — transmitting anyway"
-                                )
+                                logger.warning("CAD max attempts — transmitting anyway")
                     except Exception as e:
                         logger.warning(f"CAD failed: {e}, proceeding with TX")
                         break
@@ -272,7 +288,8 @@ class USBLoRaRadio(_RadioBase):
             # ── Transmit ─────────────────────────────────────
             try:
                 resp = await self._send_command(
-                    CMD_TX_REQUEST, data,
+                    CMD_TX_REQUEST,
+                    data,
                     expect_cmd=CMD_TX_DONE,
                     timeout=10.0,
                 )
@@ -286,13 +303,12 @@ class USBLoRaRadio(_RadioBase):
                         airtime_us = struct.unpack("<I", resp[:4])[0]
                     airtime_ms = airtime_us / 1000.0
 
-                    logger.debug(
-                        f"TX done: {len(data)}B, airtime={airtime_ms:.1f}ms"
-                    )
+                    logger.debug(f"TX done: {len(data)}B, airtime={airtime_ms:.1f}ms")
 
                     # Restore RX continuous mode
                     await self._send_command(
-                        CMD_RX_START, b"",
+                        CMD_RX_START,
+                        b"",
                         expect_cmd=CMD_RX_STARTED,
                         timeout=2.0,
                     )
@@ -307,7 +323,8 @@ class USBLoRaRadio(_RadioBase):
                     logger.error("TX failed — no TX_DONE response")
                     # Try to restore RX anyway
                     await self._send_command(
-                        CMD_RX_START, b"",
+                        CMD_RX_START,
+                        b"",
                         expect_cmd=CMD_RX_STARTED,
                         timeout=2.0,
                     )
@@ -373,9 +390,7 @@ class USBLoRaRadio(_RadioBase):
         # Schedule modem metric refresh (non-blocking)
         if self._event_loop:
             self._event_loop.call_soon_threadsafe(
-                lambda: self._event_loop.create_task(
-                    self._refresh_background_metrics()
-                )
+                lambda: self._event_loop.create_task(self._refresh_background_metrics())
             )
 
         return True
@@ -404,7 +419,8 @@ class USBLoRaRadio(_RadioBase):
     async def get_modem_status(self) -> Optional[dict]:
         """Query detailed status from the modem firmware."""
         resp = await self._send_command(
-            CMD_STATUS_REQ, b"",
+            CMD_STATUS_REQ,
+            b"",
             expect_cmd=CMD_STATUS_RESP,
             timeout=2.0,
         )
@@ -419,9 +435,7 @@ class USBLoRaRadio(_RadioBase):
                 "last_snr": fields[5] / 10.0,
                 "noise_floor": fields[6] / 10.0,
                 "temp_c": fields[7],
-                "radio_state": ["idle/rx", "tx", "error"][
-                    min(fields[8], 2)
-                ],
+                "radio_state": ["idle/rx", "tx", "error"][min(fields[8], 2)],
             }
             self._crc_errors = status["crc_errors"]
             self.crc_error_count = status["crc_errors"]
@@ -466,7 +480,8 @@ class USBLoRaRadio(_RadioBase):
         Also updates the cached self._noise_floor value.
         """
         resp = await self._send_command(
-            CMD_NOISE_REQ, b"",
+            CMD_NOISE_REQ,
+            b"",
             expect_cmd=CMD_NOISE_RESP,
             timeout=2.0,
         )
@@ -496,15 +511,19 @@ class USBLoRaRadio(_RadioBase):
             # Same caching rationale as tcp_radio: avoid re-sending unchanged
             # thresholds during the per-sample inner loop of calibration.
             if new_peak != self._custom_cad_peak or new_min != self._custom_cad_min:
-                payload = bytes([
-                    0x01,
-                    new_peak & 0xFF,
-                    new_min & 0xFF,
-                    0x00,
-                ])
+                payload = bytes(
+                    [
+                        0x01,
+                        new_peak & 0xFF,
+                        new_min & 0xFF,
+                        0x00,
+                    ]
+                )
                 await self._send_command(
-                    CMD_SET_CAD_PARAMS, payload,
-                    expect_cmd=CMD_CAD_PARAMS_RESP, timeout=2.0,
+                    CMD_SET_CAD_PARAMS,
+                    payload,
+                    expect_cmd=CMD_CAD_PARAMS_RESP,
+                    timeout=2.0,
                 )
                 self._custom_cad_peak = new_peak
                 self._custom_cad_min = new_min
@@ -549,10 +568,13 @@ class USBLoRaRadio(_RadioBase):
             raise ValueError("tcp_port out of range")
 
         payload = (
-            bytes([len(ssid_b)]) + ssid_b +
-            bytes([len(pass_b)]) + pass_b +
-            struct.pack("<H", tcp_port) +
-            bytes([len(tok_b)]) + tok_b
+            bytes([len(ssid_b)])
+            + ssid_b
+            + bytes([len(pass_b)])
+            + pass_b
+            + struct.pack("<H", tcp_port)
+            + bytes([len(tok_b)])
+            + tok_b
         )
         resp = await self._send_command(
             CMD_SET_WIFI, payload, expect_cmd=CMD_WIFI_STATUS, timeout=3.0
@@ -617,17 +639,17 @@ class USBLoRaRadio(_RadioBase):
             i = 0
             mode = payload[i]
             i += 1
-            ip = f"{payload[i]}.{payload[i+1]}.{payload[i+2]}.{payload[i+3]}"
+            ip = f"{payload[i]}.{payload[i + 1]}.{payload[i + 2]}.{payload[i + 3]}"
             i += 4
-            port = payload[i] | (payload[i+1] << 8)
+            port = payload[i] | (payload[i + 1] << 8)
             i += 2
             slen = payload[i]
             i += 1
-            ssid = payload[i:i+slen].decode("utf-8", errors="replace")
+            ssid = payload[i : i + slen].decode("utf-8", errors="replace")
             i += slen
             hlen = payload[i]
             i += 1
-            host = payload[i:i+hlen].decode("utf-8", errors="replace")
+            host = payload[i : i + hlen].decode("utf-8", errors="replace")
         except (IndexError, UnicodeDecodeError) as e:
             logger.error(f"Malformed WIFI_STATUS: {e}")
             return None
@@ -703,8 +725,8 @@ class USBLoRaRadio(_RadioBase):
         resp = self._read_frame_sync(timeout=10.0, expect_cmd=CMD_CONFIG_RESP)
         if resp and resp[0] == CMD_CONFIG_RESP:
             logger.info(
-                f"Radio configured: {self.frequency/1e6:.1f}MHz SF{self.spreading_factor} "
-                f"BW{self.bandwidth/1000:.0f}kHz {self.tx_power}dBm "
+                f"Radio configured: {self.frequency / 1e6:.1f}MHz SF{self.spreading_factor} "
+                f"BW{self.bandwidth / 1000:.0f}kHz {self.tx_power}dBm "
                 f"sync=0x{self.sync_word:04X} pre={self.preamble_length}"
             )
             return True
@@ -751,7 +773,7 @@ class USBLoRaRadio(_RadioBase):
                 cmd = hdr[0]
                 length = struct.unpack("<H", hdr[1:3])[0]
                 if length > MAX_LORA_PAYLOAD + 16:
-                    continue   # garbage length — must be a fake SYNC
+                    continue  # garbage length — must be a fake SYNC
 
                 payload = self._serial.read(length) if length > 0 else b""
                 if len(payload) < length:
@@ -842,9 +864,7 @@ class USBLoRaRadio(_RadioBase):
                     buf = buf[frame_size:]
 
                     if crc_recv != crc_comp:
-                        logger.warning(
-                            f"RX CRC mismatch, cmd=0x{cmd:02X}, dropping"
-                        )
+                        logger.warning(f"RX CRC mismatch, cmd=0x{cmd:02X}, dropping")
                         continue
 
                     self._dispatch_frame(cmd, payload)
@@ -878,8 +898,7 @@ class USBLoRaRadio(_RadioBase):
             self._rx_count += 1
 
             logger.debug(
-                f"RX: {len(lora_data)}B RSSI={rssi}dBm "
-                f"SNR={snr_x10/10:.1f}dB"
+                f"RX: {len(lora_data)}B RSSI={rssi}dBm SNR={snr_x10 / 10:.1f}dB"
             )
 
             # Invoke RX callback on the event loop thread.
@@ -976,7 +995,8 @@ class USBLoRaRadio(_RadioBase):
     async def _perform_cad(self, timeout: float = 1.0) -> bool:
         """Perform Channel Activity Detection. Returns True if busy."""
         resp = await self._send_command(
-            CMD_CAD_REQUEST, b"",
+            CMD_CAD_REQUEST,
+            b"",
             expect_cmd=CMD_CAD_RESP,
             timeout=timeout,
         )

@@ -23,9 +23,9 @@ from typing import Dict, Optional
 
 from common import create_mesh_node
 
-from pymc_core.node.handlers.login_server import LoginServerHandler
-from pymc_core.protocol import Identity, LocalIdentity
-from pymc_core.protocol.constants import PUB_KEY_SIZE
+from openhop_core.node.handlers.login_server import LoginServerHandler
+from openhop_core.protocol import Identity, LocalIdentity
+from openhop_core.protocol.constants import PUB_KEY_SIZE
 
 
 def create_mesh_node_with_identity(
@@ -39,12 +39,12 @@ def create_mesh_node_with_identity(
     # Set up logging (copied from common.py)
     logger = logging.getLogger(__name__)
 
-    # Add the src directory to the path so we can import pymc_core
+    # Add the src directory to the path so we can import openhop_core
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
     from common import create_radio
 
-    from pymc_core.node.node import MeshNode
+    from openhop_core.node.node import MeshNode
 
     logger.info(f"Creating mesh node with name: {node_name} using {radio_type} radio")
 
@@ -262,7 +262,7 @@ async def run_login_server(
         use_hardcoded_identity: Use hardcoded identity for easy testing
     """
     print("=" * 60)
-    print("PyMC Core - Login Server Example")
+    print("openHop Core - Login Server Example")
     print("=" * 60)
     print(f"Admin Password: {admin_password}")
     print(f"Guest Password: {guest_password if guest_password else '<disabled>'}")

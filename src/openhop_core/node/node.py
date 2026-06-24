@@ -142,7 +142,7 @@ class MeshNode:
         """Synchronisation helper for async response callbacks.
 
         .. deprecated::
-            Use :class:`~pymc_core.companion.models.ResponseWaiter` from the
+            Use :class:`~openhop_core.companion.models.ResponseWaiter` from the
             companion layer instead.
         """
 

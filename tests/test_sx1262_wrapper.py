@@ -1,7 +1,7 @@
 import pytest
 
-from pymc_core.hardware.sx1262_wrapper import SX1262Radio
-from pymc_core.hardware.signal_utils import snr_register_to_db
+from openhop_core.hardware.sx1262_wrapper import SX1262Radio
+from openhop_core.hardware.signal_utils import snr_register_to_db
 
 
 def test_positive_snr_conversion():
