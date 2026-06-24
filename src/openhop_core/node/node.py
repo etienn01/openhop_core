@@ -7,7 +7,7 @@ import logging
 from typing import Any, Optional
 
 # Fix for Python 3.10+ compatibility with PyYAML
-if not hasattr(collections, "Hashable"):
+if "Hashable" not in collections.__dict__:
     setattr(collections, "Hashable", collections.abc.Hashable)
 
 from ..protocol import LocalIdentity

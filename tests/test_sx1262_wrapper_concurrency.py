@@ -1214,14 +1214,18 @@ class TestRaceConditionSimulations:
         radio.set_rx_callback(lambda _: None)
         task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
 
+        expected = 0
         for _ in range(3):
+            expected += 1
             radio._last_irq_status = IRQ_CRC_ERR
             radio._rx_done_event.set()
-            # Wait until the task clears the event (= packet processed)
+            # Wait until this specific IRQ has been counted before firing the next one.
             await _wait_condition(
-                lambda: not radio._rx_done_event.is_set(),
+                lambda: radio.crc_error_count >= expected,
                 timeout=1.0,
             )
+            # Prevent stale wakeups from reusing the previous CRC IRQ status.
+            radio._last_irq_status = IRQ_NONE
 
         radio._initialized = False
         task.cancel()
@@ -1874,18 +1878,25 @@ class TestCoverageGapBranches:
         assert any("Error cleaning up previous instance" in r.message for r in caplog.records)
 
     def test_constructor_uses_existing_gpio_manager(self, mock_gpio):
+        import importlib
+
         from openhop_core.hardware.sx1262_wrapper import SX1262Radio
+        sx126x_module = importlib.import_module("openhop_core.hardware.lora.LoRaRF.SX126x")
+        previous_gpio_manager = getattr(sx126x_module, "_gpio_manager", None)
+        sx126x_module.set_gpio_manager(mock_gpio)
 
-        with (
-            patch("openhop_core.hardware.lora.LoRaRF.SX126x._gpio_manager", mock_gpio),
-            patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager") as gp_patch,
-            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager") as set_patch,
-        ):
-            radio = SX1262Radio(radio_timing_delay=0.0)
+        try:
+            with (
+                patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager") as gp_patch,
+                patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager") as set_patch,
+            ):
+                radio = SX1262Radio(radio_timing_delay=0.0)
 
-        assert radio._gpio_manager is mock_gpio
-        gp_patch.assert_not_called()
-        set_patch.assert_not_called()
+            assert radio._gpio_manager is mock_gpio
+            gp_patch.assert_not_called()
+            set_patch.assert_not_called()
+        finally:
+            sx126x_module.set_gpio_manager(previous_gpio_manager)
 
     def test_trampoline_early_return_when_shutting_down(self, radio):
         radio._shutting_down = True
