@@ -227,7 +227,7 @@ async def calibrate_cad(radio_type: str = "waveshare", staged: bool = True):
     try:
         # Create and verify radio
         radio = create_radio(radio_type)
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         if not isinstance(radio, SX1262Radio):
             logger.error(f"Need SX1262Radio, got {type(radio).__name__}")

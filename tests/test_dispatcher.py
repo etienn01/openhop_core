@@ -1,20 +1,21 @@
 import asyncio
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from pymc_core.node.dispatcher import Dispatcher, DispatcherState
-from pymc_core.protocol import Packet
-from pymc_core.protocol.constants import (
+from openhop_core.node.dispatcher import Dispatcher, DispatcherState
+from openhop_core.protocol import Packet
+from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
+    PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_TRACE,
     PAYLOAD_TYPE_TXT_MSG,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
 )
-from pymc_core.protocol.packet_filter import PacketFilter
-from pymc_core.protocol.packet_utils import PathUtils
+from openhop_core.protocol.packet_filter import PacketFilter
+from openhop_core.protocol.packet_utils import PathUtils
 
 
 def create_test_packet(payload_type: int, payload: bytes) -> bytes:
@@ -177,6 +178,27 @@ class TestDispatcherInitialization:
         assert 100 in dispatcher._handlers
         assert dispatcher._handlers[100] == mock_handler
 
+    @pytest.mark.asyncio
+    async def test_multipart_ack_releases_waiting_send(self, dispatcher):
+        """A received MULTIPART ack is routed into _register_ack_received and releases a
+        waiting send, just like a discrete ACK."""
+        dispatcher.register_default_handlers(
+            contacts=None, local_identity=dispatcher.local_identity, event_service=None
+        )
+        assert PAYLOAD_TYPE_MULTIPART in dispatcher._handlers
+
+        crc = 0x12345678
+        evt = asyncio.Event()
+        dispatcher._waiting_acks[crc] = evt
+
+        # wrapper byte (remaining=1, inner=ACK) + 4-byte CRC (little-endian 0x12345678)
+        payload = bytes([(1 << 4) | PAYLOAD_TYPE_ACK]) + b"\x78\x56\x34\x12"
+        data = create_test_packet(PAYLOAD_TYPE_MULTIPART, payload)
+        await dispatcher._process_received_packet(data)
+
+        assert evt.is_set()
+        assert crc not in dispatcher._waiting_acks
+
 
 class TestDispatcherPacketProcessing:
     """Test packet processing and routing."""
@@ -283,12 +305,12 @@ class TestDispatcherACKSystem:
     def test_recent_ack_cleanup(self, dispatcher):
         """Test cleanup of old recent ACKs."""
         crc = 0x12345678
-        old_time = asyncio.get_event_loop().time() - 10  # 10 seconds ago
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        old_time = loop.time() - 10  # 10 seconds ago
         dispatcher._recent_acks[crc] = old_time
 
         # Simulate cleanup
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
             now = loop.time()
             dispatcher._recent_acks = {
@@ -366,7 +388,7 @@ class TestDispatcherSendPacket:
     @pytest.mark.asyncio
     async def test_default_path_hash_mode_applied_to_flood_packet(self, dispatcher):
         """When path_hash_mode is set, flood packets with 0 hops get path_len bits 6-7 set."""
-        from pymc_core.protocol.constants import PH_TYPE_SHIFT
+        from openhop_core.protocol.constants import PH_TYPE_SHIFT
 
         dispatcher.set_default_path_hash_mode(1)  # 2-byte hashes
         pkt = Packet()
@@ -386,7 +408,7 @@ class TestDispatcherSendPacket:
     @pytest.mark.asyncio
     async def test_path_hash_mode_not_overwritten_when_companion_applied(self, dispatcher):
         """Packet with _path_hash_mode_applied is not overwritten by dispatcher default."""
-        from pymc_core.protocol.constants import PH_TYPE_SHIFT
+        from openhop_core.protocol.constants import PH_TYPE_SHIFT
 
         dispatcher.set_default_path_hash_mode(2)  # 3-byte
         pkt = Packet()
@@ -407,7 +429,7 @@ class TestDispatcherSendPacket:
     @pytest.mark.asyncio
     async def test_trace_flood_rejected(self, dispatcher):
         """TRACE payload with flood route is rejected; send_packet returns False and no TX."""
-        from pymc_core.protocol.constants import PH_TYPE_SHIFT
+        from openhop_core.protocol.constants import PH_TYPE_SHIFT
 
         pkt = Packet()
         pkt.header = (1 << 6) | (PAYLOAD_TYPE_TRACE << PH_TYPE_SHIFT) | ROUTE_TYPE_FLOOD
@@ -424,7 +446,7 @@ class TestDispatcherSendPacket:
     @pytest.mark.asyncio
     async def test_trace_direct_still_sends(self, dispatcher):
         """TRACE with direct route is still sent (no regression)."""
-        from pymc_core.protocol.constants import PH_TYPE_SHIFT
+        from openhop_core.protocol.constants import PH_TYPE_SHIFT
 
         pkt = Packet()
         pkt.header = (1 << 6) | (PAYLOAD_TYPE_TRACE << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
@@ -495,20 +517,57 @@ class TestDispatcherSendPacket:
 
         assert result is True
 
+    @pytest.mark.asyncio
+    async def test_send_packet_returns_false_when_radio_send_returns_none(self, dispatcher):
+        """If radio.send returns None, dispatcher must fail the send."""
+        packet = Packet()
+        packet.header = (0 << 6) | (0 << 4) | (PAYLOAD_TYPE_ADVERT << 2) | 0
+        packet.payload = bytearray(b"test_packet_data")
+        packet.payload_len = len(packet.payload)
+        packet.path_len = 0
+
+        dispatcher.radio.send = AsyncMock(return_value=None)
+
+        result = await dispatcher.send_packet(packet, wait_for_ack=False)
+
+        assert result is False
+
     def test_own_packet_detection(self, dispatcher):
-        """Test detection of own packets."""
-        # Create packet with our own address as source
+        """Test detection of own packets (TXT uses payload[1] as src hash)."""
         our_hash = dispatcher.local_identity.get_public_key()[0]
         payload = bytes([0, our_hash]) + b"test"  # dest_hash=0, src_hash=our_hash
         packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, payload)
 
-        # Parse the packet to check
         packet = Packet()
         packet.read_from(packet_data)
 
-        # Should detect as own packet
-        is_own = packet.payload[1] == our_hash
-        assert is_own
+        assert dispatcher._is_own_packet(packet) is True
+
+    def test_own_advert_uses_payload_first_byte(self, dispatcher):
+        """ADVERT packets carry pubkey at payload[0]; must not use payload[1]."""
+        our_hash = dispatcher.local_identity.get_public_key()[0]
+        # Second pubkey byte matches our_hash but first byte does not — must not drop.
+        other_pubkey = bytes([our_hash ^ 0xFF]) + bytes([our_hash]) + bytes(30)
+        packet = Packet()
+        packet.header = (1 << 6) | (PAYLOAD_TYPE_ADVERT << 2)
+        packet.payload = bytearray(other_pubkey + b"\x00" * 40)
+        packet.payload_len = len(packet.payload)
+        packet.path_len = 0
+
+        assert packet.payload[1] == our_hash
+        assert packet.payload[0] != our_hash
+        assert dispatcher._is_own_packet(packet) is False
+
+    def test_own_advert_detected_by_first_pubkey_byte(self, dispatcher):
+        """Own advert: payload[0] equals our pubkey hash."""
+        our_pubkey = dispatcher.local_identity.get_public_key()
+        packet = Packet()
+        packet.header = (1 << 6) | (PAYLOAD_TYPE_ADVERT << 2)
+        packet.payload = bytearray(our_pubkey + b"\x00" * 40)
+        packet.payload_len = len(packet.payload)
+        packet.path_len = 0
+
+        assert dispatcher._is_own_packet(packet) is True
 
 
 class TestDispatcherCallbacks:
@@ -651,6 +710,29 @@ class TestDispatcherMaintenance:
 
         # Verify cleanup was called
         dispatcher.packet_filter.cleanup_old_hashes.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_forever_health_check_uses_to_thread(self, dispatcher):
+        """Health checks should run via asyncio.to_thread to avoid loop blocking."""
+        dispatcher.radio.check_radio_health = Mock(return_value=True)
+
+        sleep_calls = {"count": 0}
+
+        async def fake_sleep(_seconds):
+            sleep_calls["count"] += 1
+            if sleep_calls["count"] >= 60:
+                raise asyncio.CancelledError()
+
+        to_thread_mock = AsyncMock(return_value=True)
+
+        with (
+            patch("openhop_core.node.dispatcher.asyncio.sleep", side_effect=fake_sleep),
+            patch("openhop_core.node.dispatcher.asyncio.to_thread", to_thread_mock),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await dispatcher.run_forever()
+
+        to_thread_mock.assert_awaited_once_with(dispatcher.radio.check_radio_health)
 
 
 class TestDispatcherErrorHandling:

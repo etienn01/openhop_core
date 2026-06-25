@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from pymc_core.companion import CompanionRadio
-from pymc_core.companion.models import Channel
-from pymc_core.protocol import LocalIdentity, Packet, PacketBuilder
-from pymc_core.protocol.constants import (
+from openhop_core.companion import CompanionRadio
+from openhop_core.companion.models import Channel
+from openhop_core.protocol import LocalIdentity, Packet, PacketBuilder
+from openhop_core.protocol.constants import (
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
-from pymc_core.protocol.transport_keys import calc_transport_code, get_auto_key_for
+from openhop_core.protocol.transport_keys import calc_transport_code, get_auto_key_for
 
 # ---------------------------------------------------------------------------
 # Helpers

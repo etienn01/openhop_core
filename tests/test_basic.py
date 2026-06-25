@@ -1,8 +1,8 @@
-from pymc_core import CryptoUtils, LocalIdentity, MeshNode, Packet, __version__
+from openhop_core import CryptoUtils, LocalIdentity, MeshNode, Packet, __version__
 
 
 def test_version():
-    assert __version__ == "1.0.10"
+    assert __version__ == "1.1.1"
 
 
 def test_import():

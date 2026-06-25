@@ -1,6 +1,6 @@
 import pytest
 
-from pymc_core import LocalIdentity
+from openhop_core import LocalIdentity
 
 
 # MeshNode tests (mock-based since we don't have real radio hardware)
@@ -40,7 +40,7 @@ def test_mesh_node_helper_methods():
 # ResponseWaiter tests
 def test_response_waiter():
     """Test ResponseWaiter functionality."""
-    from pymc_core.node import MeshNode
+    from openhop_core.node import MeshNode
 
     waiter = MeshNode._ResponseWaiter()
 
@@ -55,7 +55,7 @@ def test_response_waiter():
 @pytest.mark.asyncio
 async def test_response_waiter_timeout():
     """Test ResponseWaiter timeout functionality."""
-    from pymc_core.node import MeshNode
+    from openhop_core.node import MeshNode
 
     waiter = MeshNode._ResponseWaiter()
 

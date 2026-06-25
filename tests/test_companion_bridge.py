@@ -4,12 +4,12 @@ import asyncio
 
 import pytest
 
-from pymc_core.companion import CompanionBridge
-from pymc_core.companion.constants import ADV_TYPE_CHAT, AUTOADD_CHAT
-from pymc_core.companion.models import Contact
-from pymc_core.node.events import MeshEvents
-from pymc_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
-from pymc_core.protocol.constants import (
+from openhop_core.companion import CompanionBridge
+from openhop_core.companion.constants import ADV_TYPE_CHAT, AUTOADD_CHAT
+from openhop_core.companion.models import Contact
+from openhop_core.node.events import MeshEvents
+from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
+from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_PATH,
@@ -18,7 +18,7 @@ from pymc_core.protocol.constants import (
     PAYLOAD_TYPE_TXT_MSG,
     ROUTE_TYPE_FLOOD,
 )
-from pymc_core.protocol.packet_utils import PathUtils
+from openhop_core.protocol.packet_utils import PathUtils
 
 
 def _make_peer_contact(name: str) -> Contact:
@@ -67,6 +67,19 @@ class TestCompanionBridgeInit:
             authenticate_callback=auth_cb,
         )
         assert bridge._handlers is not None
+
+    def test_set_other_params_propagates_multi_acks(self):
+        """set_other_params pushes the multi_acks pref into the text handler."""
+        bridge = CompanionBridge(LocalIdentity(), MockPacketInjector(), node_name="Test")
+        text_handler = bridge._get_text_handler()
+        assert text_handler is not None
+
+        bridge.set_other_params(manual_add=0, telemetry_modes=0, advert_loc_policy=0, multi_acks=1)
+        assert bridge.prefs.multi_acks == 1
+        assert text_handler.multi_acks == 1
+
+        bridge.set_other_params(manual_add=0, telemetry_modes=0, advert_loc_policy=0, multi_acks=0)
+        assert text_handler.multi_acks == 0
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +282,34 @@ class TestCompanionBridgeSendAndShare:
         assert pkt.path_len == len(path)
         assert bytes(pkt.payload) == payload
         assert wait_for_ack is False
+
+    async def test_send_raw_packet_parses_and_injects(self):
+        """send_raw_packet parses on-air bytes into a Packet and sends them verbatim."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        await bridge.start()
+        # Build a real on-air packet and serialize it to wire bytes.
+        source = PacketBuilder.create_raw_data(b"\x01\x02\x03\x04")
+        raw_bytes = source.write_to()
+        result = await bridge.send_raw_packet(0, raw_bytes)
+        await bridge.stop()
+        assert result is True
+        assert len(injector.calls) == 1
+        pkt, wait_for_ack = injector.calls[0]
+        # The injected packet round-trips the original wire bytes.
+        assert pkt.write_to() == raw_bytes
+        assert wait_for_ack is False
+
+    async def test_send_raw_packet_unparseable_returns_false(self):
+        """send_raw_packet returns False (no injection) when bytes don't parse."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        await bridge.start()
+        # Header byte only: read_from has no path_len/payload to parse -> failure.
+        result = await bridge.send_raw_packet(0, b"\x00")
+        await bridge.stop()
+        assert result is False
+        assert injector.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -570,8 +611,8 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         node_discovered_calls = []
         advert_received_calls = []
 
-        def on_node(data):
-            node_discovered_calls.append(data)
+        def on_node(contact):
+            node_discovered_calls.append(contact)
 
         def on_advert(c):
             advert_received_calls.append(c)
@@ -582,7 +623,8 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         assert bridge.contacts.get_count() == 0
         assert len(advert_received_calls) == 0
         assert len(node_discovered_calls) == 1
-        assert node_discovered_calls[0]["name"] == "RepeaterNode"
+        assert node_discovered_calls[0].name == "RepeaterNode"
+        assert isinstance(node_discovered_calls[0], Contact)
 
     async def test_node_discovered_event_path_adds_contact_and_fires_advert_received(self):
         """Event path with optional inbound_path: store updated, advert_received fired once."""
@@ -616,6 +658,34 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event_data)
         assert bridge.contacts.get_count() == 1
         assert len(advert_received_calls) == 2
+
+    async def test_stored_contact_fires_both_advert_received_and_node_discovered(self):
+        """Firmware parity (onDiscoveredContact fires for every advert): a stored contact
+        fires advert_received (persist) AND node_discovered (client frame push)."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        peer = LocalIdentity()
+        event_data = {
+            "public_key": peer.get_public_key().hex(),
+            "name": "StoredNode",
+            "contact_type": ADV_TYPE_CHAT,
+            "lat": 0.0,
+            "lon": 0.0,
+            "advert_timestamp": 1000,
+            "timestamp": 1000,
+            "snr": 0.0,
+            "rssi": 0,
+        }
+        node_discovered_calls = []
+        advert_received_calls = []
+
+        bridge.on_node_discovered(lambda c: node_discovered_calls.append(c))
+        bridge.on_advert_received(lambda c: advert_received_calls.append(c))
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event_data)
+        assert bridge.contacts.get_count() == 1
+        assert len(advert_received_calls) == 1
+        assert len(node_discovered_calls) == 1
+        assert node_discovered_calls[0].name == "StoredNode"
 
 
 # ---------------------------------------------------------------------------

@@ -4,25 +4,27 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-# from pymc_core.node.events import MeshEvents  # Not currently used
-from pymc_core.node.handlers import (
+# from openhop_core.node.events import MeshEvents  # Not currently used
+from openhop_core.node.handlers import (
     AckHandler,
     AdvertHandler,
     BaseHandler,
     GroupTextHandler,
     LoginResponseHandler,
+    MultipartAckHandler,
     PathHandler,
     ProtocolRequestHandler,
     ProtocolResponseHandler,
     TextMessageHandler,
     TraceHandler,
 )
-from pymc_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
-from pymc_core.protocol.constants import (
+from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
+from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_ANON_REQ,
     PAYLOAD_TYPE_GRP_TXT,
+    PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_PATH,
     PAYLOAD_TYPE_REQ,
     PAYLOAD_TYPE_RESPONSE,
@@ -34,6 +36,7 @@ from pymc_core.protocol.constants import (
     SIGNATURE_SIZE,
     TIMESTAMP_SIZE,
 )
+from openhop_core.protocol.packet_utils import PathUtils
 
 
 # Mock classes for testing
@@ -120,6 +123,17 @@ class TestAckHandler:
         self.log_fn.assert_called()
 
     @pytest.mark.asyncio
+    async def test_process_discrete_ack_six_bytes(self):
+        """Firmware emits 6-byte ACKs (hash + ext-attempt + random); match first 4 bytes."""
+        packet = Packet()
+        # 4-byte CRC 0x12345678 followed by an ext-attempt byte and a random byte
+        packet.payload = bytearray(b"\x78\x56\x34\x12\x02\xAB")
+
+        crc = await self.handler.process_discrete_ack(packet)
+        assert crc == 0x12345678
+        self.log_fn.assert_called()
+
+    @pytest.mark.asyncio
     async def test_call_discrete_ack(self):
         """Test calling ACK handler with discrete ACK packet."""
         # Create packet with 4-byte CRC payload
@@ -135,6 +149,47 @@ class TestAckHandler:
 
 
 # Text Message Handler Tests
+class TestMultipartAckHandler:
+    def setup_method(self):
+        self.log_fn = MagicMock()
+        self.callback = AsyncMock()
+        self.handler = MultipartAckHandler(self.log_fn)
+        self.handler.set_ack_received_callback(self.callback)
+
+    def test_payload_type(self):
+        assert MultipartAckHandler.payload_type() == PAYLOAD_TYPE_MULTIPART
+
+    @pytest.mark.asyncio
+    async def test_extracts_embedded_ack(self):
+        """A MULTIPART ACK notifies the callback with the embedded 4-byte CRC."""
+        packet = Packet()
+        # wrapper byte (remaining=1, inner=ACK) + 4-byte CRC + extra bytes
+        packet.payload = bytearray(
+            bytes([(1 << 4) | PAYLOAD_TYPE_ACK]) + b"\x78\x56\x34\x12\x00\xAB"
+        )
+
+        await self.handler(packet)
+        self.callback.assert_awaited_once_with(0x12345678)
+
+    @pytest.mark.asyncio
+    async def test_too_short_ignored(self):
+        """Payload without a full embedded CRC notifies nothing."""
+        packet = Packet()
+        packet.payload = bytearray(bytes([(1 << 4) | PAYLOAD_TYPE_ACK]) + b"\x12\x34")
+
+        await self.handler(packet)
+        self.callback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_ack_inner_type_ignored(self):
+        """A MULTIPART whose inner type is not ACK notifies nothing."""
+        packet = Packet()
+        packet.payload = bytearray(bytes([(1 << 4) | 0x02]) + b"\x78\x56\x34\x12")
+
+        await self.handler(packet)
+        self.callback.assert_not_awaited()
+
+
 class TestTextMessageHandler:
     def setup_method(self):
         self.local_identity = LocalIdentity()
@@ -178,6 +233,153 @@ class TestTextMessageHandler:
 
         # Should return early without processing
         self.log_fn.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_direct_ack_roundtrip_matches_sender_crc(self):
+        """Receiver-emitted ACK[:4] equals the sender's expected ack_crc (firmware parity)."""
+        import asyncio
+
+        from openhop_core.protocol.packet_builder import PacketBuilder
+
+        sender = LocalIdentity()
+        receiver = self.local_identity  # handler's identity
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        # Sender composes a DIRECT DM addressed to the receiver
+        receiver_contact = _SendContact(receiver.get_public_key().hex())
+        packet, ack_crc = PacketBuilder.create_text_message(
+            receiver_contact, sender, "hello round trip", attempt=0, message_type="direct"
+        )
+
+        # Receiver knows the sender as a contact (32-byte pubkey)
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        ]
+
+        await self.handler(packet)
+
+        # ACK is emitted after a delay via a background task; poll for it.
+        for _ in range(80):
+            if self.send_packet_fn.called:
+                break
+            await asyncio.sleep(0.05)
+
+        assert self.send_packet_fn.called
+        ack_packet = self.send_packet_fn.call_args.args[0]
+        assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
+        assert len(ack_packet.payload) == 6
+        assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
+
+    def _make_direct_dm_with_path(self, text="multi ack route"):
+        """Build a direct DM addressed to the handler, with the sender registered as a
+        contact that has a known multi-hop out_path. Returns (packet, ack_crc, out_path,
+        out_path_len)."""
+        sender = LocalIdentity()
+        receiver = self.local_identity
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        receiver_contact = _SendContact(receiver.get_public_key().hex())
+        packet, ack_crc = PacketBuilder.create_text_message(
+            receiver_contact, sender, text, attempt=0, message_type="direct"
+        )
+
+        # Sender contact known to the receiver, with a 2-hop out_path
+        out_path = bytes([0x11, 0x22])
+        out_path_len = PathUtils.encode_path_len(1, 2)
+        contact = MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        contact.out_path = out_path
+        contact.out_path_len = out_path_len
+        self.contacts.contacts = [contact]
+        return packet, ack_crc, out_path, out_path_len
+
+    async def _wait_for_sends(self, count):
+        import asyncio
+
+        for _ in range(120):
+            if self.send_packet_fn.call_count >= count:
+                break
+            await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
+    async def test_direct_known_path_routes_ack(self):
+        """With a known out_path and multi_acks off, the ACK is routed along the path."""
+        self.handler.set_multi_acks(0)
+        packet, ack_crc, out_path, out_path_len = self._make_direct_dm_with_path()
+
+        await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert self.send_packet_fn.call_count == 1
+        ack_packet = self.send_packet_fn.call_args_list[0].args[0]
+        assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
+        assert bytes(ack_packet.path) == out_path
+        assert ack_packet.path_len == out_path_len
+        assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
+
+    @pytest.mark.asyncio
+    async def test_direct_unknown_path_floods_ack(self):
+        """With an unknown reverse out_path, the ACK is flood-routed (not path-less direct)."""
+        sender = LocalIdentity()
+        receiver = self.local_identity
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        receiver_contact = _SendContact(receiver.get_public_key().hex())
+        packet, ack_crc = PacketBuilder.create_text_message(
+            receiver_contact, sender, "no reverse path", attempt=0, message_type="direct"
+        )
+        # Sender is a known contact but with an UNKNOWN out_path back to it.
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        ]
+
+        await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert self.send_packet_fn.call_count == 1
+        ack_packet = self.send_packet_fn.call_args_list[0].args[0]
+        assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
+        assert (ack_packet.header & 0x03) == ROUTE_TYPE_FLOOD  # flooded, not direct
+        assert ack_packet.path_len == 0  # no path
+        assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
+
+    @pytest.mark.asyncio
+    async def test_direct_multi_ack_emits_multipart_then_ack(self):
+        """With multi_acks on and a known path, a MULTIPART fires before the normal ACK."""
+        self.handler.set_multi_acks(1)
+        packet, ack_crc, out_path, out_path_len = self._make_direct_dm_with_path()
+
+        await self.handler(packet)
+        await self._wait_for_sends(2)
+
+        assert self.send_packet_fn.call_count == 2
+        first = self.send_packet_fn.call_args_list[0].args[0]
+        second = self.send_packet_fn.call_args_list[1].args[0]
+
+        # multipart is staggered earlier, so it is sent first
+        assert first.get_payload_type() == PAYLOAD_TYPE_MULTIPART
+        assert second.get_payload_type() == PAYLOAD_TYPE_ACK
+
+        # both carry the out_path and the same embedded CRC
+        assert bytes(first.path) == out_path and first.path_len == out_path_len
+        assert bytes(second.path) == out_path and second.path_len == out_path_len
+        assert (first.payload[0] & 0x0F) == PAYLOAD_TYPE_ACK
+        assert int.from_bytes(first.payload[1:5], "little") == ack_crc
+        assert int.from_bytes(second.payload[:4], "little") == ack_crc
 
 
 # Advert Handler Tests
@@ -402,8 +604,8 @@ class TestProtocolResponseHandler:
     @pytest.mark.asyncio
     async def test_contact_path_updated_callback_invoked_on_path_update(self):
         """PATH decrypts and updates contact path; contact_path_updated callback is invoked."""
-        from pymc_core.companion.contact_store import ContactStore
-        from pymc_core.companion.models import Contact
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.companion.models import Contact
 
         local_identity = LocalIdentity()
         peer_identity = LocalIdentity()
@@ -453,9 +655,9 @@ class TestProtocolResponseHandler:
     @pytest.mark.asyncio
     async def test_contact_path_updated_with_2byte_hashes(self):
         """PATH with 2-byte hashes decrypts and updates contact path correctly."""
-        from pymc_core.companion.contact_store import ContactStore
-        from pymc_core.companion.models import Contact
-        from pymc_core.protocol.packet_utils import PathUtils
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.companion.models import Contact
+        from openhop_core.protocol.packet_utils import PathUtils
 
         local_identity = LocalIdentity()
         peer_identity = LocalIdentity()
@@ -502,6 +704,64 @@ class TestProtocolResponseHandler:
         assert callback_calls[0][0] == peer_pubkey
         assert callback_calls[0][1] == path_len_byte  # encoded byte, not raw count
         assert callback_calls[0][2] == path_bytes  # all 4 bytes of path data
+
+    @pytest.mark.asyncio
+    async def test_login_path_return_learns_path_without_waiter(self):
+        """Zero-hop login PATH-return must trigger path learning + reciprocal PATH
+        even with no stats/telemetry waiter registered (Fix B).
+
+        During login no response callback exists yet, so the old guard dropped the
+        PATH-return before path learning could run, leaving out_path_len == -1 and
+        forcing the follow-up stats REQ to flood. The PATH branch must always decrypt
+        so _update_contact_path + reciprocal PATH run (firmware onContactPathRecv)."""
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.companion.models import Contact
+
+        local_identity = LocalIdentity()  # companion
+        server_identity = LocalIdentity()  # firmware repeater
+        server_pubkey = server_identity.get_public_key()
+        contacts = ContactStore(5)
+        contacts.add(Contact(public_key=server_pubkey, name="Repeater"))
+        handler = ProtocolResponseHandler(MagicMock(), local_identity, contacts)
+
+        # Login state: no response waiter and no binary callback registered.
+        injector = AsyncMock()
+        handler.set_packet_injector(injector)
+        path_updates = []
+
+        async def on_path_updated(pub, path_len, path_bytes_arg):
+            path_updates.append((pub, path_len, path_bytes_arg))
+
+        handler.set_contact_path_updated_callback(on_path_updated)
+
+        # Firmware zero-hop login reply: 13-byte login response embedded in a
+        # flood PATH-return with an empty (0-hop) path.
+        reply = bytearray(13)
+        struct.pack_into("<I", reply, 0, 1234)  # timestamp
+        reply[4] = 0x00  # RESP_SERVER_LOGIN_OK
+        client_hash = local_identity.get_public_key()[0]
+        server_hash = server_pubkey[0]
+        secret = Identity(server_pubkey).calc_shared_secret(local_identity.get_private_key())
+        pkt = PacketBuilder.create_path_return(
+            dest_hash=client_hash,
+            src_hash=server_hash,
+            secret=secret,
+            path=[],
+            extra_type=PAYLOAD_TYPE_RESPONSE,
+            extra=bytes(reply),
+        )
+        assert pkt.is_route_flood()
+
+        await handler(pkt)
+
+        # Path learned as zero-hop direct (out_path_len == 0).
+        assert len(path_updates) == 1
+        assert path_updates[0][0] == server_pubkey
+        assert path_updates[0][1] == 0
+        learned = contacts.get_by_key(server_pubkey)
+        assert learned.out_path_len == 0
+        # Reciprocal PATH sent back so the repeater learns its route to us.
+        injector.assert_awaited_once()
 
 
 class TestProtocolRequestHandler:
@@ -554,7 +814,7 @@ class TestProtocolRequestHandler:
 
     def test_flood_req_applies_path_hash_mode(self):
         """Path-return packet preserves incoming path hash size (2-byte hashes)."""
-        from pymc_core.protocol.packet_utils import PathUtils
+        from openhop_core.protocol.packet_utils import PathUtils
 
         peer_identity = LocalIdentity()
         client = self._client_with_key(peer_identity.get_public_key())
@@ -738,7 +998,7 @@ async def test_handlers_can_be_called():
 # AnonReqResponseHandler Tests (separate from LoginResponseHandler)
 def test_anon_req_response_handler():
     """Test AnonReqResponseHandler can be imported and has correct payload type."""
-    from pymc_core.node.handlers import AnonReqResponseHandler
+    from openhop_core.node.handlers import AnonReqResponseHandler
 
     # Should have same payload type as anonymous requests
     assert AnonReqResponseHandler.payload_type() == PAYLOAD_TYPE_ANON_REQ
@@ -757,7 +1017,7 @@ class TestLoginServerHandler:
     """
 
     def setup_method(self):
-        from pymc_core.node.handlers.login_server import LoginServerHandler
+        from openhop_core.node.handlers.login_server import LoginServerHandler
 
         self.server_identity = LocalIdentity()
         self.client_identity_local = LocalIdentity()
@@ -788,9 +1048,7 @@ class TestLoginServerHandler:
 
         # Calculate shared secret (client side)
         server_id = Identity(server_pubkey)
-        shared_secret = server_id.calc_shared_secret(
-            self.client_identity_local.get_private_key()
-        )
+        shared_secret = server_id.calc_shared_secret(self.client_identity_local.get_private_key())
         aes_key = shared_secret[:16]
 
         # Repeater format plaintext: timestamp(4) + password + null
@@ -824,7 +1082,7 @@ class TestLoginServerHandler:
 
     def test_payload_type(self):
         """LoginServerHandler handles ANON_REQ packets."""
-        from pymc_core.node.handlers.login_server import LoginServerHandler
+        from openhop_core.node.handlers.login_server import LoginServerHandler
 
         assert LoginServerHandler.payload_type() == PAYLOAD_TYPE_ANON_REQ
 
@@ -857,7 +1115,7 @@ class TestLoginServerHandler:
 
     @pytest.mark.asyncio
     async def test_direct_login_sends_response_datagram(self):
-        """Direct login → RESPONSE datagram via flood (matches C++ sendFlood(createDatagram) path)."""
+        """Direct login: RESPONSE datagram via flood (C++ sendFlood/createDatagram)."""
         pkt = self._build_login_packet(password="admin123", route_type="direct")
         await self.handler(pkt)
 
@@ -881,11 +1139,8 @@ class TestLoginServerHandler:
         response_pkt, _ = self.sent_packets[0]
 
         # Decrypt the PATH payload to verify inner structure
-        server_pubkey = self.server_identity.get_public_key()
         client_id = Identity(self.client_identity_local.get_public_key())
-        shared_secret = client_id.calc_shared_secret(
-            self.server_identity.get_private_key()
-        )
+        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
         aes_key = shared_secret[:16]
 
         # PATH payload: dest_hash(1) + src_hash(1) + mac_and_ciphertext
@@ -969,9 +1224,7 @@ class TestLoginServerHandler:
 
         # Decrypt and verify is_admin field
         client_id = Identity(self.client_identity_local.get_public_key())
-        shared_secret = client_id.calc_shared_secret(
-            self.server_identity.get_private_key()
-        )
+        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
         aes_key = shared_secret[:16]
         encrypted_part = bytes(response_pkt.payload[2:])
         plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_part)
@@ -999,9 +1252,7 @@ class TestLoginServerHandler:
     async def test_flood_login_with_path_includes_path_in_response(self):
         """Flood login with path hashes → PATH response includes those hashes."""
         path_hashes = [0xAA, 0xBB]
-        pkt = self._build_login_packet(
-            password="admin123", route_type="flood", path=path_hashes
-        )
+        pkt = self._build_login_packet(password="admin123", route_type="flood", path=path_hashes)
         # path_len encodes hash size and count: (hash_size-1)<<6 | count
         # For 1-byte hashes with 2 hops: (0<<6) | 2 = 2
         pkt.path_len = 2
@@ -1014,9 +1265,7 @@ class TestLoginServerHandler:
 
         # Decrypt and verify path is included
         client_id = Identity(self.client_identity_local.get_public_key())
-        shared_secret = client_id.calc_shared_secret(
-            self.server_identity.get_private_key()
-        )
+        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
         aes_key = shared_secret[:16]
         encrypted_part = bytes(response_pkt.payload[2:])
         plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_part)

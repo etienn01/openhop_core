@@ -1,10 +1,10 @@
 # Dispatcher API Reference
 
-This section documents the Dispatcher class and related functionality in pyMC_Core.
+This section documents the Dispatcher class and related functionality in openHop Core.
 
 ## Dispatcher
 
-::: pymc_core.node.dispatcher.Dispatcher
+::: openhop_core.node.dispatcher.Dispatcher
     handler: python
     options:
       show_root_heading: true

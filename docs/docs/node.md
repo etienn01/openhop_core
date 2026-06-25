@@ -1,23 +1,23 @@
 # MeshNode Usage Guide
 
-The `MeshNode` class is the primary interface for interacting with a mesh network in pyMC_Core. This guide provides examples and explanations of how to use the MeshNode class for various mesh operations.
+The `MeshNode` class is the primary interface for interacting with a mesh network in openHop Core. This guide provides examples and explanations of how to use the MeshNode class for various mesh operations.
 
 ## Prerequisites
 
-> **Important**: Before running examples, ensure you have pyMC_Core installed. On modern Python installations (Ubuntu 22.04+, Debian 12+), you may encounter `externally-managed-environment` errors when installing packages system-wide. Create a virtual environment first:
+> **Important**: Before running examples, ensure you have openHop Core installed. On modern Python installations (Ubuntu 22.04+, Debian 12+), you may encounter `externally-managed-environment` errors when installing packages system-wide. Create a virtual environment first:
 >
 > ```bash
 > # Create virtual environment
-> python3 -m venv pymc_env
+> python3 -m venv openhop_env
 >
 > # Activate virtual environment
 > # On Linux/Mac:
-> source pymc_env/bin/activate
+> source openhop_env/bin/activate
 > # On Windows:
-> pymc_env\Scripts\activate
+> openhop_env\Scripts\activate
 >
-> # Install pyMC_Core
-> pip install pymc_core[hardware]
+> # Install openHop Core
+> pip install openhop-core[hardware]
 > ```
 
 ## Available Examples
@@ -54,7 +54,7 @@ python examples/send_text_message.py meshadv-mini
 
 ## Radio Setup
 
-pyMC_Core supports multiple LoRa radio hardware configurations. Below are the setup instructions for supported devices.
+openHop Core supports multiple LoRa radio hardware configurations. Below are the setup instructions for supported devices.
 
 ### Waveshare LoRaWAN/GNSS HAT
 
@@ -75,7 +75,7 @@ The Waveshare HAT is a popular SX1262-based LoRa module for Raspberry Pi with of
 - RXEN: Connected to DIO2 (not used directly)
 
 ```python
-from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
 # Waveshare HAT configuration (matches official pinout)
 radio = SX1262Radio(
@@ -116,7 +116,7 @@ The all-in-one extension board with SX1262 LoRa support.
   ```
 
 ```python
-from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
 # uConsole configuration
 radio = SX1262Radio(
@@ -159,7 +159,7 @@ The meshadv and meshadv-mini are available from FrequencyLabs, and are open sour
 - RXEN: Connected to DIO2 (not used directly)
 
 ```python
-from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
 # meshadv-mini HAT configuration (matches official pinout)
 radio = SX1262Radio(
@@ -227,8 +227,8 @@ radio.begin()
 
 ```python
 import asyncio
-from pymc_core.node.node import MeshNode
-from pymc_core.protocol.identity import LocalIdentity
+from openhop_core.node.node import MeshNode
+from openhop_core.protocol.identity import LocalIdentity
 
 async def create_mesh_node():
     # Create local identity (generates new keys if none provided)
@@ -264,7 +264,7 @@ See the working example in `examples/send_text_message.py`:
 packet, crc = PacketBuilder.create_text_message(
     contact=mock_contact,
     local_identity=identity,
-    message="Hello from PyMC Core! This is a test message",
+    message="Hello from openHop Core! This is a test message",
     attempt=0,
     message_type="flood"
 )
@@ -385,7 +385,7 @@ trace_packet = PacketBuilder.create_trace_packet(
 ### Setting Up Event Service
 
 ```python
-from pymc_core.node.events import EventService
+from openhop_core.node.events import EventService
 
 # Create event service
 event_service = EventService()

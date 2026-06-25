@@ -1,6 +1,6 @@
 # Node API Reference
 
-This section documents the node management classes and functions in pyMC_Core.
+This section documents the node management classes and functions in openHop Core.
 
 ## Dispatcher default path hash mode
 
@@ -32,7 +32,7 @@ path hashes. For example: use ``incoming.get_path_hash_size()`` and call
 
 ## MeshNode
 
-::: pymc_core.node.node.MeshNode
+::: openhop_core.node.node.MeshNode
     handler: python
     options:
       show_root_heading: true
@@ -41,7 +41,7 @@ path hashes. For example: use ``incoming.get_path_hash_size()`` and call
 
 ## Event System
 
-::: pymc_core.node.events
+::: openhop_core.node.events
     handler: python
     options:
       show_root_heading: true
@@ -51,7 +51,7 @@ path hashes. For example: use ``incoming.get_path_hash_size()`` and call
 
 ### Base Handler
 
-::: pymc_core.node.handlers.base
+::: openhop_core.node.handlers.base
     handler: python
     options:
       show_root_heading: true
@@ -59,7 +59,7 @@ path hashes. For example: use ``incoming.get_path_hash_size()`` and call
 
 ### ACK Handler
 
-::: pymc_core.node.handlers.ack
+::: openhop_core.node.handlers.ack
     handler: python
     options:
       show_root_heading: true
@@ -67,7 +67,7 @@ path hashes. For example: use ``incoming.get_path_hash_size()`` and call
 
 ### Advert Handler
 
-::: pymc_core.node.handlers.advert
+::: openhop_core.node.handlers.advert
     handler: python
     options:
       show_root_heading: true
@@ -75,7 +75,7 @@ path hashes. For example: use ``incoming.get_path_hash_size()`` and call
 
 ### Text Handler
 
-::: pymc_core.node.handlers.text
+::: openhop_core.node.handlers.text
     handler: python
     options:
       show_root_heading: true
@@ -83,7 +83,7 @@ path hashes. For example: use ``incoming.get_path_hash_size()`` and call
 
 ### Group Text Handler
 
-::: pymc_core.node.handlers.group_text
+::: openhop_core.node.handlers.group_text
     handler: python
     options:
       show_root_heading: true
@@ -91,7 +91,7 @@ path hashes. For example: use ``incoming.get_path_hash_size()`` and call
 
 ### Login Response Handler
 
-::: pymc_core.node.handlers.login_response
+::: openhop_core.node.handlers.login_response
     handler: python
     options:
       show_root_heading: true
@@ -99,7 +99,7 @@ path hashes. For example: use ``incoming.get_path_hash_size()`` and call
 
 ### Path Handler
 
-::: pymc_core.node.handlers.path
+::: openhop_core.node.handlers.path
     handler: python
     options:
       show_root_heading: true
@@ -107,7 +107,7 @@ path hashes. For example: use ``incoming.get_path_hash_size()`` and call
 
 ### Protocol Response Handler
 
-::: pymc_core.node.handlers.protocol_response
+::: openhop_core.node.handlers.protocol_response
     handler: python
     options:
       show_root_heading: true
@@ -115,7 +115,7 @@ path hashes. For example: use ``incoming.get_path_hash_size()`` and call
 
 ### Trace Handler
 
-::: pymc_core.node.handlers.trace
+::: openhop_core.node.handlers.trace
     handler: python
     options:
       show_root_heading: true

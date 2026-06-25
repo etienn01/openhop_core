@@ -12,7 +12,7 @@ import asyncio
 
 from common import create_mesh_node, RADIO_TYPES
 
-from pymc_core.protocol.packet_builder import PacketBuilder
+from openhop_core.protocol.packet_builder import PacketBuilder
 
 # Node type values from C++ AdvertDataHelpers.h
 ADV_TYPE_REPEATER = 2

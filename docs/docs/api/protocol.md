@@ -1,10 +1,10 @@
 # Protocol API Reference
 
-This section documents the protocol-related classes and functions in pyMC_Core.
+This section documents the protocol-related classes and functions in openHop Core.
 
 ## Packet Types
 
-::: pymc_core.protocol.constants
+::: openhop_core.protocol.constants
     handler: python
     options:
       show_root_heading: true
@@ -12,7 +12,7 @@ This section documents the protocol-related classes and functions in pyMC_Core.
 
 ## Packet Structure
 
-::: pymc_core.protocol.packet
+::: openhop_core.protocol.packet
     handler: python
     options:
       show_root_heading: true
@@ -20,7 +20,7 @@ This section documents the protocol-related classes and functions in pyMC_Core.
 
 ## Packet Builder
 
-::: pymc_core.protocol.packet_builder
+::: openhop_core.protocol.packet_builder
     handler: python
     options:
       show_root_heading: true
@@ -28,7 +28,7 @@ This section documents the protocol-related classes and functions in pyMC_Core.
 
 ## Packet Filter
 
-::: pymc_core.protocol.packet_filter
+::: openhop_core.protocol.packet_filter
     handler: python
     options:
       show_root_heading: true
@@ -36,7 +36,7 @@ This section documents the protocol-related classes and functions in pyMC_Core.
 
 ## Packet Utils
 
-::: pymc_core.protocol.packet_utils
+::: openhop_core.protocol.packet_utils
     handler: python
     options:
       show_root_heading: true
@@ -44,7 +44,7 @@ This section documents the protocol-related classes and functions in pyMC_Core.
 
 ## Crypto Module
 
-::: pymc_core.protocol.crypto
+::: openhop_core.protocol.crypto
     handler: python
     options:
       show_root_heading: true
@@ -52,7 +52,7 @@ This section documents the protocol-related classes and functions in pyMC_Core.
 
 ## Identity Management
 
-::: pymc_core.protocol.identity
+::: openhop_core.protocol.identity
     handler: python
     options:
       show_root_heading: true
@@ -60,7 +60,7 @@ This section documents the protocol-related classes and functions in pyMC_Core.
 
 ## Protocol Utils
 
-::: pymc_core.protocol.utils
+::: openhop_core.protocol.utils
     handler: python
     options:
       show_root_heading: true

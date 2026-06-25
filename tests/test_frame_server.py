@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from pymc_core.companion.constants import (
+from openhop_core.companion.constants import (
     ERR_CODE_ILLEGAL_ARG,
     ERR_CODE_NOT_FOUND,
     ERR_CODE_TABLE_FULL,
@@ -16,12 +16,13 @@ from pymc_core.companion.constants import (
     PUB_KEY_SIZE,
     PUSH_CODE_ADVERT,
     PUSH_CODE_NEW_ADVERT,
+    RESP_CODE_ALLOWED_REPEAT_FREQ,
     RESP_CODE_CHANNEL_DATA_RECV,
     RESP_CODE_DEFAULT_FLOOD_SCOPE,
     RESP_CODE_OK,
 )
-from pymc_core.companion.frame_server import CompanionFrameServer, _build_advert_push_frames
-from pymc_core.companion.models import Contact, NodePrefs, QueuedMessage, SentResult
+from openhop_core.companion.frame_server import CompanionFrameServer, _build_advert_push_frames
+from openhop_core.companion.models import Contact, QueuedMessage, SentResult
 
 
 def test_build_advert_push_frames_short_only_when_no_name():
@@ -99,6 +100,91 @@ def test_build_advert_push_frames_out_path_len_negative_becomes_0xff():
     assert full[35] == 0xFF
 
 
+@pytest.mark.asyncio
+async def test_node_discovered_pushes_new_advert_when_auto_add_filtered():
+    """Chat node filtered by selective auto-add still pushes NEW_ADVERT to client."""
+    from unittest.mock import AsyncMock
+
+    from openhop_core.companion.companion_bridge import CompanionBridge
+    from openhop_core.companion.constants import AUTOADD_REPEATER
+    from openhop_core.node.events import MeshEvents
+    from openhop_core.protocol import LocalIdentity
+
+    injector = AsyncMock(return_value=True)
+    bridge = CompanionBridge(LocalIdentity(), injector)
+    bridge.prefs.manual_add_contacts = 1
+    bridge.prefs.autoadd_config = AUTOADD_REPEATER
+
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=256)
+    server._setup_push_callbacks()
+
+    peer = LocalIdentity()
+    event_data = {
+        "public_key": peer.get_public_key().hex(),
+        "name": "Meshcore_Jetson_Node",
+        "contact_type": 1,
+        "lat": 0.0,
+        "lon": 0.0,
+        "advert_timestamp": 1000,
+        "timestamp": 1000,
+        "snr": 12.5,
+        "rssi": -38,
+    }
+    await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event_data)
+
+    assert bridge.contacts.get_count() == 0
+    assert server._write_queue.qsize() == 1
+    frame = server._write_queue.get_nowait()
+    # Queued frames carry a 3-byte outbound header (FRAME_OUTBOUND_PREFIX + uint16 length)
+    # prepended by _enqueue_frame; the push code and payload start after it.
+    data = frame[3:]
+    assert data[0] == PUSH_CODE_NEW_ADVERT
+    name_offset = 1 + 32 + 3 + MAX_PATH_SIZE
+    name_b = data[name_offset : name_offset + 32]
+    assert name_b.startswith(b"Meshcore_Jetson_Node")
+
+
+@pytest.mark.asyncio
+async def test_node_discovered_pushes_short_advert_for_stored_contact():
+    """A stored (auto-added) contact's advert pushes the short ADVERT only, mirroring
+    firmware onDiscoveredContact(is_new=false)."""
+    from unittest.mock import AsyncMock
+
+    from openhop_core.companion.companion_bridge import CompanionBridge
+    from openhop_core.node.events import MeshEvents
+    from openhop_core.protocol import LocalIdentity
+
+    injector = AsyncMock(return_value=True)
+    bridge = CompanionBridge(LocalIdentity(), injector)
+    bridge.prefs.manual_add_contacts = 0  # auto-add all types
+
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=256)
+    server._setup_push_callbacks()
+
+    peer = LocalIdentity()
+    event_data = {
+        "public_key": peer.get_public_key().hex(),
+        "name": "StoredNode",
+        "contact_type": 1,
+        "lat": 0.0,
+        "lon": 0.0,
+        "advert_timestamp": 1000,
+        "timestamp": 1000,
+        "snr": 12.5,
+        "rssi": -38,
+    }
+    await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event_data)
+
+    assert bridge.contacts.get_count() == 1  # stored
+    assert server._write_queue.qsize() == 1
+    frame = server._write_queue.get_nowait()
+    data = frame[3:]  # strip the 3-byte outbound header
+    assert data[0] == PUSH_CODE_ADVERT  # short frame only (no full NEW_ADVERT)
+    assert len(data) == 1 + PUB_KEY_SIZE
+
+
 def test_build_advert_push_frames_name_truncated_to_32_bytes():
     """Long name is truncated to 32 bytes in full frame."""
     pubkey = bytes(range(32))
@@ -137,7 +223,9 @@ class _MockBridgeChannelData:
     def get_channel(self, idx: int):
         return self._channel if idx == 1 else None
 
-    async def send_channel_data(self, channel_idx, data_type, payload, *, path=None, path_len_encoded=None):
+    async def send_channel_data(
+        self, channel_idx, data_type, payload, *, path=None, path_len_encoded=None
+    ):
         self.calls.append((channel_idx, data_type, payload, path, path_len_encoded))
         return self._send_ok
 
@@ -173,7 +261,7 @@ async def test_cmd_send_raw_data_valid_writes_ok():
 @pytest.mark.asyncio
 async def test_cmd_send_channel_data_valid_direct_path():
     """CMD_SEND_CHANNEL_DATA parses path/data_type/payload and delegates to bridge."""
-    from pymc_core.protocol.packet_utils import PathUtils
+    from openhop_core.protocol.packet_utils import PathUtils
 
     bridge = _MockBridgeChannelData(send_ok=True)
     server = CompanionFrameServer(bridge, "hash", port=0)
@@ -181,7 +269,7 @@ async def test_cmd_send_channel_data_valid_direct_path():
     server._write_err = Mock()
 
     path_len = PathUtils.encode_path_len(1, 2)  # two 1-byte hops
-    payload = b"\xDE\xAD\xBE"
+    payload = b"\xde\xad\xbe"
     data = bytes([1, path_len, 0x10, 0x20, 0x34, 0x12]) + payload
     await server._cmd_send_channel_data(data)
 
@@ -285,7 +373,7 @@ async def test_cmd_send_raw_data_send_failure_writes_table_full():
 @pytest.mark.asyncio
 async def test_cmd_send_raw_data_2byte_hashes():
     """CMD_SEND_RAW_DATA with 2-byte hash path encoding."""
-    from pymc_core.protocol.packet_utils import PathUtils
+    from openhop_core.protocol.packet_utils import PathUtils
 
     bridge = _MockBridgeSendRawDirect(success=True)
     server = CompanionFrameServer(bridge, "hash", port=0)
@@ -294,7 +382,7 @@ async def test_cmd_send_raw_data_2byte_hashes():
     # path_len_encoded=0x42 → 2-byte hashes, 2 hops → 4 bytes of path
     path_len_byte = PathUtils.encode_path_len(2, 2)  # 0x42
     path_data = b"\x01\x02\x03\x04"
-    payload_data = b"\xAA\xBB\xCC\xDD"
+    payload_data = b"\xaa\xbb\xcc\xdd"
     data = bytes([path_len_byte]) + path_data + payload_data
     await server._cmd_send_raw_data(data)
     assert len(bridge.calls) == 1
@@ -322,7 +410,7 @@ async def test_cmd_send_raw_data_invalid_path_encoding():
 @pytest.mark.asyncio
 async def test_cmd_send_raw_data_truncated_multibyte_path():
     """CMD_SEND_RAW_DATA with not enough path bytes for 2-byte encoding → error."""
-    from pymc_core.protocol.packet_utils import PathUtils
+    from openhop_core.protocol.packet_utils import PathUtils
 
     bridge = _MockBridgeSendRawDirect()
     server = CompanionFrameServer(bridge, "hash", port=0)
@@ -383,7 +471,7 @@ def test_build_message_frame_channel_data_v15():
         snr=2.0,
         rssi=-90,
         channel_data_type=0x1234,
-        channel_data_payload=b"\xAA\xBB",
+        channel_data_payload=b"\xaa\xbb",
     )
     frame = server._build_message_frame(msg)
     assert frame[0] == RESP_CODE_CHANNEL_DATA_RECV
@@ -391,7 +479,7 @@ def test_build_message_frame_channel_data_v15():
     assert frame[5] == 0xFF
     assert frame[6:8] == b"\x34\x12"
     assert frame[8] == 2
-    assert frame[9:11] == b"\xAA\xBB"
+    assert frame[9:11] == b"\xaa\xbb"
 
 
 @pytest.mark.asyncio
@@ -535,7 +623,7 @@ async def test_cmd_set_path_hash_mode_valid():
 @pytest.mark.asyncio
 async def test_cmd_set_path_hash_mode_invalid_mode():
     """CMD_SET_PATH_HASH_MODE with mode >= 3 → ERR_CODE_ILLEGAL_ARG."""
-    from pymc_core.companion.constants import ERR_CODE_ILLEGAL_ARG
+    from openhop_core.companion.constants import ERR_CODE_ILLEGAL_ARG
 
     bridge = _MockBridgePathHashMode()
     server = CompanionFrameServer(bridge, "hash", port=0)
@@ -549,7 +637,7 @@ async def test_cmd_set_path_hash_mode_invalid_mode():
 @pytest.mark.asyncio
 async def test_cmd_set_path_hash_mode_wrong_subtype():
     """CMD_SET_PATH_HASH_MODE with subtype != 0 → ERR_CODE_ILLEGAL_ARG."""
-    from pymc_core.companion.constants import ERR_CODE_ILLEGAL_ARG
+    from openhop_core.companion.constants import ERR_CODE_ILLEGAL_ARG
 
     bridge = _MockBridgePathHashMode()
     server = CompanionFrameServer(bridge, "hash", port=0)
@@ -563,7 +651,7 @@ async def test_cmd_set_path_hash_mode_wrong_subtype():
 @pytest.mark.asyncio
 async def test_cmd_set_path_hash_mode_too_short():
     """CMD_SET_PATH_HASH_MODE with only 1 byte → ERR_CODE_ILLEGAL_ARG."""
-    from pymc_core.companion.constants import ERR_CODE_ILLEGAL_ARG
+    from openhop_core.companion.constants import ERR_CODE_ILLEGAL_ARG
 
     bridge = _MockBridgePathHashMode()
     server = CompanionFrameServer(bridge, "hash", port=0)
@@ -577,8 +665,8 @@ async def test_cmd_set_path_hash_mode_too_short():
 @pytest.mark.asyncio
 async def test_device_info_includes_path_hash_mode():
     """RESP_CODE_DEVICE_INFO frame includes path_hash_mode at byte [81]."""
-    from pymc_core.companion.constants import RESP_CODE_DEVICE_INFO
-    from pymc_core.companion.models import NodePrefs
+    from openhop_core.companion.constants import RESP_CODE_DEVICE_INFO
+    from openhop_core.companion.models import NodePrefs
 
     prefs = NodePrefs()
     prefs.path_hash_mode = 2  # 3-byte hashes
@@ -609,7 +697,7 @@ async def test_device_info_includes_path_hash_mode():
 @pytest.mark.asyncio
 async def test_cmd_send_status_req_failure_no_empty_push():
     """Failed status request must NOT send PUSH_CODE_STATUS_RESPONSE (matches firmware)."""
-    from pymc_core.companion.constants import PUSH_CODE_STATUS_RESPONSE, RESP_CODE_SENT
+    from openhop_core.companion.constants import PUSH_CODE_STATUS_RESPONSE, RESP_CODE_SENT
 
     bridge = Mock()
     bridge.send_status_request = AsyncMock(return_value={"success": False, "reason": "timeout"})
@@ -628,7 +716,7 @@ async def test_cmd_send_status_req_failure_no_empty_push():
 @pytest.mark.asyncio
 async def test_cmd_send_status_req_empty_raw_bytes_no_push():
     """Status response with empty raw_bytes must NOT send PUSH_CODE_STATUS_RESPONSE."""
-    from pymc_core.companion.constants import PUSH_CODE_STATUS_RESPONSE, RESP_CODE_SENT
+    from openhop_core.companion.constants import PUSH_CODE_STATUS_RESPONSE, RESP_CODE_SENT
 
     bridge = Mock()
     bridge.send_status_request = AsyncMock(
@@ -648,7 +736,7 @@ async def test_cmd_send_status_req_empty_raw_bytes_no_push():
 @pytest.mark.asyncio
 async def test_cmd_send_status_req_success_sends_push_with_data():
     """Successful status request with data sends PUSH_CODE_STATUS_RESPONSE with raw_bytes."""
-    from pymc_core.companion.constants import PUSH_CODE_STATUS_RESPONSE
+    from openhop_core.companion.constants import PUSH_CODE_STATUS_RESPONSE
 
     raw = b"\x01" * 56
     bridge = Mock()
@@ -672,7 +760,7 @@ async def test_cmd_send_status_req_success_sends_push_with_data():
 @pytest.mark.asyncio
 async def test_cmd_send_telemetry_req_failure_no_empty_push():
     """Failed telemetry request must NOT send PUSH_CODE_TELEMETRY_RESPONSE."""
-    from pymc_core.companion.constants import PUSH_CODE_TELEMETRY_RESPONSE, RESP_CODE_SENT
+    from openhop_core.companion.constants import PUSH_CODE_TELEMETRY_RESPONSE, RESP_CODE_SENT
 
     bridge = Mock()
     bridge.send_telemetry_request = AsyncMock(return_value={"success": False})
@@ -826,3 +914,251 @@ async def test_handle_client_connection_reset_disconnects_cleanly(caplog):
     assert server._client_reader is None
     assert server._writer_task is None
     assert any("ConnectionResetError" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_cmd_get_allowed_repeat_freq_empty_list():
+    """CMD_GET_ALLOWED_REPEAT_FREQ replies with the response code and no ranges."""
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    frames: list[bytes] = []
+    server._write_frame = lambda f: frames.append(f)
+    await server._cmd_get_allowed_repeat_freq(b"")
+    assert frames == [bytes([RESP_CODE_ALLOWED_REPEAT_FREQ])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_raw_packet_unsupported_without_bridge_method():
+    """CMD_SEND_RAW_PACKET returns UNSUPPORTED when the bridge can't inject packets."""
+    bridge = Mock(spec=[])  # no send_raw_packet attribute
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_err = Mock()
+    server._write_ok = Mock()
+    await server._cmd_send_raw_packet(bytes([0x00, 0xAA, 0xBB]))
+    server._write_err.assert_called_once_with(ERR_CODE_UNSUPPORTED_CMD)
+    server._write_ok.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_raw_packet_delegates_to_bridge():
+    """CMD_SEND_RAW_PACKET parses [priority][raw...] and delegates to the bridge."""
+    bridge = Mock()
+    bridge.send_raw_packet = AsyncMock(return_value=True)
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+    server._write_err = Mock()
+    await server._cmd_send_raw_packet(bytes([0x05, 0xDE, 0xAD, 0xBE]))
+    bridge.send_raw_packet.assert_awaited_once_with(0x05, b"\xde\xad\xbe")
+    server._write_ok.assert_called_once()
+    server._write_err.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_raw_packet_too_short():
+    """CMD_SEND_RAW_PACKET rejects a frame with no packet body."""
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    server._write_err = Mock()
+    await server._cmd_send_raw_packet(bytes([0x00]))
+    server._write_err.assert_called_once_with(ERR_CODE_ILLEGAL_ARG)
+
+
+def test_parse_binary_response_regions():
+    """Anon REGIONS response decodes clock + comma-separated region names."""
+    from openhop_core.companion import binary_parsing
+    from openhop_core.companion.constants import ANON_REQ_TYPE_REGIONS, PROTOCOL_CODE_ANON_REQ
+
+    # response_data (tag already stripped) = clock(4) + null-terminated name list
+    data = struct.pack("<I", 0x11223344) + b"home,usa,*\x00"
+    parsed = binary_parsing.parse_binary_response(
+        PROTOCOL_CODE_ANON_REQ, data, context={"anon_sub_type": ANON_REQ_TYPE_REGIONS}
+    )
+    assert parsed["type"] == "regions"
+    assert parsed["clock"] == 0x11223344
+    assert parsed["regions"] == ["home", "usa", "*"]
+
+
+def test_parse_binary_response_anon_not_mistaken_for_owner_info():
+    """A REGIONS anon response must NOT be parsed as REQ owner-info, even though
+    both carry numeric type 0x07."""
+    from openhop_core.companion import binary_parsing
+    from openhop_core.companion.constants import ANON_REQ_TYPE_REGIONS, PROTOCOL_CODE_ANON_REQ
+
+    data = struct.pack("<I", 0) + b"alpha\x00"
+    parsed = binary_parsing.parse_binary_response(
+        PROTOCOL_CODE_ANON_REQ, data, context={"anon_sub_type": ANON_REQ_TYPE_REGIONS}
+    )
+    assert parsed["type"] == "regions"
+    assert "owner_info" not in parsed
+
+
+def test_device_info_reports_firmware_ver_code_13():
+    """Companion advertises FIRMWARE_VER_CODE 13 (PR #2672 non-contact anon requests)."""
+    from openhop_core.companion.constants import FIRMWARE_VER_CODE
+
+    assert FIRMWARE_VER_CODE == 13
+
+
+class _MockBridgeAnonReq:
+    """Minimal bridge for CMD_SEND_ANON_REQ tests."""
+
+    def __init__(self, result: SentResult):
+        self._result = result
+        self.calls = []
+
+    async def send_anon_req(self, pub_key: bytes, data: bytes):
+        self.calls.append((pub_key, data))
+        return self._result
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_anon_req_failure_writes_table_full():
+    """PR #2672: anon-req failure maps to ERR_CODE_TABLE_FULL, not NOT_FOUND."""
+    bridge = _MockBridgeAnonReq(SentResult(success=False))
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_err = Mock()
+    server._write_frame = Mock()
+    await server._cmd_send_anon_req(b"\x01" * 32 + b"\x07")
+    assert len(bridge.calls) == 1
+    server._write_err.assert_called_once_with(ERR_CODE_TABLE_FULL)
+    server._write_frame.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_anon_req_success_writes_sent():
+    """Successful anon req emits a RESP_CODE_SENT frame (direct => flood byte 0)."""
+    from openhop_core.companion.constants import RESP_CODE_SENT
+
+    bridge = _MockBridgeAnonReq(
+        SentResult(success=True, is_flood=False, expected_ack=0x11223344, timeout_ms=4000)
+    )
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    frames = []
+    server._write_frame = Mock(side_effect=lambda f: frames.append(f))
+    server._write_err = Mock()
+    await server._cmd_send_anon_req(b"\x02" * 32 + b"\x07")
+    server._write_err.assert_not_called()
+    assert len(frames) == 1
+    assert frames[0][0] == RESP_CODE_SENT
+    assert frames[0][1] == 0  # not flood
+    assert struct.unpack("<I", frames[0][2:6])[0] == 0x11223344
+
+
+@pytest.mark.asyncio
+async def test_maybe_persist_contact_skips_transient():
+    """_maybe_persist_contact guards transient (ADV_TYPE_NONE) entries even when a
+    subclass overrides _persist_contact (e.g. the repeater's SQLite upsert)."""
+    from types import SimpleNamespace
+
+    server = CompanionFrameServer(object(), "hash", port=0)
+    persisted = []
+    server._persist_contact = AsyncMock(side_effect=lambda c: persisted.append(c))
+
+    await server._maybe_persist_contact(SimpleNamespace(adv_type=0))  # ADV_TYPE_NONE
+    assert persisted == []  # skipped
+    server._persist_contact.assert_not_called()
+
+    real = SimpleNamespace(adv_type=1)  # ADV_TYPE_CHAT
+    await server._maybe_persist_contact(real)
+    assert persisted == [real]  # persisted
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_flood_scope_dispatches_mode_byte():
+    """CMD_SET_FLOOD_SCOPE_KEY: mode 1 -> unscoped, mode 0 -> set/reset scope (FW #2492)."""
+    bridge = Mock()
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+
+    # mode 1 (v12+): force unscoped
+    await server._cmd_set_flood_scope(bytes([0x01]))
+    bridge.set_flood_unscoped.assert_called_once()
+    bridge.set_flood_scope.assert_not_called()
+
+    # mode 0 with a 16-byte key: set scope override (key from data[1:17])
+    bridge.reset_mock()
+    key = bytes(range(16))
+    await server._cmd_set_flood_scope(bytes([0x00]) + key)
+    bridge.set_flood_scope.assert_called_once_with(key)
+    bridge.set_flood_unscoped.assert_not_called()
+
+    # mode 0, short: reset scope
+    bridge.reset_mock()
+    await server._cmd_set_flood_scope(bytes([0x00]))
+    bridge.set_flood_scope.assert_called_once_with(None)
+
+
+def test_max_frame_size_is_176():
+    """Companion frame size tracks firmware PR #2022 (172 -> 176)."""
+    from openhop_core.companion.constants import (
+        MAX_CHANNEL_DATA_LENGTH,
+        MAX_FRAME_SIZE,
+        MAX_PAYLOAD_SIZE,
+    )
+
+    assert MAX_FRAME_SIZE == 176
+    assert MAX_PAYLOAD_SIZE == 173
+    assert MAX_CHANNEL_DATA_LENGTH == 167
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_txt_msg_threads_host_timestamp():
+    """Plain DM: the host-supplied msg_timestamp (data[2:6]) is passed through verbatim so
+    retries share a stable timestamp (mirrors firmware sendMessage)."""
+    from unittest.mock import AsyncMock
+
+    from openhop_core.companion.companion_bridge import CompanionBridge
+    from openhop_core.companion.constants import TXT_TYPE_CLI_DATA, TXT_TYPE_PLAIN
+    from openhop_core.companion.models import Contact, SentResult
+    from openhop_core.protocol import LocalIdentity
+
+    bridge = CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+    peer = LocalIdentity()
+    pubkey = peer.get_public_key()
+    bridge.contacts.add(Contact(public_key=pubkey, name="Peer"))
+    bridge.send_text_message = AsyncMock(
+        return_value=SentResult(
+            success=True, is_flood=False, expected_ack=0x11223344, timeout_ms=5000
+        )
+    )
+
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=256)
+
+    host_ts = 1700000000
+    # data: txt_type(1) + attempt(1) + msg_timestamp(4, LE) + pubkey_prefix(6) + text
+    data = bytes([TXT_TYPE_PLAIN, 0]) + struct.pack("<I", host_ts) + pubkey[:6] + b"hello"
+    await server._cmd_send_txt_msg(data)
+
+    bridge.send_text_message.assert_awaited_once()
+    assert bridge.send_text_message.call_args.kwargs["timestamp"] == host_ts
+
+    # CLI_DATA mints a fresh timestamp (timestamp=None), matching firmware's RTC override.
+    bridge.send_text_message.reset_mock()
+    data_cli = bytes([TXT_TYPE_CLI_DATA, 0]) + struct.pack("<I", host_ts) + pubkey[:6] + b"cmd"
+    await server._cmd_send_txt_msg(data_cli)
+    assert bridge.send_text_message.call_args.kwargs["timestamp"] is None
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_txt_msg_zero_host_timestamp_mints_fresh():
+    """A zero/omitted host timestamp falls back to a fresh timestamp (timestamp=None)."""
+    from unittest.mock import AsyncMock
+
+    from openhop_core.companion.companion_bridge import CompanionBridge
+    from openhop_core.companion.constants import TXT_TYPE_PLAIN
+    from openhop_core.companion.models import Contact, SentResult
+    from openhop_core.protocol import LocalIdentity
+
+    bridge = CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+    peer = LocalIdentity()
+    pubkey = peer.get_public_key()
+    bridge.contacts.add(Contact(public_key=pubkey, name="Peer"))
+    bridge.send_text_message = AsyncMock(
+        return_value=SentResult(success=True, is_flood=False, expected_ack=0, timeout_ms=5000)
+    )
+
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=256)
+
+    data = bytes([TXT_TYPE_PLAIN, 0]) + struct.pack("<I", 0) + pubkey[:6] + b"hi"
+    await server._cmd_send_txt_msg(data)
+    assert bridge.send_text_message.call_args.kwargs["timestamp"] is None

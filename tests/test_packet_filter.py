@@ -1,6 +1,6 @@
 import time
 
-from pymc_core.protocol.packet_filter import PacketFilter
+from openhop_core.protocol.packet_filter import PacketFilter
 
 
 class TestPacketFilter:

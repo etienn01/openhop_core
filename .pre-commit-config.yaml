@@ -33,7 +33,7 @@ repos:
           "--extend-ignore=E203,E231,W503"
         ]
         # Exclude third-party code but check our core code
-        exclude: '^(src/pymc_core/hardware/lora/|examples/)'
+        exclude: '^(src/openhop_core/hardware/lora/|examples/)'
 
   # Run pytest to ensure all tests pass
   # - repo: local

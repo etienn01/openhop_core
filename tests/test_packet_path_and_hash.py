@@ -15,8 +15,8 @@ import struct
 
 import pytest
 
-from pymc_core.protocol import Packet
-from pymc_core.protocol.constants import (
+from openhop_core.protocol import Packet
+from openhop_core.protocol.constants import (
     MAX_HASH_SIZE,
     MAX_PACKET_PAYLOAD,
     MAX_PATH_SIZE,
@@ -32,7 +32,7 @@ from pymc_core.protocol.constants import (
     ROUTE_TYPE_TRANSPORT_DIRECT,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
-from pymc_core.protocol.packet_utils import PacketHashingUtils, PacketValidationUtils
+from openhop_core.protocol.packet_utils import PacketHashingUtils, PacketValidationUtils
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -566,7 +566,7 @@ class TestPacketHashingUtilsStandalone:
 class TestEdgeCases:
     def test_max_payload_hashes_correctly(self):
         """MAX_PACKET_PAYLOAD-sized payload should hash without error."""
-        from pymc_core.protocol.constants import MAX_PACKET_PAYLOAD
+        from openhop_core.protocol.constants import MAX_PACKET_PAYLOAD
 
         payload = bytes(range(256)) * (MAX_PACKET_PAYLOAD // 256 + 1)
         payload = payload[:MAX_PACKET_PAYLOAD]
@@ -656,7 +656,7 @@ class TestBadPacketDeserialization:
 
     def test_path_len_exceeds_max(self):
         """Encoded path_len that decodes to > MAX_PATH_SIZE (64) bytes must be rejected."""
-        from pymc_core.protocol.packet_utils import PathUtils
+        from openhop_core.protocol.packet_utils import PathUtils
 
         header = _make_header(PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_FLOOD)
         # 33 hops × 2 bytes = 66 path bytes (exceeds MAX_PATH_SIZE)
@@ -709,7 +709,7 @@ class TestBadPacketDeserialization:
 
     def test_path_len_exact_max_accepted(self):
         """Encoded path_len that decodes to exactly MAX_PATH_SIZE (64) bytes should be accepted."""
-        from pymc_core.protocol.packet_utils import PathUtils
+        from openhop_core.protocol.packet_utils import PathUtils
 
         header = _make_header(PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_FLOOD)
         # 32 hops × 2 bytes = 64 path bytes (exactly MAX_PATH_SIZE)

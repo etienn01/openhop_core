@@ -1,16 +1,16 @@
-# Contributing to pyMC_Core
+# Contributing to openHop Core
 
-We welcome contributions to pyMC_Core! This document provides guidelines for contributing to the project.
+We welcome contributions to openHop Core! This document provides guidelines for contributing to the project.
 
 ## Development Setup
 
 !!! warning "Virtual Environment Required"
-    Due to Python 3.11+'s externally-managed-environment restrictions, you **must** use a virtual environment when working with pyMC Core. This prevents conflicts with system packages and ensures a clean development environment.
+    Due to Python 3.11+'s externally-managed-environment restrictions, you **must** use a virtual environment when working with openHop Core. This prevents conflicts with system packages and ensures a clean development environment.
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/rightup/pyMC_core/dev
-   cd pyMC_Core
+   git clone https://github.com/rightup/openhop-core/dev
+   cd openHop Core
    ```
 
 2. **Set up development environment**
@@ -154,7 +154,7 @@ The documentation will be available at `http://localhost:8000`.
 
 When adding support for new hardware:
 
-1. Create a new hardware module in `src/pymc_core/hardware/`
+1. Create a new hardware module in `src/openhop_core/hardware/`
 2. Implement the `RadioDevice` interface
 3. Add configuration options
 4. Include setup instructions
@@ -182,4 +182,4 @@ When extending the protocol:
 - Ask questions in GitHub Discussions
 - Join our community chat
 
-Thank you for contributing to pyMC_Core!
+Thank you for contributing to openHop Core!
