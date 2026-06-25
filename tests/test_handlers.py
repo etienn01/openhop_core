@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-# from pymc_core.node.events import MeshEvents  # Not currently used
-from pymc_core.node.handlers import (
+# from openhop_core.node.events import MeshEvents  # Not currently used
+from openhop_core.node.handlers import (
     AckHandler,
     AdvertHandler,
     BaseHandler,
@@ -18,8 +18,8 @@ from pymc_core.node.handlers import (
     TextMessageHandler,
     TraceHandler,
 )
-from pymc_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
-from pymc_core.protocol.constants import (
+from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
+from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_ANON_REQ,
@@ -36,7 +36,7 @@ from pymc_core.protocol.constants import (
     SIGNATURE_SIZE,
     TIMESTAMP_SIZE,
 )
-from pymc_core.protocol.packet_utils import PathUtils
+from openhop_core.protocol.packet_utils import PathUtils
 
 
 # Mock classes for testing
@@ -239,7 +239,7 @@ class TestTextMessageHandler:
         """Receiver-emitted ACK[:4] equals the sender's expected ack_crc (firmware parity)."""
         import asyncio
 
-        from pymc_core.protocol.packet_builder import PacketBuilder
+        from openhop_core.protocol.packet_builder import PacketBuilder
 
         sender = LocalIdentity()
         receiver = self.local_identity  # handler's identity
@@ -604,8 +604,8 @@ class TestProtocolResponseHandler:
     @pytest.mark.asyncio
     async def test_contact_path_updated_callback_invoked_on_path_update(self):
         """PATH decrypts and updates contact path; contact_path_updated callback is invoked."""
-        from pymc_core.companion.contact_store import ContactStore
-        from pymc_core.companion.models import Contact
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.companion.models import Contact
 
         local_identity = LocalIdentity()
         peer_identity = LocalIdentity()
@@ -655,9 +655,9 @@ class TestProtocolResponseHandler:
     @pytest.mark.asyncio
     async def test_contact_path_updated_with_2byte_hashes(self):
         """PATH with 2-byte hashes decrypts and updates contact path correctly."""
-        from pymc_core.companion.contact_store import ContactStore
-        from pymc_core.companion.models import Contact
-        from pymc_core.protocol.packet_utils import PathUtils
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.companion.models import Contact
+        from openhop_core.protocol.packet_utils import PathUtils
 
         local_identity = LocalIdentity()
         peer_identity = LocalIdentity()
@@ -714,8 +714,8 @@ class TestProtocolResponseHandler:
         PATH-return before path learning could run, leaving out_path_len == -1 and
         forcing the follow-up stats REQ to flood. The PATH branch must always decrypt
         so _update_contact_path + reciprocal PATH run (firmware onContactPathRecv)."""
-        from pymc_core.companion.contact_store import ContactStore
-        from pymc_core.companion.models import Contact
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.companion.models import Contact
 
         local_identity = LocalIdentity()  # companion
         server_identity = LocalIdentity()  # firmware repeater
@@ -814,7 +814,7 @@ class TestProtocolRequestHandler:
 
     def test_flood_req_applies_path_hash_mode(self):
         """Path-return packet preserves incoming path hash size (2-byte hashes)."""
-        from pymc_core.protocol.packet_utils import PathUtils
+        from openhop_core.protocol.packet_utils import PathUtils
 
         peer_identity = LocalIdentity()
         client = self._client_with_key(peer_identity.get_public_key())
@@ -998,7 +998,7 @@ async def test_handlers_can_be_called():
 # AnonReqResponseHandler Tests (separate from LoginResponseHandler)
 def test_anon_req_response_handler():
     """Test AnonReqResponseHandler can be imported and has correct payload type."""
-    from pymc_core.node.handlers import AnonReqResponseHandler
+    from openhop_core.node.handlers import AnonReqResponseHandler
 
     # Should have same payload type as anonymous requests
     assert AnonReqResponseHandler.payload_type() == PAYLOAD_TYPE_ANON_REQ
@@ -1017,7 +1017,7 @@ class TestLoginServerHandler:
     """
 
     def setup_method(self):
-        from pymc_core.node.handlers.login_server import LoginServerHandler
+        from openhop_core.node.handlers.login_server import LoginServerHandler
 
         self.server_identity = LocalIdentity()
         self.client_identity_local = LocalIdentity()
@@ -1082,7 +1082,7 @@ class TestLoginServerHandler:
 
     def test_payload_type(self):
         """LoginServerHandler handles ANON_REQ packets."""
-        from pymc_core.node.handlers.login_server import LoginServerHandler
+        from openhop_core.node.handlers.login_server import LoginServerHandler
 
         assert LoginServerHandler.payload_type() == PAYLOAD_TYPE_ANON_REQ
 

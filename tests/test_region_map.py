@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from pymc_core.protocol import LocalIdentity, Packet, PacketBuilder
-from pymc_core.protocol.constants import ROUTE_TYPE_TRANSPORT_FLOOD
-from pymc_core.protocol.region_map import REGION_DENY_FLOOD, RegionEntry, RegionMap
-from pymc_core.protocol.transport_keys import calc_transport_code, get_auto_key_for
+from openhop_core.protocol import LocalIdentity, Packet, PacketBuilder
+from openhop_core.protocol.constants import ROUTE_TYPE_TRANSPORT_FLOOD
+from openhop_core.protocol.region_map import REGION_DENY_FLOOD, RegionEntry, RegionMap
+from openhop_core.protocol.transport_keys import calc_transport_code, get_auto_key_for
 
 
 def _make_scoped_packet(region_name: str) -> Packet:

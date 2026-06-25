@@ -1,7 +1,7 @@
 """Tests for companion stores and models: ContactStore, ChannelStore, MessageQueue, PathCache."""
 
-from pymc_core.companion import ChannelStore, ContactStore, MessageQueue, PathCache, StatsCollector
-from pymc_core.companion.models import (
+from openhop_core.companion import ChannelStore, ContactStore, MessageQueue, PathCache, StatsCollector
+from openhop_core.companion.models import (
     AdvertPath,
     Channel,
     Contact,
@@ -239,7 +239,7 @@ class TestContactStore:
         assert store.get_by_key(b"\x01" * 32) is not None
 
     def test_add_transient_pool_capped_reuses_oldest(self):
-        from pymc_core.companion.constants import MAX_ANON_CONTACTS
+        from openhop_core.companion.constants import MAX_ANON_CONTACTS
 
         store = ContactStore(max_contacts=1000)
         for i in range(MAX_ANON_CONTACTS):

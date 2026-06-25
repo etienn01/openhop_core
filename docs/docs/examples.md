@@ -1,10 +1,10 @@
 # Examples
 
-This section contains practical examples of using pyMC_Core for mesh communications.
+This section contains practical examples of using openHop Core for mesh communications.
 
-## PyMC Core Examples
+## openHop Core Examples
 
-This directory contains examples for using PyMC Core functionality. More examples will be added over time.
+This directory contains examples for using openHop Core functionality. More examples will be added over time.
 
 ## Available Examples
 
@@ -127,7 +127,7 @@ python examples/ping_repeater_trace.py --radio-type kiss-tnc --serial-port /dev/
 
 ### Supported Radio Hardware
 
-pyMC_Core supports both direct SX1262 radio control and KISS TNC devices:
+openHop Core supports both direct SX1262 radio control and KISS TNC devices:
 
 ### SX1262 Direct Radio Hardware
 
@@ -211,25 +211,25 @@ pyMC_Core supports both direct SX1262 radio control and KISS TNC devices:
 >
 > ```bash
 > # Create virtual environment
-> python3 -m venv pymc_env
+> python3 -m venv openhop_env
 >
 > # Activate virtual environment
 > # On Linux/Mac:
-> source pymc_env/bin/activate
+> source openhop_env/bin/activate
 > # On Windows:
-> pymc_env\Scripts\activate
+> openhop_env\Scripts\activate
 > ```
 
 ### Core Dependencies
 ```bash
-pip install pymc_core
+pip install openhop-core
 ```
 
 ### Hardware Dependencies
 
 **For SX1262 Direct Radio:**
 ```bash
-pip install pymc_core[hardware]
+pip install openhop-core[hardware]
 # or manually:
 pip install gpiozero lgpio
 ```
@@ -241,7 +241,7 @@ pip install pyserial
 
 ### All Dependencies
 ```bash
-pip install pymc_core[all]
+pip install openhop-core[all]
 ```
 
 ## Hardware Setup
@@ -272,7 +272,7 @@ The examples will automatically initialize the radio with the default configurat
 - **MeshNode**: Main node class that coordinates radio, dispatcher, and identity
 - **PacketBuilder**: Factory for creating different types of packets
 - **Dispatcher**: Handles packet transmission and reception through the radio
-- **Constants**: Use proper constants from `pymc_core.protocol.constants` instead of hardcoded values
+- **Constants**: Use proper constants from `openhop_core.protocol.constants` instead of hardcoded values
 
 ## Configuration
 
@@ -389,9 +389,9 @@ The radio configurations are defined in `common.py` for each hardware type.
 
 ```python
 import asyncio
-from pymc_core import MeshNode, LocalIdentity
-from pymc_core.protocol.packet_builder import PacketBuilder
-from pymc_core.protocol.constants import PacketType
+from openhop_core import MeshNode, LocalIdentity
+from openhop_core.protocol.packet_builder import PacketBuilder
+from openhop_core.protocol.constants import PacketType
 
 async def send_message_example():
     # Setup node (same as above)
@@ -420,8 +420,8 @@ asyncio.run(send_message_example())
 ## Packet Handling
 
 ```python
-from pymc_core.node import Dispatcher
-from pymc_core.protocol.packet_filter import PacketFilter
+from openhop_core.node import Dispatcher
+from openhop_core.protocol.packet_filter import PacketFilter
 
 class MessageHandler:
     def __init__(self, local_identity):
@@ -449,7 +449,7 @@ dispatcher.register_handler(PacketType.DATA, handler.handle_packet)
 ### SX1262 LoRa Radio
 
 ```python
-from pymc_core.hardware import SX1262Radio
+from openhop_core.hardware import SX1262Radio
 
 # SX1262 radio configuration with required parameters
 radio = SX1262Radio(
@@ -478,8 +478,8 @@ radio.enable_encryption(True)
 ### Custom Packet Types
 
 ```python
-from pymc_core.protocol.packet import Packet
-from pymc_core.protocol.constants import PacketType
+from openhop_core.protocol.packet import Packet
+from openhop_core.protocol.constants import PacketType
 
 # Define custom packet type
 CUSTOM_TYPE = 0x10
@@ -552,17 +552,17 @@ screen /dev/ttyUSB0 115200
 **Module Not Found:**
 ```bash
 # Install in development mode
-cd pyMC_core
+cd openhop-core
 pip install -e .
 
 # Or install from PyPI
-pip install pymc_core
+pip install openhop-core
 ```
 
 **Virtual Environment Issues:**
 ```bash
 # Create fresh virtual environment
-python3 -m venv pymc_env
-source pymc_env/bin/activate  # Linux/Mac
-pip install pymc_core
+python3 -m venv openhop_env
+source openhop_env/bin/activate  # Linux/Mac
+pip install openhop-core
 ```

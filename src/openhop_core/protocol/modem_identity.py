@@ -13,7 +13,7 @@ from nacl.signing import VerifyKey
 from . import CryptoUtils
 
 if TYPE_CHECKING:
-    from pymc_core.hardware.kiss_modem_wrapper import KissModemWrapper
+    from openhop_core.hardware.kiss_modem_wrapper import KissModemWrapper
 
 
 class ModemIdentity:
@@ -24,7 +24,7 @@ class ModemIdentity:
     ensuring the private key never leaves the secure modem environment.
 
     Implements the same interface as LocalIdentity for compatibility with
-    the rest of the pyMC_core stack.
+    the rest of the openhop_core stack.
     """
 
     def __init__(self, modem: "KissModemWrapper"):
@@ -139,7 +139,7 @@ class ModemIdentity:
         takes the remote's Ed25519 public key because the modem holds the
         local private key internally.
 
-        For use in pyMC_core handlers, which call calc_shared_secret on the
+        For use in openhop_core handlers, which call calc_shared_secret on the
         *peer's* Identity object (not on LocalIdentity/ModemIdentity), this
         method is provided for cases where you want to compute a shared
         secret directly using the modem's identity.
@@ -188,7 +188,8 @@ class ModemIdentity:
             RuntimeError: Always, as signing key is not accessible
         """
         raise RuntimeError(
-            "ModemIdentity does not expose signing keys. " "Use sign() for signing operations."
+            "ModemIdentity does not expose signing keys. "
+            "Use sign() for signing operations."
         )
 
     # Additional modem-specific methods
@@ -266,7 +267,9 @@ class ModemIdentity:
         """
         result = self._modem.decrypt_data(key, mac, ciphertext)
         if result is None:
-            raise RuntimeError("Modem decryption failed (MAC verification may have failed)")
+            raise RuntimeError(
+                "Modem decryption failed (MAC verification may have failed)"
+            )
         return result
 
     @property

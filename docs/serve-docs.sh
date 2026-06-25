@@ -3,7 +3,7 @@
 
 set -e
 
-echo "Building and serving pyMC_Core documentation..."
+echo "Building and serving openHop Core documentation..."
 echo "============================================"
 
 # Check if we're in the docs directory

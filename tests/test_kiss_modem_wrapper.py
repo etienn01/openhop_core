@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from pymc_core.hardware.kiss_modem_wrapper import (
+from openhop_core.hardware.kiss_modem_wrapper import (
     CMD_DATA,
     CMD_GET_BATTERY,
     CMD_GET_NOISE_FLOOR,
@@ -580,7 +580,7 @@ class TestCommandResponses:
         to_thread_side_effect.calls = 0
 
         to_thread_mock = AsyncMock(side_effect=to_thread_side_effect)
-        with patch("pymc_core.hardware.kiss_modem_wrapper.asyncio.to_thread", to_thread_mock):
+        with patch("openhop_core.hardware.kiss_modem_wrapper.asyncio.to_thread", to_thread_mock):
             result = await modem.send(b"payload")
 
         assert result is not None
@@ -597,7 +597,7 @@ class TestKissAsyncTelemetry:
     async def test_get_status_async_delegates_to_thread(self):
         modem = KissModemWrapper(port="/dev/null", auto_configure=False)
         to_thread_mock = AsyncMock(return_value={"ok": True})
-        with patch("pymc_core.hardware.kiss_modem_wrapper.asyncio.to_thread", to_thread_mock):
+        with patch("openhop_core.hardware.kiss_modem_wrapper.asyncio.to_thread", to_thread_mock):
             result = await modem.get_status_async(1.25)
         assert result == {"ok": True}
         to_thread_mock.assert_awaited_once_with(modem._sync_get_status, 1.25)
@@ -606,7 +606,7 @@ class TestKissAsyncTelemetry:
     async def test_get_noise_floor_async_delegates_to_thread(self):
         modem = KissModemWrapper(port="/dev/null", auto_configure=False)
         to_thread_mock = AsyncMock(return_value=-95)
-        with patch("pymc_core.hardware.kiss_modem_wrapper.asyncio.to_thread", to_thread_mock):
+        with patch("openhop_core.hardware.kiss_modem_wrapper.asyncio.to_thread", to_thread_mock):
             result = await modem.get_noise_floor_async(0.75)
         assert result == -95
         to_thread_mock.assert_awaited_once_with(modem.get_noise_floor, 0.75)
@@ -616,7 +616,7 @@ class TestKissAsyncTelemetry:
         modem = KissModemWrapper(port="/dev/null", auto_configure=False)
         stats = {"rx": 1, "tx": 2, "errors": 0}
         to_thread_mock = AsyncMock(return_value=stats)
-        with patch("pymc_core.hardware.kiss_modem_wrapper.asyncio.to_thread", to_thread_mock):
+        with patch("openhop_core.hardware.kiss_modem_wrapper.asyncio.to_thread", to_thread_mock):
             result = await modem.get_modem_stats_async(None)
         assert result == stats
         to_thread_mock.assert_awaited_once_with(modem.get_modem_stats, None)
@@ -1755,7 +1755,7 @@ class TestSerialRecovery:
         modem._run_post_connect_handshake = MagicMock(return_value=True)
         modem._stop_io_threads = MagicMock()
 
-        with patch("pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None):
+        with patch("openhop_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None):
             modem._reconnect_worker()
 
         assert modem._open_serial_and_start_threads.call_count == 2
@@ -1823,7 +1823,7 @@ class TestSerialRecovery:
         modem.configure_radio = MagicMock(side_effect=transient_configure_failure)
 
         with patch(
-            "pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None
+            "openhop_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None
         ) as sleep_mock, patch("threading.Event.wait", return_value=None):
             assert modem.connect() is True
 
@@ -1845,7 +1845,7 @@ class TestSerialRecovery:
         modem._set_kiss_tx_delay = MagicMock()
         modem.configure_radio = MagicMock(return_value=False)
 
-        with patch("pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None), patch(
+        with patch("openhop_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None), patch(
             "threading.Event.wait", return_value=None
         ):
             assert modem.connect() is False
@@ -1873,7 +1873,7 @@ class TestSerialRecovery:
 
         modem.configure_radio = MagicMock(side_effect=configure_with_one_retry)
 
-        with patch("pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None):
+        with patch("openhop_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None):
             assert modem.connect() is True
 
         assert observed_states == [False, False]
@@ -1895,7 +1895,7 @@ class TestSerialRecovery:
         modem._run_post_connect_handshake = MagicMock(side_effect=reconnect_handshake)
         modem._stop_io_threads = MagicMock()
 
-        with patch("pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None):
+        with patch("openhop_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None):
             modem._reconnect_worker()
 
         assert modem.is_connected is True
@@ -2071,7 +2071,7 @@ class TestBulkDecodeEquivalence:
 
     def test_oversize_frame_resync(self):
         # A frame with a lost FEND exceeds MAX_FRAME_SIZE, then a valid pair follows.
-        from pymc_core.hardware.kiss_modem_wrapper import MAX_FRAME_SIZE
+        from openhop_core.hardware.kiss_modem_wrapper import MAX_FRAME_SIZE
 
         runaway = bytes([KISS_FEND, CMD_DATA]) + bytes(MAX_FRAME_SIZE + 50)  # no closing FEND
         valid = self._kiss_encode(CMD_DATA, b"\x01\x02") + self._kiss_encode(

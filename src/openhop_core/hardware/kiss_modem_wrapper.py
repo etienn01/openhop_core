@@ -228,7 +228,7 @@ class KissModemWrapper(LoRaRadio):
     Supports packet transmission/reception, radio configuration, and cryptographic
     operations via the modem's identity.
 
-    Implements the LoRaRadio interface for PyMC Core compatibility.
+    Implements the LoRaRadio interface for openHop Core compatibility.
 
     Threading Model:
         This wrapper uses background threads for serial RX/TX. The RX callback

@@ -12,16 +12,16 @@ import struct
 
 import pytest
 
-from pymc_core.node.handlers.anon_request import (
+from openhop_core.node.handlers.anon_request import (
     ANON_REQ_TYPE_BASIC,
     ANON_REQ_TYPE_OWNER,
     ANON_REQ_TYPE_REGIONS,
     AnonRateLimiter,
     AnonRequestHandler,
 )
-from pymc_core.node.handlers.login_server import LoginServerHandler
-from pymc_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet
-from pymc_core.protocol.constants import (
+from openhop_core.node.handlers.login_server import LoginServerHandler
+from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet
+from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ANON_REQ,
     PAYLOAD_TYPE_RESPONSE,
     ROUTE_TYPE_DIRECT,

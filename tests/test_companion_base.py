@@ -4,17 +4,17 @@ import hashlib
 
 import pytest
 
-from pymc_core.companion import CompanionBridge
-from pymc_core.companion.companion_base import ResponseWaiter, adv_type_to_flags
-from pymc_core.companion.constants import (
+from openhop_core.companion import CompanionBridge
+from openhop_core.companion.companion_base import ResponseWaiter, adv_type_to_flags
+from openhop_core.companion.constants import (
     ADV_TYPE_CHAT,
     ADV_TYPE_REPEATER,
     ADV_TYPE_ROOM,
     ADV_TYPE_SENSOR,
 )
-from pymc_core.companion.models import Contact
-from pymc_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
-from pymc_core.protocol.constants import (
+from openhop_core.companion.models import Contact
+from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
+from openhop_core.protocol.constants import (
     ADVERT_FLAG_IS_CHAT_NODE,
     ADVERT_FLAG_IS_REPEATER,
     ADVERT_FLAG_IS_ROOM_SERVER,
@@ -25,7 +25,7 @@ from pymc_core.protocol.constants import (
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
-from pymc_core.protocol.utils import determine_contact_type_from_flags, get_contact_type_name
+from openhop_core.protocol.utils import determine_contact_type_from_flags, get_contact_type_name
 
 # ---------------------------------------------------------------------------
 # ResponseWaiter

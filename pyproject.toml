@@ -3,10 +3,10 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pymc_core"
-version = "1.0.14"
+name = "openhop_core"
+version = "1.1.1"
 authors = [
-    {name = "Rightup", email = "rightup@pymc.dev"},
+    {name = "Rightup", email = "rightup@openhop.dev"},
 ]
 description = "A Python MeshCore library with SPI LoRa radio support"
 readme = "README.md"
@@ -63,20 +63,20 @@ docs = [
     "mkdocs-git-revision-date-localized-plugin>=1.2.0",
     "mkdocs-git-committers-plugin-2>=1.2.0",
 ]
-all = ["pymc_core[hardware,websocket,dev,docs]"]
+all = ["openhop_core[hardware,websocket,dev,docs]"]
 
 [project.urls]
-Homepage = "https://github.com/pyMC-dev/pyMC_core/"
-Documentation = "https://rightup.github.io/pymc_dev/pyMC_core"
-Repository = "https://github.com/pyMC-dev/pyMC_core.git"
-Issues = "https://github.com/pyMC-dev/pyMC_core/issues"
+Homepage = "https://github.com/openhop-dev/openhop-core/"
+Documentation = "https://rightup.github.io/pymc_dev/openhop-core"
+Repository = "https://github.com/openhop-dev/openhop-core.git"
+Issues = "https://github.com/openhop-dev/openhop-core/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["pymc_core*"]
+include = ["openhop_core*"]
 exclude = ["__pycache__*", "*.pyc", "*.pyo"]
 
 [tool.black]
@@ -91,7 +91,7 @@ line_length = 100
 max-line-length = 100
 extend-ignore = ["E203", "W503"]
 exclude = [
-    "src/pymc_core/hardware/lora/",
+    "src/openhop_core/hardware/lora/",
     "examples/",
     "__pycache__",
     ".git",

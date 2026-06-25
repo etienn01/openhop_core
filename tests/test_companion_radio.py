@@ -2,11 +2,11 @@
 
 import pytest
 
-from pymc_core.companion import CompanionRadio
-from pymc_core.companion.constants import ADV_TYPE_CHAT
-from pymc_core.companion.models import Contact
-from pymc_core.protocol import LocalIdentity, Packet, PacketBuilder
-from pymc_core.protocol.constants import PAYLOAD_TYPE_ACK
+from openhop_core.companion import CompanionRadio
+from openhop_core.companion.constants import ADV_TYPE_CHAT
+from openhop_core.companion.models import Contact
+from openhop_core.protocol import LocalIdentity, Packet, PacketBuilder
+from openhop_core.protocol.constants import PAYLOAD_TYPE_ACK
 
 
 def _make_peer_contact(name: str) -> Contact:
@@ -427,7 +427,7 @@ class TestCompanionLoginRetry:
 
         monkeypatch.setattr(comp, "_send_packet", fake_send)
 
-        from pymc_core.companion.timing import DEFAULT_MAX_ATTEMPTS
+        from openhop_core.companion.timing import DEFAULT_MAX_ATTEMPTS
 
         result = await comp.send_login(contact.public_key, "pw")
         assert result["success"] is False

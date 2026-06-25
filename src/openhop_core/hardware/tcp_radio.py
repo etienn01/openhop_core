@@ -1,17 +1,17 @@
 """
-TCP LoRa Radio Driver for pymc_core
+TCP LoRa Radio Driver for openhop_core
 
 Implements the LoRaRadio interface using any board running the pymc_usb
 firmware in Wi-Fi/TCP mode. Same binary protocol as USBLoRaRadio — only
 the transport differs.
 
-Drop-in replacement for SX1262Radio in pymc_core's hardware layer.
+Drop-in replacement for SX1262Radio in openhop_core's hardware layer.
 
 Default sync word is 0x12 (MeshCore private syncword), matching the
 firmware default — change only if the deployment uses a custom value.
 
 Usage:
-    from pymc_core.hardware.tcp_radio import TCPLoRaRadio
+    from openhop_core.hardware.tcp_radio import TCPLoRaRadio
 
     radio = TCPLoRaRadio(
         host="192.168.1.50",
@@ -40,20 +40,35 @@ import time
 from typing import Callable, Optional
 
 from .protocol_constants import (
-    PROTO_SYNC,
-    MAX_LORA_PAYLOAD,
-    CMD_TX_REQUEST, CMD_SET_CONFIG,
-    CMD_STATUS_REQ, CMD_NOISE_REQ,
-    CMD_CAD_REQUEST, CMD_RX_START, CMD_SET_CAD_PARAMS,
-    CMD_AUTH, CMD_PING,
-    CMD_TX_DONE, CMD_TX_FAIL, CMD_RX_PACKET,
-    CMD_CONFIG_RESP, CMD_STATUS_RESP, CMD_NOISE_RESP,
-    CMD_CAD_RESP, CMD_RX_STARTED, CMD_CAD_PARAMS_RESP,
-    CMD_AUTH_OK, CMD_ERROR, CMD_PONG,
+    CMD_AUTH,
+    CMD_AUTH_OK,
+    CMD_CAD_PARAMS_RESP,
+    CMD_CAD_REQUEST,
+    CMD_CAD_RESP,
+    CMD_CONFIG_RESP,
+    CMD_ERROR,
+    CMD_NOISE_REQ,
+    CMD_NOISE_RESP,
+    CMD_PING,
+    CMD_PONG,
+    CMD_RX_PACKET,
+    CMD_RX_START,
+    CMD_RX_STARTED,
+    CMD_SET_CAD_PARAMS,
+    CMD_SET_CONFIG,
+    CMD_STATUS_REQ,
+    CMD_STATUS_RESP,
+    CMD_TX_DONE,
+    CMD_TX_FAIL,
+    CMD_TX_REQUEST,
     ERR_UNAUTHORIZED,
+    MAX_LORA_PAYLOAD,
+    PROTO_SYNC,
     RADIO_CONFIG_FMT,
-    STATUS_RESP_FMT, STATUS_RESP_SIZE,
-    crc16_ccitt, build_frame,
+    STATUS_RESP_FMT,
+    STATUS_RESP_SIZE,
+    build_frame,
+    crc16_ccitt,
 )
 
 logger = logging.getLogger("TCPLoRaRadio")
@@ -61,15 +76,18 @@ logger = logging.getLogger("TCPLoRaRadio")
 
 # Import LoRaRadio base conditionally — allows standalone testing
 try:
-    from pymc_core.hardware.base import LoRaRadio
+    from openhop_core.hardware.base import LoRaRadio
+
     _HAS_BASE = True
 except ImportError:
     _HAS_BASE = False
 
 if _HAS_BASE:
+
     class _RadioBase(LoRaRadio):
         pass
 else:
+
     class _RadioBase:
         pass
 
@@ -79,7 +97,7 @@ class TCPLoRaRadio(_RadioBase):
 
     Communicates with any board running the pymc_usb firmware in Wi-Fi
     STA mode. Provides the same interface as SX1262Radio and USBLoRaRadio
-    for transparent integration with pymc_core.
+    for transparent integration with openhop_core.
     """
 
     def __init__(
@@ -157,8 +175,8 @@ class TCPLoRaRadio(_RadioBase):
         logger.info(
             f"TCPLoRaRadio configured: {host}:{port} "
             f"(auth={'token' if self.token else 'open'}), "
-            f"freq={frequency/1e6:.1f}MHz, sf={spreading_factor}, "
-            f"bw={bandwidth/1000:.0f}kHz, power={tx_power}dBm, "
+            f"freq={frequency / 1e6:.1f}MHz, sf={spreading_factor}, "
+            f"bw={bandwidth / 1000:.0f}kHz, power={tx_power}dBm, "
             f"syncword=0x{sync_word:04X}"
         )
 
@@ -243,34 +261,29 @@ class TCPLoRaRadio(_RadioBase):
                     try:
                         channel_busy = await self._perform_cad(timeout=1.0)
                         if not channel_busy:
-                            logger.debug(
-                                f"CAD clear after {attempt + 1} attempt(s)"
-                            )
+                            logger.debug(f"CAD clear after {attempt + 1} attempt(s)")
                             break
                         else:
                             logger.debug("CAD busy — channel activity detected")
                             if attempt < self.lbt_max_attempts - 1:
                                 base_delay = random.randint(50, 200)
-                                backoff_ms = min(
-                                    base_delay * (2 ** attempt), 5000
-                                )
+                                backoff_ms = min(base_delay * (2**attempt), 5000)
                                 lbt_backoff_delays.append(float(backoff_ms))
                                 logger.debug(
                                     f"CAD backoff {backoff_ms}ms "
-                                    f"(attempt {attempt+1}/{self.lbt_max_attempts})"
+                                    f"(attempt {attempt + 1}/{self.lbt_max_attempts})"
                                 )
                                 await asyncio.sleep(backoff_ms / 1000.0)
                             else:
-                                logger.warning(
-                                    "CAD max attempts — transmitting anyway"
-                                )
+                                logger.warning("CAD max attempts — transmitting anyway")
                     except Exception as e:
                         logger.warning(f"CAD failed: {e}, proceeding with TX")
                         break
 
             try:
                 resp = await self._send_command(
-                    CMD_TX_REQUEST, data,
+                    CMD_TX_REQUEST,
+                    data,
                     expect_cmd=CMD_TX_DONE,
                     timeout=10.0,
                 )
@@ -282,12 +295,11 @@ class TCPLoRaRadio(_RadioBase):
                         airtime_us = struct.unpack("<I", resp[:4])[0]
                     airtime_ms = airtime_us / 1000.0
 
-                    logger.debug(
-                        f"TX done: {len(data)}B, airtime={airtime_ms:.1f}ms"
-                    )
+                    logger.debug(f"TX done: {len(data)}B, airtime={airtime_ms:.1f}ms")
 
                     await self._send_command(
-                        CMD_RX_START, b"",
+                        CMD_RX_START,
+                        b"",
                         expect_cmd=CMD_RX_STARTED,
                         timeout=2.0,
                     )
@@ -301,7 +313,8 @@ class TCPLoRaRadio(_RadioBase):
                 else:
                     logger.error("TX failed — no TX_DONE response")
                     await self._send_command(
-                        CMD_RX_START, b"",
+                        CMD_RX_START,
+                        b"",
                         expect_cmd=CMD_RX_STARTED,
                         timeout=2.0,
                     )
@@ -361,9 +374,7 @@ class TCPLoRaRadio(_RadioBase):
 
         if self._event_loop:
             self._event_loop.call_soon_threadsafe(
-                lambda: self._event_loop.create_task(
-                    self._refresh_background_metrics()
-                )
+                lambda: self._event_loop.create_task(self._refresh_background_metrics())
             )
         return True
 
@@ -390,7 +401,8 @@ class TCPLoRaRadio(_RadioBase):
 
     async def get_modem_status(self) -> Optional[dict]:
         resp = await self._send_command(
-            CMD_STATUS_REQ, b"",
+            CMD_STATUS_REQ,
+            b"",
             expect_cmd=CMD_STATUS_RESP,
             timeout=2.0,
         )
@@ -431,7 +443,8 @@ class TCPLoRaRadio(_RadioBase):
 
     async def refresh_noise_floor(self) -> Optional[float]:
         resp = await self._send_command(
-            CMD_NOISE_REQ, b"",
+            CMD_NOISE_REQ,
+            b"",
             expect_cmd=CMD_NOISE_RESP,
             timeout=2.0,
         )
@@ -464,15 +477,19 @@ class TCPLoRaRadio(_RadioBase):
             # since the previous call. Saves ~50-80 ms per CAD during the
             # repeated-sample phase of the calibration sweep.
             if new_peak != self._custom_cad_peak or new_min != self._custom_cad_min:
-                payload = bytes([
-                    0x01,             # symNum: CAD_ON_2_SYMB
-                    new_peak & 0xFF,
-                    new_min & 0xFF,
-                    0x00,             # exitMode: STDBY
-                ])
+                payload = bytes(
+                    [
+                        0x01,  # symNum: CAD_ON_2_SYMB
+                        new_peak & 0xFF,
+                        new_min & 0xFF,
+                        0x00,  # exitMode: STDBY
+                    ]
+                )
                 await self._send_command(
-                    CMD_SET_CAD_PARAMS, payload,
-                    expect_cmd=CMD_CAD_PARAMS_RESP, timeout=2.0,
+                    CMD_SET_CAD_PARAMS,
+                    payload,
+                    expect_cmd=CMD_CAD_PARAMS_RESP,
+                    timeout=2.0,
                 )
                 self._custom_cad_peak = new_peak
                 self._custom_cad_min = new_min
@@ -570,8 +587,8 @@ class TCPLoRaRadio(_RadioBase):
             cmd, payload = resp
             if cmd == CMD_CONFIG_RESP:
                 logger.info(
-                    f"Radio configured: {self.frequency/1e6:.1f}MHz "
-                    f"SF{self.spreading_factor} BW{self.bandwidth/1000:.0f}kHz "
+                    f"Radio configured: {self.frequency / 1e6:.1f}MHz "
+                    f"SF{self.spreading_factor} BW{self.bandwidth / 1000:.0f}kHz "
                     f"{self.tx_power}dBm sync=0x{self.sync_word:04X} "
                     f"pre={self.preamble_length}"
                 )
@@ -633,8 +650,7 @@ class TCPLoRaRadio(_RadioBase):
             computed_crc = crc16_ccitt(hdr + payload)
             if received_crc != computed_crc:
                 logger.warning(
-                    f"CRC mismatch: recv=0x{received_crc:04X} "
-                    f"comp=0x{computed_crc:04X}"
+                    f"CRC mismatch: recv=0x{received_crc:04X} comp=0x{computed_crc:04X}"
                 )
                 return None
             return (cmd, payload)
@@ -672,8 +688,9 @@ class TCPLoRaRadio(_RadioBase):
             # Re-apply custom CAD if host had programmed any.
             if self._custom_cad_peak is not None and self._custom_cad_min is not None:
                 try:
-                    self.set_custom_cad_thresholds(peak=self._custom_cad_peak,
-                                                   min_val=self._custom_cad_min)
+                    self.set_custom_cad_thresholds(
+                        peak=self._custom_cad_peak, min_val=self._custom_cad_min
+                    )
                 except Exception as e:
                     logger.warning(f"Reconnect: re-push CAD failed: {e}")
             return True
@@ -735,7 +752,9 @@ class TCPLoRaRadio(_RadioBase):
                     # Remote closed — try to reopen instead of dying; the
                     # previous behaviour left tcp_radio permanently offline
                     # until systemctl restart (known_issue_tcp_no_reconnect).
-                    logger.warning("TCP connection closed by peer — attempting reconnect")
+                    logger.warning(
+                        "TCP connection closed by peer — attempting reconnect"
+                    )
                     self._close_sock()
                     buf.clear()
                     if self._reconnect_with_backoff():
@@ -783,9 +802,7 @@ class TCPLoRaRadio(_RadioBase):
                     buf = buf[frame_size:]
 
                     if crc_recv != crc_comp:
-                        logger.warning(
-                            f"RX CRC mismatch, cmd=0x{cmd:02X}, dropping"
-                        )
+                        logger.warning(f"RX CRC mismatch, cmd=0x{cmd:02X}, dropping")
                         continue
 
                     self._dispatch_frame(cmd, payload)
@@ -815,8 +832,7 @@ class TCPLoRaRadio(_RadioBase):
             self._rx_count += 1
 
             logger.debug(
-                f"RX: {len(lora_data)}B RSSI={rssi}dBm "
-                f"SNR={snr_x10/10:.1f}dB"
+                f"RX: {len(lora_data)}B RSSI={rssi}dBm SNR={snr_x10 / 10:.1f}dB"
             )
 
             if self.rx_callback:
@@ -827,9 +843,7 @@ class TCPLoRaRadio(_RadioBase):
                         pass
 
                 if self._event_loop and self._event_loop.is_running():
-                    self._event_loop.call_soon_threadsafe(
-                        self.rx_callback, lora_data
-                    )
+                    self._event_loop.call_soon_threadsafe(self.rx_callback, lora_data)
                 else:
                     try:
                         self.rx_callback(lora_data)
@@ -916,7 +930,8 @@ class TCPLoRaRadio(_RadioBase):
 
     async def _perform_cad(self, timeout: float = 1.0) -> bool:
         resp = await self._send_command(
-            CMD_CAD_REQUEST, b"",
+            CMD_CAD_REQUEST,
+            b"",
             expect_cmd=CMD_CAD_RESP,
             timeout=timeout,
         )
@@ -951,6 +966,7 @@ class TCPLoRaRadio(_RadioBase):
                     logger.info(f"Async config push result: ok={res is not None}")
                 except Exception as e:
                     logger.error(f"Async config push error: {e}", exc_info=True)
+
             asyncio.ensure_future(_bg())
             return True
         # Different thread — blocking wait is fine.
@@ -969,13 +985,18 @@ class TCPLoRaRadio(_RadioBase):
             return True
         payload = struct.pack(
             RADIO_CONFIG_FMT,
-            self.frequency, self.bandwidth, self.spreading_factor,
-            self.coding_rate, self.tx_power, self.sync_word,
+            self.frequency,
+            self.bandwidth,
+            self.spreading_factor,
+            self.coding_rate,
+            self.tx_power,
+            self.sync_word,
             self.preamble_length,
         )
         ok = self._run_async_safe(
-            self._send_command(CMD_SET_CONFIG, payload,
-                               expect_cmd=CMD_CONFIG_RESP, timeout=5.0),
+            self._send_command(
+                CMD_SET_CONFIG, payload, expect_cmd=CMD_CONFIG_RESP, timeout=5.0
+            ),
             wait_timeout=6.0,
         )
         logger.info(f"Live config push ({changed}): {'OK' if ok else 'TIMEOUT'}")
@@ -1011,9 +1032,12 @@ class TCPLoRaRadio(_RadioBase):
 
     # CAD thresholds — v0.5.4 firmware exposes them via CMD_SET_CAD_PARAMS.
     # symNum=0x01 (2 symbols) and exitMode=0x00 (STDBY) match pymc_core SX1262 defaults.
-    def set_tcp_target(self, host: Optional[str] = None,
-                       port: Optional[int] = None,
-                       token: Optional[str] = None) -> bool:
+    def set_tcp_target(
+        self,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        token: Optional[str] = None,
+    ) -> bool:
         """Change the modem TCP endpoint at runtime.
 
         Updates self.host/port/token in place, closes the current socket,
@@ -1059,11 +1083,14 @@ class TCPLoRaRadio(_RadioBase):
             return True
         payload = bytes([0x01, peak & 0xFF, min_val & 0xFF, 0x00])
         ok = self._run_async_safe(
-            self._send_command(CMD_SET_CAD_PARAMS, payload,
-                               expect_cmd=CMD_CAD_PARAMS_RESP, timeout=3.0),
+            self._send_command(
+                CMD_SET_CAD_PARAMS, payload, expect_cmd=CMD_CAD_PARAMS_RESP, timeout=3.0
+            ),
             wait_timeout=4.0,
         )
-        logger.info(f"CAD thresholds pushed peak={peak} min={min_val}: {'OK' if ok else 'TIMEOUT'}")
+        logger.info(
+            f"CAD thresholds pushed peak={peak} min={min_val}: {'OK' if ok else 'TIMEOUT'}"
+        )
         return ok
 
     def clear_custom_cad_thresholds(self) -> None:

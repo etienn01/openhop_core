@@ -7,7 +7,7 @@ from the packet's airtime and route, then retries on that cadence:
     calcDirectTimeoutMillisFor(t, hops) = 500 + (6.0 * t + 250) * (hops + 1)
 
 where ``t`` is the estimated airtime in ms (see ``examples/companion_radio``).
-pyMC previously used fixed 10 s / 15 s waits with no resend, so a single lost
+previously used fixed 10 s / 15 s waits with no resend, so a single lost
 packet stalled for 10-15 s where firmware recovers in ~3 s.  This module
 reproduces the firmware math so login/stats/discovery use the same cadence.
 """
@@ -76,7 +76,8 @@ def calc_direct_timeout_ms(airtime_ms: float, out_path_len: int) -> int:
     hops = PathUtils.get_path_hash_count(out_path_len) if out_path_len > 0 else 0
     return int(
         SEND_TIMEOUT_BASE_MILLIS
-        + (DIRECT_SEND_PERHOP_FACTOR * airtime_ms + DIRECT_SEND_PERHOP_EXTRA_MILLIS) * (hops + 1)
+        + (DIRECT_SEND_PERHOP_FACTOR * airtime_ms + DIRECT_SEND_PERHOP_EXTRA_MILLIS)
+        * (hops + 1)
     )
 
 

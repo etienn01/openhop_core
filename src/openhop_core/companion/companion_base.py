@@ -210,7 +210,9 @@ class CompanionBase(ABC):
         self.prefs = NodePrefs(
             node_name=node_name,
             adv_type=adv_type,
-            tx_power_dbm=self._radio_config.get("power", self._radio_config.get("tx_power", 20)),
+            tx_power_dbm=self._radio_config.get(
+                "power", self._radio_config.get("tx_power", 20)
+            ),
             frequency_hz=self._radio_config.get("frequency", 915000000),
             bandwidth_hz=self._radio_config.get("bandwidth", 250000),
             spreading_factor=self._radio_config.get("spreading_factor", 10),
@@ -229,7 +231,9 @@ class CompanionBase(ABC):
         self._event_subscriber = _CompanionEventSubscriber(self)
         self._event_service.subscribe_all(self._event_subscriber)
 
-        self._push_callbacks: dict[str, list[Callable]] = {k: [] for k in PUSH_CALLBACK_KEYS}
+        self._push_callbacks: dict[str, list[Callable]] = {
+            k: [] for k in PUSH_CALLBACK_KEYS
+        }
 
         # Pending binary requests by tag (hex) for matching responses
         self._pending_binary_requests: dict[str, dict] = {}
@@ -296,7 +300,9 @@ class CompanionBase(ABC):
         requests are excluded — they are never synced to the app, mirroring the
         firmware contacts iterator in MyMesh::checkSerialInterface.
         """
-        return [c for c in self.contacts.get_all(since=since) if c.adv_type != ADV_TYPE_NONE]
+        return [
+            c for c in self.contacts.get_all(since=since) if c.adv_type != ADV_TYPE_NONE
+        ]
 
     def get_contact_by_key(self, pub_key: bytes) -> Optional[Contact]:
         """Look up a contact by its full 32-byte public key."""
@@ -858,7 +864,9 @@ class CompanionBase(ABC):
     def on_contact_path_updated(self, callback: Callable) -> None:
         self._push_callbacks["contact_path_updated"].append(callback)
 
-    async def _on_contact_path_updated(self, pub: bytes, path_len: int, path_bytes: bytes) -> None:
+    async def _on_contact_path_updated(
+        self, pub: bytes, path_len: int, path_bytes: bytes
+    ) -> None:
         """Called by ProtocolResponseHandler when contact's out_path is updated from a PATH packet.
 
         Matches companion firmware behaviour: PATH updates are only applied
@@ -953,7 +961,9 @@ class CompanionBase(ABC):
         """Remove expired entries from _pending_binary_requests."""
         now = time.time()
         expired = [
-            tag for tag, info in self._pending_binary_requests.items() if now > info["expires_at"]
+            tag
+            for tag, info in self._pending_binary_requests.items()
+            if now > info["expires_at"]
         ]
         for tag in expired:
             del self._pending_binary_requests[tag]
@@ -1009,7 +1019,9 @@ class CompanionBase(ABC):
             "binary_response", tag_bytes, response_data, parsed, request_type
         )
 
-    async def _try_handle_path_discovery(self, tag_bytes: bytes, path_info: tuple) -> bool:
+    async def _try_handle_path_discovery(
+        self, tag_bytes: bytes, path_info: tuple
+    ) -> bool:
         """If tag is pending path discovery, fire path_discovery_response and return True."""
         out_path, in_path, contact_pubkey = path_info
         tag_int = int.from_bytes(tag_bytes, "little")
@@ -1322,7 +1334,9 @@ class CompanionBase(ABC):
         tag_int = random.randint(0, 0xFFFFFFFF)
         tag_bytes = tag_int.to_bytes(4, "little")
         inv_perm = 0xFF & ~TELEM_PERM_BASE
-        req_payload = tag_bytes + bytes([REQ_TYPE_GET_TELEMETRY_DATA, inv_perm, 0, 0, 0])
+        req_payload = tag_bytes + bytes(
+            [REQ_TYPE_GET_TELEMETRY_DATA, inv_perm, 0, 0, 0]
+        )
         old_path_len = contact.out_path_len
         old_path = contact.out_path
         contact.out_path_len = -1
@@ -1644,7 +1658,9 @@ class CompanionBase(ABC):
         try:
             if data and len(data) <= 254 and (data[0] & 0x80) != 0:
                 pkt = Packet()
-                pkt.header = PacketBuilder._create_header(PAYLOAD_TYPE_CONTROL, route_type="direct")
+                pkt.header = PacketBuilder._create_header(
+                    PAYLOAD_TYPE_CONTROL, route_type="direct"
+                )
                 pkt.path_len = 0
                 pkt.path = bytearray()
                 pkt.payload = bytearray(data)
@@ -1735,7 +1751,9 @@ class CompanionBase(ABC):
                 "tag": data.get("timestamp", 0),
                 "acl_permissions": data.get("reserved", data.get("permissions", 0)),
                 "firmware_ver_level": data.get("firmware_ver_level"),
-                "reason": "Login successful" if login_result["success"] else "Login failed",
+                "reason": "Login successful"
+                if login_result["success"]
+                else "Login failed",
             }
         except Exception as e:
             logger.error(f"Login error: {e}")
@@ -1785,7 +1803,7 @@ class CompanionBase(ABC):
         """Log the pre-send path; no longer sleeps.
 
         Firmware sends the request immediately and relies on the reciprocal PATH
-        (which pyMC already sends at login time, see ProtocolResponseHandler).
+        (which openHop already sends at login time, see ProtocolResponseHandler).
         The previous 0.5s/hop sleep added up to ~1.5s+ of latency per request for
         multi-hop contacts with no reliability benefit and has been removed; the
         adaptive timeout + internal resend now handle a lost first attempt.
@@ -1855,7 +1873,9 @@ class CompanionBase(ABC):
                 "repeater": contact.name,
                 "stats": result.get("parsed", {}),
                 "response_text": result.get("text"),
-                "reason": "Stats received" if result.get("success") else "Stats request failed",
+                "reason": "Stats received"
+                if result.get("success")
+                else "Stats request failed",
             }
         except Exception as e:
             logger.error(f"Status request error: {e}")
@@ -1918,7 +1938,11 @@ class CompanionBase(ABC):
                 "contact": contact.name,
                 "telemetry_data": telemetry_data,
                 "response_text": result.get("text"),
-                "reason": ("Telemetry received" if result.get("success") else "Telemetry failed"),
+                "reason": (
+                    "Telemetry received"
+                    if result.get("success")
+                    else "Telemetry failed"
+                ),
             }
         except Exception as e:
             logger.error(f"Telemetry error: {e}")
@@ -1931,13 +1955,17 @@ class CompanionBase(ABC):
 
         Prefer ``send_binary_req`` + ``on_binary_response``.
         """
-        return await self._send_protocol_request(pub_key, PROTOCOL_CODE_BINARY_REQ, data)
+        return await self._send_protocol_request(
+            pub_key, PROTOCOL_CODE_BINARY_REQ, data
+        )
 
     async def send_anon_request(self, pub_key: bytes, data: bytes) -> dict:
         """Send an anonymous request to a contact and wait for the response."""
         return await self._send_protocol_request(pub_key, PROTOCOL_CODE_ANON_REQ, data)
 
-    async def _send_protocol_request(self, pub_key: bytes, protocol_code: int, data: bytes) -> dict:
+    async def _send_protocol_request(
+        self, pub_key: bytes, protocol_code: int, data: bytes
+    ) -> dict:
         """Build and send a protocol request, waiting for the response."""
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
@@ -2030,7 +2058,9 @@ class CompanionBase(ABC):
                 "repeater": contact.name,
                 "command": command,
                 "response": response_data["text"],
-                "reason": ("Command successful" if response_data["success"] else "No response"),
+                "reason": (
+                    "Command successful" if response_data["success"] else "No response"
+                ),
             }
         except Exception as e:
             logger.error(f"Repeater command error: {e}")
@@ -2059,7 +2089,9 @@ class CompanionBase(ABC):
     # Dedup Helper
     # -------------------------------------------------------------------------
 
-    def _check_dedup(self, cache: OrderedDict, key: str, ttl: float, max_size: int) -> bool:
+    def _check_dedup(
+        self, cache: OrderedDict, key: str, ttl: float, max_size: int
+    ) -> bool:
         """Return True if *key* is a duplicate. Evicts expired entries."""
         now = time.time()
         if key in cache:
@@ -2130,7 +2162,9 @@ class CompanionBase(ABC):
         sender_key_hex = data.get("contact_pubkey", "")
         sender_key = bytes.fromhex(sender_key_hex) if sender_key_hex else b""
         # Handler publishes "message_text"; accept "text" for compatibility
-        message_text = (data.get("message_text") or data.get("text") or "").rstrip("\x00")
+        message_text = (data.get("message_text") or data.get("text") or "").rstrip(
+            "\x00"
+        )
         # Extract SNR/RSSI from network info if available (same as channel path)
         network_info = data.get("network_info", {})
         snr = network_info.get("snr")
@@ -2181,7 +2215,9 @@ class CompanionBase(ABC):
         # MeshCore client expects "SenderName: Message" format in text field; it parses to show
         # sender and message separately. Use full_content (not message_text) so client can split.
         # Strip trailing nulls so frame matches firmware (exact string length, no padding).
-        display_text = (data.get("full_content", data.get("message_text", "")) or "").rstrip("\x00")
+        display_text = (
+            data.get("full_content", data.get("message_text", "")) or ""
+        ).rstrip("\x00")
         # Extract SNR/RSSI from network info if available
         network_info = data.get("network_info", {})
         snr = network_info.get("snr")
@@ -2213,7 +2249,9 @@ class CompanionBase(ABC):
             rssi,
         )
 
-    def _get_channel_candidates_by_hash(self, channel_hash: int) -> list[tuple[int, Channel]]:
+    def _get_channel_candidates_by_hash(
+        self, channel_hash: int
+    ) -> list[tuple[int, Channel]]:
         """Return channel candidates that match the 1-byte channel hash."""
         matches: list[tuple[int, Channel]] = []
         max_channels = getattr(self.channels, "max_channels", 40)
@@ -2281,7 +2319,11 @@ class CompanionBase(ABC):
             if route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD)
             else 0xFF
         )
-        snr = packet.get_snr() if hasattr(packet, "get_snr") else getattr(packet, "_snr", 0.0)
+        snr = (
+            packet.get_snr()
+            if hasattr(packet, "get_snr")
+            else getattr(packet, "_snr", 0.0)
+        )
         rssi = packet.rssi if hasattr(packet, "rssi") else getattr(packet, "_rssi", 0)
         queued = QueuedMessage(
             sender_key=b"",

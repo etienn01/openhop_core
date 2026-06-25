@@ -1,7 +1,7 @@
 import pytest
 
-from pymc_core.protocol import Packet
-from pymc_core.protocol.packet_utils import PathUtils
+from openhop_core.protocol import Packet
+from openhop_core.protocol.packet_utils import PathUtils
 
 
 # Packet tests

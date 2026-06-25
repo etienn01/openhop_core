@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Common utilities for PyMC Core examples.
+Common utilities for openHop Core examples.
 
-This module provides shared utilities for PyMC Core examples,
+This module provides shared utilities for openHop Core examples,
 including SX1262 radio setup and mesh node creation.
 """
 
@@ -23,13 +23,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Add the src directory to the path so we can import pymc_core
+# Add the src directory to the path so we can import openhop_core
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 logger.debug(f"Added to path: {os.path.join(os.path.dirname(__file__), '..', 'src')}")
 
-from pymc_core import LocalIdentity
-from pymc_core.hardware.base import LoRaRadio
-from pymc_core.node.node import MeshNode
+from openhop_core import LocalIdentity
+from openhop_core.hardware.base import LoRaRadio
+from openhop_core.node.node import MeshNode
 
 
 def create_radio(
@@ -58,7 +58,7 @@ def create_radio(
     try:
         # Check if this is a KISS TNC configuration
         if radio_type == "kiss-tnc":
-            from pymc_core.hardware.kiss_serial_wrapper import KissSerialWrapper
+            from openhop_core.hardware.kiss_serial_wrapper import KissSerialWrapper
 
             logger.debug("Using KISS Serial Wrapper")
 
@@ -85,7 +85,7 @@ def create_radio(
 
         # Check if this is a MeshCore KISS Modem configuration
         if radio_type == "kiss-modem":
-            from pymc_core.hardware.kiss_modem_wrapper import KissModemWrapper
+            from openhop_core.hardware.kiss_modem_wrapper import KissModemWrapper
 
             logger.debug("Using MeshCore KISS Modem Wrapper")
 
@@ -117,10 +117,10 @@ def create_radio(
 
         # Check if this is a CH341 configuration
         if radio_type == "ch341":
-            from pymc_core.hardware.ch341.ch341_gpio_manager import CH341GPIOManager
-            from pymc_core.hardware.lora.LoRaRF.SX126x import set_gpio_manager, set_spi_transport
-            from pymc_core.hardware.sx1262_wrapper import SX1262Radio
-            from pymc_core.hardware.transports.ch341_spi_transport import CH341SPITransport
+            from openhop_core.hardware.ch341.ch341_gpio_manager import CH341GPIOManager
+            from openhop_core.hardware.lora.LoRaRF.SX126x import set_gpio_manager, set_spi_transport
+            from openhop_core.hardware.sx1262_wrapper import SX1262Radio
+            from openhop_core.hardware.transports.ch341_spi_transport import CH341SPITransport
 
             logger.debug("Using CH341 USB-to-SPI adapter")
 
@@ -166,7 +166,7 @@ def create_radio(
 
         # ── pymc_tcp (pymc_usb firmware over Wi-Fi/TCP) ─────────
         if radio_type == "pymc_tcp":
-            from pymc_core.hardware.tcp_radio import TCPLoRaRadio
+            from openhop_core.hardware.tcp_radio import TCPLoRaRadio
 
             logger.debug("Using TCP LoRa Radio (pymc_usb firmware over Wi-Fi)")
 
@@ -204,7 +204,7 @@ def create_radio(
 
         # ── pymc_usb (pymc_usb firmware over USB-CDC) ───────────
         if radio_type == "pymc_usb":
-            from pymc_core.hardware.usb_radio import USBLoRaRadio
+            from openhop_core.hardware.usb_radio import USBLoRaRadio
 
             logger.debug("Using USB LoRa Radio (pymc_usb firmware)")
 
@@ -232,7 +232,7 @@ def create_radio(
             return radio
 
         # Direct SX1262 radio for other types
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         logger.debug("Imported SX1262Radio successfully")
 
@@ -386,7 +386,7 @@ def create_mesh_node(
 
         # Create identity - use modem identity if requested and available
         if use_modem_identity and radio_type == "kiss-modem":
-            from pymc_core.protocol.modem_identity import ModemIdentity
+            from openhop_core.protocol.modem_identity import ModemIdentity
 
             logger.debug("Creating ModemIdentity from KISS modem...")
             identity = ModemIdentity(radio)

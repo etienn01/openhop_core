@@ -1,19 +1,19 @@
-site_name: pyMC_Core Documentation
-site_description: Documentation for the pyMC_Core – A Python MeshCore library with SPI LoRa radio support
-site_author: pyMC Team
+site_name: openHop Core Documentation
+site_description: Documentation for openHop Core – A Python MeshCore library with SPI LoRa radio support
+site_author: openHop Team
 
 # Repository
-repo_name: pyMC_Core
-repo_url: https://github.com/rightup/pyMC_Core
-edit_uri: edit/main/            # enables “Edit this page” button
+repo_name: openhop-core
+repo_url: https://github.com/pyMC-dev/openhop-core
+edit_uri: edit/main/            # enables "Edit this page" button
 
 # (Optional, recommended) Public site URL if you use GitHub Pages
-site_url: https://rightup.github.io/pyMC_core/
+site_url: https://rightup.github.io/openhop-core/
 
 theme:
   name: material
-  logo: images/PyMC.svg
-  favicon: images/favicon.ico
+  logo: images/openhop_transparent_trim.png
+  favicon: images/openhop_transparent_trim.png
   features:
     - content.code.copy
     - content.code.select
