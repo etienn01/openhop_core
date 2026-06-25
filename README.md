@@ -178,8 +178,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Support
 
 - [Documentation](https://pymc-dev.github.io/openhop-core/)
-- [Issues](https://github.com/pymc-dev/openHop Core/issues)
-- [Discussions](https://github.com/pymc-dev/openHop Core/discussions)
+- [Issues](https://github.com/openhop-dev/openHop Core/issues)
+- [Discussions](https://github.com/openhop-dev/openHop Core/discussions)
 - [pyMC Discord](https://discord.gg/3s8MMaSTzq)
 - [Meshcore Discord](https://meshcore.gg/)
 

@@ -66,10 +66,10 @@ docs = [
 all = ["openhop_core[hardware,websocket,dev,docs]"]
 
 [project.urls]
-Homepage = "https://github.com/pyMC-dev/openhop-core/"
+Homepage = "https://github.com/openhop-dev/openhop-core/"
 Documentation = "https://rightup.github.io/pymc_dev/openhop-core"
-Repository = "https://github.com/pyMC-dev/openhop-core.git"
-Issues = "https://github.com/pyMC-dev/openhop-core/issues"
+Repository = "https://github.com/openhop-dev/openhop-core.git"
+Issues = "https://github.com/openhop-dev/openhop-core/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
