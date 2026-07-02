@@ -1,4 +1,4 @@
-import asyncio
+import inspect
 import struct
 from typing import Callable, Optional
 
@@ -224,7 +224,7 @@ class LoginResponseHandler(BaseHandler):
         """Safely call the login callback without blocking."""
         try:
             if self.login_callback is not None:
-                if asyncio.iscoroutinefunction(self.login_callback):
+                if inspect.iscoroutinefunction(self.login_callback):
                     await self.login_callback(success, data)
                 else:
                     self.login_callback(success, data)

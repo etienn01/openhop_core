@@ -45,6 +45,7 @@ class MockContact:
         self.public_key = public_key
         self.name = name
         self.last_advert = 0
+        self.sync_since = 0
 
 
 class MockContactBook:
@@ -356,6 +357,69 @@ class TestTextMessageHandler:
         assert (ack_packet.header & 0x03) == ROUTE_TYPE_FLOOD  # flooded, not direct
         assert ack_packet.path_len == 0  # no path
         assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
+
+    @pytest.mark.asyncio
+    async def test_signed_plain_advances_contact_sync_since(self):
+        """Signed plain traffic should advance contact.sync_since (firmware parity)."""
+        sender = LocalIdentity()
+        receiver = self.local_identity
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        receiver_contact = _SendContact(receiver.get_public_key().hex())
+        signed_timestamp = 0x12345678
+        packet, _ = PacketBuilder.create_text_message(
+            receiver_contact,
+            sender,
+            "signed update",
+            attempt=0,
+            message_type="direct",
+            txt_type=0x02,
+            timestamp=signed_timestamp,
+        )
+        contact = MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        self.contacts.contacts = [contact]
+
+        await self.handler(packet)
+
+        assert contact.sync_since == signed_timestamp
+
+    @pytest.mark.asyncio
+    async def test_signed_plain_emits_delivery_ack(self):
+        """Signed plain traffic should emit an ACK (room-server push compatibility)."""
+        sender = LocalIdentity()
+        receiver = self.local_identity
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        receiver_contact = _SendContact(receiver.get_public_key().hex())
+        packet, _ = PacketBuilder.create_text_message(
+            receiver_contact,
+            sender,
+            "signed ack",
+            attempt=0,
+            message_type="direct",
+            txt_type=0x02,
+            timestamp=0x12345679,
+        )
+        contact = MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        contact.type = 3  # room server
+        self.contacts.contacts = [contact]
+
+        await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert self.send_packet_fn.call_count == 1
+        ack_packet = self.send_packet_fn.call_args_list[0].args[0]
+        assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
 
     @pytest.mark.asyncio
     async def test_direct_multi_ack_emits_multipart_then_ack(self):

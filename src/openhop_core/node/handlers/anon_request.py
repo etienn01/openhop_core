@@ -10,6 +10,12 @@ the 4-byte timestamp (``data[4]``) selects the handler:
 - ``ANON_REQ_TYPE_OWNER`` (0x02) -> ``"node_name\nowner_info"``.
 - ``ANON_REQ_TYPE_BASIC`` (0x03) -> clock + a feature-flags byte.
 
+For room-server identities, firmware parity is different from repeaters:
+``simple_room_server/MyMesh.cpp`` treats all ``PAYLOAD_TYPE_ANON_REQ`` packets
+as login payloads (timestamp + sync_since + password), so this handler bypasses
+sub-type dispatch and delegates directly to ``LoginServerHandler`` when
+``login_handler.is_room_server`` is true.
+
 The regions/owner/basic responders only answer route-direct requests and are
 gated behind a shared :class:`AnonRateLimiter` (mirroring the firmware
 ``anon_limiter``) so the node does not become a flood amplifier.
@@ -146,6 +152,13 @@ class AnonRequestHandler(BaseHandler):
                 plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_data)
             except Exception as e:
                 self.log(f"[AnonReq] Failed to decrypt request: {e}")
+                return
+            # Firmware parity (simple_room_server): room servers do not subtype
+            # dispatch ANON_REQ by plaintext byte 4. Their login payload is:
+            # timestamp(4) + sync_since(4) + password...
+            # so byte 4 is sync_since[0], not an anon request code.
+            if getattr(self.login_handler, "is_room_server", False):
+                await self.login_handler(packet)
                 return
 
             if len(plaintext) < 5:
