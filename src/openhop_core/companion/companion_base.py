@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import inspect
 import logging
 import random
 import struct
@@ -2353,7 +2354,7 @@ class CompanionBase(ABC):
     async def _fire_callbacks(self, event_name: str, *args: Any) -> None:
         for callback in self._push_callbacks.get(event_name, []):
             try:
-                if asyncio.iscoroutinefunction(callback):
+                if inspect.iscoroutinefunction(callback):
                     await callback(*args)
                 else:
                     callback(*args)

@@ -12,6 +12,7 @@ Frame format:
 """
 
 import asyncio
+import inspect
 import logging
 import socket
 import struct
@@ -1675,7 +1676,7 @@ class CompanionFrameServer:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         if self.stats_getter:
-            if asyncio.iscoroutinefunction(self.stats_getter):
+            if inspect.iscoroutinefunction(self.stats_getter):
                 stats = await self.stats_getter(stats_type)
             else:
                 stats = await asyncio.to_thread(self.stats_getter, stats_type)
