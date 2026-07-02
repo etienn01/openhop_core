@@ -228,7 +228,30 @@ class TextMessageHandler(BaseHandler):
         # Following C++ pattern: only TXT_TYPE_PLAIN (0x00) gets ACKs
         TXT_TYPE_PLAIN = 0x00
         TXT_TYPE_CLI_DATA = 0x01  # noqa: F841
-        send_ack = txt_type == TXT_TYPE_PLAIN
+        TXT_TYPE_SIGNED_PLAIN = 0x02
+
+        # Firmware parity (BaseChatMesh::onPeerDataRecv): signed plain traffic
+        # advances the sender contact's sync_since watermark.
+        if txt_type == TXT_TYPE_SIGNED_PLAIN:
+            try:
+                previous_sync = int(getattr(matched_contact, "sync_since", 0) or 0)
+            except Exception:
+                previous_sync = 0
+            if timestamp_int > previous_sync:
+                try:
+                    matched_contact.sync_since = timestamp_int
+                    backing_contact = getattr(matched_contact, "_contact", None)
+                    if backing_contact is not None:
+                        backing_contact.sync_since = timestamp_int
+                        if hasattr(self.contacts, "update"):
+                            self.contacts.update(backing_contact)
+                    self.log(
+                        f"Updated contact sync_since to {timestamp_int} "
+                        f"for {getattr(matched_contact, 'name', '?')}"
+                    )
+                except Exception as sync_err:
+                    self.log(f"Failed to update contact sync_since: {sync_err}")
+        send_ack = txt_type in (TXT_TYPE_PLAIN, TXT_TYPE_SIGNED_PLAIN)
 
         if send_ack:
             scheduled = self._build_ack_responses(
@@ -245,9 +268,16 @@ class TextMessageHandler(BaseHandler):
             for pkt, delay_s in scheduled:
                 asyncio.create_task(self._send_delayed_ack(pkt, delay_s, timestamp_int))
         else:
-            self.log(f"Skipping ACK for txt_type={txt_type} (CLI command)")
+            self.log(f"Skipping ACK for txt_type={txt_type} (non-delivery-acked type)")
 
-        decoded_msg = message_body.decode("utf-8", "replace")
+        if (
+            txt_type == TXT_TYPE_SIGNED_PLAIN
+            and getattr(matched_contact, "type", None) == 3
+            and len(message_body) >= 4
+        ):
+            decoded_msg = message_body[4:].decode("utf-8", "replace")
+        else:
+            decoded_msg = message_body.decode("utf-8", "replace")
         self.log(f"Received TXT_MSG: {decoded_msg}")
 
         # Check if this is a command response (if callback is set)
