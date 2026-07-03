@@ -24,7 +24,7 @@ RESP_SERVER_LOGIN_OK = 0x00  # Login successful
 RESP_SERVER_LOGIN_FAILED = 0x01  # Login failed
 
 # Firmware version
-FIRMWARE_VER_LEVEL = 1
+FIRMWARE_VER_LEVEL = 2
 
 
 class LoginServerHandler(BaseHandler):
@@ -118,7 +118,9 @@ class LoginServerHandler(BaseHandler):
 
             # Decrypt the login request
             try:
-                plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_data)
+                plaintext = CryptoUtils.mac_then_decrypt(
+                    aes_key, shared_secret, encrypted_data
+                )
             except Exception as e:
                 self.log(f"[LoginServer] Failed to decrypt login request: {e}")
                 return
@@ -141,7 +143,9 @@ class LoginServerHandler(BaseHandler):
             if self.is_room_server:
                 # Room server format: sync_since(4) + password
                 if len(plaintext) < 8:
-                    self.log("[LoginServer] Room server packet too short for sync_since field")
+                    self.log(
+                        "[LoginServer] Room server packet too short for sync_since field"
+                    )
                     return
                 sync_since = struct.unpack("<I", plaintext[4:8])[0]
 
@@ -167,7 +171,9 @@ class LoginServerHandler(BaseHandler):
                     null_idx = len(plaintext)
 
                 password_bytes = plaintext[4:null_idx]
-                self.log(f"[LoginServer] Repeater format: password from byte 4 to {null_idx}")
+                self.log(
+                    f"[LoginServer] Repeater format: password from byte 4 to {null_idx}"
+                )
 
             # Null-terminate password
             null_idx = password_bytes.find(b"\x00")
@@ -187,7 +193,11 @@ class LoginServerHandler(BaseHandler):
             sig = inspect.signature(self.authenticate)
             if "sync_since" in sig.parameters:
                 success, permissions = self.authenticate(
-                    client_identity, shared_secret, password, client_timestamp, sync_since
+                    client_identity,
+                    shared_secret,
+                    password,
+                    client_timestamp,
+                    sync_since,
                 )
             else:
                 # Old signature without sync_since
@@ -241,7 +251,9 @@ class LoginServerHandler(BaseHandler):
             # is_admin: check if permission bits include admin bit (0x02)
             reply_data[6] = 1 if (permissions & 0x02) else 0
             reply_data[7] = permissions  # full permissions byte
-            struct.pack_into("<I", reply_data, 8, random.randint(0, 0xFFFFFFFF))  # random blob
+            struct.pack_into(
+                "<I", reply_data, 8, random.randint(0, 0xFFFFFFFF)
+            )  # random blob
             reply_data[12] = FIRMWARE_VER_LEVEL  # firmware version
 
             # Create response packet
@@ -292,7 +304,7 @@ class LoginServerHandler(BaseHandler):
                 )
                 packet_type_name = "RESPONSE(flood)"
                 self.log(
-                    f"[LoginServer] Creating RESPONSE datagram (direct login, flood reply)"
+                    "[LoginServer] Creating RESPONSE datagram (direct login, flood reply)"
                 )
 
             # Debug: Log packet details
