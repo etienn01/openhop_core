@@ -36,6 +36,13 @@ PAYLOAD_TYPE_CONTROL = 0x0B
 PAYLOAD_TYPE_RAW_CUSTOM = 0x0F
 
 # ---------------------------------------------------------------------------
+# Text message sub-types (upper 6 bits of TXT message flags byte)
+# ---------------------------------------------------------------------------
+TXT_TYPE_PLAIN = 0x00
+TXT_TYPE_CLI_DATA = 0x01
+TXT_TYPE_SIGNED_PLAIN = 0x02
+
+# ---------------------------------------------------------------------------
 # Payload version values (2 bits)
 # ---------------------------------------------------------------------------
 PAYLOAD_VER_1 = 0x00  # Currently supported
@@ -115,7 +122,9 @@ CONTACT_TYPE_HYBRID = 4
 # Protocol Request Types
 REQ_TYPE_GET_STATUS = 0x01  # Get repeater stats (RepeaterStats struct)
 REQ_TYPE_GET_TELEMETRY_DATA = 0x03  # Get telemetry data (CayenneLPP)
-REQ_TYPE_GET_OWNER_INFO = 0x07  # Variable-length: tag(4) + "version\nname\nowner" (simple_repeater)
+REQ_TYPE_GET_OWNER_INFO = (
+    0x07  # Variable-length: tag(4) + "version\nname\nowner" (simple_repeater)
+)
 TELEM_PERM_BASE = 0x01
 TELEM_PERM_LOCATION = 0x02
 TELEM_PERM_ENVIRONMENT = 0x04

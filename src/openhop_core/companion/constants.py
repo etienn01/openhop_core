@@ -5,6 +5,16 @@ from __future__ import annotations
 import base64
 from enum import IntEnum
 
+from ..protocol.constants import (
+    TXT_TYPE_CLI_DATA as PROTOCOL_TXT_TYPE_CLI_DATA,
+)
+from ..protocol.constants import (
+    TXT_TYPE_PLAIN as PROTOCOL_TXT_TYPE_PLAIN,
+)
+from ..protocol.constants import (
+    TXT_TYPE_SIGNED_PLAIN as PROTOCOL_TXT_TYPE_SIGNED_PLAIN,
+)
+
 # ---------------------------------------------------------------------------
 # ADV Types (contact/node classification)
 # ---------------------------------------------------------------------------
@@ -20,11 +30,12 @@ ADV_TYPE_SENSOR = 4
 MAX_ANON_CONTACTS = 8
 
 # ---------------------------------------------------------------------------
-# Text Types
+# Text Types (re-exported from protocol constants for companion imports)
 # ---------------------------------------------------------------------------
-TXT_TYPE_PLAIN = 0
-TXT_TYPE_CLI_DATA = 1
-TXT_TYPE_SIGNED_PLAIN = 2
+TXT_TYPE_PLAIN = PROTOCOL_TXT_TYPE_PLAIN
+TXT_TYPE_CLI_DATA = PROTOCOL_TXT_TYPE_CLI_DATA
+TXT_TYPE_SIGNED_PLAIN = PROTOCOL_TXT_TYPE_SIGNED_PLAIN
+
 
 # ---------------------------------------------------------------------------
 # Telemetry Modes
