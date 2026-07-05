@@ -152,7 +152,11 @@ def _build_advert_push_frames(contact: Contact) -> tuple[bytes, Optional[bytes]]
     short = bytes([PUSH_CODE_ADVERT]) + pubkey_b
     if not contact.name:
         return (short, None)
-    op = contact.out_path if isinstance(contact.out_path, bytes) else bytes(contact.out_path or [])
+    op = (
+        contact.out_path
+        if isinstance(contact.out_path, bytes)
+        else bytes(contact.out_path or [])
+    )
     op = op[:MAX_PATH_SIZE].ljust(MAX_PATH_SIZE, b"\x00")
     nb = (
         contact.name.encode("utf-8", errors="replace")
@@ -227,9 +231,15 @@ class CompanionFrameServer:
         if device_version is None:
             # At least 2 chars so client substring(0, 2) etc. doesn't RangeError
             device_version = f"{FIRMWARE_VER_CODE}.0"
-        self._build_date_bytes = (build_date.encode("utf-8") + b"\x00")[:12].ljust(12, b"\x00")
-        self._model_bytes = (device_model.encode("utf-8") + b"\x00")[:40].ljust(40, b"\x00")
-        self._version_bytes = (device_version.encode("utf-8") + b"\x00")[:20].ljust(20, b"\x00")
+        self._build_date_bytes = (build_date.encode("utf-8") + b"\x00")[:12].ljust(
+            12, b"\x00"
+        )
+        self._model_bytes = (device_model.encode("utf-8") + b"\x00")[:40].ljust(
+            40, b"\x00"
+        )
+        self._version_bytes = (device_version.encode("utf-8") + b"\x00")[:20].ljust(
+            20, b"\x00"
+        )
 
         # Command dispatch registry: cmd byte -> async handler(data)
         self._cmd_handlers = {
@@ -450,7 +460,11 @@ class CompanionFrameServer:
                         "advert_received: expected Contact, got %s — converting",
                         type(contact).__name__,
                     )
-                    contact = Contact.from_dict(contact) if isinstance(contact, dict) else contact
+                    contact = (
+                        Contact.from_dict(contact)
+                        if isinstance(contact, dict)
+                        else contact
+                    )
                 await self._maybe_persist_contact(contact)
             except Exception as e:
                 logger.exception("advert_received callback error: %s", e)
@@ -543,10 +557,16 @@ class CompanionFrameServer:
             await self._persist_companion_message(msg_dict)
             _write_push(bytes([PUSH_CODE_MSG_WAITING]))
 
-        def on_binary_response(tag_bytes, response_data, parsed=None, request_type=None):
+        def on_binary_response(
+            tag_bytes, response_data, parsed=None, request_type=None
+        ):
             frame = (
                 bytes([PUSH_CODE_BINARY_RESPONSE, 0])
-                + (tag_bytes if isinstance(tag_bytes, bytes) else struct.pack("<I", tag_bytes))
+                + (
+                    tag_bytes
+                    if isinstance(tag_bytes, bytes)
+                    else struct.pack("<I", tag_bytes)
+                )
                 + response_data
             )
             _write_push(frame)
@@ -679,7 +699,10 @@ class CompanionFrameServer:
         if rssi_byte < 0:
             rssi_byte += 256
         payload_len = min(len(raw), MAX_PAYLOAD_SIZE - 3)  # 3 = code + snr + rssi
-        data = bytes([PUSH_CODE_LOG_RX_DATA, snr_byte & 0xFF, rssi_byte & 0xFF]) + raw[:payload_len]
+        data = (
+            bytes([PUSH_CODE_LOG_RX_DATA, snr_byte & 0xFF, rssi_byte & 0xFF])
+            + raw[:payload_len]
+        )
         self._enqueue_frame(data)
 
     async def push_rx_raw_async(self, snr: float, rssi: int, raw: bytes) -> None:
@@ -732,7 +755,9 @@ class CompanionFrameServer:
             + payload_slice
         )
         self._enqueue_frame(data)
-        logger.debug("Pushed control data 0x8E to client: payload_len=%s", len(payload_slice))
+        logger.debug(
+            "Pushed control data 0x8E to client: payload_len=%s", len(payload_slice)
+        )
 
     def _enqueue_frame(self, data: bytes) -> None:
         """Build an outbound frame and enqueue it for the writer task.
@@ -754,7 +779,9 @@ class CompanionFrameServer:
         try:
             self._write_queue.put_nowait(frame)
         except asyncio.QueueFull:
-            logger.warning("Write queue full (%s); dropping frame", self._write_queue.maxsize)
+            logger.warning(
+                "Write queue full (%s); dropping frame", self._write_queue.maxsize
+            )
 
     def _write_frame(self, data: bytes) -> None:
         """Alias for ``_enqueue_frame``; retained for subclass compatibility."""
@@ -803,7 +830,9 @@ class CompanionFrameServer:
                     now = self.bridge.get_time()
                     hb_data = bytes([RESP_CODE_CURR_TIME]) + struct.pack("<I", now)
                     frame = (
-                        bytes([FRAME_OUTBOUND_PREFIX]) + struct.pack("<H", len(hb_data)) + hb_data
+                        bytes([FRAME_OUTBOUND_PREFIX])
+                        + struct.pack("<H", len(hb_data))
+                        + hb_data
                     )
 
                 if frame is None:  # Sentinel → orderly shutdown
@@ -899,7 +928,9 @@ class CompanionFrameServer:
         self._client_reader = reader
         self._client_writer = writer
         self._configure_socket(writer)
-        local_write_queue: asyncio.Queue = asyncio.Queue(maxsize=self._WRITE_QUEUE_MAXSIZE)
+        local_write_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=self._WRITE_QUEUE_MAXSIZE
+        )
         self._write_queue = local_write_queue
         self._setup_push_callbacks()
         logger.info("Companion client connected (port=%s)", self.port)
@@ -1066,8 +1097,12 @@ class CompanionFrameServer:
         if len(data) >= 1:
             self._app_target_ver = data[0]
         firmware_ver = FIRMWARE_VER_CODE
-        max_contacts = getattr(getattr(self.bridge, "contacts", None), "max_contacts", 1000)
-        max_channels_val = getattr(getattr(self.bridge, "channels", None), "max_channels", 40)
+        max_contacts = getattr(
+            getattr(self.bridge, "contacts", None), "max_contacts", 1000
+        )
+        max_channels_val = getattr(
+            getattr(self.bridge, "channels", None), "max_channels", 40
+        )
         max_contacts_div_2 = min(max_contacts // 2, 255)
         max_channels = min(max_channels_val, 255)
         ble_pin = 0
@@ -1093,7 +1128,9 @@ class CompanionFrameServer:
             + self._version_bytes
             + bytes([client_repeat & 0xFF, path_hash_mode & 0xFF])
         )
-        version_str = self._version_bytes.split(b"\x00")[0].decode("utf-8", errors="replace")
+        version_str = self._version_bytes.split(b"\x00")[0].decode(
+            "utf-8", errors="replace"
+        )
         logger.info(
             "Companion device info sent: FIRMWARE_VER_CODE=%s (byte at index 1), "
             "version string=%r, frame_len=%s",
@@ -1106,22 +1143,32 @@ class CompanionFrameServer:
     async def _cmd_get_contacts(self, data: bytes) -> None:
         since = struct.unpack("<I", data[:4])[0] if len(data) >= 4 else 0
         contacts = self.bridge.get_contacts(since=since)
-        self._write_frame(bytes([RESP_CODE_CONTACTS_START]) + struct.pack("<I", len(contacts)))
+        self._write_frame(
+            bytes([RESP_CODE_CONTACTS_START]) + struct.pack("<I", len(contacts))
+        )
         for i, c in enumerate(contacts):
             self._write_contact_frame(c)
         most_recent = max((c.lastmod for c in contacts), default=0)
-        self._write_frame(bytes([RESP_CODE_END_OF_CONTACTS]) + struct.pack("<I", most_recent))
+        self._write_frame(
+            bytes([RESP_CODE_END_OF_CONTACTS]) + struct.pack("<I", most_recent)
+        )
 
     def _write_contact_frame(self, c: Contact) -> None:
         """Encode and write a single RESP_CODE_CONTACT frame."""
-        pubkey = c.public_key if isinstance(c.public_key, bytes) else bytes.fromhex(c.public_key)
-        name = (c.name.encode("utf-8")[:32] if isinstance(c.name, str) else c.name[:32]).ljust(
-            32, b"\x00"
+        pubkey = (
+            c.public_key
+            if isinstance(c.public_key, bytes)
+            else bytes.fromhex(c.public_key)
         )
+        name = (
+            c.name.encode("utf-8")[:32] if isinstance(c.name, str) else c.name[:32]
+        ).ljust(32, b"\x00")
         opl_byte = 0xFF if c.out_path_len < 0 else min(c.out_path_len, 255)
         frame = (
             bytes([RESP_CODE_CONTACT, *pubkey, c.adv_type, c.flags, opl_byte])
-            + (c.out_path[:MAX_PATH_SIZE] if c.out_path else b"").ljust(MAX_PATH_SIZE, b"\x00")
+            + (c.out_path[:MAX_PATH_SIZE] if c.out_path else b"").ljust(
+                MAX_PATH_SIZE, b"\x00"
+            )
             + name
             + struct.pack("<I", c.last_advert_timestamp)
             + struct.pack("<i", int(c.gps_lat * 1e6))
@@ -1157,7 +1204,9 @@ class CompanionFrameServer:
         # matching firmware which overrides CLI_DATA with the RTC to avoid replay protection.
         host_timestamp = int.from_bytes(data[2:6], "little")
         use_timestamp = (
-            None if (txt_type == TXT_TYPE_CLI_DATA or host_timestamp == 0) else host_timestamp
+            None
+            if (txt_type == TXT_TYPE_CLI_DATA or host_timestamp == 0)
+            else host_timestamp
         )
         pubkey_prefix = data[6:12]
         text = data[12:].decode("utf-8", errors="replace").rstrip("\x00")
@@ -1390,7 +1439,11 @@ class CompanionFrameServer:
         frame = bytes([RESP_CODE_SENT, 0]) + struct.pack("<II", tag, est_timeout_ms)
         self._write_frame(frame)
         # If we are the final hop, push trace data immediately
-        if path_bytes and self.local_hash is not None and path_bytes[-1] == self.local_hash:
+        if (
+            path_bytes
+            and self.local_hash is not None
+            and path_bytes[-1] == self.local_hash
+        ):
             path_sz = flags & 0x03
             snr_len = path_len >> path_sz
             path_snrs = bytes(snr_len)
@@ -1431,7 +1484,9 @@ class CompanionFrameServer:
                     + payload
                 )
             txt_type = 0
-            text_bytes = (msg.text or "").rstrip("\x00").encode("utf-8", errors="replace")
+            text_bytes = (
+                (msg.text or "").rstrip("\x00").encode("utf-8", errors="replace")
+            )
             if self._app_target_ver >= 3:
                 return (
                     bytes(
@@ -1461,7 +1516,9 @@ class CompanionFrameServer:
                 + text_bytes
             )
         prefix = (
-            msg.sender_key[:6] if len(msg.sender_key) >= 6 else msg.sender_key.ljust(6, b"\x00")
+            msg.sender_key[:6]
+            if len(msg.sender_key) >= 6
+            else msg.sender_key.ljust(6, b"\x00")
         )
         path_len_byte = msg.path_len if msg.path_len < 256 else 0xFF
         text_bytes = msg.text.encode("utf-8", errors="replace")
@@ -1496,7 +1553,9 @@ class CompanionFrameServer:
             return
         pubkey = data[:32]
         password = (
-            data[32:].decode("utf-8", errors="replace").rstrip("\x00") if len(data) > 32 else ""
+            data[32:].decode("utf-8", errors="replace").rstrip("\x00")
+            if len(data) > 32
+            else ""
         )
         self._write_frame(bytes([RESP_CODE_SENT, 1]) + struct.pack("<II", 0, 10000))
         result = await self.bridge.send_login(pubkey, password)
@@ -1528,7 +1587,9 @@ class CompanionFrameServer:
         self._write_frame(bytes([RESP_CODE_SENT, 0]) + struct.pack("<II", 0, 15000))
         result = await self.bridge.send_status_request(pubkey)
         if not result.get("success"):
-            logger.debug("Status request failed for %s; no push sent)", pubkey[:6].hex())
+            logger.debug(
+                "Status request failed for %s; no push sent)", pubkey[:6].hex()
+            )
             return
         stats_data = result.get("stats", {})
         raw_bytes = stats_data.get("raw_bytes", b"")
@@ -1538,7 +1599,9 @@ class CompanionFrameServer:
                 pubkey[:6].hex(),
             )
             return
-        self._write_frame(bytes([PUSH_CODE_STATUS_RESPONSE, 0]) + pubkey[:6] + raw_bytes)
+        self._write_frame(
+            bytes([PUSH_CODE_STATUS_RESPONSE, 0]) + pubkey[:6] + raw_bytes
+        )
 
     async def _cmd_send_telemetry_req(self, data: bytes) -> None:
         # Protocol: CMD_SEND_TELEMETRY_REQ has reserved bytes(3) then pub_key bytes(32).
@@ -1559,7 +1622,9 @@ class CompanionFrameServer:
             want_environment=want_environment,
         )
         if not result.get("success"):
-            logger.debug("Telemetry request failed for %s; no push sent", pubkey[:6].hex())
+            logger.debug(
+                "Telemetry request failed for %s; no push sent", pubkey[:6].hex()
+            )
             return
         telem_data = result.get("telemetry_data", {})
         raw_bytes = telem_data.get("raw_bytes", b"")
@@ -1569,7 +1634,9 @@ class CompanionFrameServer:
                 pubkey[:6].hex(),
             )
             return
-        self._write_frame(bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + pubkey[:6] + raw_bytes)
+        self._write_frame(
+            bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + pubkey[:6] + raw_bytes
+        )
         logger.info("Telemetry push sent to client: %d bytes LPP", len(raw_bytes))
 
     async def _cmd_send_self_advert(self, data: bytes) -> None:
@@ -1775,7 +1842,9 @@ class CompanionFrameServer:
     async def _cmd_get_channel(self, data: bytes) -> None:
         get_full_list = len(data) == 0
         channel_idx = data[0] if not get_full_list else 0
-        max_channels_val = getattr(getattr(self.bridge, "channels", None), "max_channels", 40)
+        max_channels_val = getattr(
+            getattr(self.bridge, "channels", None), "max_channels", 40
+        )
 
         def _channel_info_frame(idx: int, ch) -> bytes:
             if ch is None:
@@ -1783,7 +1852,9 @@ class CompanionFrameServer:
                 secret = b"\x00" * 16
             else:
                 name = ch.name.encode("utf-8", errors="replace")[:32].ljust(32, b"\x00")
-                secret = (ch.secret[:16] if ch.secret else b"\x00" * 16).ljust(16, b"\x00")
+                secret = (ch.secret[:16] if ch.secret else b"\x00" * 16).ljust(
+                    16, b"\x00"
+                )
             return bytes([RESP_CODE_CHANNEL_INFO, idx]) + name + secret
 
         if get_full_list:
@@ -1859,7 +1930,9 @@ class CompanionFrameServer:
             return
         name_raw = data[:31]
         key = data[31 : 31 + 16]
-        scope_name = name_raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
+        scope_name = (
+            name_raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
+        )
         if not scope_name or len(scope_name) >= 31:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
@@ -1877,7 +1950,9 @@ class CompanionFrameServer:
         name, key = scope
         name_field = name.encode("utf-8", errors="replace")[:30].ljust(31, b"\x00")
         key_field = bytes(key[:16]).ljust(16, b"\x00")
-        self._write_frame(bytes([RESP_CODE_DEFAULT_FLOOD_SCOPE]) + name_field + key_field)
+        self._write_frame(
+            bytes([RESP_CODE_DEFAULT_FLOOD_SCOPE]) + name_field + key_field
+        )
 
     # -------------------------------------------------------------------------
     # Time, radio, tuning, share/export, logout, custom vars, autoadd
@@ -2024,7 +2099,9 @@ class CompanionFrameServer:
         custom_vars = self.bridge.get_custom_vars()
         parts = [f"{k}:{v}" for k, v in custom_vars.items()]
         csv = ",".join(parts)[:140]
-        self._write_frame(bytes([RESP_CODE_CUSTOM_VARS]) + csv.encode("utf-8", errors="replace"))
+        self._write_frame(
+            bytes([RESP_CODE_CUSTOM_VARS]) + csv.encode("utf-8", errors="replace")
+        )
 
     async def _cmd_set_custom_var(self, data: bytes) -> None:
         if len(data) < 3:
@@ -2060,7 +2137,9 @@ class CompanionFrameServer:
         telemetry_modes = data[1] if len(data) >= 2 else 0
         advert_loc_policy = data[2] if len(data) >= 3 else 0
         multi_acks = data[3] if len(data) >= 4 else 0
-        self.bridge.set_other_params(manual_add, telemetry_modes, advert_loc_policy, multi_acks)
+        self.bridge.set_other_params(
+            manual_add, telemetry_modes, advert_loc_policy, multi_acks
+        )
         self._write_ok()
 
     async def _cmd_send_raw_data(self, data: bytes) -> None:
