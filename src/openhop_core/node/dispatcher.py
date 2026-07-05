@@ -375,10 +375,6 @@ class Dispatcher:
         snr: Optional[float] = None,
     ) -> None:
         """Process received packet. rssi/snr are per-packet when provided."""
-        self._log(
-            f"[RX DEBUG] Processing packet: {len(data)} bytes, data: {data.hex()[:32]}..."
-        )
-
         # Notify raw RX subscribers so clients can track repeats
         if rssi is not None:
             rssi_val = rssi
@@ -411,7 +407,6 @@ class Dispatcher:
         pkt = Packet()
         try:
             pkt.read_from(data)
-            self._log("[RX DEBUG] Packet parsed successfully")
         except Exception as err:
             self._log(f"Malformed packet: {err}")
             self.packet_filter.blacklist(raw_hash)
@@ -421,10 +416,6 @@ class Dispatcher:
         # Packets at max hops for their path encoding must not be retransmitted
         if PathUtils.is_path_at_max_hops(pkt.path_len):
             pkt.mark_do_not_retransmit()
-
-        ptype = pkt.header >> PH_TYPE_SHIFT
-
-        self._log(f"[RX DEBUG] Packet type: {ptype:02X}")
 
         # Use per-packet rssi/snr when provided (avoids race); else fall back to radio last values
         pkt._rssi = rssi if rssi is not None else self.radio.get_last_rssi()
@@ -474,7 +465,6 @@ class Dispatcher:
             return
 
         # Handle ACK matching for waiting senders
-        self._log("[RX DEBUG] Dispatching packet to handlers")
         await self._dispatch(pkt)
 
     # ------------------------------------------------------------------
@@ -661,7 +651,13 @@ class Dispatcher:
     async def _dispatch(self, pkt: Packet) -> None:
         payload_type = pkt.get_payload_type()
         type_name = PAYLOAD_TYPES.get(payload_type, f"UNKNOWN_{payload_type}")
-        self._log(f"RX {type_name} ({payload_type})")
+        payload_preview = pkt.payload[: min(10, pkt.payload_len)].hex() if pkt.payload_len > 0 else ""
+        if payload_preview:
+            self._log(
+                f"RX {type_name} ({payload_type}) len={pkt.payload_len} payload={payload_preview}"
+            )
+        else:
+            self._log(f"RX {type_name} ({payload_type}) len={pkt.payload_len}")
 
         self._logger.debug(
             f"Received packet type {type_name}, payload length: {pkt.payload_len}"

@@ -15,6 +15,12 @@ from .gpio_manager import GPIOPinManager
 from .lora.LoRaRF.SX126x import SX126x, set_gpio_manager
 
 logger = logging.getLogger("SX1262_wrapper")
+TRACE_LEVEL = 5
+logging.addLevelName(TRACE_LEVEL, "TRACE")
+
+
+def _trace(message: str) -> None:
+    logger.log(TRACE_LEVEL, message)
 
 
 class SX1262Radio(LoRaRadio):
@@ -304,7 +310,7 @@ class SX1262Radio(LoRaRadio):
 
             self._last_irq_status = irqStat
             if irqStat & self.lora.IRQ_TX_DONE:
-                logger.debug(
+                _trace(
                     "[TX] TX_DONE interrupt (0x{:04X})".format(self.lora.IRQ_TX_DONE)
                 )
                 self._tx_done_event.set()
@@ -312,9 +318,9 @@ class SX1262Radio(LoRaRadio):
             if irqStat & (self.lora.IRQ_CAD_DETECTED | self.lora.IRQ_CAD_DONE):
                 cad_detected = bool(irqStat & self.lora.IRQ_CAD_DETECTED)
                 if cad_detected:
-                    logger.debug(f"[CAD] Channel activity detected (0x{irqStat:04X})")
+                    _trace(f"[CAD] Channel activity detected (0x{irqStat:04X})")
                 else:
-                    logger.debug(f"[CAD] Channel clear detected (0x{irqStat:04X})")
+                    _trace(f"[CAD] Channel clear detected (0x{irqStat:04X})")
 
                 self._last_cad_detected = cad_detected
                 self._last_cad_irq_status = irqStat
@@ -333,7 +339,7 @@ class SX1262Radio(LoRaRadio):
 
                 # Log all interrupt types for debugging
                 if irqStat & self.lora.IRQ_RX_DONE:
-                    logger.debug(
+                    _trace(
                         "[RX] RX_DONE interrupt (0x{:04X})".format(
                             self.lora.IRQ_RX_DONE
                         )
@@ -380,7 +386,7 @@ class SX1262Radio(LoRaRadio):
                 if irqStat & terminal_interrupts:
                     if not self._tx_lock.locked():
                         self._rx_done_event.set()
-                        logger.debug(
+                        _trace(
                             f"[RX] Terminal interrupt 0x{irqStat:04X} - waking background task"
                         )
                     else:
@@ -439,7 +445,7 @@ class SX1262Radio(LoRaRadio):
                             self._rx_done_event.wait(), timeout=self.RADIO_TIMING_DELAY
                         )
                         self._rx_done_event.clear()
-                        logger.debug("[RX] RX_DONE event triggered!")
+                        _trace("[RX] RX_DONE event triggered!")
 
                         # Mark that we're processing a packet (prevents noise floor sampling)
                         self._is_receiving_packet = True
@@ -519,7 +525,7 @@ class SX1262Radio(LoRaRadio):
                                         rxStartBufferPointer, payloadLengthRx
                                     )
                                     packet_data = bytes(buffer)
-                                    logger.debug(
+                                    _trace(
                                         f"[RX] Packet data: {packet_data.hex()[:32]}... "
                                         f"({len(packet_data)} bytes)"
                                     )
@@ -561,7 +567,7 @@ class SX1262Radio(LoRaRadio):
                                     self.lora.request(self.lora.RX_CONTINUOUS)
                                     self.lora.clearIrqStatus(0xFFFF)
                                     await asyncio.sleep(self.RADIO_TIMING_DELAY)
-                                    logger.debug(
+                                    _trace(
                                         f"[RX] Restored RX continuous mode after IRQ 0x{irqStat:04X}"
                                     )
                                 except Exception as e:
@@ -959,7 +965,7 @@ class SX1262Radio(LoRaRadio):
         timeout_ms = math.ceil(air_time_ms) + 1000
         driver_timeout = timeout_ms * 64
 
-        logger.debug(
+        _trace(
             f"TX timing SF{sf}/{bw_hz / 1000:.1f}kHz "
             f"CR4/{cr} {packet_length}B: "
             f"symbol={symbol_time * 1000:.3f}ms, "
@@ -1022,12 +1028,12 @@ class SX1262Radio(LoRaRadio):
             try:
                 channel_busy = await self.perform_cad(timeout=0.5)
                 if not channel_busy:
-                    logger.debug(
+                    _trace(
                         f"CAD check clear - channel available after {lbt_attempts + 1} attempts"
                     )
                     break
 
-                logger.debug("CAD check still busy - channel activity detected")
+                _trace("CAD check still busy - channel activity detected")
                 lbt_attempts += 1
                 if lbt_attempts < max_lbt_attempts:
                     # Jitter (50-200ms)
@@ -1039,7 +1045,7 @@ class SX1262Radio(LoRaRadio):
 
                     lbt_backoff_delays.append(float(backoff_ms))
 
-                    logger.debug(
+                    _trace(
                         f"CAD backoff - waiting {backoff_ms}ms before retry "
                         f"(attempt {lbt_attempts}/{max_lbt_attempts})"
                     )
@@ -1141,7 +1147,7 @@ class SX1262Radio(LoRaRadio):
         Primary path: IRQ edge -> _tx_done_event.
         Fallback path: periodic polling of IRQ status (useful if an IRQ edge is missed).
         """
-        logger.debug(f"[TX] Waiting for TX completion (timeout: {timeout_seconds}s)")
+        _trace(f"[TX] Waiting for TX completion (timeout: {timeout_seconds}s)")
         start_time = time.time()
 
         poll_interval = 0.05  # 50ms polling fallback
@@ -1162,7 +1168,7 @@ class SX1262Radio(LoRaRadio):
 
             try:
                 await asyncio.wait_for(self._tx_done_event.wait(), timeout=wait_for)
-                logger.debug("[TX] TX completion interrupt received!")
+                _trace("[TX] TX completion interrupt received!")
                 return True
             except asyncio.TimeoutError:
                 pass
@@ -1221,7 +1227,7 @@ class SX1262Radio(LoRaRadio):
         irqStat = self.lora.getIrqStatus()
 
         # Check what actually happened
-        logger.debug(f"Final interrupt status: 0x{irqStat:04X}")
+        _trace(f"Final interrupt status: 0x{irqStat:04X}")
 
         if irqStat & self.lora.IRQ_TX_DONE:
             pass  # Success
@@ -1250,7 +1256,7 @@ class SX1262Radio(LoRaRadio):
 
     async def _restore_rx_mode(self) -> None:
         """Restore radio to RX continuous mode after transmission"""
-        logger.debug("[TX->RX] Starting RX mode restoration after transmission")
+        _trace("[TX->RX] Starting RX mode restoration after transmission")
         try:
             if self.lora:
                 # Critical sequence to prevent interrupt race conditions
@@ -1291,7 +1297,7 @@ class SX1262Radio(LoRaRadio):
                 # Always restore external RF switch control pins to RX mode
                 self._control_tx_rx_pins(tx_mode=False)
 
-                logger.debug("[TX->RX] RX mode restoration completed")
+                _trace("[TX->RX] RX mode restoration completed")
 
         except Exception as e:
             logger.warning(f"[TX->RX] Failed to restore RX mode after TX: {e}")
@@ -1314,7 +1320,7 @@ class SX1262Radio(LoRaRadio):
 
                 self._prepare_packet_transmission(data_list, length)
 
-                logger.debug(
+                _trace(
                     f"Setting TX timeout: {final_timeout_ms}ms "
                     f"(tOut={driver_timeout}) for {length} bytes"
                 )
@@ -1684,7 +1690,7 @@ class SX1262Radio(LoRaRadio):
             for retry in range(3):
                 irq_pin_state = self._gpio_manager.read_pin(self.irq_pin_number)
                 if not irq_pin_state:  # LOW is good
-                    logger.debug(f"[CAD] IRQ pin is LOW after clear (retry {retry})")
+                    _trace(f"[CAD] IRQ pin is LOW after clear (retry {retry})")
                     break
                 else:
                     logger.warning(
@@ -1731,7 +1737,7 @@ class SX1262Radio(LoRaRadio):
                 0.01
             )  # 10ms should be enough for CAD to complete (~8ms for 2 symbols)
 
-            logger.debug(
+            _trace(
                 f"[CAD] Operation started - checking channel with peak={det_peak}, min={det_min}"
             )
 
@@ -1744,12 +1750,12 @@ class SX1262Radio(LoRaRadio):
                 detected = self._last_cad_detected
                 cad_done = bool(irq & self.lora.IRQ_CAD_DONE)
 
-                logger.debug(f"CAD operation completed - IRQ status: 0x{irq:04X}")
+                _trace(f"CAD operation completed - IRQ status: 0x{irq:04X}")
 
                 if detected:
-                    logger.debug("CAD result: BUSY - channel activity detected")
+                    _trace("CAD result: BUSY - channel activity detected")
                 else:
-                    logger.debug("CAD result: CLEAR - no channel activity detected")
+                    _trace("CAD result: CLEAR - no channel activity detected")
 
                 # Clear hardware IRQ status
                 current_irq = self.lora.getIrqStatus()
@@ -1771,10 +1777,10 @@ class SX1262Radio(LoRaRadio):
                     return detected
 
             except asyncio.TimeoutError:
-                logger.debug("CAD operation timed out - assuming channel clear")
+                _trace("CAD operation timed out - assuming channel clear")
                 irq = self.lora.getIrqStatus()
                 if irq != 0:
-                    logger.debug(f"CAD timeout but IRQ status: 0x{irq:04X}")
+                    _trace(f"CAD timeout but IRQ status: 0x{irq:04X}")
                     self.lora.clearIrqStatus(irq)
 
                 if calibration:

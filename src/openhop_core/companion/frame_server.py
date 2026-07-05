@@ -209,6 +209,10 @@ class CompanionFrameServer:
         self.local_hash = local_hash
         self.stats_getter = stats_getter
         self._control_handler = control_handler
+        # Track discovery tags for no-op callbacks created by this frame server,
+        # so we only clear callbacks we own and never remove repeater-level
+        # discovery callbacks that are still collecting responses.
+        self._companion_discovery_tags: set[int] = set()
         self._heartbeat_interval = heartbeat_interval
         self._client_idle_timeout_sec = client_idle_timeout_sec
         self._server: Optional[asyncio.Server] = None
@@ -698,10 +702,13 @@ class CompanionFrameServer:
         if self._write_queue is None:
             logger.warning("Push control data skipped: no client connection")
             return
-        # Discovery response (0x90): clear the no-op callback
+        # Discovery response (0x90): clear only no-op callbacks owned by this
+        # frame server (created by CMD_SEND_CONTROL_DATA discovery requests).
         if self._control_handler and len(payload) >= 6 and (payload[0] & 0xF0) == 0x90:
             tag = struct.unpack("<I", payload[2:6])[0]
-            self._control_handler.clear_response_callback(tag)
+            if tag in self._companion_discovery_tags:
+                self._control_handler.clear_response_callback(tag)
+                self._companion_discovery_tags.discard(tag)
         snr_val = snr if isinstance(snr, (int, float)) else 0.0
         rssi_val = rssi if isinstance(rssi, (int, float)) else 0
         snr_byte = max(-128, min(127, int(round(float(snr_val) * 4))))
@@ -1307,6 +1314,7 @@ class CompanionFrameServer:
         # Discovery request: register a no-op response callback
         if self._control_handler and len(data) >= 6 and (data[0] & 0xF0) == 0x80:
             tag = struct.unpack("<I", data[2:6])[0]
+            self._companion_discovery_tags.add(tag)
             self._control_handler.set_response_callback(tag, lambda _: None)
         send_control = getattr(self.bridge, "send_control_data", None)
         if not send_control:
