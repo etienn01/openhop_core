@@ -651,7 +651,9 @@ class Dispatcher:
     async def _dispatch(self, pkt: Packet) -> None:
         payload_type = pkt.get_payload_type()
         type_name = PAYLOAD_TYPES.get(payload_type, f"UNKNOWN_{payload_type}")
-        payload_preview = pkt.payload[: min(10, pkt.payload_len)].hex() if pkt.payload_len > 0 else ""
+        payload_preview = (
+            pkt.payload[: min(10, pkt.payload_len)].hex() if pkt.payload_len > 0 else ""
+        )
         if payload_preview:
             self._log(
                 f"RX {type_name} ({payload_type}) len={pkt.payload_len} payload={payload_preview}"
