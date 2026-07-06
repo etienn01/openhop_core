@@ -20,6 +20,14 @@ import time
 from typing import Any, Callable, Optional
 
 from ..protocol import CryptoUtils
+from ..protocol.constants import (
+    ADVERT_FLAG_HAS_LOCATION,
+    ADVERT_FLAG_HAS_NAME,
+    ADVERT_FLAG_IS_CHAT_NODE,
+    TELEM_PERM_BASE,
+    TELEM_PERM_ENVIRONMENT,
+    TELEM_PERM_LOCATION,
+)
 from ..protocol.packet_utils import PathUtils
 from .constants import (
     ADV_TYPE_CHAT,
@@ -74,6 +82,7 @@ from .constants import (
     CMD_SET_TUNING_PARAMS,
     CMD_SHARE_CONTACT,
     CMD_SYNC_NEXT_MESSAGE,
+    CONTACT_NAME_SIZE,
     ERR_CODE_BAD_STATE,
     ERR_CODE_ILLEGAL_ARG,
     ERR_CODE_NOT_FOUND,
@@ -145,9 +154,9 @@ def _build_advert_push_frames(contact: Contact) -> tuple[bytes, Optional[bytes]]
     full frame from contact.  Thread-safe for ``asyncio.to_thread``."""
     pubkey_b = contact.public_key
     if isinstance(pubkey_b, bytes):
-        pubkey_b = pubkey_b[:32].ljust(32, b"\x00")
+        pubkey_b = pubkey_b[:PUB_KEY_SIZE].ljust(PUB_KEY_SIZE, b"\x00")
     else:
-        pubkey_b = b"\x00" * 32
+        pubkey_b = b"\x00" * PUB_KEY_SIZE
     short = bytes([PUSH_CODE_ADVERT]) + pubkey_b
     if not contact.name:
         return (short, None)
@@ -157,8 +166,8 @@ def _build_advert_push_frames(contact: Contact) -> tuple[bytes, Optional[bytes]]
         contact.name.encode("utf-8", errors="replace")
         if isinstance(contact.name, str)
         else (contact.name if isinstance(contact.name, bytes) else b"")
-    )[:32].ljust(32, b"\x00")
-    opl_byte = 0xFF if contact.out_path_len < 0 else min(contact.out_path_len, 255)
+    )[:CONTACT_NAME_SIZE].ljust(CONTACT_NAME_SIZE, b"\x00")
+    opl_byte = OUT_PATH_UNKNOWN if contact.out_path_len < 0 else min(contact.out_path_len, 255)
     full = (
         bytes([PUSH_CODE_NEW_ADVERT])
         + pubkey_b
@@ -427,7 +436,7 @@ class CompanionFrameServer:
             short ADVERT (pubkey only) for a stored contact.
             """
             pubkey = contact.public_key
-            if not isinstance(pubkey, bytes) or len(pubkey) < 32:
+            if not isinstance(pubkey, bytes) or len(pubkey) < PUB_KEY_SIZE:
                 return
             short, full = await asyncio.to_thread(_build_advert_push_frames, contact)
             if is_new:
@@ -475,12 +484,12 @@ class CompanionFrameServer:
             if not (
                 hasattr(contact, "public_key")
                 and isinstance(contact.public_key, bytes)
-                and len(contact.public_key) >= 32
+                and len(contact.public_key) >= PUB_KEY_SIZE
             ):
                 return
             if not self.bridge.contacts.get_by_key(contact.public_key):
                 return
-            _write_push(bytes([PUSH_CODE_PATH_UPDATED]) + contact.public_key[:32])
+            _write_push(bytes([PUSH_CODE_PATH_UPDATED]) + contact.public_key[:PUB_KEY_SIZE])
             try:
                 await self._maybe_persist_contact(contact)
             except Exception as e:
@@ -565,21 +574,22 @@ class CompanionFrameServer:
             _write_push(frame)
 
         def on_contact_deleted(pub_key):
-            if isinstance(pub_key, bytes) and len(pub_key) >= 32:
-                _write_push(bytes([PUSH_CODE_CONTACT_DELETED]) + pub_key[:32])
+            if isinstance(pub_key, bytes) and len(pub_key) >= PUB_KEY_SIZE:
+                _write_push(bytes([PUSH_CODE_CONTACT_DELETED]) + pub_key[:PUB_KEY_SIZE])
 
         def on_contacts_full():
             _write_push(bytes([PUSH_CODE_CONTACTS_FULL]))
 
         def on_raw_data_received(payload_bytes: bytes, snr: float, rssi: int) -> None:
-            """Push PUSH_CODE_RAW_DATA (0x84): code, SNR byte, RSSI byte, 0xFF, payload."""
+            """Push PUSH_CODE_RAW_DATA (0x84): code, SNR byte, RSSI byte,
+            path-len byte (unknown), payload."""
             snr_byte = max(-128, min(127, int(round(snr * 4))))
             rssi_byte = max(-128, min(127, int(rssi)))
             payload_len = min(len(payload_bytes), MAX_PAYLOAD_SIZE - 4)
             data = (
                 bytes([PUSH_CODE_RAW_DATA])
                 + struct.pack("<bb", snr_byte, rssi_byte)
-                + bytes([0xFF])
+                + bytes([OUT_PATH_UNKNOWN])
                 + payload_bytes[:payload_len]
             )
             _write_push(data)
@@ -619,8 +629,8 @@ class CompanionFrameServer:
         """
         if self._write_queue is None:
             return
-        path_sz = flags & 0x03
-        expected_snr_len = path_len >> path_sz
+        hash_width = PathUtils.trace_payload_hash_width(flags)
+        expected_snr_len = path_len // hash_width
         if len(path_snrs) != expected_snr_len:
             logger.debug(
                 "push_trace_data: path_snrs len %s != expected %s",
@@ -1107,10 +1117,12 @@ class CompanionFrameServer:
     def _write_contact_frame(self, c: Contact) -> None:
         """Encode and write a single RESP_CODE_CONTACT frame."""
         pubkey = c.public_key if isinstance(c.public_key, bytes) else bytes.fromhex(c.public_key)
-        name = (c.name.encode("utf-8")[:32] if isinstance(c.name, str) else c.name[:32]).ljust(
-            32, b"\x00"
-        )
-        opl_byte = 0xFF if c.out_path_len < 0 else min(c.out_path_len, 255)
+        name = (
+            c.name.encode("utf-8")[:CONTACT_NAME_SIZE]
+            if isinstance(c.name, str)
+            else c.name[:CONTACT_NAME_SIZE]
+        ).ljust(CONTACT_NAME_SIZE, b"\x00")
+        opl_byte = OUT_PATH_UNKNOWN if c.out_path_len < 0 else min(c.out_path_len, 255)
         frame = (
             bytes([RESP_CODE_CONTACT, *pubkey, c.adv_type, c.flags, opl_byte])
             + (c.out_path[:MAX_PATH_SIZE] if c.out_path else b"").ljust(MAX_PATH_SIZE, b"\x00")
@@ -1243,11 +1255,11 @@ class CompanionFrameServer:
             self._write_err(ERR_CODE_TABLE_FULL)
 
     async def _cmd_send_binary_req(self, data: bytes) -> None:
-        if len(data) < 33:
+        if len(data) < PUB_KEY_SIZE + 1:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
-        pubkey = data[:32]
-        req_data = data[32:]
+        pubkey = data[:PUB_KEY_SIZE]
+        req_data = data[PUB_KEY_SIZE:]
         send_binary_req = getattr(self.bridge, "send_binary_req", None)
         if not send_binary_req:
             self._write_err(ERR_CODE_UNSUPPORTED_CMD)
@@ -1269,11 +1281,11 @@ class CompanionFrameServer:
         self._write_frame(frame)
 
     async def _cmd_send_anon_req(self, data: bytes) -> None:
-        if len(data) < 33:
+        if len(data) < PUB_KEY_SIZE + 1:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
-        pubkey = data[:32]
-        req_data = data[32:]
+        pubkey = data[:PUB_KEY_SIZE]
+        req_data = data[PUB_KEY_SIZE:]
         send_anon_req = getattr(self.bridge, "send_anon_req", None)
         if not send_anon_req:
             self._write_err(ERR_CODE_UNSUPPORTED_CMD)
@@ -1327,10 +1339,10 @@ class CompanionFrameServer:
             "Path discovery request received (cmd 52), data_len=%s",
             len(data),
         )
-        if len(data) < 33:
+        if len(data) < 1 + PUB_KEY_SIZE:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
-        pub_key = data[1:33]
+        pub_key = data[1 : 1 + PUB_KEY_SIZE]
         send_req = getattr(self.bridge, "send_path_discovery_req", None)
         if not send_req:
             self._write_err(ERR_CODE_UNSUPPORTED_CMD)
@@ -1360,8 +1372,8 @@ class CompanionFrameServer:
         flags = data[8]
         path_bytes = data[9:]
         path_len = len(path_bytes)
-        path_sz = flags & 0x03
-        if (path_len >> path_sz) > MAX_PATH_SIZE or (path_len % (1 << path_sz)) != 0:
+        hash_width = PathUtils.trace_payload_hash_width(flags)
+        if (path_len // hash_width) > MAX_PATH_SIZE or (path_len % hash_width) != 0:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         send_raw = getattr(self.bridge, "send_trace_path_raw", None)
@@ -1382,8 +1394,7 @@ class CompanionFrameServer:
         self._write_frame(frame)
         # If we are the final hop, push trace data immediately
         if path_bytes and self.local_hash is not None and path_bytes[-1] == self.local_hash:
-            path_sz = flags & 0x03
-            snr_len = path_len >> path_sz
+            snr_len = path_len // hash_width
             path_snrs = bytes(snr_len)
             final_snr_byte = 0
             self.push_trace_data(
@@ -1482,12 +1493,14 @@ class CompanionFrameServer:
         self._write_frame(self._build_message_frame(msg))
 
     async def _cmd_send_login(self, data: bytes) -> None:
-        if len(data) < 32:
+        if len(data) < PUB_KEY_SIZE:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
-        pubkey = data[:32]
+        pubkey = data[:PUB_KEY_SIZE]
         password = (
-            data[32:].decode("utf-8", errors="replace").rstrip("\x00") if len(data) > 32 else ""
+            data[PUB_KEY_SIZE:].decode("utf-8", errors="replace").rstrip("\x00")
+            if len(data) > PUB_KEY_SIZE
+            else ""
         )
         self._write_frame(bytes([RESP_CODE_SENT, 1]) + struct.pack("<II", 0, 10000))
         result = await self.bridge.send_login(pubkey, password)
@@ -1512,10 +1525,10 @@ class CompanionFrameServer:
             self._write_frame(bytes([PUSH_CODE_LOGIN_FAIL, 0]) + pubkey[:6])
 
     async def _cmd_send_status_req(self, data: bytes) -> None:
-        if len(data) < 32:
+        if len(data) < PUB_KEY_SIZE:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
-        pubkey = data[0:32]
+        pubkey = data[0:PUB_KEY_SIZE]
         self._write_frame(bytes([RESP_CODE_SENT, 0]) + struct.pack("<II", 0, 15000))
         result = await self.bridge.send_status_request(pubkey)
         if not result.get("success"):
@@ -1534,14 +1547,15 @@ class CompanionFrameServer:
     async def _cmd_send_telemetry_req(self, data: bytes) -> None:
         # Protocol: CMD_SEND_TELEMETRY_REQ has reserved bytes(3) then pub_key bytes(32).
         # See MeshCore Companion-Radio-Protocol: CMD_SEND_TELEMETRY_REQ frame format.
-        if len(data) < 35:
+        if len(data) < 3 + PUB_KEY_SIZE:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
-        pubkey = data[3:35]
-        flags = 0x07  # request all: base + location + environment
-        want_base = bool(flags & 0x01)
-        want_location = bool(flags & 0x02)
-        want_environment = bool(flags & 0x04)
+        pubkey = data[3 : 3 + PUB_KEY_SIZE]
+        # Request all: base + location + environment
+        flags = TELEM_PERM_BASE | TELEM_PERM_LOCATION | TELEM_PERM_ENVIRONMENT
+        want_base = bool(flags & TELEM_PERM_BASE)
+        want_location = bool(flags & TELEM_PERM_LOCATION)
+        want_environment = bool(flags & TELEM_PERM_ENVIRONMENT)
         self._write_frame(bytes([RESP_CODE_SENT, 0]) + struct.pack("<II", 0, 15000))
         result = await self.bridge.send_telemetry_request(
             pubkey,
@@ -1585,7 +1599,7 @@ class CompanionFrameServer:
         if len(data) < 36:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
-        pubkey = data[0:32]
+        pubkey = data[0:PUB_KEY_SIZE]
         adv_type = data[32]
         flags = data[33]
         out_path_len = struct.unpack_from("<b", data, 34)[0]
@@ -1595,13 +1609,13 @@ class CompanionFrameServer:
         else:
             out_path = data[35 : len(data)].rstrip(b"\x00") if len(data) > 35 else b""
         name_start = 35 + MAX_PATH_SIZE
-        name_end = name_start + 32
+        name_end = name_start + CONTACT_NAME_SIZE
         if len(data) >= name_end:
             name_raw = data[name_start:name_end]
         elif len(data) > name_start:
-            name_raw = data[name_start : len(data)].ljust(32, b"\x00")
+            name_raw = data[name_start : len(data)].ljust(CONTACT_NAME_SIZE, b"\x00")
         else:
-            name_raw = b"\x00" * 32
+            name_raw = b"\x00" * CONTACT_NAME_SIZE
         name = name_raw.split(b"\x00")[0].decode("utf-8", errors="replace")
         last_advert = 0
         if len(data) >= name_end + 4:
@@ -1934,18 +1948,18 @@ class CompanionFrameServer:
             if raw is None:
                 self._write_err(ERR_CODE_NOT_FOUND)
                 return
-            pubkey = raw[:32]
+            pubkey = raw[:PUB_KEY_SIZE]
             name_raw = raw[33:65].split(b"\x00")[0]
             lat, lon = struct.unpack_from("<ii", raw, 65)
-            flags = 0x01  # IS_CHAT_NODE
+            flags = ADVERT_FLAG_IS_CHAT_NODE
             loc_bytes = b""
             if lat != 0 or lon != 0:
-                flags |= 0x10  # HAS_LOCATION
+                flags |= ADVERT_FLAG_HAS_LOCATION
                 loc_bytes = struct.pack("<ii", lat, lon)
             max_name = 32 - 1 - len(loc_bytes)
             name_bytes = name_raw[:max_name]
             if name_bytes:
-                flags |= 0x80  # HAS_NAME
+                flags |= ADVERT_FLAG_HAS_NAME
             appdata = bytes([flags]) + loc_bytes + name_bytes
             timestamp = int(time.time()) & 0xFFFFFFFF
             ts_bytes = struct.pack("<I", timestamp)

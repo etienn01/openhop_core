@@ -23,17 +23,17 @@ import time
 from typing import Callable, Optional, Tuple
 
 from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder
-from ...protocol.constants import MAX_PACKET_PAYLOAD, PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_RESPONSE
+from ...protocol.constants import (
+    ANON_REQ_TYPE_BASIC,
+    ANON_REQ_TYPE_OWNER,
+    ANON_REQ_TYPE_REGIONS,
+    MAX_PACKET_PAYLOAD,
+    PAYLOAD_TYPE_ANON_REQ,
+    PAYLOAD_TYPE_RESPONSE,
+)
 from ...protocol.packet_utils import PathUtils
 from .base import BaseHandler
 from .login_server import LoginServerHandler
-
-# Anonymous-request sub-types (first byte of an ANON_REQ payload after the
-# 4-byte timestamp). Mirrors ``openhop_core.companion.constants`` but defined here
-# to avoid a circular import (the companion package imports node.handlers).
-ANON_REQ_TYPE_REGIONS = 0x01
-ANON_REQ_TYPE_OWNER = 0x02
-ANON_REQ_TYPE_BASIC = 0x03
 
 # Server response delay (ms) — matches firmware SERVER_RESPONSE_DELAY.
 SERVER_RESPONSE_DELAY_MS = 300

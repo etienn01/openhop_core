@@ -119,3 +119,12 @@ REQ_TYPE_GET_OWNER_INFO = 0x07  # Variable-length: tag(4) + "version\nname\nowne
 TELEM_PERM_BASE = 0x01
 TELEM_PERM_LOCATION = 0x02
 TELEM_PERM_ENVIRONMENT = 0x04
+
+# ---------------------------------------------------------------------------
+# Anonymous request sub-types (first byte of an ANON_REQ payload, after the
+# 4-byte timestamp). Wire values shared by the anon-request handler (node) and
+# the companion protocol; see firmware simple_repeater/MyMesh.cpp.
+# ---------------------------------------------------------------------------
+ANON_REQ_TYPE_REGIONS = 0x01  # repeater replies with comma-separated region names
+ANON_REQ_TYPE_OWNER = 0x02  # repeater replies with "name\nowner"
+ANON_REQ_TYPE_BASIC = 0x03  # repeater replies with clock + feature flags

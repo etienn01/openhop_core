@@ -25,6 +25,7 @@ from ..protocol.constants import (
     PAYLOAD_TYPE_RAW_CUSTOM,
     PAYLOAD_TYPE_RESPONSE,
     PAYLOAD_TYPE_TXT_MSG,
+    PUB_KEY_SIZE,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
@@ -89,7 +90,7 @@ class _BridgeAckHandler:
             try:
                 pk = contact.public_key
                 pub = bytes.fromhex(pk) if isinstance(pk, str) else bytes(pk)
-                if len(pub) != 32 or pub[0] != src_hash:
+                if len(pub) != PUB_KEY_SIZE or pub[0] != src_hash:
                     continue
                 contacts_tried += 1
                 peer_id = Identity(pub)
@@ -305,8 +306,8 @@ class CompanionBridge(CompanionBase):
 
     async def process_received_packet(self, packet: Packet) -> None:
         """Process a packet destined for this companion."""
-        ptype = packet.header >> 2 & 0x0F
-        route_type = packet.header & 0x03
+        ptype = packet.get_payload_type()
+        route_type = packet.get_route_type()
         is_flood = route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD)
         self.stats.record_rx(is_flood=is_flood)
 

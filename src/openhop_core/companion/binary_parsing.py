@@ -6,6 +6,8 @@ import logging
 from typing import Optional
 
 from .constants import (
+    ANON_BASIC_FEAT_BRIDGE_MASK,
+    ANON_BASIC_FEAT_DISABLED,
     ANON_REQ_TYPE_BASIC,
     ANON_REQ_TYPE_OWNER,
     ANON_REQ_TYPE_REGIONS,
@@ -169,12 +171,14 @@ def _parse_anon_basic(data: bytes) -> dict:
     """Parse ANON_REQ_TYPE_BASIC response: clock(4) + feature flags(1)."""
     clock = int.from_bytes(data[:4], "little") if len(data) >= 4 else 0
     features = data[4] if len(data) >= 5 else 0
+    bridge_type = features & ANON_BASIC_FEAT_BRIDGE_MASK
     return {
         "type": "basic",
         "clock": clock,
         "features": features,
-        "is_bridge": bool(features & 0x01),
-        "is_disabled": bool(features & 0x80),
+        "is_bridge": bridge_type != 0,
+        "bridge_type": bridge_type,
+        "is_disabled": bool(features & ANON_BASIC_FEAT_DISABLED),
     }
 
 
