@@ -2838,3 +2838,15 @@ class TestCoverageSecondPass:
         radio._rx_irq_task = task
         radio.cleanup()
         task.cancel.assert_called_once()
+
+
+class TestHandleInterruptIdempotency:
+    def test_second_call_with_zero_irq_preserves_last_irq_status(self, radio):
+        radio.lora.getIrqStatus.return_value = IRQ_CRC_ERR
+        radio._handle_interrupt()
+        assert radio._last_irq_status == IRQ_CRC_ERR
+
+        radio.lora.getIrqStatus.return_value = IRQ_NONE
+        radio._handle_interrupt()
+
+        assert radio._last_irq_status == IRQ_CRC_ERR
