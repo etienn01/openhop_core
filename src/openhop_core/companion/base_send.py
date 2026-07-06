@@ -404,7 +404,9 @@ class _SendOpsMixin:
             self.stats.record_tx_error()
             return SentResult(success=False)
 
-    async def send_channel_message(self, channel_idx: int, text: str) -> bool:
+    async def send_channel_message(
+        self, channel_idx: int, text: str, timestamp: Optional[int] = None
+    ) -> bool:
         """Send a message to a channel."""
         channel = self.channels.get(channel_idx)
         if not channel:
@@ -417,6 +419,7 @@ class _SendOpsMixin:
                 message=text,
                 sender_name=self.prefs.node_name,
                 channels_config=self.channels.get_channels(),
+                timestamp=timestamp,
             )
             self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
