@@ -2,7 +2,6 @@ import threading
 from unittest.mock import MagicMock
 
 
-
 def _make_polling_manager():
     from openhop_core.hardware.gpio_manager import GPIOPinManager
 
@@ -10,7 +9,6 @@ def _make_polling_manager():
     gm._pins = {}
     gm._input_callbacks = {}
     return gm
-
 
 
 def _run_polling(gm, pin, reads, interval=0.001):
@@ -41,7 +39,6 @@ def _run_polling(gm, pin, reads, interval=0.001):
     thread.join(timeout=2.0)
     assert not thread.is_alive(), "Polling thread did not terminate within 2s"
     return callbacks
-
 
 
 def test_stuck_high_recovers_with_second_callback():
