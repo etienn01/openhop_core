@@ -217,6 +217,9 @@ class CompanionFrameServer:
         # so we only clear callbacks we own and never remove repeater-level
         # discovery callbacks that are still collecting responses.
         self._companion_discovery_tags: set[int] = set()
+        # Track anon/binary request tags originated by this frame server so only
+        # this virtual companion consumes the matching PUSH_CODE_BINARY_RESPONSE.
+        self._companion_binary_tags: set[int] = set()
         self._heartbeat_interval = heartbeat_interval
         self._client_idle_timeout_sec = client_idle_timeout_sec
         self._server: Optional[asyncio.Server] = None
@@ -560,6 +563,25 @@ class CompanionFrameServer:
         def on_binary_response(
             tag_bytes, response_data, parsed=None, request_type=None
         ):
+            tag_int: Optional[int]
+            if isinstance(tag_bytes, bytes):
+                if len(tag_bytes) < 4:
+                    return
+                tag_int = struct.unpack("<I", tag_bytes[:4])[0]
+            else:
+                try:
+                    tag_int = int(tag_bytes)
+                except (TypeError, ValueError):
+                    return
+            if tag_int not in self._companion_binary_tags:
+                # Region discovery replies can be generated outside this
+                # frame-server request path; allow those through for parity
+                # with pre-owner-tag behavior while keeping other responses
+                # isolated to the requesting virtual companion.
+                if not (isinstance(parsed, dict) and parsed.get("type") == "regions"):
+                    return
+            else:
+                self._companion_binary_tags.discard(tag_int)
             frame = (
                 bytes([PUSH_CODE_BINARY_RESPONSE, 0])
                 + (
@@ -1320,6 +1342,8 @@ class CompanionFrameServer:
             return
         tag = result.expected_ack if result.expected_ack is not None else 0
         timeout_ms = result.timeout_ms if result.timeout_ms is not None else 10000
+        if result.expected_ack is not None:
+            self._companion_binary_tags.add(tag)
         frame = bytes([RESP_CODE_SENT, 1 if result.is_flood else 0]) + struct.pack(
             "<II", tag, timeout_ms
         )
@@ -1348,6 +1372,8 @@ class CompanionFrameServer:
             return
         tag = result.expected_ack if result.expected_ack is not None else 0
         timeout_ms = result.timeout_ms if result.timeout_ms is not None else 10000
+        if result.expected_ack is not None:
+            self._companion_binary_tags.add(tag)
         frame = bytes([RESP_CODE_SENT, 1 if result.is_flood else 0]) + struct.pack(
             "<II", tag, timeout_ms
         )
