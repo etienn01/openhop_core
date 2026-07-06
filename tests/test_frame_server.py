@@ -8,21 +8,40 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from openhop_core.companion.constants import (
+    CMD_GET_DEVICE_TIME,
+    ERR_CODE_BAD_STATE,
     ERR_CODE_ILLEGAL_ARG,
     ERR_CODE_NOT_FOUND,
     ERR_CODE_TABLE_FULL,
     ERR_CODE_UNSUPPORTED_CMD,
+    FRAME_OUTBOUND_PREFIX,
     MAX_PATH_SIZE,
+    MAX_PAYLOAD_SIZE,
     PUB_KEY_SIZE,
     PUSH_CODE_ADVERT,
     PUSH_CODE_NEW_ADVERT,
     RESP_CODE_ALLOWED_REPEAT_FREQ,
     RESP_CODE_CHANNEL_DATA_RECV,
+    RESP_CODE_CHANNEL_INFO,
+    RESP_CODE_CHANNEL_MSG_RECV,
+    RESP_CODE_CHANNEL_MSG_RECV_V3,
+    RESP_CODE_CONTACT,
+    RESP_CODE_CONTACT_MSG_RECV,
+    RESP_CODE_CONTACT_MSG_RECV_V3,
+    RESP_CODE_CONTACTS_START,
+    RESP_CODE_CURR_TIME,
     RESP_CODE_DEFAULT_FLOOD_SCOPE,
+    RESP_CODE_END_OF_CONTACTS,
+    RESP_CODE_ERR,
+    RESP_CODE_NO_MORE_MESSAGES,
     RESP_CODE_OK,
+    RESP_CODE_SELF_INFO,
+    RESP_CODE_SENT,
+    RESP_CODE_STATS,
+    STATS_TYPE_PACKETS,
 )
 from openhop_core.companion.frame_server import CompanionFrameServer, _build_advert_push_frames
-from openhop_core.companion.models import Contact, QueuedMessage, SentResult
+from openhop_core.companion.models import Channel, Contact, NodePrefs, QueuedMessage, SentResult
 
 
 def test_build_advert_push_frames_short_only_when_no_name():
@@ -1162,3 +1181,555 @@ async def test_cmd_send_txt_msg_zero_host_timestamp_mints_fresh():
     data = bytes([TXT_TYPE_PLAIN, 0]) + struct.pack("<I", 0) + pubkey[:6] + b"hi"
     await server._cmd_send_txt_msg(data)
     assert bridge.send_text_message.call_args.kwargs["timestamp"] is None
+
+
+# ---------------------------------------------------------------------------
+# Command dispatch (_handle_cmd)
+# ---------------------------------------------------------------------------
+
+
+def _make_capture_server(bridge, **kwargs):
+    """Server whose outbound frames (responses and errors) land in a list."""
+    server = CompanionFrameServer(bridge, "hash", port=0, **kwargs)
+    frames: list[bytes] = []
+    server._write_frame = lambda f: frames.append(f)
+    return server, frames
+
+
+@pytest.mark.asyncio
+async def test_handle_cmd_empty_payload_is_illegal_arg():
+    server, frames = _make_capture_server(Mock())
+    await server._handle_cmd(b"")
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+
+
+@pytest.mark.asyncio
+async def test_handle_cmd_unknown_cmd_is_unsupported():
+    server, frames = _make_capture_server(Mock())
+    await server._handle_cmd(bytes([0xEE]))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+
+
+@pytest.mark.asyncio
+async def test_handle_cmd_handler_exception_maps_to_illegal_arg():
+    server, frames = _make_capture_server(Mock())
+
+    async def boom(data):
+        raise RuntimeError("boom")
+
+    server._cmd_handlers[CMD_GET_DEVICE_TIME] = boom
+    await server._handle_cmd(bytes([CMD_GET_DEVICE_TIME]))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+
+
+@pytest.mark.asyncio
+async def test_handle_cmd_dispatches_to_registered_handler():
+    bridge = Mock()
+    bridge.get_time = Mock(return_value=1_700_000_000)
+    server, frames = _make_capture_server(bridge)
+    await server._handle_cmd(bytes([CMD_GET_DEVICE_TIME]))
+    assert frames == [bytes([RESP_CODE_CURR_TIME]) + struct.pack("<I", 1_700_000_000)]
+
+
+# ---------------------------------------------------------------------------
+# CMD_APP_START / self info
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cmd_app_start_self_info_layout():
+    prefs = NodePrefs(node_name="TestNode", latitude=12.5, longitude=-3.25)
+    pubkey = bytes(range(32))
+    bridge = Mock()
+    bridge.get_self_info = Mock(return_value=prefs)
+    bridge.get_public_key = Mock(return_value=pubkey)
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_app_start(bytes([1]))
+
+    (frame,) = frames
+    assert frame[0] == RESP_CODE_SELF_INFO
+    assert frame[4:36] == pubkey
+    lat, lon = struct.unpack_from("<ii", frame, 36)
+    assert lat == int(12.5 * 1e6)
+    assert lon == int(-3.25 * 1e6)
+    assert frame.endswith(b"TestNode")
+    assert server._app_target_ver == 1
+
+
+# ---------------------------------------------------------------------------
+# Contact list / lookup frames
+# ---------------------------------------------------------------------------
+
+
+def _contact(name="alice", first_byte=0x42, **overrides) -> Contact:
+    defaults = dict(
+        public_key=bytes([first_byte]) + bytes(31),
+        name=name,
+        adv_type=1,
+        flags=0,
+        out_path_len=-1,
+        out_path=b"",
+        last_advert_timestamp=1_600_000_000,
+        lastmod=1_600_000_100,
+        gps_lat=47.5,
+        gps_lon=-122.25,
+    )
+    defaults.update(overrides)
+    return Contact(**defaults)
+
+
+@pytest.mark.asyncio
+async def test_cmd_get_contacts_start_body_end_sequence():
+    c1 = _contact("alice", 0x42, lastmod=100)
+    c2 = _contact("bob", 0x43, lastmod=200)
+    bridge = Mock()
+    bridge.get_contacts = Mock(return_value=[c1, c2])
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_get_contacts(struct.pack("<I", 50))
+
+    bridge.get_contacts.assert_called_once_with(since=50)
+    assert frames[0] == bytes([RESP_CODE_CONTACTS_START]) + struct.pack("<I", 2)
+    assert frames[1][0] == RESP_CODE_CONTACT
+    assert frames[2][0] == RESP_CODE_CONTACT
+    assert frames[3] == bytes([RESP_CODE_END_OF_CONTACTS]) + struct.pack("<I", 200)
+
+
+@pytest.mark.asyncio
+async def test_write_contact_frame_layout():
+    contact = _contact("alice", 0x42, out_path_len=2, out_path=b"\x0a\x0b")
+    bridge = Mock()
+    bridge.contacts.get_by_key = Mock(return_value=contact)
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_get_contact_by_key(contact.public_key)
+
+    (frame,) = frames
+    assert frame[0] == RESP_CODE_CONTACT
+    assert frame[1:33] == contact.public_key
+    assert frame[33] == contact.adv_type
+    assert frame[34] == contact.flags
+    assert frame[35] == 2  # out_path_len
+    assert frame[36 : 36 + MAX_PATH_SIZE] == b"\x0a\x0b".ljust(MAX_PATH_SIZE, b"\x00")
+    name_field = frame[36 + MAX_PATH_SIZE : 36 + MAX_PATH_SIZE + 32]
+    assert name_field == b"alice".ljust(32, b"\x00")
+    last_advert, lat, lon, lastmod = struct.unpack("<IiiI", frame[36 + MAX_PATH_SIZE + 32 :])
+    assert last_advert == contact.last_advert_timestamp
+    assert lat == int(contact.gps_lat * 1e6)
+    assert lon == int(contact.gps_lon * 1e6)
+    assert lastmod == contact.lastmod
+
+
+@pytest.mark.asyncio
+async def test_write_contact_frame_unknown_path_encodes_0xff():
+    contact = _contact("alice", out_path_len=-1)
+    bridge = Mock()
+    bridge.contacts.get_by_key = Mock(return_value=contact)
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_get_contact_by_key(contact.public_key)
+    assert frames[0][35] == 0xFF
+
+
+@pytest.mark.asyncio
+async def test_cmd_get_contact_by_key_not_found_and_short_data():
+    bridge = Mock()
+    bridge.contacts.get_by_key = Mock(return_value=None)
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_get_contact_by_key(bytes(32))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_NOT_FOUND])]
+    frames.clear()
+    await server._cmd_get_contact_by_key(b"\x01\x02")
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_remove_contact_saves_on_success():
+    bridge = Mock()
+    bridge.remove_contact = Mock(return_value=True)
+    server, frames = _make_capture_server(bridge)
+    server._save_contacts = AsyncMock()
+    await server._cmd_remove_contact(bytes(32))
+    assert frames == [bytes([RESP_CODE_OK])]
+    server._save_contacts.assert_awaited_once()
+
+    bridge.remove_contact = Mock(return_value=False)
+    frames.clear()
+    server._save_contacts.reset_mock()
+    await server._cmd_remove_contact(bytes(32))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_NOT_FOUND])]
+    server._save_contacts.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# CMD_SEND_TXT_MSG error/success frames
+# ---------------------------------------------------------------------------
+
+
+def _txt_bridge(contact, result):
+    bridge = Mock()
+    bridge.contacts.get_by_key_prefix = Mock(return_value=contact)
+    bridge.send_text_message = AsyncMock(return_value=result)
+    return bridge
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_txt_msg_success_sent_frame_fields():
+    contact = _contact()
+    result = SentResult(success=True, is_flood=True, expected_ack=0xAABBCCDD, timeout_ms=7000)
+    server, frames = _make_capture_server(_txt_bridge(contact, result))
+    data = bytes([0, 0]) + struct.pack("<I", 123) + contact.public_key[:6] + b"hi"
+    await server._cmd_send_txt_msg(data)
+    (frame,) = frames
+    assert frame[0] == RESP_CODE_SENT
+    assert frame[1] == 1  # flood
+    ack, timeout = struct.unpack("<II", frame[2:10])
+    assert ack == 0xAABBCCDD
+    assert timeout == 7000
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_txt_msg_unknown_contact_and_failure():
+    server, frames = _make_capture_server(_txt_bridge(None, SentResult(True)))
+    data = bytes([0, 0]) + struct.pack("<I", 1) + bytes(6) + b"hi"
+    await server._cmd_send_txt_msg(data)
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_NOT_FOUND])]
+
+    contact = _contact()
+    server, frames = _make_capture_server(_txt_bridge(contact, SentResult(False)))
+    data = bytes([0, 0]) + struct.pack("<I", 1) + contact.public_key[:6] + b"hi"
+    await server._cmd_send_txt_msg(data)
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_BAD_STATE])]
+
+    server, frames = _make_capture_server(_txt_bridge(contact, SentResult(True)))
+    await server._cmd_send_txt_msg(b"\x00\x00")  # too short
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+
+
+# ---------------------------------------------------------------------------
+# CMD_SEND_CHANNEL_TXT_MSG
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_channel_txt_msg_paths():
+    bridge = Mock()
+    bridge.get_channel = Mock(return_value=Channel(name="general", secret=bytes(16)))
+    bridge.send_channel_message = AsyncMock(return_value=True)
+    server, frames = _make_capture_server(bridge)
+
+    data = bytes([0, 1]) + struct.pack("<I", 0) + b"hello"
+    await server._cmd_send_channel_txt_msg(data)
+    assert frames == [bytes([RESP_CODE_OK])]
+    bridge.send_channel_message.assert_awaited_once_with(1, "hello")
+
+    # Non-plain txt_type is rejected before channel lookup
+    frames.clear()
+    await server._cmd_send_channel_txt_msg(bytes([1, 1]) + struct.pack("<I", 0) + b"x")
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+
+    # Unknown channel
+    bridge.get_channel = Mock(return_value=None)
+    frames.clear()
+    await server._cmd_send_channel_txt_msg(bytes([0, 9]) + struct.pack("<I", 0) + b"x")
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_NOT_FOUND])]
+
+
+# ---------------------------------------------------------------------------
+# CMD_SEND_BINARY_REQ
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_binary_req_success_and_unsupported():
+    bridge = Mock()
+    bridge.send_binary_req = AsyncMock(
+        return_value=SentResult(success=True, is_flood=False, expected_ack=0x1122, timeout_ms=9000)
+    )
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_send_binary_req(bytes(32) + b"\x01\x02")
+    (frame,) = frames
+    assert frame[0] == RESP_CODE_SENT
+    tag, timeout = struct.unpack("<II", frame[2:10])
+    assert (tag, timeout) == (0x1122, 9000)
+
+    no_method = Mock(spec=[])
+    server, frames = _make_capture_server(no_method)
+    await server._cmd_send_binary_req(bytes(32) + b"\x01")
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+
+
+# ---------------------------------------------------------------------------
+# CMD_SYNC_NEXT_MESSAGE and _build_message_frame variants
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cmd_sync_next_message_empty_queue():
+    bridge = Mock()
+    bridge.sync_next_message = Mock(return_value=None)
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_sync_next_message(b"")
+    assert frames == [bytes([RESP_CODE_NO_MORE_MESSAGES])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_sync_next_message_returns_bridge_message():
+    msg = QueuedMessage(
+        sender_key=bytes([0x42]) + bytes(31), txt_type=0, timestamp=1_650_000_000, text="hi"
+    )
+    bridge = Mock()
+    bridge.sync_next_message = Mock(return_value=msg)
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_sync_next_message(b"")
+    assert frames == [server._build_message_frame(msg)]
+
+
+@pytest.mark.asyncio
+async def test_cmd_sync_next_message_falls_back_to_persistence():
+    msg = QueuedMessage(sender_key=bytes(32), timestamp=5, text="persisted")
+    bridge = Mock()
+    bridge.sync_next_message = Mock(return_value=None)
+    server, frames = _make_capture_server(bridge)
+    server._sync_next_from_persistence = lambda: msg
+    await server._cmd_sync_next_message(b"")
+    assert frames == [server._build_message_frame(msg)]
+
+
+def test_build_message_frame_contact_v1_and_v3():
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    msg = QueuedMessage(
+        sender_key=bytes([0xAA] * 32),
+        txt_type=2,
+        timestamp=1_650_000_000,
+        text="hey",
+        path_len=3,
+        snr=2.0,
+    )
+    server._app_target_ver = 0
+    frame = server._build_message_frame(msg)
+    assert frame == (
+        bytes([RESP_CODE_CONTACT_MSG_RECV])
+        + bytes([0xAA] * 6)
+        + bytes([3, 2])
+        + struct.pack("<I", 1_650_000_000)
+        + b"hey"
+    )
+
+    server._app_target_ver = 3
+    frame_v3 = server._build_message_frame(msg)
+    assert frame_v3[0] == RESP_CODE_CONTACT_MSG_RECV_V3
+    assert frame_v3[1] == 8  # snr * 4
+    assert frame_v3[4:10] == bytes([0xAA] * 6)
+    assert frame_v3.endswith(b"hey")
+
+
+def test_build_message_frame_channel_v1_and_v3():
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    msg = QueuedMessage(
+        sender_key=b"",
+        timestamp=7,
+        text="ch",
+        is_channel=True,
+        channel_idx=2,
+        path_len=1,
+    )
+    server._app_target_ver = 0
+    frame = server._build_message_frame(msg)
+    assert frame == (bytes([RESP_CODE_CHANNEL_MSG_RECV, 2, 1, 0]) + struct.pack("<I", 7) + b"ch")
+
+    server._app_target_ver = 3
+    frame_v3 = server._build_message_frame(msg)
+    assert frame_v3[0] == RESP_CODE_CHANNEL_MSG_RECV_V3
+    assert frame_v3[4] == 2  # channel_idx
+    assert frame_v3[5] == 1  # path_len
+    assert frame_v3.endswith(b"ch")
+
+
+# ---------------------------------------------------------------------------
+# CMD_GET_CHANNEL / CMD_SET_CHANNEL
+# ---------------------------------------------------------------------------
+
+
+def _channel_bridge(channels: dict, max_channels: int = 4):
+    bridge = Mock()
+    bridge.channels = Mock(max_channels=max_channels)
+    bridge.get_channel = Mock(side_effect=channels.get)
+    bridge.set_channel = Mock(return_value=True)
+    return bridge
+
+
+@pytest.mark.asyncio
+async def test_cmd_get_channel_single():
+    bridge = _channel_bridge({1: Channel(name="general", secret=b"\x01" * 16)})
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_get_channel(bytes([1]))
+    (frame,) = frames
+    assert frame[0] == RESP_CODE_CHANNEL_INFO
+    assert frame[1] == 1
+    assert frame[2:34].rstrip(b"\x00") == b"general"
+    assert frame[34:50] == b"\x01" * 16
+
+
+@pytest.mark.asyncio
+async def test_cmd_get_channel_full_list_and_out_of_range():
+    bridge = _channel_bridge({0: Channel(name="a", secret=bytes(16))})
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_get_channel(b"")
+    assert len(frames) == 4  # one frame per slot, empty slots zero-filled
+    assert all(f[0] == RESP_CODE_CHANNEL_INFO for f in frames)
+
+    frames.clear()
+    await server._cmd_get_channel(bytes([200]))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_NOT_FOUND])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_channel_secret_encodings():
+    bridge = _channel_bridge({})
+    server, frames = _make_capture_server(bridge)
+    server._save_channels = AsyncMock()
+
+    # 16-byte raw secret
+    await server._cmd_set_channel(bytes([2]) + b"general".ljust(32, b"\x00") + b"\x05" * 16)
+    assert frames == [bytes([RESP_CODE_OK])]
+    bridge.set_channel.assert_called_with(2, "general", b"\x05" * 16)
+    server._save_channels.assert_awaited_once()
+
+    # 64-char hex secret
+    secret = bytes(range(32))
+    frames.clear()
+    await server._cmd_set_channel(
+        bytes([0]) + b"hex".ljust(32, b"\x00") + secret.hex().encode("ascii")
+    )
+    assert frames == [bytes([RESP_CODE_OK])]
+    bridge.set_channel.assert_called_with(0, "hex", secret)
+
+    # Too short
+    frames.clear()
+    await server._cmd_set_channel(bytes([0]) + b"x" * 8)
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+
+
+# ---------------------------------------------------------------------------
+# CMD_GET_STATS
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cmd_get_stats_packets_layout_and_invalid_type():
+    bridge = Mock()
+    bridge.get_stats = Mock(return_value={})
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_get_stats(bytes([STATS_TYPE_PACKETS]))
+    (frame,) = frames
+    assert frame[0] == RESP_CODE_STATS
+    assert frame[1] == STATS_TYPE_PACKETS
+    assert len(frame) == 2 + 7 * 4
+
+    frames.clear()
+    await server._cmd_get_stats(bytes([9]))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_get_stats_uses_stats_getter():
+    async def getter(stats_type):
+        return {"recv": 5, "sent": 6}
+
+    server, frames = _make_capture_server(Mock(), stats_getter=getter)
+    await server._cmd_get_stats(bytes([STATS_TYPE_PACKETS]))
+    recv, sent = struct.unpack_from("<II", frames[0], 2)
+    assert (recv, sent) == (5, 6)
+
+
+# ---------------------------------------------------------------------------
+# _enqueue_frame framing rules
+# ---------------------------------------------------------------------------
+
+
+def test_enqueue_frame_header_format():
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=8)
+    server._enqueue_frame(b"\x01\x02\x03")
+    raw = server._write_queue.get_nowait()
+    assert raw == bytes([FRAME_OUTBOUND_PREFIX]) + struct.pack("<H", 3) + b"\x01\x02\x03"
+
+
+def test_enqueue_frame_truncates_oversize_payload():
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=8)
+    server._enqueue_frame(bytes(MAX_PAYLOAD_SIZE + 50))
+    raw = server._write_queue.get_nowait()
+    assert struct.unpack("<H", raw[1:3])[0] == MAX_PAYLOAD_SIZE
+
+
+def test_enqueue_frame_no_queue_and_queue_full_are_safe():
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    server._write_queue = None
+    server._enqueue_frame(b"\x01")  # must not raise
+
+    server._write_queue = asyncio.Queue(maxsize=1)
+    server._enqueue_frame(b"\x01")
+    server._enqueue_frame(b"\x02")  # dropped, must not raise
+    assert server._write_queue.qsize() == 1
+
+
+# ---------------------------------------------------------------------------
+# Simple device commands
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_device_time():
+    bridge = Mock()
+    bridge.set_time = Mock(return_value=True)
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_set_device_time(struct.pack("<I", 1_700_000_123))
+    assert frames == [bytes([RESP_CODE_OK])]
+    bridge.set_time.assert_called_once_with(1_700_000_123)
+
+    frames.clear()
+    await server._cmd_set_device_time(b"\x01")  # too short
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_advert_name_strips_nulls():
+    bridge = Mock()
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_set_advert_name(b"NewName\x00")
+    assert frames == [bytes([RESP_CODE_OK])]
+    bridge.set_advert_name.assert_called_once_with("NewName")
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_self_advert_flood_flag():
+    bridge = Mock()
+    bridge.advertise = AsyncMock(return_value=True)
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_send_self_advert(bytes([1]))
+    assert frames == [bytes([RESP_CODE_OK])]
+    bridge.advertise.assert_awaited_once_with(flood=True)
+
+    bridge.advertise.reset_mock()
+    frames.clear()
+    await server._cmd_send_self_advert(b"")
+    bridge.advertise.assert_awaited_once_with(flood=False)
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_radio_params_validates_ranges():
+    bridge = Mock()
+    server, frames = _make_capture_server(bridge)
+
+    bad_freq = struct.pack("<II", 50, 250_000) + bytes([10, 5])
+    await server._cmd_set_radio_params(bad_freq)
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+    bridge.set_radio_params.assert_not_called()
+
+    frames.clear()
+    good = struct.pack("<II", 915_000, 250_000) + bytes([10, 5])
+    await server._cmd_set_radio_params(good)
+    assert frames == [bytes([RESP_CODE_OK])]
+    bridge.set_radio_params.assert_called_once_with(915_000_000, 250_000, 10, 5)
