@@ -29,6 +29,7 @@ from ..protocol.constants import (
     TELEM_PERM_LOCATION,
 )
 from ..protocol.packet_utils import PathUtils
+from .binary_parsing import decode_exported_contact
 from .constants import (
     ADV_TYPE_CHAT,
     ADV_TYPE_NONE,
@@ -144,9 +145,41 @@ from .constants import (
     STATS_TYPE_RADIO,
     TXT_TYPE_CLI_DATA,
 )
-from .models import Contact, QueuedMessage
+from .models import Contact, QueuedMessage, SentResult
 
 logger = logging.getLogger("CompanionFrameServer")
+
+
+def _encode_contact_fields(contact: Contact) -> bytes:
+    """Encode the contact body shared by RESP_CODE_CONTACT and
+    PUSH_CODE_NEW_ADVERT frames: pubkey(32) + adv_type + flags + out_path_len
+    + out_path(64) + name(32) + last_advert(4) + lat(4) + lon(4) + lastmod(4).
+    """
+    pubkey_b = contact.public_key
+    if isinstance(pubkey_b, str):
+        pubkey_b = bytes.fromhex(pubkey_b)
+    if isinstance(pubkey_b, bytes):
+        pubkey_b = pubkey_b[:PUB_KEY_SIZE].ljust(PUB_KEY_SIZE, b"\x00")
+    else:
+        pubkey_b = b"\x00" * PUB_KEY_SIZE
+    op = contact.out_path if isinstance(contact.out_path, bytes) else bytes(contact.out_path or [])
+    op = op[:MAX_PATH_SIZE].ljust(MAX_PATH_SIZE, b"\x00")
+    nb = (
+        contact.name.encode("utf-8", errors="replace")
+        if isinstance(contact.name, str)
+        else (contact.name if isinstance(contact.name, bytes) else b"")
+    )[:CONTACT_NAME_SIZE].ljust(CONTACT_NAME_SIZE, b"\x00")
+    opl_byte = OUT_PATH_UNKNOWN if contact.out_path_len < 0 else min(contact.out_path_len, 255)
+    return (
+        pubkey_b
+        + bytes([contact.adv_type, contact.flags, opl_byte])
+        + op
+        + nb
+        + struct.pack("<I", contact.last_advert_timestamp)
+        + struct.pack("<i", int(contact.gps_lat * 1e6))
+        + struct.pack("<i", int(contact.gps_lon * 1e6))
+        + struct.pack("<I", contact.lastmod)
+    )
 
 
 def _build_advert_push_frames(contact: Contact) -> tuple[bytes, Optional[bytes]]:
@@ -160,25 +193,7 @@ def _build_advert_push_frames(contact: Contact) -> tuple[bytes, Optional[bytes]]
     short = bytes([PUSH_CODE_ADVERT]) + pubkey_b
     if not contact.name:
         return (short, None)
-    op = contact.out_path if isinstance(contact.out_path, bytes) else bytes(contact.out_path or [])
-    op = op[:MAX_PATH_SIZE].ljust(MAX_PATH_SIZE, b"\x00")
-    nb = (
-        contact.name.encode("utf-8", errors="replace")
-        if isinstance(contact.name, str)
-        else (contact.name if isinstance(contact.name, bytes) else b"")
-    )[:CONTACT_NAME_SIZE].ljust(CONTACT_NAME_SIZE, b"\x00")
-    opl_byte = OUT_PATH_UNKNOWN if contact.out_path_len < 0 else min(contact.out_path_len, 255)
-    full = (
-        bytes([PUSH_CODE_NEW_ADVERT])
-        + pubkey_b
-        + bytes([contact.adv_type, contact.flags, opl_byte])
-        + op
-        + nb
-        + struct.pack("<I", contact.last_advert_timestamp)
-        + struct.pack("<i", int(contact.gps_lat * 1e6))
-        + struct.pack("<i", int(contact.gps_lon * 1e6))
-        + struct.pack("<I", contact.lastmod)
-    )
+    full = bytes([PUSH_CODE_NEW_ADVERT]) + _encode_contact_fields(contact)
     return (short, full)
 
 
@@ -768,6 +783,18 @@ class CompanionFrameServer:
     def _write_err(self, err_code: int) -> None:
         self._write_frame(bytes([RESP_CODE_ERR, err_code]))
 
+    def _write_sent_response(self, is_flood: bool, tag: int, timeout_ms: int) -> None:
+        """Write a RESP_CODE_SENT frame: [code][flood][tag u32][timeout_ms u32]."""
+        self._write_frame(
+            bytes([RESP_CODE_SENT, 1 if is_flood else 0]) + struct.pack("<II", tag, timeout_ms)
+        )
+
+    def _write_sent_result(self, result: SentResult, *, default_timeout_ms: int = 10000) -> None:
+        """Write RESP_CODE_SENT from a SentResult, defaulting a missing tag/timeout."""
+        tag = result.expected_ack if result.expected_ack is not None else 0
+        timeout_ms = result.timeout_ms if result.timeout_ms is not None else default_timeout_ms
+        self._write_sent_response(result.is_flood, tag, timeout_ms)
+
     # -------------------------------------------------------------------------
     # Writer task
     # -------------------------------------------------------------------------
@@ -1116,23 +1143,7 @@ class CompanionFrameServer:
 
     def _write_contact_frame(self, c: Contact) -> None:
         """Encode and write a single RESP_CODE_CONTACT frame."""
-        pubkey = c.public_key if isinstance(c.public_key, bytes) else bytes.fromhex(c.public_key)
-        name = (
-            c.name.encode("utf-8")[:CONTACT_NAME_SIZE]
-            if isinstance(c.name, str)
-            else c.name[:CONTACT_NAME_SIZE]
-        ).ljust(CONTACT_NAME_SIZE, b"\x00")
-        opl_byte = OUT_PATH_UNKNOWN if c.out_path_len < 0 else min(c.out_path_len, 255)
-        frame = (
-            bytes([RESP_CODE_CONTACT, *pubkey, c.adv_type, c.flags, opl_byte])
-            + (c.out_path[:MAX_PATH_SIZE] if c.out_path else b"").ljust(MAX_PATH_SIZE, b"\x00")
-            + name
-            + struct.pack("<I", c.last_advert_timestamp)
-            + struct.pack("<i", int(c.gps_lat * 1e6))
-            + struct.pack("<i", int(c.gps_lon * 1e6))
-            + struct.pack("<I", c.lastmod)
-        )
-        self._write_frame(frame)
+        self._write_frame(bytes([RESP_CODE_CONTACT]) + _encode_contact_fields(c))
 
     async def _cmd_get_contact_by_key(self, data: bytes) -> None:
         if len(data) < PUB_KEY_SIZE:
@@ -1169,13 +1180,8 @@ class CompanionFrameServer:
         if not contact:
             self._write_err(ERR_CODE_NOT_FOUND)
             return
-        pubkey = (
-            contact.public_key
-            if isinstance(contact.public_key, bytes)
-            else bytes.fromhex(contact.public_key)
-        )
         result = await self.bridge.send_text_message(
-            pubkey,
+            contact.public_key_bytes,
             text,
             txt_type=txt_type,
             attempt=attempt,
@@ -1183,12 +1189,7 @@ class CompanionFrameServer:
             timestamp=use_timestamp,
         )
         if result.success:
-            ack = result.expected_ack or 0
-            timeout = result.timeout_ms or 5000
-            frame = bytes([RESP_CODE_SENT, 1 if result.is_flood else 0]) + struct.pack(
-                "<II", ack, timeout
-            )
-            self._write_frame(frame)
+            self._write_sent_result(result, default_timeout_ms=5000)
         else:
             self._write_err(ERR_CODE_BAD_STATE)
 
@@ -1273,12 +1274,7 @@ class CompanionFrameServer:
         if not result.success:
             self._write_err(ERR_CODE_NOT_FOUND)
             return
-        tag = result.expected_ack if result.expected_ack is not None else 0
-        timeout_ms = result.timeout_ms if result.timeout_ms is not None else 10000
-        frame = bytes([RESP_CODE_SENT, 1 if result.is_flood else 0]) + struct.pack(
-            "<II", tag, timeout_ms
-        )
-        self._write_frame(frame)
+        self._write_sent_result(result)
 
     async def _cmd_send_anon_req(self, data: bytes) -> None:
         if len(data) < PUB_KEY_SIZE + 1:
@@ -1301,12 +1297,7 @@ class CompanionFrameServer:
             # transient contact" and "send failed" map to ERR_CODE_TABLE_FULL.
             self._write_err(ERR_CODE_TABLE_FULL)
             return
-        tag = result.expected_ack if result.expected_ack is not None else 0
-        timeout_ms = result.timeout_ms if result.timeout_ms is not None else 10000
-        frame = bytes([RESP_CODE_SENT, 1 if result.is_flood else 0]) + struct.pack(
-            "<II", tag, timeout_ms
-        )
-        self._write_frame(frame)
+        self._write_sent_result(result)
 
     async def _cmd_send_control_data(self, data: bytes) -> None:
         if len(data) < 2:
@@ -1356,12 +1347,7 @@ class CompanionFrameServer:
         if not result.success:
             self._write_err(ERR_CODE_NOT_FOUND)
             return
-        tag = result.expected_ack if result.expected_ack is not None else 0
-        timeout_ms = result.timeout_ms if result.timeout_ms is not None else 10000
-        frame = bytes([RESP_CODE_SENT, 1 if result.is_flood else 0]) + struct.pack(
-            "<II", tag, timeout_ms
-        )
-        self._write_frame(frame)
+        self._write_sent_result(result)
 
     async def _cmd_send_trace_path(self, data: bytes) -> None:
         if len(data) < 10:
@@ -1390,8 +1376,7 @@ class CompanionFrameServer:
             self._write_err(ERR_CODE_TABLE_FULL)
             return
         est_timeout_ms = 5000 + (path_len * 200)
-        frame = bytes([RESP_CODE_SENT, 0]) + struct.pack("<II", tag, est_timeout_ms)
-        self._write_frame(frame)
+        self._write_sent_response(False, tag, est_timeout_ms)
         # If we are the final hop, push trace data immediately
         if path_bytes and self.local_hash is not None and path_bytes[-1] == self.local_hash:
             snr_len = path_len // hash_width
@@ -1502,7 +1487,7 @@ class CompanionFrameServer:
             if len(data) > PUB_KEY_SIZE
             else ""
         )
-        self._write_frame(bytes([RESP_CODE_SENT, 1]) + struct.pack("<II", 0, 10000))
+        self._write_sent_response(True, 0, 10000)
         result = await self.bridge.send_login(pubkey, password)
         if result.get("success"):
             # Layout matches MeshCore companion_radio onContactResponse
@@ -1529,7 +1514,7 @@ class CompanionFrameServer:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         pubkey = data[0:PUB_KEY_SIZE]
-        self._write_frame(bytes([RESP_CODE_SENT, 0]) + struct.pack("<II", 0, 15000))
+        self._write_sent_response(False, 0, 15000)
         result = await self.bridge.send_status_request(pubkey)
         if not result.get("success"):
             logger.debug("Status request failed for %s; no push sent)", pubkey[:6].hex())
@@ -1556,7 +1541,7 @@ class CompanionFrameServer:
         want_base = bool(flags & TELEM_PERM_BASE)
         want_location = bool(flags & TELEM_PERM_LOCATION)
         want_environment = bool(flags & TELEM_PERM_ENVIRONMENT)
-        self._write_frame(bytes([RESP_CODE_SENT, 0]) + struct.pack("<II", 0, 15000))
+        self._write_sent_response(False, 0, 15000)
         result = await self.bridge.send_telemetry_request(
             pubkey,
             want_base=want_base,
@@ -1948,9 +1933,13 @@ class CompanionFrameServer:
             if raw is None:
                 self._write_err(ERR_CODE_NOT_FOUND)
                 return
-            pubkey = raw[:PUB_KEY_SIZE]
-            name_raw = raw[33:65].split(b"\x00")[0]
-            lat, lon = struct.unpack_from("<ii", raw, 65)
+            parsed = decode_exported_contact(raw)
+            if parsed is None:
+                self._write_err(ERR_CODE_NOT_FOUND)
+                return
+            pubkey = parsed["public_key"]
+            name_raw = parsed["name_raw"]
+            lat, lon = parsed["lat_microdeg"], parsed["lon_microdeg"]
             flags = ADVERT_FLAG_IS_CHAT_NODE
             loc_bytes = b""
             if lat != 0 or lon != 0:

@@ -44,6 +44,7 @@ from ..protocol.constants import (
 from ..protocol.crypto import CryptoUtils
 from ..protocol.packet_utils import PathUtils
 from ..protocol.transport_keys import calc_transport_code, get_auto_key_for
+from .binary_parsing import decode_exported_contact, encode_exported_contact
 from .channel_store import ChannelStore
 from .constants import (
     ADV_TYPE_CHAT,
@@ -165,6 +166,32 @@ class _CompanionEventSubscriber(EventSubscriber):
         await self._companion._handle_mesh_event(event_type, data)
 
 
+class _SeenCache:
+    """TTL- and size-bounded set of recently seen packet hashes for dedup."""
+
+    def __init__(self, ttl: float = 300.0, max_size: int = 1000):
+        self._entries: OrderedDict[str, float] = OrderedDict()
+        self._ttl = ttl
+        self._max_size = max_size
+
+    def check_and_add(self, key: str) -> bool:
+        """Return True if *key* is a duplicate; otherwise record it.
+
+        Expired entries are evicted on each call, and the oldest entry is
+        dropped once the cache exceeds ``max_size``.
+        """
+        now = time.time()
+        if key in self._entries:
+            return True
+        expired = [k for k, ts in self._entries.items() if now - ts > self._ttl]
+        for k in expired:
+            del self._entries[k]
+        self._entries[key] = now
+        if len(self._entries) > self._max_size:
+            self._entries.popitem(last=False)
+        return False
+
+
 def adv_type_to_flags(adv_type: int) -> int:
     """Convert ADV_TYPE_* constant to advertisement flags byte."""
     if adv_type == ADV_TYPE_CHAT:
@@ -210,9 +237,7 @@ class CompanionBase(ABC):
         self.prefs = NodePrefs(
             node_name=node_name,
             adv_type=adv_type,
-            tx_power_dbm=self._radio_config.get(
-                "power", self._radio_config.get("tx_power", 20)
-            ),
+            tx_power_dbm=self._radio_config.get("power", self._radio_config.get("tx_power", 20)),
             frequency_hz=self._radio_config.get("frequency", 915000000),
             bandwidth_hz=self._radio_config.get("bandwidth", 250000),
             spreading_factor=self._radio_config.get("spreading_factor", 10),
@@ -231,9 +256,7 @@ class CompanionBase(ABC):
         self._event_subscriber = _CompanionEventSubscriber(self)
         self._event_service.subscribe_all(self._event_subscriber)
 
-        self._push_callbacks: dict[str, list[Callable]] = {
-            k: [] for k in PUSH_CALLBACK_KEYS
-        }
+        self._push_callbacks: dict[str, list[Callable]] = {k: [] for k in PUSH_CALLBACK_KEYS}
 
         # Pending binary requests by tag (hex) for matching responses
         self._pending_binary_requests: dict[str, dict] = {}
@@ -242,19 +265,12 @@ class CompanionBase(ABC):
         # Pending ACK CRCs for send_confirmed (Bridge and Radio)
         self._pending_ack_crcs: set[int] = set()
 
-        # GRP_TXT dedup by packet hash: match Mesh.cpp (!_tables->hasSeen(pkt));
-        # companion queues one frame per logical message like the firmware.
-        self._seen_grp_txt: OrderedDict[str, float] = OrderedDict()
-        self._seen_grp_txt_ttl = 300
-        self._seen_grp_txt_max = 1000
-        # TXT_MSG (direct) dedup by packet hash so reconnects don't re-queue same packet.
-        self._seen_txt: OrderedDict[str, float] = OrderedDict()
-        self._seen_txt_ttl = 300
-        self._seen_txt_max = 1000
-        # GRP_DATA dedup by packet hash so sync_next_message only returns one entry per packet.
-        self._seen_grp_data: OrderedDict[str, float] = OrderedDict()
-        self._seen_grp_data_ttl = 300
-        self._seen_grp_data_max = 1000
+        # Per-payload-type dedup caches keyed by packet hash, matching Mesh.cpp
+        # (!_tables->hasSeen(pkt)): the companion queues one frame per logical
+        # message and reconnects don't re-queue the same packet.
+        self._seen_grp_txt = _SeenCache()
+        self._seen_txt = _SeenCache()
+        self._seen_grp_data = _SeenCache()
 
         # Allow subclasses to restore persisted preferences on startup.
         self._load_prefs()
@@ -300,9 +316,7 @@ class CompanionBase(ABC):
         requests are excluded — they are never synced to the app, mirroring the
         firmware contacts iterator in MyMesh::checkSerialInterface.
         """
-        return [
-            c for c in self.contacts.get_all(since=since) if c.adv_type != ADV_TYPE_NONE
-        ]
+        return [c for c in self.contacts.get_all(since=since) if c.adv_type != ADV_TYPE_NONE]
 
     def get_contact_by_key(self, pub_key: bytes) -> Optional[Contact]:
         """Look up a contact by its full 32-byte public key."""
@@ -312,7 +326,7 @@ class CompanionBase(ABC):
         """Look up a contact by name, returning the full Contact or None."""
         proxy = self.contacts.get_by_name(name)
         if proxy:
-            return self.contacts.get_by_key(bytes.fromhex(proxy.public_key))
+            return self.contacts.get_by_key(proxy.public_key_bytes)
         return None
 
     def add_update_contact(self, contact: Contact) -> bool:
@@ -328,52 +342,37 @@ class CompanionBase(ABC):
     def export_contact(self, pub_key: Optional[bytes] = None) -> Optional[bytes]:
         """Export a contact (or self) as a 73-byte binary packet."""
         if pub_key is None:
-            key = self._identity.get_public_key()
-            name = self.prefs.node_name.encode("utf-8")[:32]
-            name = name + b"\x00" * (32 - len(name))
-            lat = int(self.prefs.latitude * 1e6)
-            lon = int(self.prefs.longitude * 1e6)
-            return struct.pack(
-                "<32sB32sii",
-                key,
+            return encode_exported_contact(
+                self._identity.get_public_key(),
                 self.prefs.adv_type,
-                name,
-                lat,
-                lon,
+                self.prefs.node_name,
+                self.prefs.latitude,
+                self.prefs.longitude,
             )
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
             return None
-        name = contact.name.encode("utf-8")[:32]
-        name = name + b"\x00" * (32 - len(name))
-        lat = int(contact.gps_lat * 1e6)
-        lon = int(contact.gps_lon * 1e6)
-        return struct.pack(
-            "<32sB32sii",
+        return encode_exported_contact(
             contact.public_key,
             contact.adv_type,
-            name,
-            lat,
-            lon,
+            contact.name,
+            contact.gps_lat,
+            contact.gps_lon,
         )
 
     def import_contact(self, packet_data: bytes) -> bool:
         """Import a contact from a 73-byte binary packet."""
-        if len(packet_data) < 73:
+        parsed = decode_exported_contact(packet_data)
+        if parsed is None:
             logger.warning(f"Import data too short: {len(packet_data)} bytes")
             return False
         try:
-            pub_key = packet_data[:32]
-            adv_type = packet_data[32]
-            name_raw = packet_data[33:65]
-            lat, lon = struct.unpack_from("<ii", packet_data, 65)
-            name = name_raw.split(b"\x00")[0].decode("utf-8", errors="replace")
             contact = Contact(
-                public_key=pub_key,
-                name=name,
-                adv_type=adv_type,
-                gps_lat=lat / 1e6,
-                gps_lon=lon / 1e6,
+                public_key=parsed["public_key"],
+                name=parsed["name"],
+                adv_type=parsed["adv_type"],
+                gps_lat=parsed["gps_lat"],
+                gps_lon=parsed["gps_lon"],
                 lastmod=int(time.time()),
             )
             return self.contacts.add(contact)
@@ -864,9 +863,7 @@ class CompanionBase(ABC):
     def on_contact_path_updated(self, callback: Callable) -> None:
         self._push_callbacks["contact_path_updated"].append(callback)
 
-    async def _on_contact_path_updated(
-        self, pub: bytes, path_len: int, path_bytes: bytes
-    ) -> None:
+    async def _on_contact_path_updated(self, pub: bytes, path_len: int, path_bytes: bytes) -> None:
         """Called by ProtocolResponseHandler when contact's out_path is updated from a PATH packet.
 
         Matches companion firmware behaviour: PATH updates are only applied
@@ -961,9 +958,7 @@ class CompanionBase(ABC):
         """Remove expired entries from _pending_binary_requests."""
         now = time.time()
         expired = [
-            tag
-            for tag, info in self._pending_binary_requests.items()
-            if now > info["expires_at"]
+            tag for tag, info in self._pending_binary_requests.items() if now > info["expires_at"]
         ]
         for tag in expired:
             del self._pending_binary_requests[tag]
@@ -1019,9 +1014,7 @@ class CompanionBase(ABC):
             "binary_response", tag_bytes, response_data, parsed, request_type
         )
 
-    async def _try_handle_path_discovery(
-        self, tag_bytes: bytes, path_info: tuple
-    ) -> bool:
+    async def _try_handle_path_discovery(self, tag_bytes: bytes, path_info: tuple) -> bool:
         """If tag is pending path discovery, fire path_discovery_response and return True."""
         out_path, in_path, contact_pubkey = path_info
         tag_int = int.from_bytes(tag_bytes, "little")
@@ -1334,9 +1327,7 @@ class CompanionBase(ABC):
         tag_int = random.randint(0, 0xFFFFFFFF)
         tag_bytes = tag_int.to_bytes(4, "little")
         inv_perm = 0xFF & ~TELEM_PERM_BASE
-        req_payload = tag_bytes + bytes(
-            [REQ_TYPE_GET_TELEMETRY_DATA, inv_perm, 0, 0, 0]
-        )
+        req_payload = tag_bytes + bytes([REQ_TYPE_GET_TELEMETRY_DATA, inv_perm, 0, 0, 0])
         old_path_len = contact.out_path_len
         old_path = contact.out_path
         contact.out_path_len = -1
@@ -1658,9 +1649,7 @@ class CompanionBase(ABC):
         try:
             if data and len(data) <= 254 and (data[0] & 0x80) != 0:
                 pkt = Packet()
-                pkt.header = PacketBuilder._create_header(
-                    PAYLOAD_TYPE_CONTROL, route_type="direct"
-                )
+                pkt.header = PacketBuilder._create_header(PAYLOAD_TYPE_CONTROL, route_type="direct")
                 pkt.path_len = 0
                 pkt.path = bytearray()
                 pkt.payload = bytearray(data)
@@ -1693,7 +1682,7 @@ class CompanionBase(ABC):
         login_handler = self._get_login_response_handler()
         if not login_handler:
             return {"success": False, "reason": "Login handler not available"}
-        dest_hash = bytes.fromhex(proxy.public_key)[0]
+        dest_hash = proxy.dest_hash
         login_handler.store_login_password(dest_hash, password)
         login_result: dict = {"success": False, "data": {}}
         login_event = asyncio.Event()
@@ -1751,9 +1740,7 @@ class CompanionBase(ABC):
                 "tag": data.get("timestamp", 0),
                 "acl_permissions": data.get("reserved", data.get("permissions", 0)),
                 "firmware_ver_level": data.get("firmware_ver_level"),
-                "reason": "Login successful"
-                if login_result["success"]
-                else "Login failed",
+                "reason": "Login successful" if login_result["success"] else "Login failed",
             }
         except Exception as e:
             logger.error(f"Login error: {e}")
@@ -1830,7 +1817,7 @@ class CompanionBase(ABC):
         proto_handler = self._get_protocol_response_handler()
         if not proto_handler:
             return {"success": False, "reason": "Protocol handler not available"}
-        contact_hash = bytes.fromhex(proxy.public_key)[0]
+        contact_hash = proxy.dest_hash
         waiter = ResponseWaiter()
         proto_handler.set_response_callback(contact_hash, waiter.callback)
         try:
@@ -1873,9 +1860,7 @@ class CompanionBase(ABC):
                 "repeater": contact.name,
                 "stats": result.get("parsed", {}),
                 "response_text": result.get("text"),
-                "reason": "Stats received"
-                if result.get("success")
-                else "Stats request failed",
+                "reason": "Stats received" if result.get("success") else "Stats request failed",
             }
         except Exception as e:
             logger.error(f"Status request error: {e}")
@@ -1904,7 +1889,7 @@ class CompanionBase(ABC):
         proto_handler = self._get_protocol_response_handler()
         if not proto_handler:
             return {"success": False, "reason": "Protocol handler not available"}
-        contact_hash = bytes.fromhex(proxy.public_key)[0]
+        contact_hash = proxy.dest_hash
         waiter = ResponseWaiter()
         proto_handler.set_response_callback(contact_hash, waiter.callback)
         try:
@@ -1938,11 +1923,7 @@ class CompanionBase(ABC):
                 "contact": contact.name,
                 "telemetry_data": telemetry_data,
                 "response_text": result.get("text"),
-                "reason": (
-                    "Telemetry received"
-                    if result.get("success")
-                    else "Telemetry failed"
-                ),
+                "reason": ("Telemetry received" if result.get("success") else "Telemetry failed"),
             }
         except Exception as e:
             logger.error(f"Telemetry error: {e}")
@@ -1955,17 +1936,13 @@ class CompanionBase(ABC):
 
         Prefer ``send_binary_req`` + ``on_binary_response``.
         """
-        return await self._send_protocol_request(
-            pub_key, PROTOCOL_CODE_BINARY_REQ, data
-        )
+        return await self._send_protocol_request(pub_key, PROTOCOL_CODE_BINARY_REQ, data)
 
     async def send_anon_request(self, pub_key: bytes, data: bytes) -> dict:
         """Send an anonymous request to a contact and wait for the response."""
         return await self._send_protocol_request(pub_key, PROTOCOL_CODE_ANON_REQ, data)
 
-    async def _send_protocol_request(
-        self, pub_key: bytes, protocol_code: int, data: bytes
-    ) -> dict:
+    async def _send_protocol_request(self, pub_key: bytes, protocol_code: int, data: bytes) -> dict:
         """Build and send a protocol request, waiting for the response."""
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
@@ -1979,7 +1956,7 @@ class CompanionBase(ABC):
         proto_handler = self._get_protocol_response_handler()
         if not proto_handler:
             return {"success": False, "reason": "Protocol handler not available"}
-        contact_hash = bytes.fromhex(proxy.public_key)[0]
+        contact_hash = proxy.dest_hash
         waiter = ResponseWaiter()
         proto_handler.set_response_callback(contact_hash, waiter.callback)
         try:
@@ -2058,9 +2035,7 @@ class CompanionBase(ABC):
                 "repeater": contact.name,
                 "command": command,
                 "response": response_data["text"],
-                "reason": (
-                    "Command successful" if response_data["success"] else "No response"
-                ),
+                "reason": ("Command successful" if response_data["success"] else "No response"),
             }
         except Exception as e:
             logger.error(f"Repeater command error: {e}")
@@ -2084,25 +2059,6 @@ class CompanionBase(ABC):
     def sync_next_message(self) -> Optional[QueuedMessage]:
         """Pop and return the next queued message, or None."""
         return self.message_queue.pop()
-
-    # -------------------------------------------------------------------------
-    # Dedup Helper
-    # -------------------------------------------------------------------------
-
-    def _check_dedup(
-        self, cache: OrderedDict, key: str, ttl: float, max_size: int
-    ) -> bool:
-        """Return True if *key* is a duplicate. Evicts expired entries."""
-        now = time.time()
-        if key in cache:
-            return True
-        expired = [k for k, ts in cache.items() if now - ts > ttl]
-        for k in expired:
-            del cache[k]
-        cache[key] = now
-        if len(cache) > max_size:
-            cache.popitem(last=False)
-        return False
 
     # -------------------------------------------------------------------------
     # Event Handling (shared)
@@ -2154,17 +2110,13 @@ class CompanionBase(ABC):
     async def _handle_new_message(self, data: dict) -> None:
         # Deduplicate by packet hash so reconnects don't queue the same packet multiple times.
         pkt_hash = data.get("packet_hash")
-        if pkt_hash and self._check_dedup(
-            self._seen_txt, pkt_hash, self._seen_txt_ttl, self._seen_txt_max
-        ):
+        if pkt_hash and self._seen_txt.check_and_add(pkt_hash):
             return
 
         sender_key_hex = data.get("contact_pubkey", "")
         sender_key = bytes.fromhex(sender_key_hex) if sender_key_hex else b""
         # Handler publishes "message_text"; accept "text" for compatibility
-        message_text = (data.get("message_text") or data.get("text") or "").rstrip(
-            "\x00"
-        )
+        message_text = (data.get("message_text") or data.get("text") or "").rstrip("\x00")
         # Extract SNR/RSSI from network info if available (same as channel path)
         network_info = data.get("network_info", {})
         snr = network_info.get("snr")
@@ -2199,9 +2151,7 @@ class CompanionBase(ABC):
         # Deduplicate by packet hash so we queue one frame per logical message, matching
         # firmware: Mesh.cpp only calls onChannelMessageRecv when !_tables->hasSeen(pkt).
         pkt_hash = data.get("packet_hash")
-        if pkt_hash and self._check_dedup(
-            self._seen_grp_txt, pkt_hash, self._seen_grp_txt_ttl, self._seen_grp_txt_max
-        ):
+        if pkt_hash and self._seen_grp_txt.check_and_add(pkt_hash):
             return
 
         path_len = data.get("path_len", 0)
@@ -2215,9 +2165,7 @@ class CompanionBase(ABC):
         # MeshCore client expects "SenderName: Message" format in text field; it parses to show
         # sender and message separately. Use full_content (not message_text) so client can split.
         # Strip trailing nulls so frame matches firmware (exact string length, no padding).
-        display_text = (
-            data.get("full_content", data.get("message_text", "")) or ""
-        ).rstrip("\x00")
+        display_text = (data.get("full_content", data.get("message_text", "")) or "").rstrip("\x00")
         # Extract SNR/RSSI from network info if available
         network_info = data.get("network_info", {})
         snr = network_info.get("snr")
@@ -2249,9 +2197,7 @@ class CompanionBase(ABC):
             rssi,
         )
 
-    def _get_channel_candidates_by_hash(
-        self, channel_hash: int
-    ) -> list[tuple[int, Channel]]:
+    def _get_channel_candidates_by_hash(self, channel_hash: int) -> list[tuple[int, Channel]]:
         """Return channel candidates that match the 1-byte channel hash."""
         matches: list[tuple[int, Channel]] = []
         max_channels = getattr(self.channels, "max_channels", 40)
@@ -2275,12 +2221,7 @@ class CompanionBase(ABC):
         if len(payload) < 4:
             return
         packet_hash = packet.calculate_packet_hash().hex().upper()
-        if self._check_dedup(
-            self._seen_grp_data,
-            packet_hash,
-            self._seen_grp_data_ttl,
-            self._seen_grp_data_max,
-        ):
+        if self._seen_grp_data.check_and_add(packet_hash):
             return
 
         channel_hash = payload[0]
@@ -2319,11 +2260,7 @@ class CompanionBase(ABC):
             if route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD)
             else 0xFF
         )
-        snr = (
-            packet.get_snr()
-            if hasattr(packet, "get_snr")
-            else getattr(packet, "_snr", 0.0)
-        )
+        snr = packet.get_snr() if hasattr(packet, "get_snr") else getattr(packet, "_snr", 0.0)
         rssi = packet.rssi if hasattr(packet, "rssi") else getattr(packet, "_rssi", 0)
         queued = QueuedMessage(
             sender_key=b"",

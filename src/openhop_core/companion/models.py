@@ -26,6 +26,17 @@ class Contact:
     # for CMD_SHARE_CONTACT replay (firmware blob).
     last_advert_packet: Optional[bytes] = None
 
+    @property
+    def public_key_bytes(self) -> bytes:
+        """Public key as raw bytes (tolerates hex-string storage)."""
+        pk = self.public_key
+        return pk if isinstance(pk, bytes) else bytes.fromhex(pk)
+
+    @property
+    def dest_hash(self) -> int:
+        """First public-key byte — the destination hash used on the wire."""
+        return self.public_key_bytes[0]
+
     @classmethod
     def from_dict(
         cls,
