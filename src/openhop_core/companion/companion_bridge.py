@@ -218,10 +218,10 @@ class CompanionBridge(CompanionBase):
                 await asyncio.sleep(delay_ms / 1000.0)
                 await self._packet_injector(pkt, wait_for_ack=False)
 
-            asyncio.create_task(_delayed_send())
+            self._spawn_background_task(_delayed_send(), "login delayed send")
 
         def _log(msg: str) -> None:
-            logger.debug(f"[CompanionBridge] {msg}")
+            logger.debug("[CompanionBridge] %s", msg)
 
         ack_handler = _BridgeAckHandler(self)
 
@@ -316,12 +316,12 @@ class CompanionBridge(CompanionBase):
             try:
                 await handler(packet)
             except Exception as e:
-                logger.error(f"Handler error for type {ptype:02X}: {e}")
+                logger.error("Handler error for type %02X: %s", ptype, e)
         elif ptype == PAYLOAD_TYPE_GRP_DATA:
             try:
                 await self._handle_group_data_packet(packet)
             except Exception as e:
-                logger.error(f"Group data handler error: {e}")
+                logger.error("Group data handler error: %s", e)
 
         # NOTE: PATH packets are already delivered to protocol_response_handler
         # via PathHandler.__call__ (path.py), which runs as the handler above.
@@ -344,8 +344,9 @@ class CompanionBridge(CompanionBase):
         self._running = True
         self._apply_multi_acks_pref()
         logger.info(
-            f"CompanionBridge started: name={self.prefs.node_name}, "
-            f"key={self._identity.get_public_key().hex()[:16]}..."
+            "CompanionBridge started: name=%s, key=%s...",
+            self.prefs.node_name,
+            self._identity.get_public_key().hex()[:16],
         )
 
     async def stop(self) -> None:
@@ -363,8 +364,8 @@ class CompanionBridge(CompanionBase):
     def import_private_key(self, key: bytes) -> bool:
         try:
             self._identity = LocalIdentity(seed=key)
-            logger.info(f"Imported new identity: {self._identity.get_public_key().hex()[:16]}...")
+            logger.info("Imported new identity: %s...", self._identity.get_public_key().hex()[:16])
             return True
         except Exception as e:
-            logger.error(f"Error importing private key: {e}")
+            logger.error("Error importing private key: %s", e)
             return False

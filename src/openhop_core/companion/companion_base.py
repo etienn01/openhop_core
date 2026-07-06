@@ -264,6 +264,8 @@ class CompanionBase(ABC):
         self._pending_discovery_tags: set[int] = set()
         # Pending ACK CRCs for send_confirmed (Bridge and Radio)
         self._pending_ack_crcs: set[int] = set()
+        # Fire-and-forget tasks kept alive until done (see _spawn_background_task)
+        self._background_tasks: set[asyncio.Task] = set()
 
         # Per-payload-type dedup caches keyed by packet hash, matching Mesh.cpp
         # (!_tables->hasSeen(pkt)): the companion queues one frame per logical
@@ -364,7 +366,7 @@ class CompanionBase(ABC):
         """Import a contact from a 73-byte binary packet."""
         parsed = decode_exported_contact(packet_data)
         if parsed is None:
-            logger.warning(f"Import data too short: {len(packet_data)} bytes")
+            logger.warning("Import data too short: %s bytes", len(packet_data))
             return False
         try:
             contact = Contact(
@@ -377,7 +379,7 @@ class CompanionBase(ABC):
             )
             return self.contacts.add(contact)
         except Exception as e:
-            logger.error(f"Error importing contact: {e}")
+            logger.error("Error importing contact: %s", e)
             return False
 
     # -------------------------------------------------------------------------
@@ -570,7 +572,7 @@ class CompanionBase(ABC):
         try:
             return self._identity.sign(bytes(self._sign_buffer))
         except Exception as e:
-            logger.error(f"Signing error: {e}")
+            logger.error("Signing error: %s", e)
             return None
         finally:
             self._sign_buffer = None
@@ -1009,7 +1011,7 @@ class CompanionBase(ABC):
                 context=context,
             )
         except Exception as e:
-            logger.debug(f"Binary response parse for type {request_type}: {e}")
+            logger.debug("Binary response parse for type %s: %s", request_type, e)
         await self._fire_callbacks(
             "binary_response", tag_bytes, response_data, parsed, request_type
         )
@@ -1143,7 +1145,7 @@ class CompanionBase(ABC):
             pkt.path = bytearray()
             return await self._send_packet(pkt, wait_for_ack=False)
         except Exception as e:
-            logger.error(f"Error sharing contact: {e}")
+            logger.error("Error sharing contact: %s", e)
             return False
 
     async def send_trace_path_raw(
@@ -1161,7 +1163,7 @@ class CompanionBase(ABC):
             self._apply_path_hash_mode(pkt)
             return await self._send_packet(pkt, wait_for_ack=False)
         except Exception as e:
-            logger.error(f"Error sending trace (raw path): {e}")
+            logger.error("Error sending trace (raw path): %s", e)
             return False
 
     async def send_binary_req(
@@ -1212,7 +1214,7 @@ class CompanionBase(ABC):
             self._apply_path_hash_mode(pkt)
             success = await self._send_packet(pkt, wait_for_ack=False)
         except Exception as e:
-            logger.error(f"Binary request send error: {e}")
+            logger.error("Binary request send error: %s", e)
             if "tag_hex" in locals():
                 self._pending_binary_requests.pop(tag_hex, None)
             return SentResult(success=False)
@@ -1288,7 +1290,7 @@ class CompanionBase(ABC):
             )
             success = await self._send_packet(pkt, wait_for_ack=False)
         except Exception as e:
-            logger.error(f"Anon request send error: {e}")
+            logger.error("Anon request send error: %s", e)
             if "tag_hex" in locals():
                 self._pending_binary_requests.pop(tag_hex, None)
             return SentResult(success=False)
@@ -1352,7 +1354,7 @@ class CompanionBase(ABC):
                 timeout_ms=DEFAULT_RESPONSE_TIMEOUT_MS,
             )
         except Exception as e:
-            logger.error(f"Error in path discovery: {e}")
+            logger.error("Error in path discovery: %s", e)
             return SentResult(success=False)
         finally:
             current = self.contacts.get_by_key(pub_key)
@@ -1380,7 +1382,7 @@ class CompanionBase(ABC):
         """
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
-            logger.warning(f"Contact not found for key {pub_key.hex()[:12]}...")
+            logger.warning("Contact not found for key %s...", pub_key.hex()[:12])
             return SentResult(success=False)
         # Resolve by exact public key, not name: two contacts can share a name
         # (e.g. a re-keyed node) and get_by_name returns the first match, which
@@ -1429,7 +1431,7 @@ class CompanionBase(ABC):
                 timeout_ms=DEFAULT_RESPONSE_TIMEOUT_MS,
             )
         except Exception as e:
-            logger.error(f"Error sending text message: {e}")
+            logger.error("Error sending text message: %s", e)
             self.stats.record_tx_error()
             return SentResult(success=False)
 
@@ -1437,7 +1439,7 @@ class CompanionBase(ABC):
         """Send a message to a channel."""
         channel = self.channels.get(channel_idx)
         if not channel:
-            logger.warning(f"Channel {channel_idx} not found")
+            logger.warning("Channel %s not found", channel_idx)
             return False
         try:
             pkt = PacketBuilder.create_group_datagram(
@@ -1456,7 +1458,7 @@ class CompanionBase(ABC):
                 self.stats.record_tx_error()
             return success
         except Exception as e:
-            logger.error(f"Error sending channel message: {e}")
+            logger.error("Error sending channel message: %s", e)
             self.stats.record_tx_error()
             return False
 
@@ -1513,7 +1515,7 @@ class CompanionBase(ABC):
                 self.stats.record_tx_error()
             return success
         except Exception as e:
-            logger.error(f"Error sending channel data: {e}")
+            logger.error("Error sending channel data: %s", e)
             self.stats.record_tx_error()
             return False
 
@@ -1544,7 +1546,7 @@ class CompanionBase(ABC):
             success = await self._send_packet(pkt, wait_for_ack=False)
             return SentResult(success=success)
         except Exception as e:
-            logger.error(f"Error sending raw data: {e}")
+            logger.error("Error sending raw data: %s", e)
             return SentResult(success=False)
 
     async def send_raw_data_direct(
@@ -1574,7 +1576,7 @@ class CompanionBase(ABC):
                 self.stats.record_tx_error()
             return SentResult(success=success)
         except Exception as e:
-            logger.error(f"Error sending raw data direct: {e}")
+            logger.error("Error sending raw data direct: %s", e)
             return SentResult(success=False)
 
     async def send_raw_packet(self, priority: int, packet_bytes: bytes) -> bool:
@@ -1600,7 +1602,7 @@ class CompanionBase(ABC):
             if not pkt.read_from(bytes(packet_bytes)):
                 return False
         except Exception as e:
-            logger.warning(f"send_raw_packet: failed to parse packet: {e}")
+            logger.warning("send_raw_packet: failed to parse packet: %s", e)
             return False
         try:
             success = await self._send_packet(pkt, wait_for_ack=False)
@@ -1610,7 +1612,7 @@ class CompanionBase(ABC):
                 self.stats.record_tx_error()
             return success
         except Exception as e:
-            logger.error(f"Error sending raw packet: {e}")
+            logger.error("Error sending raw packet: %s", e)
             self.stats.record_tx_error()
             return False
 
@@ -1633,7 +1635,7 @@ class CompanionBase(ABC):
             self._apply_path_hash_mode(pkt)
             return await self._send_packet(pkt, wait_for_ack=False)
         except Exception as e:
-            logger.error(f"Error sending trace: {e}")
+            logger.error("Error sending trace: %s", e)
             return False
 
     async def send_control_data(self, data: Any = None) -> bool:
@@ -1665,7 +1667,7 @@ class CompanionBase(ABC):
             self._apply_path_hash_mode(pkt)
             return await self._send_packet(pkt, wait_for_ack=False)
         except Exception as e:
-            logger.error(f"Error sending control data: {e}")
+            logger.error("Error sending control data: %s", e)
             return False
 
     async def send_login(self, pub_key: bytes, password: str) -> dict:
@@ -1743,7 +1745,7 @@ class CompanionBase(ABC):
                 "reason": "Login successful" if login_result["success"] else "Login failed",
             }
         except Exception as e:
-            logger.error(f"Login error: {e}")
+            logger.error("Login error: %s", e)
             return {"success": False, "reason": str(e)}
         finally:
             login_handler.set_login_callback(None)
@@ -1762,7 +1764,7 @@ class CompanionBase(ABC):
             await self._send_packet(pkt, wait_for_ack=False)
             return True
         except Exception as e:
-            logger.error(f"Logout error: {e}")
+            logger.error("Logout error: %s", e)
             return False
 
     def _response_timeout_s(self, pkt: Packet, proxy: Any) -> float:
@@ -1863,7 +1865,7 @@ class CompanionBase(ABC):
                 "reason": "Stats received" if result.get("success") else "Stats request failed",
             }
         except Exception as e:
-            logger.error(f"Status request error: {e}")
+            logger.error("Status request error: %s", e)
             return {"success": False, "reason": str(e)}
         finally:
             proto_handler.clear_response_callback(contact_hash)
@@ -1926,7 +1928,7 @@ class CompanionBase(ABC):
                 "reason": ("Telemetry received" if result.get("success") else "Telemetry failed"),
             }
         except Exception as e:
-            logger.error(f"Telemetry error: {e}")
+            logger.error("Telemetry error: %s", e)
             return {"success": False, "reason": str(e)}
         finally:
             proto_handler.clear_response_callback(contact_hash)
@@ -1981,7 +1983,7 @@ class CompanionBase(ABC):
                 "reason": "Success" if result.get("success") else "Failed",
             }
         except Exception as e:
-            logger.error(f"Protocol request error: {e}")
+            logger.error("Protocol request error: %s", e)
             return {"success": False, "reason": str(e)}
         finally:
             proto_handler.clear_response_callback(contact_hash)
@@ -2038,7 +2040,7 @@ class CompanionBase(ABC):
                 "reason": ("Command successful" if response_data["success"] else "No response"),
             }
         except Exception as e:
-            logger.error(f"Repeater command error: {e}")
+            logger.error("Repeater command error: %s", e)
             return {"success": False, "reason": str(e)}
         finally:
             text_handler.set_command_response_callback(None)
@@ -2105,7 +2107,7 @@ class CompanionBase(ABC):
             elif event_type == MeshEvents.TELEMETRY_UPDATED:
                 await self._fire_callbacks("telemetry_response", data)
         except Exception as e:
-            logger.error(f"Error handling mesh event {event_type}: {e}")
+            logger.error("Error handling mesh event %s: %s", event_type, e)
 
     async def _handle_new_message(self, data: dict) -> None:
         # Deduplicate by packet hash so reconnects don't queue the same packet multiple times.
@@ -2295,12 +2297,31 @@ class CompanionBase(ABC):
                 else:
                     callback(*args)
             except Exception as e:
-                logger.error(f"Error in {event_name} callback: {e}")
+                logger.error("Error in %s callback: %s", event_name, e)
+
+    def _spawn_background_task(self, coro: Any, label: str) -> asyncio.Task:
+        """Create a fire-and-forget task that is tracked until done.
+
+        Holding a reference prevents premature garbage collection (see the
+        asyncio.create_task docs) and the done callback surfaces exceptions
+        that would otherwise be silently dropped.
+        """
+        task = asyncio.get_running_loop().create_task(coro)
+        self._background_tasks.add(task)
+
+        def _on_done(t: asyncio.Task) -> None:
+            self._background_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                logger.error("Background task %s failed: %s", label, t.exception())
+
+        task.add_done_callback(_on_done)
+        return task
 
     def _schedule_fire_callbacks(self, event_name: str, *args: Any) -> None:
         """Schedule _fire_callbacks from sync code (e.g. set_channel). No-op if no running loop."""
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._fire_callbacks(event_name, *args))
+            self._spawn_background_task(
+                self._fire_callbacks(event_name, *args), f"fire_callbacks({event_name})"
+            )
         except RuntimeError:
             pass

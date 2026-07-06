@@ -129,8 +129,9 @@ class CompanionRadio(CompanionBase):
         self._apply_multi_acks_pref()
         self._dispatcher_task = asyncio.create_task(self.node.start())
         logger.info(
-            f"CompanionRadio started: name={self.prefs.node_name}, "
-            f"key={self._identity.get_public_key().hex()[:16]}..."
+            "CompanionRadio started: name=%s, key=%s...",
+            self.prefs.node_name,
+            self._identity.get_public_key().hex()[:16],
         )
 
     async def stop(self) -> None:
@@ -207,7 +208,7 @@ class CompanionRadio(CompanionBase):
                 )
                 return True
             except Exception as e:
-                logger.error(f"Error configuring radio: {e}")
+                logger.error("Error configuring radio: %s", e)
                 return False
         return True
 
@@ -218,7 +219,7 @@ class CompanionRadio(CompanionBase):
                 self._radio.set_tx_power(power_dbm)
                 return True
             except Exception as e:
-                logger.error(f"Error setting TX power: {e}")
+                logger.error("Error setting TX power: %s", e)
                 return False
         return True
 
@@ -242,10 +243,10 @@ class CompanionRadio(CompanionBase):
                 event_service=self._event_service,
             )
             self._setup_packet_callbacks()
-            logger.info(f"Imported new identity: {self._identity.get_public_key().hex()[:16]}...")
+            logger.info("Imported new identity: %s...", self._identity.get_public_key().hex()[:16])
             return True
         except Exception as e:
-            logger.error(f"Error importing private key: {e}")
+            logger.error("Error importing private key: %s", e)
             return False
 
     # -------------------------------------------------------------------------
