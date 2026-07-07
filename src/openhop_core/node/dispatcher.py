@@ -86,6 +86,15 @@ class Dispatcher:
             int, Any
         ] = {}  # Store actual handler objects for method access
 
+        # Handler references for companion-layer access; populated by
+        # register_default_handlers(). Declared here so callers can rely on
+        # the attributes existing (None until handlers are registered).
+        self.text_message_handler: Optional[Any] = None
+        self.protocol_response_handler: Optional[Any] = None
+        self.login_response_handler: Optional[Any] = None
+        self.group_text_handler: Optional[Any] = None
+        self.telemetry_response_handler: Optional[Any] = None
+
         # Keep our identity handy for detecting our own packets
         self.local_identity: Optional[Any] = None
 
@@ -156,6 +165,10 @@ class Dispatcher:
             )
 
         self._logger.info(f"Registered handler for payload type {payload_type}")
+
+    def get_handler_instance(self, payload_type: int) -> Optional[Any]:
+        """Return the registered handler instance for a payload type, or None."""
+        return self._handler_instances.get(payload_type)
 
     def register_fallback_handler(self, handler: Callable[[Packet], Awaitable[None]]):
         """Register a fallback handler for unhandled payload types."""

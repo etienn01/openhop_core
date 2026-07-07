@@ -108,13 +108,13 @@ class CompanionRadio(CompanionBase):
     # -------------------------------------------------------------------------
 
     def _get_protocol_response_handler(self) -> Any:
-        return getattr(self.node.dispatcher, "protocol_response_handler", None)
+        return self.node.dispatcher.protocol_response_handler
 
     def _get_login_response_handler(self) -> Any:
-        return getattr(self.node.dispatcher, "login_response_handler", None)
+        return self.node.dispatcher.login_response_handler
 
     def _get_text_handler(self) -> Any:
-        return getattr(self.node.dispatcher, "text_message_handler", None)
+        return self.node.dispatcher.text_message_handler
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -194,7 +194,7 @@ class CompanionRadio(CompanionBase):
 
     def _get_group_text_handler(self):
         """Return the group text handler for name sync."""
-        return getattr(self.node.dispatcher, "group_text_handler", None)
+        return self.node.dispatcher.group_text_handler
 
     def set_radio_params(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
         super().set_radio_params(freq_hz, bw_hz, sf, cr)
@@ -272,10 +272,7 @@ class CompanionRadio(CompanionBase):
         dispatcher.set_ack_received_listener(self._on_ack_received)
         dispatcher.add_raw_packet_subscriber(self._on_raw_packet_rx_log)
         dispatcher.raw_data_received_callback = self._on_raw_custom_received
-        if (
-            hasattr(dispatcher, "protocol_response_handler")
-            and dispatcher.protocol_response_handler
-        ):
+        if dispatcher.protocol_response_handler:
             dispatcher.protocol_response_handler.set_binary_response_callback(
                 self._on_binary_response
             )

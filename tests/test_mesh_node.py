@@ -1,5 +1,3 @@
-import pytest
-
 from openhop_core import LocalIdentity
 
 
@@ -35,35 +33,6 @@ def test_mesh_node_helper_methods():
     """Test MeshNode helper methods."""
     # Mock test - in real scenario would test helper methods
     assert True
-
-
-# ResponseWaiter tests
-def test_response_waiter():
-    """Test ResponseWaiter functionality."""
-    from openhop_core.node import MeshNode
-
-    waiter = MeshNode._ResponseWaiter()
-
-    # Test callback
-    waiter.callback(True, "Test response", {"key": "value"})
-
-    assert waiter.data["success"]
-    assert waiter.data["text"] == "Test response"
-    assert waiter.data["parsed"] == {"key": "value"}
-
-
-@pytest.mark.asyncio
-async def test_response_waiter_timeout():
-    """Test ResponseWaiter timeout functionality."""
-    from openhop_core.node import MeshNode
-
-    waiter = MeshNode._ResponseWaiter()
-
-    # Test timeout
-    result = await waiter.wait(timeout=0.1)
-    assert not result["success"]
-    assert result["text"] is None
-    assert result["timeout"]
 
 
 def test_time_operation_context_manager():

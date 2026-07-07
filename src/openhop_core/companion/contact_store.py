@@ -42,21 +42,6 @@ class ContactProxy:
         """First public-key byte — the destination hash used on the wire."""
         return self.public_key_bytes[0]
 
-    def _sync_from_contact(self) -> None:
-        """Update proxy fields from the underlying Contact."""
-        c = self._contact
-        self.public_key = c.public_key.hex()
-        self.name = c.name
-        self.type = c.adv_type
-        self.flags = c.flags
-        self.out_path = list(c.out_path) if c.out_path else []
-        self.out_path_len = c.out_path_len
-        self.sync_since = c.sync_since
-        self.last_advert_timestamp = c.last_advert_timestamp
-        self.lastmod = c.lastmod
-        self.gps_lat = c.gps_lat
-        self.gps_lon = c.gps_lon
-
 
 class ContactStore:
     """In-memory contact storage compatible with MeshNode's contacts interface.
