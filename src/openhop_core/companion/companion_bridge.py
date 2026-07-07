@@ -13,6 +13,7 @@ import logging
 from typing import Any, Callable, Iterable, Optional
 
 from ..node.handlers import create_core_handlers
+from ..node.handlers.crypto_helpers import iter_decrypt_by_src_hash
 from ..node.handlers.login_server import LoginServerHandler
 from ..protocol import LocalIdentity, Packet
 from ..protocol.constants import (
@@ -25,7 +26,6 @@ from ..protocol.constants import (
     PAYLOAD_TYPE_RAW_CUSTOM,
     PAYLOAD_TYPE_RESPONSE,
     PAYLOAD_TYPE_TXT_MSG,
-    PUB_KEY_SIZE,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
@@ -73,8 +73,6 @@ class _BridgeAckHandler:
         Path update and contact_path_updated are handled by ProtocolResponseHandler;
         this only extracts ACK for send_confirmed.
         """
-        from ..protocol import CryptoUtils, Identity
-
         payload = packet.payload
         if not payload or len(payload) < 2 + 6:
             return None
@@ -85,26 +83,15 @@ class _BridgeAckHandler:
             return None
         encrypted = bytes(payload[2:])
         # Try each contact with matching src_hash until decryption succeeds
-        contacts_tried = 0
-        for contact in self._bridge.contacts.contacts:
-            try:
-                pk = contact.public_key
-                pub = bytes.fromhex(pk) if isinstance(pk, str) else bytes(pk)
-                if len(pub) != PUB_KEY_SIZE or pub[0] != src_hash:
-                    continue
-                contacts_tried += 1
-                peer_id = Identity(pub)
-                shared_secret = peer_id.calc_shared_secret(self._bridge._identity.get_private_key())
-                aes_key = shared_secret[:16]
-                decrypted = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted)
-            except Exception as e:
-                logger.debug(
-                    "process_path_ack_variants: decrypt failed for src=0x%02x " "contact=%s: %s",
-                    src_hash,
-                    getattr(contact, "name", "?"),
-                    e,
-                )
-                continue
+        decrypt_attempts = iter_decrypt_by_src_hash(
+            self._bridge.contacts.contacts,
+            src_hash,
+            self._bridge._identity,
+            encrypted,
+        )
+        decrypted_any = False
+        for _contact, _pub, _secret, decrypted in decrypt_attempts:
+            decrypted_any = True
             if len(decrypted) < 2:
                 logger.debug(
                     "process_path_ack_variants: decrypted too short (%d) for src=0x%02x",
@@ -136,13 +123,12 @@ class _BridgeAckHandler:
             if len(decrypted) >= extra_start + 1 + 4 and decrypted[extra_start] == PAYLOAD_TYPE_ACK:
                 return int.from_bytes(decrypted[extra_start + 1 : extra_start + 5], "little")
             return None
-        if contacts_tried > 0:
-            logger.debug(
-                "process_path_ack_variants: no contact decrypted successfully for src=0x%02x "
-                "(tried %d)",
-                src_hash,
-                contacts_tried,
-            )
+        logger.debug(
+            "process_path_ack_variants: no contact yielded a usable PATH payload "
+            "for src=0x%02x (decrypted_any=%s)",
+            src_hash,
+            decrypted_any,
+        )
         return None
 
     async def _notify_ack_received(self, crc: int) -> None:

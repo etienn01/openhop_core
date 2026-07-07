@@ -2,6 +2,8 @@
 Centralized protocol utility functions and lookup tables for mesh network.
 """
 
+import hashlib
+
 from .constants import (
     ADVERT_FLAG_HAS_FEATURE1,
     ADVERT_FLAG_HAS_FEATURE2,
@@ -11,6 +13,9 @@ from .constants import (
     ADVERT_FLAG_IS_REPEATER,
     ADVERT_FLAG_IS_ROOM_SERVER,
     ADVERT_FLAG_IS_SENSOR,
+    PH_ROUTE_MASK,
+    PH_TYPE_MASK,
+    PH_TYPE_SHIFT,
     PUB_KEY_SIZE,
     SIGNATURE_SIZE,
     TIMESTAMP_SIZE,
@@ -186,8 +191,8 @@ def get_route_type_name(route_type: int) -> str:
 
 def format_packet_info(header: int, payload_length: int = 0) -> str:
     """Format packet header information for logging/debugging."""
-    payload_type = header >> 4
-    route_type = header & 0x03
+    payload_type = (header >> PH_TYPE_SHIFT) & PH_TYPE_MASK
+    route_type = header & PH_ROUTE_MASK
 
     type_name = get_packet_type_name(payload_type)
     route_name = get_route_type_name(route_type)
@@ -197,3 +202,22 @@ def format_packet_info(header: int, payload_length: int = 0) -> str:
         info += f", Size: {payload_length} bytes"
 
     return info
+
+
+def normalize_channel_secret(secret: bytes) -> bytes:
+    """Pad or truncate a channel PSK to the 32-byte key the firmware stores."""
+    secret = bytes(secret or b"")
+    if len(secret) < 32:
+        return secret + b"\x00" * (32 - len(secret))
+    return secret[:32]
+
+
+def derive_channel_hash(secret: bytes) -> int:
+    """1-byte channel hash: first byte of SHA-256 over the effective key.
+
+    Matches MeshCore firmware: a 128-bit key (second 16 bytes zero) hashes
+    only the first 16 bytes; otherwise the full 32 bytes are hashed.
+    """
+    secret = normalize_channel_secret(secret)
+    hash_input = secret[:16] if secret[16:32] == b"\x00" * 16 else secret
+    return hashlib.sha256(hash_input).digest()[0]

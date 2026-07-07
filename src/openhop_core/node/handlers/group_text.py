@@ -5,6 +5,7 @@ from typing import Optional
 from ...protocol import Packet
 from ...protocol.constants import PAYLOAD_TYPE_GRP_TXT, ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
 from ...protocol.crypto import CryptoUtils
+from ...protocol.utils import derive_channel_hash
 from .base import BaseHandler
 
 
@@ -85,11 +86,11 @@ class GroupTextHandler(BaseHandler):
 
     def _derive_channel_hash(self, channel_secret: str) -> int:
         """Derive channel hash (first byte of SHA256) to match MeshCore firmware."""
-        import hashlib
-
-        secret_bytes = self._secret_bytes_for_hash(channel_secret)
-        channel_key = hashlib.sha256(secret_bytes).digest()
-        return channel_key[0]
+        try:
+            secret_bytes = bytes.fromhex(channel_secret)
+        except ValueError:
+            secret_bytes = channel_secret.encode("utf-8")
+        return derive_channel_hash(secret_bytes)
 
     def _derive_channel_keys(self, channel_secret: str) -> tuple:
         """Derive all necessary keys from channel secret."""
@@ -318,7 +319,7 @@ class GroupTextHandler(BaseHandler):
                     # Extract path from packet (list of node hashes)
                     path = list(packet.path) if hasattr(packet, "path") and packet.path else None
                     # path_len: flood packets use actual path length; direct uses 0xFF
-                    route_type = packet.header & 0x03
+                    route_type = packet.get_route_type()
                     if route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD):
                         path_len = getattr(packet, "path_len", 0) or len(packet.path or [])
                     else:

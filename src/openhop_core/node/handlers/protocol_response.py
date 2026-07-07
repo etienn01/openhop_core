@@ -8,11 +8,12 @@ import asyncio
 import struct
 from typing import Any, Callable, Dict, Optional
 
-from ...protocol import CryptoUtils, Identity, Packet
+from ...protocol import Packet
 from ...protocol.constants import PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_RESPONSE, ROUTE_TYPE_DIRECT
 from ...protocol.crypto import CIPHER_BLOCK_SIZE, CIPHER_MAC_SIZE
 from ...protocol.packet_builder import PacketBuilder
 from ...protocol.packet_utils import PathUtils
+from .crypto_helpers import iter_decrypt_by_src_hash
 
 # ---------------------------------------------------------------------------
 # Built-in CayenneLPP decoder (no external dependency)
@@ -221,7 +222,7 @@ class ProtocolResponseHandler:
             # Both PATH and RESPONSE packets share the same structure:
             # dest_hash(1) + src_hash(1) + encrypted_data(N)
             src_hash = pkt.payload[1]
-            pkt_type = (pkt.header >> 2) & 0x0F
+            pkt_type = pkt.get_payload_type()
             route_label = "FLOOD" if pkt.is_route_flood() else "DIRECT"
             if pkt_type == PAYLOAD_TYPE_RESPONSE:
                 self._log(
@@ -281,7 +282,7 @@ class ProtocolResponseHandler:
                 and len(raw_decrypted) >= 4
             ):
                 path_info = None
-                pkt_type = (pkt.header >> 2) & 0x0F
+                pkt_type = pkt.get_payload_type()
 
                 if pkt_type == PAYLOAD_TYPE_PATH:
                     # PATH packet: decrypted is path_len(1)+path(N)+extra_type(1)+extra
@@ -504,26 +505,14 @@ class ProtocolResponseHandler:
                 f"encrypted_data={enc_len}B (need MAC(2)+≥15 bytes ciphertext)"
             )
             return False, "Payload too short", {}, None
-        pkt_type = (pkt.header >> 2) & 0x0F
+        pkt_type = pkt.get_payload_type()
 
         # Try every contact matching src_hash (same “try all hash matches” as TXT_MSG and PATH ACK).
         # Repeaters use the same ECDH shared secret as login (createPathReturn(..., secret, ...)).
-        # Firmware: ed25519_key_exchange uses first 32B of priv (clamped) and (y+1)/(1-y) for peer
-        # pub; we match via libsodium ed25519_pk_to_curve25519 + scalarmult.
         contacts_tried = list(self._contacts_by_hash(src_hash))
-        for contact in contacts_tried:
-            try:
-                pk = contact.public_key
-                contact_pubkey = pk if isinstance(pk, bytes) else bytes.fromhex(pk)
-                if len(contact_pubkey) != 32:
-                    continue
-                peer_id = Identity(contact_pubkey)
-                shared_secret = peer_id.calc_shared_secret(self._local_identity.get_private_key())
-                aes_key = shared_secret[:16]
-                decrypted = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_data)
-            except Exception:
-                continue
-
+        for _contact, contact_pubkey, shared_secret, decrypted in iter_decrypt_by_src_hash(
+            contacts_tried, src_hash, self._local_identity, encrypted_data
+        ):
             # Determine the actual response data based on packet type.
             response_data = decrypted
             if pkt_type == PAYLOAD_TYPE_PATH:

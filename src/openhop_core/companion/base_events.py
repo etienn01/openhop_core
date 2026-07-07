@@ -12,6 +12,7 @@ from ..node.events import MeshEvents
 from ..protocol import Packet
 from ..protocol.constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
 from ..protocol.crypto import CryptoUtils
+from ..protocol.utils import derive_channel_hash, normalize_channel_secret
 from .models import Channel, Contact, QueuedMessage
 
 logger = logging.getLogger("CompanionBase")
@@ -165,13 +166,7 @@ class _RxEventsMixin:
             channel = self.channels.get(idx)
             if channel is None:
                 continue
-            secret = bytes(channel.secret or b"")
-            if len(secret) < 32:
-                secret = secret + b"\x00" * (32 - len(secret))
-            else:
-                secret = secret[:32]
-            hash_input = secret[:16] if secret[16:32] == b"\x00" * 16 else secret
-            if hashlib.sha256(hash_input).digest()[0] == channel_hash:
+            if derive_channel_hash(channel.secret) == channel_hash:
                 matches.append((idx, channel))
         return matches
 
@@ -191,11 +186,7 @@ class _RxEventsMixin:
         plaintext: Optional[bytes] = None
 
         for idx, channel in self._get_channel_candidates_by_hash(channel_hash):
-            secret = bytes(channel.secret or b"")
-            if len(secret) < 32:
-                secret = secret + b"\x00" * (32 - len(secret))
-            else:
-                secret = secret[:32]
+            secret = normalize_channel_secret(channel.secret)
             try:
                 plaintext = CryptoUtils.mac_then_decrypt(
                     hashlib.sha256(secret).digest(), secret, cipher_mac + ciphertext

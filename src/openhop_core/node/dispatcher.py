@@ -10,7 +10,6 @@ from ..protocol.constants import (  # Payload types
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_TRACE,
-    PH_TYPE_SHIFT,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
@@ -264,7 +263,7 @@ class Dispatcher:
         async def fallback_handler(pkt):
             # Get payload type for logging
             try:
-                ptype = pkt.header >> PH_TYPE_SHIFT
+                ptype = pkt.get_payload_type()
                 type_name = PAYLOAD_TYPES.get(ptype, f"unknown_{ptype}")
             except Exception:
                 type_name = "unknown"
@@ -420,7 +419,7 @@ class Dispatcher:
         if PathUtils.is_path_at_max_hops(pkt.path_len):
             pkt.mark_do_not_retransmit()
 
-        ptype = pkt.header >> PH_TYPE_SHIFT
+        ptype = pkt.get_payload_type()
 
         self._log(f"[RX DEBUG] Packet type: {ptype:02X}")
 
@@ -465,7 +464,7 @@ class Dispatcher:
             self._log(
                 "   This suggests your packet was repeated by another node and came back to you!"
             )
-            self._log(f"Ignoring own packet (type={pkt.header >> 4:02X}) to prevent loops")
+            self._log(f"Ignoring own packet (type={pkt.get_payload_type():02X}) to prevent loops")
             return
 
         # Handle ACK matching for waiting senders
@@ -554,7 +553,7 @@ class Dispatcher:
         expected_crc: Optional[int] = None,
     ) -> bool:
         """Send a packet immediately (assumes lock is held)."""
-        payload_type = packet.header >> PH_TYPE_SHIFT
+        payload_type = packet.get_payload_type()
 
         # ------------------------------------------------------------------ #
         #  Send the packet (lock ensures only one transmission at a time)

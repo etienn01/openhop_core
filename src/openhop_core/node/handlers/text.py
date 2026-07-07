@@ -216,7 +216,7 @@ class TextMessageHandler(BaseHandler):
         timestamp_int = int.from_bytes(timestamp, "little")
 
         # Determine message routing type from packet header
-        route_type = packet.header & 0x03  # Route type is in bits 0-1
+        route_type = packet.get_route_type()
         is_flood = route_type == 1  # ROUTE_TYPE_FLOOD = 1
 
         self.log(
