@@ -21,17 +21,19 @@ __all__ = [
     "__version__",
 ]
 
-# Conditional import for CompanionRadio
+# Conditional import for the companion layer
 try:
+    from .companion.companion_bridge import CompanionBridge
     from .companion.companion_radio import CompanionRadio
 
     _COMPANION_AVAILABLE = True
 except ImportError:
     _COMPANION_AVAILABLE = False
     CompanionRadio = None
+    CompanionBridge = None
 
 if _COMPANION_AVAILABLE:
-    __all__.append("CompanionRadio")
+    __all__.extend(["CompanionRadio", "CompanionBridge"])
 
 
 # End of mesh package exports

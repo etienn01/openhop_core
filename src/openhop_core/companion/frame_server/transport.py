@@ -229,6 +229,66 @@ class _FrameTransportMixin:
         except OSError as e:
             logger.debug("Could not set TCP keepalive: %s", e)
 
+    async def _evict_existing_client(self) -> None:
+        """Close the current client connection to make room for a new one."""
+        logger.info(
+            "Companion already has a client; evicting previous connection (port=%s)",
+            self.port,
+        )
+        old_writer = self._client_writer
+        old_writer_task = self._writer_task
+        # Cancel and await the old writer task so it's fully gone before we replace
+        # the queue and create a new task (avoids the new task being mistaken for
+        # a failed writer when the old task had already exited).
+        if old_writer_task is not None:
+            old_writer_task.cancel()
+            try:
+                await old_writer_task
+            except asyncio.CancelledError:
+                pass
+            if self._writer_task is old_writer_task:
+                self._writer_task = None
+        try:
+            old_writer.close()
+            await old_writer.wait_closed()
+        except Exception:
+            pass
+
+    async def _read_client_frames(
+        self, reader: asyncio.StreamReader, writer_task: asyncio.Task
+    ) -> str:
+        """Read and dispatch inbound frames until disconnect; return the reason."""
+        while True:
+            try:
+                prefix = await asyncio.wait_for(
+                    reader.read(1), timeout=self._client_idle_timeout_sec
+                )
+            except asyncio.TimeoutError:
+                return "idle_timeout"
+            if not prefix:
+                return "empty_read"
+            if prefix[0] != FRAME_INBOUND_PREFIX:
+                logger.warning("Invalid frame prefix: 0x%02x", prefix[0])
+                continue
+            len_bytes = await reader.readexactly(2)
+            frame_len = struct.unpack("<H", len_bytes)[0]
+            if frame_len > MAX_FRAME_SIZE:
+                logger.warning("Frame too long: %s", frame_len)
+                return "frame_too_long"
+            payload = await reader.readexactly(frame_len)
+            await self._handle_cmd(payload)
+            if writer_task.done():
+                if not writer_task.cancelled():
+                    exc = writer_task.exception()
+                    if exc is not None:
+                        logger.error(
+                            "Writer task failed (port=%s): %s",
+                            self.port,
+                            exc,
+                            exc_info=True,
+                        )
+                return "writer_failed"
+
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -238,28 +298,7 @@ class _FrameTransportMixin:
         frees the slot when no data is received for client_idle_timeout_sec.
         """
         if self._client_writer:
-            logger.info(
-                "Companion already has a client; evicting previous connection (port=%s)",
-                self.port,
-            )
-            old_writer = self._client_writer
-            old_writer_task = self._writer_task
-            # Cancel and await the old writer task so it's fully gone before we replace
-            # the queue and create a new task (avoids the new task being mistaken for
-            # a failed writer when the old task had already exited).
-            if old_writer_task is not None:
-                old_writer_task.cancel()
-                try:
-                    await old_writer_task
-                except asyncio.CancelledError:
-                    pass
-                if self._writer_task is old_writer_task:
-                    self._writer_task = None
-            try:
-                old_writer.close()
-                await old_writer.wait_closed()
-            except Exception:
-                pass
+            await self._evict_existing_client()
 
         self._client_reader = reader
         self._client_writer = writer
@@ -273,40 +312,7 @@ class _FrameTransportMixin:
         self._writer_task = local_writer_task
         disconnect_reason: Optional[str] = None
         try:
-            while True:
-                try:
-                    prefix = await asyncio.wait_for(
-                        reader.read(1), timeout=self._client_idle_timeout_sec
-                    )
-                except asyncio.TimeoutError:
-                    disconnect_reason = "idle_timeout"
-                    break
-                if not prefix:
-                    disconnect_reason = "empty_read"
-                    break
-                if prefix[0] != FRAME_INBOUND_PREFIX:
-                    logger.warning("Invalid frame prefix: 0x%02x", prefix[0])
-                    continue
-                len_bytes = await reader.readexactly(2)
-                frame_len = struct.unpack("<H", len_bytes)[0]
-                if frame_len > MAX_FRAME_SIZE:
-                    logger.warning("Frame too long: %s", frame_len)
-                    disconnect_reason = "frame_too_long"
-                    break
-                payload = await reader.readexactly(frame_len)
-                await self._handle_cmd(payload)
-                if local_writer_task.done():
-                    disconnect_reason = "writer_failed"
-                    if not local_writer_task.cancelled():
-                        exc = local_writer_task.exception()
-                        if exc is not None:
-                            logger.error(
-                                "Writer task failed (port=%s): %s",
-                                self.port,
-                                exc,
-                                exc_info=True,
-                            )
-                    break
+            disconnect_reason = await self._read_client_frames(reader, local_writer_task)
         except asyncio.IncompleteReadError:
             disconnect_reason = "incomplete_read"
         except (ConnectionResetError, BrokenPipeError) as e:
@@ -315,35 +321,47 @@ class _FrameTransportMixin:
             disconnect_reason = f"other: {type(e).__name__}: {e}"
             logger.error("Client handler error: %s", e, exc_info=True)
         finally:
-            if self._write_queue is local_write_queue:
-                try:
-                    local_write_queue.put_nowait(None)  # Sentinel
-                except asyncio.QueueFull:
-                    pass
-            else:
-                logger.debug(
-                    "Skipping stale queue cleanup for disconnected client (port=%s)",
-                    self.port,
-                )
-            if self._writer_task is local_writer_task:
-                local_writer_task.cancel()
-                try:
-                    await local_writer_task
-                except asyncio.CancelledError:
-                    pass
-                self._writer_task = None
-            else:
-                logger.debug(
-                    "Skipping stale writer cleanup for disconnected client (port=%s)",
-                    self.port,
-                )
-            if self._write_queue is local_write_queue:
-                self._write_queue = None
-            if self._client_writer is writer:
-                self._client_writer = None
-                self._client_reader = None
-                logger.info(
-                    "Companion client disconnected (port=%s): %s",
-                    self.port,
-                    disconnect_reason or "unknown",
-                )
+            await self._cleanup_client(
+                writer, local_write_queue, local_writer_task, disconnect_reason
+            )
+
+    async def _cleanup_client(
+        self,
+        writer: asyncio.StreamWriter,
+        write_queue: asyncio.Queue,
+        writer_task: asyncio.Task,
+        disconnect_reason: Optional[str],
+    ) -> None:
+        """Tear down per-client state, skipping parts a new client already replaced."""
+        if self._write_queue is write_queue:
+            try:
+                write_queue.put_nowait(None)  # Sentinel
+            except asyncio.QueueFull:
+                pass
+        else:
+            logger.debug(
+                "Skipping stale queue cleanup for disconnected client (port=%s)",
+                self.port,
+            )
+        if self._writer_task is writer_task:
+            writer_task.cancel()
+            try:
+                await writer_task
+            except asyncio.CancelledError:
+                pass
+            self._writer_task = None
+        else:
+            logger.debug(
+                "Skipping stale writer cleanup for disconnected client (port=%s)",
+                self.port,
+            )
+        if self._write_queue is write_queue:
+            self._write_queue = None
+        if self._client_writer is writer:
+            self._client_writer = None
+            self._client_reader = None
+            logger.info(
+                "Companion client disconnected (port=%s): %s",
+                self.port,
+                disconnect_reason or "unknown",
+            )
