@@ -118,8 +118,23 @@ DEFAULT_MAX_CONTACTS = 1000
 DEFAULT_OFFLINE_QUEUE_SIZE = 512
 DEFAULT_MAX_CHANNELS = 40
 CONTACT_NAME_SIZE = 32
+CHANNEL_NAME_SIZE = 32  # channel name field width (CHANNEL_INFO / SET_CHANNEL)
 MAX_SIGN_DATA_SIZE = 8192  # 8KB signing buffer (matches firmware)
 MAX_PENDING_ACK_CRCS = 64
+
+# ---------------------------------------------------------------------------
+# Response-timeout hints (ms) returned in RESP_CODE_SENT frames. The firmware
+# computes est_timeout per packet (calcFlood/DirectTimeoutMillisFor); the
+# virtual companion performs the wait internally and returns fixed hints.
+# ---------------------------------------------------------------------------
+TXT_MSG_TIMEOUT_HINT_MS = 5000
+BINARY_REQ_TIMEOUT_HINT_MS = 10000
+LOGIN_TIMEOUT_HINT_MS = 10000
+STATUS_TIMEOUT_HINT_MS = 15000
+TELEMETRY_TIMEOUT_HINT_MS = 15000
+# Trace estimate: base + per-path-byte increment (CMD_SEND_TRACE_PATH).
+TRACE_BASE_TIMEOUT_MS = 5000
+TRACE_PER_PATH_BYTE_TIMEOUT_MS = 200
 
 # ===========================================================================
 # Frame Protocol Constants (MeshCore Companion Radio Protocol)
@@ -252,7 +267,14 @@ PUSH_CODE_CONTACT_DELETED = 0x8F
 PUSH_CODE_CONTACTS_FULL = 0x90
 
 # ---------------------------------------------------------------------------
-# Error codes
+# Error codes (payload of RESP_CODE_ERR). Frame-server convention:
+#   ERR_CODE_ILLEGAL_ARG      malformed/short command payload; also the
+#                             dispatcher's catch-all for handler exceptions
+#   ERR_CODE_NOT_FOUND        unknown contact/channel/resource
+#   ERR_CODE_TABLE_FULL       store full or send failure (firmware maps
+#                             MSG_SEND_FAILED here, e.g. anon/binary req)
+#   ERR_CODE_BAD_STATE        valid request that cannot run right now
+#   ERR_CODE_UNSUPPORTED_CMD  unknown command or feature not available
 # ---------------------------------------------------------------------------
 ERR_CODE_UNSUPPORTED_CMD = 1
 ERR_CODE_NOT_FOUND = 2

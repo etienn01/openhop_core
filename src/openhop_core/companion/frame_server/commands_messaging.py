@@ -14,6 +14,7 @@ from ..constants import (
     ERR_CODE_TABLE_FULL,
     ERR_CODE_UNSUPPORTED_CMD,
     FIRMWARE_VER_CODE,
+    LOGIN_TIMEOUT_HINT_MS,
     MAX_CHANNEL_DATA_LENGTH,
     MAX_PATH_SIZE,
     OUT_PATH_UNKNOWN,
@@ -28,6 +29,11 @@ from ..constants import (
     RESP_CODE_CONTACT_MSG_RECV,
     RESP_CODE_CONTACT_MSG_RECV_V3,
     RESP_CODE_NO_MORE_MESSAGES,
+    STATUS_TIMEOUT_HINT_MS,
+    TELEMETRY_TIMEOUT_HINT_MS,
+    TRACE_BASE_TIMEOUT_MS,
+    TRACE_PER_PATH_BYTE_TIMEOUT_MS,
+    TXT_MSG_TIMEOUT_HINT_MS,
     TXT_TYPE_CLI_DATA,
 )
 from ..models import QueuedMessage
@@ -67,7 +73,7 @@ class _MessagingCommandsMixin:
             timestamp=use_timestamp,
         )
         if result.success:
-            self._write_sent_result(result, default_timeout_ms=5000)
+            self._write_sent_result(result, default_timeout_ms=TXT_MSG_TIMEOUT_HINT_MS)
         else:
             self._write_err(ERR_CODE_BAD_STATE)
 
@@ -253,7 +259,7 @@ class _MessagingCommandsMixin:
         if not ok:
             self._write_err(ERR_CODE_TABLE_FULL)
             return
-        est_timeout_ms = 5000 + (path_len * 200)
+        est_timeout_ms = TRACE_BASE_TIMEOUT_MS + (path_len * TRACE_PER_PATH_BYTE_TIMEOUT_MS)
         self._write_sent_response(False, tag, est_timeout_ms)
         # If we are the final hop, push trace data immediately
         if path_bytes and self.local_hash is not None and path_bytes[-1] == self.local_hash:
@@ -365,7 +371,7 @@ class _MessagingCommandsMixin:
             if len(data) > PUB_KEY_SIZE
             else ""
         )
-        self._write_sent_response(True, 0, 10000)
+        self._write_sent_response(True, 0, LOGIN_TIMEOUT_HINT_MS)
         result = await self.bridge.send_login(pubkey, password)
         if result.get("success"):
             # Layout matches MeshCore companion_radio onContactResponse
@@ -392,7 +398,7 @@ class _MessagingCommandsMixin:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         pubkey = data[0:PUB_KEY_SIZE]
-        self._write_sent_response(False, 0, 15000)
+        self._write_sent_response(False, 0, STATUS_TIMEOUT_HINT_MS)
         result = await self.bridge.send_status_request(pubkey)
         if not result.get("success"):
             logger.debug("Status request failed for %s; no push sent)", pubkey[:6].hex())
@@ -419,7 +425,7 @@ class _MessagingCommandsMixin:
         want_base = bool(flags & TELEM_PERM_BASE)
         want_location = bool(flags & TELEM_PERM_LOCATION)
         want_environment = bool(flags & TELEM_PERM_ENVIRONMENT)
-        self._write_sent_response(False, 0, 15000)
+        self._write_sent_response(False, 0, TELEMETRY_TIMEOUT_HINT_MS)
         result = await self.bridge.send_telemetry_request(
             pubkey,
             want_base=want_base,

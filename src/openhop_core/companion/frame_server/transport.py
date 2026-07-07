@@ -9,6 +9,7 @@ import sys
 from typing import Optional
 
 from ..constants import (
+    BINARY_REQ_TIMEOUT_HINT_MS,
     FRAME_INBOUND_PREFIX,
     FRAME_OUTBOUND_PREFIX,
     MAX_FRAME_SIZE,
@@ -122,7 +123,9 @@ class _FrameTransportMixin:
             bytes([RESP_CODE_SENT, 1 if is_flood else 0]) + struct.pack("<II", tag, timeout_ms)
         )
 
-    def _write_sent_result(self, result: SentResult, *, default_timeout_ms: int = 10000) -> None:
+    def _write_sent_result(
+        self, result: SentResult, *, default_timeout_ms: int = BINARY_REQ_TIMEOUT_HINT_MS
+    ) -> None:
         """Write RESP_CODE_SENT from a SentResult, defaulting a missing tag/timeout."""
         tag = result.expected_ack if result.expected_ack is not None else 0
         timeout_ms = result.timeout_ms if result.timeout_ms is not None else default_timeout_ms
