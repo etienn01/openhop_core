@@ -22,6 +22,11 @@ class MessageQueue:
         self._queue: deque[QueuedMessage] = deque(maxlen=max_size)
         self._max_size = max_size
 
+    @property
+    def max_size(self) -> int:
+        """Maximum number of messages retained (oldest dropped beyond this)."""
+        return self._max_size
+
     def push(self, msg: QueuedMessage) -> bool:
         """Add a message to the queue. Returns True on success.
 

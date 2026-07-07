@@ -115,7 +115,28 @@ CONTACT_TYPE_HYBRID = 4
 # Protocol Request Types
 REQ_TYPE_GET_STATUS = 0x01  # Get repeater stats (RepeaterStats struct)
 REQ_TYPE_GET_TELEMETRY_DATA = 0x03  # Get telemetry data (CayenneLPP)
-REQ_TYPE_GET_OWNER_INFO = 0x07  # Variable-length: tag(4) + "version\nname\nowner" (simple_repeater)
+REQ_TYPE_GET_OWNER_INFO = (
+    0x07  # Variable-length: tag(4) + "version\nname\nowner" (simple_repeater)
+)
 TELEM_PERM_BASE = 0x01
 TELEM_PERM_LOCATION = 0x02
 TELEM_PERM_ENVIRONMENT = 0x04
+
+# ---------------------------------------------------------------------------
+# Anonymous request sub-types (first byte of an ANON_REQ payload, after the
+# 4-byte timestamp). Wire values shared by the anon-request handler (node) and
+# the companion protocol; see firmware simple_repeater/MyMesh.cpp.
+# ---------------------------------------------------------------------------
+ANON_REQ_TYPE_REGIONS = 0x01  # repeater replies with comma-separated region names
+ANON_REQ_TYPE_OWNER = 0x02  # repeater replies with "name\nowner"
+ANON_REQ_TYPE_BASIC = 0x03  # repeater replies with clock + feature flags
+
+# ---------------------------------------------------------------------------
+# Text message types (upper 6 bits of the TXT_MSG flags byte; firmware
+# TxtDataHelpers.h). Wire values shared by node.handlers.text and companion.
+# ---------------------------------------------------------------------------
+TXT_TYPE_PLAIN = 0  # plain text message
+TXT_TYPE_CLI_DATA = 1  # CLI command/response (no delivery ACK)
+# Signed plain text (e.g. room server posts): a 4-byte author pubkey prefix
+# precedes the text in the decrypted payload.
+TXT_TYPE_SIGNED_PLAIN = 2

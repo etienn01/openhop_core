@@ -32,20 +32,15 @@ class ContactProxy:
         self.gps_lat = contact.gps_lat
         self.gps_lon = contact.gps_lon
 
-    def _sync_from_contact(self) -> None:
-        """Update proxy fields from the underlying Contact."""
-        c = self._contact
-        self.public_key = c.public_key.hex()
-        self.name = c.name
-        self.type = c.adv_type
-        self.flags = c.flags
-        self.out_path = list(c.out_path) if c.out_path else []
-        self.out_path_len = c.out_path_len
-        self.sync_since = c.sync_since
-        self.last_advert_timestamp = c.last_advert_timestamp
-        self.lastmod = c.lastmod
-        self.gps_lat = c.gps_lat
-        self.gps_lon = c.gps_lon
+    @property
+    def public_key_bytes(self) -> bytes:
+        """Public key as raw bytes (the proxy stores it as a hex string)."""
+        return bytes.fromhex(self.public_key)
+
+    @property
+    def dest_hash(self) -> int:
+        """First public-key byte — the destination hash used on the wire."""
+        return self.public_key_bytes[0]
 
 
 class ContactStore:
@@ -267,9 +262,9 @@ class ContactStore:
                 name=rec.get("name", ""),
                 adv_type=rec.get("adv_type", 0),
                 flags=rec.get("flags", 0),
-                out_path_len=-1
-                if rec.get("out_path_len", -1) in (-1, 255)
-                else rec.get("out_path_len", -1),
+                out_path_len=(
+                    -1 if rec.get("out_path_len", -1) in (-1, 255) else rec.get("out_path_len", -1)
+                ),
                 out_path=out_path,
                 last_advert_timestamp=rec.get("last_advert_timestamp", 0),
                 lastmod=rec.get("lastmod", 0),
@@ -301,9 +296,9 @@ class ContactStore:
                     "gps_lat": c.gps_lat,
                     "gps_lon": c.gps_lon,
                     "sync_since": c.sync_since,
-                    "last_advert_packet": c.last_advert_packet.hex()
-                    if c.last_advert_packet
-                    else "",
+                    "last_advert_packet": (
+                        c.last_advert_packet.hex() if c.last_advert_packet else ""
+                    ),
                 }
             )
         return result

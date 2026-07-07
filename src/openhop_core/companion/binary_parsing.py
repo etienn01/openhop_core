@@ -3,16 +3,64 @@
 from __future__ import annotations
 
 import logging
+import struct
 from typing import Optional
 
 from .constants import (
+    ANON_BASIC_FEAT_BRIDGE_MASK,
+    ANON_BASIC_FEAT_DISABLED,
     ANON_REQ_TYPE_BASIC,
     ANON_REQ_TYPE_OWNER,
     ANON_REQ_TYPE_REGIONS,
+    CONTACT_NAME_SIZE,
     BinaryReqType,
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Exported-contact binary format (CMD_EXPORT_CONTACT / CMD_IMPORT_CONTACT):
+# pubkey(32) + adv_type(1) + name(32, NUL padded) + lat(i32 µdeg) + lon(i32 µdeg)
+# ---------------------------------------------------------------------------
+EXPORTED_CONTACT_STRUCT = "<32sB32sii"
+EXPORTED_CONTACT_SIZE = struct.calcsize(EXPORTED_CONTACT_STRUCT)  # 73 bytes
+
+
+def encode_exported_contact(
+    pub_key: bytes, adv_type: int, name: str, gps_lat: float, gps_lon: float
+) -> bytes:
+    """Encode the 73-byte exported-contact blob."""
+    name_field = name.encode("utf-8")[:CONTACT_NAME_SIZE].ljust(CONTACT_NAME_SIZE, b"\x00")
+    return struct.pack(
+        EXPORTED_CONTACT_STRUCT,
+        pub_key,
+        adv_type,
+        name_field,
+        int(gps_lat * 1e6),
+        int(gps_lon * 1e6),
+    )
+
+
+def decode_exported_contact(data: bytes) -> Optional[dict]:
+    """Decode a 73-byte exported-contact blob; returns None if too short.
+
+    ``name_raw`` preserves the undecoded name bytes (up to the first NUL) for
+    callers that re-encode the name on the wire.
+    """
+    if len(data) < EXPORTED_CONTACT_SIZE:
+        return None
+    pub_key, adv_type, name_field, lat, lon = struct.unpack_from(EXPORTED_CONTACT_STRUCT, data)
+    name_raw = name_field.split(b"\x00")[0]
+    return {
+        "public_key": pub_key,
+        "adv_type": adv_type,
+        "name": name_raw.decode("utf-8", errors="replace"),
+        "name_raw": name_raw,
+        "gps_lat": lat / 1e6,
+        "gps_lon": lon / 1e6,
+        "lat_microdeg": lat,
+        "lon_microdeg": lon,
+    }
 
 
 def parse_binary_response(
@@ -169,12 +217,14 @@ def _parse_anon_basic(data: bytes) -> dict:
     """Parse ANON_REQ_TYPE_BASIC response: clock(4) + feature flags(1)."""
     clock = int.from_bytes(data[:4], "little") if len(data) >= 4 else 0
     features = data[4] if len(data) >= 5 else 0
+    bridge_type = features & ANON_BASIC_FEAT_BRIDGE_MASK
     return {
         "type": "basic",
         "clock": clock,
         "features": features,
-        "is_bridge": bool(features & 0x01),
-        "is_disabled": bool(features & 0x80),
+        "is_bridge": bridge_type != 0,
+        "bridge_type": bridge_type,
+        "is_disabled": bool(features & ANON_BASIC_FEAT_DISABLED),
     }
 
 

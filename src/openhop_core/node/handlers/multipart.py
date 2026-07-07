@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import inspect
 from typing import Awaitable, Callable, Optional
 
 from ...protocol import Packet
@@ -28,7 +28,9 @@ class MultipartAckHandler(BaseHandler):
 
     def __init__(self, log_fn):
         self.log = log_fn
-        self._ack_received_callback: Optional[Callable[[int], Awaitable[None] | None]] = None
+        self._ack_received_callback: Optional[
+            Callable[[int], Awaitable[None] | None]
+        ] = None
 
     def set_ack_received_callback(
         self, callback: Optional[Callable[[int], Awaitable[None] | None]]
@@ -63,7 +65,6 @@ class MultipartAckHandler(BaseHandler):
         """Notify the dispatcher that an ACK was received."""
         if self._ack_received_callback:
             cb = self._ack_received_callback
-            if asyncio.iscoroutinefunction(cb):
-                await cb(crc)
-            else:
-                cb(crc)
+            result = cb(crc)
+            if inspect.isawaitable(result):
+                await result

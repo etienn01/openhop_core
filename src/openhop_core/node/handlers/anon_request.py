@@ -10,6 +10,12 @@ the 4-byte timestamp (``data[4]``) selects the handler:
 - ``ANON_REQ_TYPE_OWNER`` (0x02) -> ``"node_name\nowner_info"``.
 - ``ANON_REQ_TYPE_BASIC`` (0x03) -> clock + a feature-flags byte.
 
+For room-server identities, firmware parity is different from repeaters:
+``simple_room_server/MyMesh.cpp`` treats all ``PAYLOAD_TYPE_ANON_REQ`` packets
+as login payloads (timestamp + sync_since + password), so this handler bypasses
+sub-type dispatch and delegates directly to ``LoginServerHandler`` when
+``login_handler.is_room_server`` is true.
+
 The regions/owner/basic responders only answer route-direct requests and are
 gated behind a shared :class:`AnonRateLimiter` (mirroring the firmware
 ``anon_limiter``) so the node does not become a flood amplifier.
@@ -23,17 +29,17 @@ import time
 from typing import Callable, Optional, Tuple
 
 from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder
-from ...protocol.constants import MAX_PACKET_PAYLOAD, PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_RESPONSE
+from ...protocol.constants import (
+    ANON_REQ_TYPE_BASIC,
+    ANON_REQ_TYPE_OWNER,
+    ANON_REQ_TYPE_REGIONS,
+    MAX_PACKET_PAYLOAD,
+    PAYLOAD_TYPE_ANON_REQ,
+    PAYLOAD_TYPE_RESPONSE,
+)
 from ...protocol.packet_utils import PathUtils
 from .base import BaseHandler
 from .login_server import LoginServerHandler
-
-# Anonymous-request sub-types (first byte of an ANON_REQ payload after the
-# 4-byte timestamp). Mirrors ``openhop_core.companion.constants`` but defined here
-# to avoid a circular import (the companion package imports node.handlers).
-ANON_REQ_TYPE_REGIONS = 0x01
-ANON_REQ_TYPE_OWNER = 0x02
-ANON_REQ_TYPE_BASIC = 0x03
 
 # Server response delay (ms) — matches firmware SERVER_RESPONSE_DELAY.
 SERVER_RESPONSE_DELAY_MS = 300
@@ -146,6 +152,13 @@ class AnonRequestHandler(BaseHandler):
                 plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_data)
             except Exception as e:
                 self.log(f"[AnonReq] Failed to decrypt request: {e}")
+                return
+            # Firmware parity (simple_room_server): room servers do not subtype
+            # dispatch ANON_REQ by plaintext byte 4. Their login payload is:
+            # timestamp(4) + sync_since(4) + password...
+            # so byte 4 is sync_since[0], not an anon request code.
+            if getattr(self.login_handler, "is_room_server", False):
+                await self.login_handler(packet)
                 return
 
             if len(plaintext) < 5:

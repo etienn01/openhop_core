@@ -1300,7 +1300,9 @@ class TestRaceConditionSimulations:
             # Prevent stale wakeups from reusing the previous CRC IRQ status.
             radio._last_irq_status = IRQ_NONE
             await _wait_condition(
-                lambda: not radio._is_receiving_packet and not radio._rx_done_event.is_set(),
+                lambda: (
+                    not radio._is_receiving_packet and not radio._rx_done_event.is_set()
+                ),
                 timeout=1.0,
             )
 
@@ -2838,3 +2840,15 @@ class TestCoverageSecondPass:
         radio._rx_irq_task = task
         radio.cleanup()
         task.cancel.assert_called_once()
+
+
+class TestHandleInterruptIdempotency:
+    def test_second_call_with_zero_irq_preserves_last_irq_status(self, radio):
+        radio.lora.getIrqStatus.return_value = IRQ_CRC_ERR
+        radio._handle_interrupt()
+        assert radio._last_irq_status == IRQ_CRC_ERR
+
+        radio.lora.getIrqStatus.return_value = IRQ_NONE
+        radio._handle_interrupt()
+
+        assert radio._last_irq_status == IRQ_CRC_ERR

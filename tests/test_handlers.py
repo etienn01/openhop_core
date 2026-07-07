@@ -18,7 +18,14 @@ from openhop_core.node.handlers import (
     TextMessageHandler,
     TraceHandler,
 )
-from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
+from openhop_core.node.handlers.login_server import FIRMWARE_VER_LEVEL
+from openhop_core.protocol import (
+    CryptoUtils,
+    Identity,
+    LocalIdentity,
+    Packet,
+    PacketBuilder,
+)
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
@@ -45,6 +52,7 @@ class MockContact:
         self.public_key = public_key
         self.name = name
         self.last_advert = 0
+        self.sync_since = 0
 
 
 class MockContactBook:
@@ -127,7 +135,7 @@ class TestAckHandler:
         """Firmware emits 6-byte ACKs (hash + ext-attempt + random); match first 4 bytes."""
         packet = Packet()
         # 4-byte CRC 0x12345678 followed by an ext-attempt byte and a random byte
-        packet.payload = bytearray(b"\x78\x56\x34\x12\x02\xAB")
+        packet.payload = bytearray(b"\x78\x56\x34\x12\x02\xab")
 
         crc = await self.handler.process_discrete_ack(packet)
         assert crc == 0x12345678
@@ -165,7 +173,7 @@ class TestMultipartAckHandler:
         packet = Packet()
         # wrapper byte (remaining=1, inner=ACK) + 4-byte CRC + extra bytes
         packet.payload = bytearray(
-            bytes([(1 << 4) | PAYLOAD_TYPE_ACK]) + b"\x78\x56\x34\x12\x00\xAB"
+            bytes([(1 << 4) | PAYLOAD_TYPE_ACK]) + b"\x78\x56\x34\x12\x00\xab"
         )
 
         await self.handler(packet)
@@ -253,7 +261,11 @@ class TestTextMessageHandler:
         # Sender composes a DIRECT DM addressed to the receiver
         receiver_contact = _SendContact(receiver.get_public_key().hex())
         packet, ack_crc = PacketBuilder.create_text_message(
-            receiver_contact, sender, "hello round trip", attempt=0, message_type="direct"
+            receiver_contact,
+            sender,
+            "hello round trip",
+            attempt=0,
+            message_type="direct",
         )
 
         # Receiver knows the sender as a contact (32-byte pubkey)
@@ -340,7 +352,11 @@ class TestTextMessageHandler:
 
         receiver_contact = _SendContact(receiver.get_public_key().hex())
         packet, ack_crc = PacketBuilder.create_text_message(
-            receiver_contact, sender, "no reverse path", attempt=0, message_type="direct"
+            receiver_contact,
+            sender,
+            "no reverse path",
+            attempt=0,
+            message_type="direct",
         )
         # Sender is a known contact but with an UNKNOWN out_path back to it.
         self.contacts.contacts = [
@@ -356,6 +372,69 @@ class TestTextMessageHandler:
         assert (ack_packet.header & 0x03) == ROUTE_TYPE_FLOOD  # flooded, not direct
         assert ack_packet.path_len == 0  # no path
         assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
+
+    @pytest.mark.asyncio
+    async def test_signed_plain_advances_contact_sync_since(self):
+        """Signed plain traffic should advance contact.sync_since (firmware parity)."""
+        sender = LocalIdentity()
+        receiver = self.local_identity
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        receiver_contact = _SendContact(receiver.get_public_key().hex())
+        signed_timestamp = 0x12345678
+        packet, _ = PacketBuilder.create_text_message(
+            receiver_contact,
+            sender,
+            "signed update",
+            attempt=0,
+            message_type="direct",
+            txt_type=0x02,
+            timestamp=signed_timestamp,
+        )
+        contact = MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        self.contacts.contacts = [contact]
+
+        await self.handler(packet)
+
+        assert contact.sync_since == signed_timestamp
+
+    @pytest.mark.asyncio
+    async def test_signed_plain_emits_delivery_ack(self):
+        """Signed plain traffic should emit an ACK (room-server push compatibility)."""
+        sender = LocalIdentity()
+        receiver = self.local_identity
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        receiver_contact = _SendContact(receiver.get_public_key().hex())
+        packet, _ = PacketBuilder.create_text_message(
+            receiver_contact,
+            sender,
+            "signed ack",
+            attempt=0,
+            message_type="direct",
+            txt_type=0x02,
+            timestamp=0x12345679,
+        )
+        contact = MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        contact.type = 3  # room server
+        self.contacts.contacts = [contact]
+
+        await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert self.send_packet_fn.call_count == 1
+        ack_packet = self.send_packet_fn.call_args_list[0].args[0]
+        assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
 
     @pytest.mark.asyncio
     async def test_direct_multi_ack_emits_multipart_then_ack(self):
@@ -445,7 +524,9 @@ class TestPathHandler:
         self.log_fn = MagicMock()
         self.ack_handler = AckHandler(self.log_fn)
         self.protocol_response_handler = MagicMock()
-        self.handler = PathHandler(self.log_fn, self.ack_handler, self.protocol_response_handler)
+        self.handler = PathHandler(
+            self.log_fn, self.ack_handler, self.protocol_response_handler
+        )
 
     def test_payload_type(self):
         """Test path handler payload type."""
@@ -532,7 +613,9 @@ class TestLoginResponseHandler:
         self.log_fn = MagicMock()
         self.send_packet_fn = AsyncMock()
         self.local_identity = LocalIdentity()
-        self.handler = LoginResponseHandler(self.local_identity, self.contacts, self.log_fn)
+        self.handler = LoginResponseHandler(
+            self.local_identity, self.contacts, self.log_fn
+        )
 
     def test_payload_type(self):
         """Test login response handler payload type."""
@@ -553,7 +636,9 @@ class TestProtocolResponseHandler:
         self.log_fn = MagicMock()
         self.send_packet_fn = AsyncMock()
         self.local_identity = LocalIdentity()
-        self.handler = ProtocolResponseHandler(self.log_fn, self.local_identity, self.contacts)
+        self.handler = ProtocolResponseHandler(
+            self.log_fn, self.local_identity, self.contacts
+        )
 
     def test_payload_type(self):
         """Test protocol response handler payload type."""
@@ -640,7 +725,9 @@ class TestProtocolResponseHandler:
 
         callback_calls = []
 
-        async def on_path_updated(pub: bytes, path_len: int, path_bytes_arg: bytes) -> None:
+        async def on_path_updated(
+            pub: bytes, path_len: int, path_bytes_arg: bytes
+        ) -> None:
             callback_calls.append((pub, path_len, path_bytes_arg))
 
         handler.set_contact_path_updated_callback(on_path_updated)
@@ -693,7 +780,9 @@ class TestProtocolResponseHandler:
 
         callback_calls = []
 
-        async def on_path_updated(pub: bytes, path_len: int, path_bytes_arg: bytes) -> None:
+        async def on_path_updated(
+            pub: bytes, path_len: int, path_bytes_arg: bytes
+        ) -> None:
             callback_calls.append((pub, path_len, path_bytes_arg))
 
         handler.set_contact_path_updated_callback(on_path_updated)
@@ -741,7 +830,9 @@ class TestProtocolResponseHandler:
         reply[4] = 0x00  # RESP_SERVER_LOGIN_OK
         client_hash = local_identity.get_public_key()[0]
         server_hash = server_pubkey[0]
-        secret = Identity(server_pubkey).calc_shared_secret(local_identity.get_private_key())
+        secret = Identity(server_pubkey).calc_shared_secret(
+            local_identity.get_private_key()
+        )
         pkt = PacketBuilder.create_path_return(
             dest_hash=client_hash,
             src_hash=server_hash,
@@ -802,9 +893,13 @@ class TestProtocolRequestHandler:
         assert original.is_route_flood()
 
         response_data = b"\x39\x30\x00\x00\x00"  # timestamp LE + req_type 0
-        shared_secret = peer_identity.calc_shared_secret(self.local_identity.get_private_key())
+        shared_secret = peer_identity.calc_shared_secret(
+            self.local_identity.get_private_key()
+        )
 
-        result = self.handler._build_response(original, client, response_data, shared_secret)
+        result = self.handler._build_response(
+            original, client, response_data, shared_secret
+        )
 
         assert result is not None
         assert result.get_payload_type() == PAYLOAD_TYPE_PATH
@@ -818,7 +913,9 @@ class TestProtocolRequestHandler:
 
         peer_identity = LocalIdentity()
         client = self._client_with_key(peer_identity.get_public_key())
-        shared_secret = peer_identity.calc_shared_secret(self.local_identity.get_private_key())
+        shared_secret = peer_identity.calc_shared_secret(
+            self.local_identity.get_private_key()
+        )
 
         original = Packet()
         original.header = (ROUTE_TYPE_FLOOD & 0x03) | (PAYLOAD_TYPE_REQ << 2)
@@ -827,7 +924,9 @@ class TestProtocolRequestHandler:
         original.path = bytearray([0x01, 0x02, 0x03, 0x04])
         response_data = b"\x00\x00\x00\x00\x00"
 
-        result = self.handler._build_response(original, client, response_data, shared_secret)
+        result = self.handler._build_response(
+            original, client, response_data, shared_secret
+        )
 
         assert result is not None
         assert result.get_payload_type() == PAYLOAD_TYPE_PATH
@@ -840,7 +939,9 @@ class TestProtocolRequestHandler:
         client = self._client_with_key(peer_identity.get_public_key())
         client.out_path = b""
         client.out_path_len = -1
-        shared_secret = peer_identity.calc_shared_secret(self.local_identity.get_private_key())
+        shared_secret = peer_identity.calc_shared_secret(
+            self.local_identity.get_private_key()
+        )
 
         original = Packet()
         original.header = (ROUTE_TYPE_DIRECT & 0x03) | (PAYLOAD_TYPE_REQ << 2)
@@ -849,7 +950,9 @@ class TestProtocolRequestHandler:
         assert not original.is_route_flood()
 
         response_data = b"\x01\x00\x00\x00\x00"
-        result = self.handler._build_response(original, client, response_data, shared_secret)
+        result = self.handler._build_response(
+            original, client, response_data, shared_secret
+        )
 
         assert result is not None
         assert result.get_payload_type() == PAYLOAD_TYPE_RESPONSE
@@ -862,7 +965,9 @@ class TestProtocolRequestHandler:
         client = self._client_with_key(peer_identity.get_public_key())
         client.out_path = bytes([0x01, 0x02])
         client.out_path_len = 2
-        shared_secret = peer_identity.calc_shared_secret(self.local_identity.get_private_key())
+        shared_secret = peer_identity.calc_shared_secret(
+            self.local_identity.get_private_key()
+        )
 
         original = Packet()
         original.header = (ROUTE_TYPE_DIRECT & 0x03) | (PAYLOAD_TYPE_REQ << 2)
@@ -870,7 +975,9 @@ class TestProtocolRequestHandler:
         original.path = bytearray()
 
         response_data = b"\x02\x00\x00\x00\x00"
-        result = self.handler._build_response(original, client, response_data, shared_secret)
+        result = self.handler._build_response(
+            original, client, response_data, shared_secret
+        )
 
         assert result is not None
         assert result.get_payload_type() == PAYLOAD_TYPE_RESPONSE
@@ -895,7 +1002,9 @@ class TestTraceHandler:
 
     def test_parse_trace_payload_one_byte_hashes(self):
         """flags=0: 1 byte per hop; path 0x01 0x02 = two hops."""
-        payload = struct.pack("<IIB", 0x11111111, 0x22222222, 0x00) + bytes([0x01, 0x02])
+        payload = struct.pack("<IIB", 0x11111111, 0x22222222, 0x00) + bytes(
+            [0x01, 0x02]
+        )
         r = self.handler._parse_trace_payload(payload)
         assert r["valid"]
         assert r["path_hash_width"] == 1
@@ -972,7 +1081,9 @@ async def test_handlers_can_be_called():
 
     handlers = [
         AckHandler(log_fn),
-        TextMessageHandler(local_identity, contacts, log_fn, send_packet_fn, event_service),
+        TextMessageHandler(
+            local_identity, contacts, log_fn, send_packet_fn, event_service
+        ),
         AdvertHandler(log_fn),
         PathHandler(log_fn),
         GroupTextHandler(local_identity, contacts, log_fn, send_packet_fn),
@@ -992,7 +1103,9 @@ async def test_handlers_can_be_called():
         except Exception as e:
             # Some handlers may raise exceptions due to incomplete setup,
             # but they should be callable
-            assert isinstance(e, (ValueError, AttributeError, TypeError))  # Expected exceptions
+            assert isinstance(
+                e, (ValueError, AttributeError, TypeError)
+            )  # Expected exceptions
 
 
 # AnonReqResponseHandler Tests (separate from LoginResponseHandler)
@@ -1048,7 +1161,9 @@ class TestLoginServerHandler:
 
         # Calculate shared secret (client side)
         server_id = Identity(server_pubkey)
-        shared_secret = server_id.calc_shared_secret(self.client_identity_local.get_private_key())
+        shared_secret = server_id.calc_shared_secret(
+            self.client_identity_local.get_private_key()
+        )
         aes_key = shared_secret[:16]
 
         # Repeater format plaintext: timestamp(4) + password + null
@@ -1140,7 +1255,9 @@ class TestLoginServerHandler:
 
         # Decrypt the PATH payload to verify inner structure
         client_id = Identity(self.client_identity_local.get_public_key())
-        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
+        shared_secret = client_id.calc_shared_secret(
+            self.server_identity.get_private_key()
+        )
         aes_key = shared_secret[:16]
 
         # PATH payload: dest_hash(1) + src_hash(1) + mac_and_ciphertext
@@ -1174,7 +1291,7 @@ class TestLoginServerHandler:
         assert perms == 0x03
 
         fw_ver = login_reply[12]
-        assert fw_ver == 1  # FIRMWARE_VER_LEVEL
+        assert fw_ver == FIRMWARE_VER_LEVEL
 
     @pytest.mark.asyncio
     async def test_failed_auth_sends_no_response(self):
@@ -1224,7 +1341,9 @@ class TestLoginServerHandler:
 
         # Decrypt and verify is_admin field
         client_id = Identity(self.client_identity_local.get_public_key())
-        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
+        shared_secret = client_id.calc_shared_secret(
+            self.server_identity.get_private_key()
+        )
         aes_key = shared_secret[:16]
         encrypted_part = bytes(response_pkt.payload[2:])
         plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_part)
@@ -1252,7 +1371,9 @@ class TestLoginServerHandler:
     async def test_flood_login_with_path_includes_path_in_response(self):
         """Flood login with path hashes → PATH response includes those hashes."""
         path_hashes = [0xAA, 0xBB]
-        pkt = self._build_login_packet(password="admin123", route_type="flood", path=path_hashes)
+        pkt = self._build_login_packet(
+            password="admin123", route_type="flood", path=path_hashes
+        )
         # path_len encodes hash size and count: (hash_size-1)<<6 | count
         # For 1-byte hashes with 2 hops: (0<<6) | 2 = 2
         pkt.path_len = 2
@@ -1265,7 +1386,9 @@ class TestLoginServerHandler:
 
         # Decrypt and verify path is included
         client_id = Identity(self.client_identity_local.get_public_key())
-        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
+        shared_secret = client_id.calc_shared_secret(
+            self.server_identity.get_private_key()
+        )
         aes_key = shared_secret[:16]
         encrypted_part = bytes(response_pkt.payload[2:])
         plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_part)
@@ -1276,3 +1399,105 @@ class TestLoginServerHandler:
         assert plaintext[1] == 0xAA
         assert plaintext[2] == 0xBB
         assert plaintext[3] == PAYLOAD_TYPE_RESPONSE  # extra_type
+
+
+# ---------------------------------------------------------------------------
+# TXT_TYPE_SIGNED_PLAIN (room server posts)
+# ---------------------------------------------------------------------------
+
+
+def _make_signed_room_post(
+    sender,
+    receiver,
+    text=b"room post",
+    author_prefix=b"\xde\xad\xbe\xef",
+    ts=1_700_000_000,
+    attempt=1,
+):
+    """Encrypted TXT_MSG exactly as a room server pushes a post (firmware
+    simple_room_server pushPostToClient): plaintext = timestamp(4) +
+    [(TXT_TYPE_SIGNED_PLAIN << 2) | attempt](1) + author_pubkey_prefix(4) + text."""
+    import struct as _struct
+    from types import SimpleNamespace
+
+    from openhop_core.protocol.constants import TXT_TYPE_SIGNED_PLAIN
+
+    flags = (TXT_TYPE_SIGNED_PLAIN << 2) | (attempt & 3)
+    plaintext = _struct.pack("<I", ts) + bytes([flags]) + author_prefix + text
+    receiver_contact = SimpleNamespace(
+        public_key=receiver.get_public_key().hex(), out_path=[], out_path_len=-1
+    )
+    payload, _secret, _aes = PacketBuilder._create_encrypted_payload(
+        receiver_contact, sender, plaintext
+    )
+    pkt = Packet()
+    pkt.header = PacketBuilder._create_header(PAYLOAD_TYPE_TXT_MSG, "direct", False)
+    pkt.path_len, pkt.path = 0, bytearray()
+    pkt.payload = bytearray(payload)
+    pkt.payload_len = len(payload)
+    return pkt, plaintext
+
+
+class TestSignedPlainMessages:
+    """TXT_TYPE_SIGNED_PLAIN carries a 4-byte author pubkey prefix before the
+    text (BaseChatMesh::onPeerDataRecv -> onSignedMessageRecv(&data[5], &data[9]))."""
+
+    def setup_method(self):
+        self.local_identity = LocalIdentity()
+        self.contacts = MockContactBook()
+        self.log_fn = MagicMock()
+        self.send_packet_fn = AsyncMock()
+        self.event_service = MockEventService()
+        self.handler = TextMessageHandler(
+            self.local_identity,
+            self.contacts,
+            self.log_fn,
+            self.send_packet_fn,
+            self.event_service,
+        )
+
+    @pytest.mark.asyncio
+    async def test_author_prefix_separated_from_text(self):
+        """The 4-byte author prefix must not leak into the message text."""
+        sender = LocalIdentity()
+        prefix = bytes([0xDE, 0xAD, 0xBE, 0xEF])
+        pkt, _ = _make_signed_room_post(sender, self.local_identity, b"room post", prefix)
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="Room")
+        ]
+
+        await self.handler(pkt)
+
+        assert self.event_service.publish_sync.called
+        _event, data = self.event_service.publish_sync.call_args.args
+        # AES block padding (NULs) is stripped downstream (base_events rstrip),
+        # exactly like the PLAIN path; the author prefix must not be in the text.
+        assert data["message_text"].rstrip("\x00") == "room post"
+        assert data["sender_prefix"] == prefix.hex()
+        assert data["txt_type"] == 2
+        assert pkt.decrypted["text"].rstrip("\x00") == "room post"
+
+    @pytest.mark.asyncio
+    async def test_signed_message_acked_with_firmware_hash(self):
+        """Signed messages get the firmware 4-byte ACK keyed with OUR pubkey."""
+        import asyncio
+
+        sender = LocalIdentity()
+        prefix = bytes([1, 2, 3, 4])
+        pkt, plaintext = _make_signed_room_post(sender, self.local_identity, b"hi room", prefix)
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="Room")
+        ]
+
+        await self.handler(pkt)
+        for _ in range(80):
+            if self.send_packet_fn.called:
+                break
+            await asyncio.sleep(0.05)
+
+        assert self.send_packet_fn.called
+        ack_packet = self.send_packet_fn.call_args.args[0]
+        assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
+        # Firmware: sha256(decrypted[0 : 9 + strlen(text)] || our pubkey)[:4]
+        expected = CryptoUtils.sha256(plaintext + self.local_identity.get_public_key())[:4]
+        assert bytes(ack_packet.payload) == expected

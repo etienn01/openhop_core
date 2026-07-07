@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import collections
 import collections.abc
 import logging
@@ -60,9 +59,7 @@ class MeshNode:
         self.event_service = event_service  # App can inject event service
 
         # Node name should be provided by app
-        self.node_name = (
-            config.get("node", {}).get("name", "unknown") if config else "unknown"
-        )
+        self.node_name = config.get("node", {}).get("name", "unknown") if config else "unknown"
         self.radio_config = config.get("radio", {}) if config else {}
 
         self.logger = logger or logging.getLogger("MeshNode")
@@ -71,9 +68,7 @@ class MeshNode:
         # App-injected analysis components
         self.packet_filter = None
 
-        self.dispatcher = Dispatcher(
-            radio, log_fn=self.log.info, packet_filter=self.packet_filter
-        )
+        self.dispatcher = Dispatcher(radio, log_fn=self.log.info, packet_filter=self.packet_filter)
 
         # Set contact book for decryption
         self.dispatcher.set_contact_book(self.contacts)
@@ -109,17 +104,13 @@ class MeshNode:
     # Transport
     # -------------------------------------------------------------------------
 
-    async def send_packet(
-        self, pkt: Any, *, wait_for_ack: bool = False, **kwargs
-    ) -> bool:
+    async def send_packet(self, pkt: Any, *, wait_for_ack: bool = False, **kwargs) -> bool:
         """Send a raw packet via the dispatcher.
 
         This is the single transport entry point.  All message-building and
         response-waiting logic lives in the companion layer.
         """
-        return await self.dispatcher.send_packet(
-            pkt, wait_for_ack=wait_for_ack, **kwargs
-        )
+        return await self.dispatcher.send_packet(pkt, wait_for_ack=wait_for_ack, **kwargs)
 
     # -------------------------------------------------------------------------
     # Event service propagation
@@ -141,36 +132,3 @@ class MeshNode:
                     handler = getattr(self.dispatcher, attr_name, None)
                     if handler and hasattr(handler, "event_service"):
                         handler.event_service = event_service
-
-    # -------------------------------------------------------------------------
-    # Backwards-compatible utilities (deprecated — prefer companion layer)
-    # -------------------------------------------------------------------------
-
-    class _ResponseWaiter:
-        """Synchronisation helper for async response callbacks.
-
-        .. deprecated::
-            Use :class:`~openhop_core.companion.models.ResponseWaiter` from the
-            companion layer instead.
-        """
-
-        def __init__(self):
-            self.event = asyncio.Event()
-            self.data = {"success": False, "text": None, "parsed": {}}
-
-        def callback(
-            self, success: bool, text: str, parsed_data: Optional[dict] = None
-        ):
-            """Standard callback for response handlers."""
-            self.data["success"] = success
-            self.data["text"] = text
-            self.data["parsed"] = parsed_data or {}
-            self.event.set()
-
-        async def wait(self, timeout: float = 10.0) -> dict:
-            """Wait for response with timeout. Returns the response data."""
-            try:
-                await asyncio.wait_for(self.event.wait(), timeout=timeout)
-                return self.data
-            except asyncio.TimeoutError:
-                return {"success": False, "text": None, "parsed": {}, "timeout": True}

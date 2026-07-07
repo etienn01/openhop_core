@@ -84,7 +84,7 @@ For examples, see the [documentation](https://pymc-dev.github.io/openhop-core/ex
 - Raspberry Pi (or compatible SBC)
 - SX1262 LoRa module
 - SPI interface enabled
-- Python 3.8+
+- Python 3.9+
 
 ## What is MeshCore?
 

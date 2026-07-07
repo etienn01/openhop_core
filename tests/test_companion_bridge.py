@@ -715,3 +715,114 @@ class TestCompanionBridgeDeduplication:
         assert msg is not None
         assert msg.text == "Hello"
         assert bridge.sync_next_message() is None
+
+
+# ---------------------------------------------------------------------------
+# Request retry / total-timeout cap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRequestTimeoutCap:
+    """The `timeout` argument caps the total wait across retries."""
+
+    def _bridge_with_contact(self):
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        contact = _make_peer_contact("Repeater")
+        bridge.contacts.add(contact)
+        return bridge, injector, contact
+
+    async def test_status_request_stops_at_total_timeout(self):
+        bridge, injector, contact = self._bridge_with_contact()
+        # Fixed short per-attempt timeout; no response ever arrives.
+        bridge._response_timeout_s = lambda pkt, proxy: 0.05
+        result = await bridge.send_status_request(contact.public_key, timeout=0.08)
+        assert result["success"] is False
+        # Budget (0.08s) allows the first attempt (0.05s) plus a clipped second
+        # attempt — never all DEFAULT_MAX_ATTEMPTS.
+        assert 1 <= len(injector.calls) <= 2
+
+    async def test_status_request_retries_without_cap_pressure(self):
+        from openhop_core.companion.timing import DEFAULT_MAX_ATTEMPTS
+
+        bridge, injector, contact = self._bridge_with_contact()
+        bridge._response_timeout_s = lambda pkt, proxy: 0.01
+        result = await bridge.send_status_request(contact.public_key, timeout=10.0)
+        assert result["success"] is False
+        assert len(injector.calls) == DEFAULT_MAX_ATTEMPTS
+
+    async def test_telemetry_request_stops_at_total_timeout(self):
+        bridge, injector, contact = self._bridge_with_contact()
+        bridge._response_timeout_s = lambda pkt, proxy: 0.05
+        result = await bridge.send_telemetry_request(contact.public_key, timeout=0.08)
+        assert result["success"] is False
+        assert 1 <= len(injector.calls) <= 2
+
+
+# ---------------------------------------------------------------------------
+# Room server posts (TXT_TYPE_SIGNED_PLAIN) end-to-end
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSignedRoomPostEndToEnd:
+    async def test_room_post_roundtrip_matches_firmware_frame(self):
+        """A pushed room post (SIGNED_PLAIN) survives RX -> queue -> app frame
+        with the text intact and the author prefix as a separate field."""
+        import struct
+        from types import SimpleNamespace
+
+        from openhop_core.companion.constants import RESP_CODE_CONTACT_MSG_RECV
+        from openhop_core.companion.frame_server import CompanionFrameServer
+        from openhop_core.protocol.constants import PAYLOAD_TYPE_TXT_MSG, TXT_TYPE_SIGNED_PLAIN
+
+        injector = MockPacketInjector()
+        room = LocalIdentity()  # the room server
+        companion = LocalIdentity()  # our virtual companion
+        bridge = CompanionBridge(companion, injector)
+        bridge.contacts.add(Contact(public_key=room.get_public_key(), name="Room"))
+
+        # Build the packet exactly as firmware pushPostToClient does:
+        # timestamp(4) + [(SIGNED_PLAIN << 2) | attempt](1) + author_prefix(4) + text
+        author_prefix = bytes([0x12, 0x34, 0x56, 0x78])
+        ts = 1_700_000_042
+        flags = (TXT_TYPE_SIGNED_PLAIN << 2) | 1
+        plaintext = struct.pack("<I", ts) + bytes([flags]) + author_prefix + b"hello room"
+        recv_contact = SimpleNamespace(
+            public_key=companion.get_public_key().hex(), out_path=[], out_path_len=-1
+        )
+        payload, _, _ = PacketBuilder._create_encrypted_payload(recv_contact, room, plaintext)
+        pkt = Packet()
+        pkt.header = PacketBuilder._create_header(PAYLOAD_TYPE_TXT_MSG, "direct", False)
+        pkt.path_len, pkt.path = 0, bytearray()
+        pkt.payload = bytearray(payload)
+        pkt.payload_len = len(payload)
+
+        await bridge.process_received_packet(pkt)
+        for _ in range(100):
+            if bridge.message_queue.count:
+                break
+            await asyncio.sleep(0.01)
+
+        msg = bridge.sync_next_message()
+        assert msg is not None
+        assert msg.text == "hello room"  # first 4 characters intact
+        assert msg.txt_type == TXT_TYPE_SIGNED_PLAIN
+        assert msg.sender_prefix == author_prefix
+        assert msg.timestamp == ts
+
+        # The app frame must match firmware queueMessage byte-for-byte:
+        # code + room_pubkey_prefix(6) + path_len + txt_type + timestamp(4)
+        # + author_prefix(4) + text
+        server = CompanionFrameServer(bridge, "hash", port=0)
+        server._app_target_ver = 0
+        frame = server._build_message_frame(msg)
+        assert frame == (
+            bytes([RESP_CODE_CONTACT_MSG_RECV])
+            + room.get_public_key()[:6]
+            + bytes([msg.path_len, TXT_TYPE_SIGNED_PLAIN])
+            + struct.pack("<I", ts)
+            + author_prefix
+            + b"hello room"
+        )

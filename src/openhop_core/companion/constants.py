@@ -5,6 +5,18 @@ from __future__ import annotations
 import base64
 from enum import IntEnum
 
+# Wire-level values shared with the node/protocol layers live in
+# protocol.constants; they are re-exported here so existing
+# ``openhop_core.companion.constants`` imports keep working.
+from ..protocol.constants import ANON_REQ_TYPE_BASIC  # noqa: F401
+from ..protocol.constants import ANON_REQ_TYPE_OWNER  # noqa: F401
+from ..protocol.constants import ANON_REQ_TYPE_REGIONS  # noqa: F401
+from ..protocol.constants import MAX_PATH_SIZE  # noqa: F401
+from ..protocol.constants import PUB_KEY_SIZE  # noqa: F401
+from ..protocol.constants import TXT_TYPE_CLI_DATA  # noqa: F401
+from ..protocol.constants import TXT_TYPE_PLAIN  # noqa: F401
+from ..protocol.constants import TXT_TYPE_SIGNED_PLAIN  # noqa: F401
+
 # ---------------------------------------------------------------------------
 # ADV Types (contact/node classification)
 # ---------------------------------------------------------------------------
@@ -20,11 +32,10 @@ ADV_TYPE_SENSOR = 4
 MAX_ANON_CONTACTS = 8
 
 # ---------------------------------------------------------------------------
-# Text Types
+# Text Types: TXT_TYPE_PLAIN / _CLI_DATA / _SIGNED_PLAIN are defined in
+# protocol.constants (wire values shared with node.handlers.text) and
+# re-exported at the top of this module.
 # ---------------------------------------------------------------------------
-TXT_TYPE_PLAIN = 0
-TXT_TYPE_CLI_DATA = 1
-TXT_TYPE_SIGNED_PLAIN = 2
 
 # ---------------------------------------------------------------------------
 # Telemetry Modes
@@ -86,14 +97,20 @@ PROTOCOL_CODE_BINARY_REQ = 0x02
 PROTOCOL_CODE_ANON_REQ = 0x07
 
 # ---------------------------------------------------------------------------
-# Anonymous request sub-types (first byte of an ANON_REQ payload, after the
-# 4-byte timestamp). Used by the "discover regions from zero-hop repeaters"
-# feature and related anonymous queries. Note these collide numerically with
+# Anonymous request sub-types: ANON_REQ_TYPE_REGIONS / _OWNER / _BASIC are
+# defined in protocol.constants (wire values shared with node.handlers) and
+# re-exported at the top of this module. Note they collide numerically with
 # BinaryReqType values, so anon responses must be disambiguated by sub-type.
 # ---------------------------------------------------------------------------
-ANON_REQ_TYPE_REGIONS = 0x01  # repeater replies with comma-separated region names
-ANON_REQ_TYPE_OWNER = 0x02  # repeater replies with "name\nowner"
-ANON_REQ_TYPE_BASIC = 0x03  # repeater replies with clock + feature flags
+# Feature flags in the ANON_REQ_TYPE_BASIC response (byte after the clock).
+# The firmware writes these inline (simple_repeater/MyMesh.cpp
+# handleAnonClockReq): bits 0-1 are a bridge-type field, bit 7 is set while
+# the repeater has forwarding disabled.
+# ---------------------------------------------------------------------------
+ANON_BASIC_FEAT_BRIDGE_MASK = 0x03  # bridge-type field (0 = no bridge)
+ANON_BASIC_FEAT_BRIDGE_UART = 0x01  # RS232/UART bridge
+ANON_BASIC_FEAT_BRIDGE_ESPNOW = 0x03  # ESP-NOW bridge
+ANON_BASIC_FEAT_DISABLED = 0x80  # repeater forwarding disabled
 
 # ---------------------------------------------------------------------------
 # Default configuration
@@ -103,8 +120,23 @@ DEFAULT_MAX_CONTACTS = 1000
 DEFAULT_OFFLINE_QUEUE_SIZE = 512
 DEFAULT_MAX_CHANNELS = 40
 CONTACT_NAME_SIZE = 32
+CHANNEL_NAME_SIZE = 32  # channel name field width (CHANNEL_INFO / SET_CHANNEL)
 MAX_SIGN_DATA_SIZE = 8192  # 8KB signing buffer (matches firmware)
 MAX_PENDING_ACK_CRCS = 64
+
+# ---------------------------------------------------------------------------
+# Response-timeout hints (ms) returned in RESP_CODE_SENT frames. The firmware
+# computes est_timeout per packet (calcFlood/DirectTimeoutMillisFor); the
+# virtual companion performs the wait internally and returns fixed hints.
+# ---------------------------------------------------------------------------
+TXT_MSG_TIMEOUT_HINT_MS = 5000
+BINARY_REQ_TIMEOUT_HINT_MS = 10000
+LOGIN_TIMEOUT_HINT_MS = 10000
+STATUS_TIMEOUT_HINT_MS = 15000
+TELEMETRY_TIMEOUT_HINT_MS = 15000
+# Trace estimate: base + per-path-byte increment (CMD_SEND_TRACE_PATH).
+TRACE_BASE_TIMEOUT_MS = 5000
+TRACE_PER_PATH_BYTE_TIMEOUT_MS = 200
 
 # ===========================================================================
 # Frame Protocol Constants (MeshCore Companion Radio Protocol)
@@ -237,7 +269,14 @@ PUSH_CODE_CONTACT_DELETED = 0x8F
 PUSH_CODE_CONTACTS_FULL = 0x90
 
 # ---------------------------------------------------------------------------
-# Error codes
+# Error codes (payload of RESP_CODE_ERR). Frame-server convention:
+#   ERR_CODE_ILLEGAL_ARG      malformed/short command payload; also the
+#                             dispatcher's catch-all for handler exceptions
+#   ERR_CODE_NOT_FOUND        unknown contact/channel/resource
+#   ERR_CODE_TABLE_FULL       store full or send failure (firmware maps
+#                             MSG_SEND_FAILED here, e.g. anon/binary req)
+#   ERR_CODE_BAD_STATE        valid request that cannot run right now
+#   ERR_CODE_UNSUPPORTED_CMD  unknown command or feature not available
 # ---------------------------------------------------------------------------
 ERR_CODE_UNSUPPORTED_CMD = 1
 ERR_CODE_NOT_FOUND = 2
@@ -259,8 +298,8 @@ MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE - 3  # max bytes after prefix + 2-byte length
 # Firmware companion command parser uses MAX_FRAME_SIZE - 9 for channel binary payloads.
 MAX_CHANNEL_DATA_LENGTH = MAX_FRAME_SIZE - 9
 OUT_PATH_UNKNOWN = 0xFF
-PUB_KEY_SIZE = 32
-MAX_PATH_SIZE = 64
+# PUB_KEY_SIZE and MAX_PATH_SIZE are re-exported from protocol.constants at
+# the top of this module.
 
 # ---------------------------------------------------------------------------
 # Default public channel PSK (from firmware MeshCore companion_radio example)

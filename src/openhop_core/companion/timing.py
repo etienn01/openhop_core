@@ -76,8 +76,7 @@ def calc_direct_timeout_ms(airtime_ms: float, out_path_len: int) -> int:
     hops = PathUtils.get_path_hash_count(out_path_len) if out_path_len > 0 else 0
     return int(
         SEND_TIMEOUT_BASE_MILLIS
-        + (DIRECT_SEND_PERHOP_FACTOR * airtime_ms + DIRECT_SEND_PERHOP_EXTRA_MILLIS)
-        * (hops + 1)
+        + (DIRECT_SEND_PERHOP_FACTOR * airtime_ms + DIRECT_SEND_PERHOP_EXTRA_MILLIS) * (hops + 1)
     )
 
 

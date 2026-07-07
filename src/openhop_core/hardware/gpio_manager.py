@@ -530,6 +530,14 @@ class GPIOPinManager:
                                 callback()
                             except Exception:
                                 pass
+                    elif current and last_state:
+                        # Recover when a brief LOW between polls is missed on gpiod polling.
+                        logger.debug(
+                            f"[GPIO] Pin {pin_number}: stuck-HIGH detected, resetting edge baseline"
+                        )
+                        last_state = False
+                        time.sleep(interval)
+                        continue
                     last_state = current
                     time.sleep(interval)
                 except Exception:

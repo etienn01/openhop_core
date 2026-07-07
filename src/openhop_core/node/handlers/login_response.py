@@ -1,4 +1,4 @@
-import asyncio
+import inspect
 import struct
 from typing import Callable, Optional
 
@@ -94,7 +94,7 @@ class LoginResponseHandler(BaseHandler):
             # Forward to protocol response handler if available (only for RESPONSE packets;
             # PATH packets are already handled by PathHandler before we are called).
             if self._protocol_response_handler:
-                pkt_type = (packet.header >> 2) & 0x0F
+                pkt_type = packet.get_payload_type()
                 if pkt_type == PAYLOAD_TYPE_PATH:
                     return  # PathHandler already invoked protocol_response_handler for this packet
                 try:
@@ -169,7 +169,7 @@ class LoginResponseHandler(BaseHandler):
             # If this is a PATH packet, unwrap the path-return envelope to get
             # the inner response.  PATH format after decryption:
             #   path_len(1) + path(N) + extra_type(1) + extra_data(M)
-            pkt_type = (packet.header >> 2) & 0x0F
+            pkt_type = packet.get_payload_type()
             if pkt_type == PAYLOAD_TYPE_PATH and len(plaintext) >= 2:
                 path_len_byte = plaintext[0]
                 path_byte_len = PathUtils.get_path_byte_len(path_len_byte)
@@ -224,7 +224,7 @@ class LoginResponseHandler(BaseHandler):
         """Safely call the login callback without blocking."""
         try:
             if self.login_callback is not None:
-                if asyncio.iscoroutinefunction(self.login_callback):
+                if inspect.iscoroutinefunction(self.login_callback):
                     await self.login_callback(success, data)
                 else:
                     self.login_callback(success, data)

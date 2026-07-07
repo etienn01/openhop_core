@@ -108,13 +108,13 @@ class CompanionRadio(CompanionBase):
     # -------------------------------------------------------------------------
 
     def _get_protocol_response_handler(self) -> Any:
-        return getattr(self.node.dispatcher, "protocol_response_handler", None)
+        return self.node.dispatcher.protocol_response_handler
 
     def _get_login_response_handler(self) -> Any:
-        return getattr(self.node.dispatcher, "login_response_handler", None)
+        return self.node.dispatcher.login_response_handler
 
     def _get_text_handler(self) -> Any:
-        return getattr(self.node.dispatcher, "text_message_handler", None)
+        return self.node.dispatcher.text_message_handler
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -129,8 +129,9 @@ class CompanionRadio(CompanionBase):
         self._apply_multi_acks_pref()
         self._dispatcher_task = asyncio.create_task(self.node.start())
         logger.info(
-            f"CompanionRadio started: name={self.prefs.node_name}, "
-            f"key={self._identity.get_public_key().hex()[:16]}..."
+            "CompanionRadio started: name=%s, key=%s...",
+            self.prefs.node_name,
+            self._identity.get_public_key().hex()[:16],
         )
 
     async def stop(self) -> None:
@@ -193,7 +194,7 @@ class CompanionRadio(CompanionBase):
 
     def _get_group_text_handler(self):
         """Return the group text handler for name sync."""
-        return getattr(self.node.dispatcher, "group_text_handler", None)
+        return self.node.dispatcher.group_text_handler
 
     def set_radio_params(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
         super().set_radio_params(freq_hz, bw_hz, sf, cr)
@@ -207,7 +208,7 @@ class CompanionRadio(CompanionBase):
                 )
                 return True
             except Exception as e:
-                logger.error(f"Error configuring radio: {e}")
+                logger.error("Error configuring radio: %s", e)
                 return False
         return True
 
@@ -218,7 +219,7 @@ class CompanionRadio(CompanionBase):
                 self._radio.set_tx_power(power_dbm)
                 return True
             except Exception as e:
-                logger.error(f"Error setting TX power: {e}")
+                logger.error("Error setting TX power: %s", e)
                 return False
         return True
 
@@ -242,10 +243,10 @@ class CompanionRadio(CompanionBase):
                 event_service=self._event_service,
             )
             self._setup_packet_callbacks()
-            logger.info(f"Imported new identity: {self._identity.get_public_key().hex()[:16]}...")
+            logger.info("Imported new identity: %s...", self._identity.get_public_key().hex()[:16])
             return True
         except Exception as e:
-            logger.error(f"Error importing private key: {e}")
+            logger.error("Error importing private key: %s", e)
             return False
 
     # -------------------------------------------------------------------------
@@ -271,10 +272,7 @@ class CompanionRadio(CompanionBase):
         dispatcher.set_ack_received_listener(self._on_ack_received)
         dispatcher.add_raw_packet_subscriber(self._on_raw_packet_rx_log)
         dispatcher.raw_data_received_callback = self._on_raw_custom_received
-        if (
-            hasattr(dispatcher, "protocol_response_handler")
-            and dispatcher.protocol_response_handler
-        ):
+        if dispatcher.protocol_response_handler:
             dispatcher.protocol_response_handler.set_binary_response_callback(
                 self._on_binary_response
             )

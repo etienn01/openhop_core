@@ -1,0 +1,247 @@
+"""Mesh-event RX handling and dedup of CompanionBase."""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import struct
+import time
+from typing import Optional
+
+from ..node.events import MeshEvents
+from ..protocol import Packet
+from ..protocol.constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
+from ..protocol.crypto import CryptoUtils
+from ..protocol.utils import derive_channel_hash, normalize_channel_secret
+from .models import Channel, Contact, QueuedMessage
+
+logger = logging.getLogger("CompanionBase")
+
+
+class _RxEventsMixin:
+    """Part of :class:`CompanionBase` (see companion_base.py)."""
+
+    # -------------------------------------------------------------------------
+    # Event Handling (shared)
+    # -------------------------------------------------------------------------
+
+    async def _handle_mesh_event(self, event_type: str, data: dict) -> None:
+        try:
+            if event_type == MeshEvents.NEW_MESSAGE:
+                await self._handle_new_message(data)
+            elif event_type == MeshEvents.NEW_CHANNEL_MESSAGE:
+                await self._handle_new_channel_message(data)
+            elif event_type == MeshEvents.NEW_CONTACT:
+                await self._fire_callbacks("node_discovered", data)
+            elif event_type == MeshEvents.CONTACT_UPDATED:
+                pass
+            elif event_type == MeshEvents.NODE_DISCOVERED:
+                # Advert pipeline (single path): all adverts applied here; one event
+                # -> one store update and at most one advert_received (Bridge and Radio).
+                now = int(time.time())
+                contact = Contact.from_dict(data, now=now)
+                # Wire advert flags (ADVERT_FLAG_IS_CHAT_NODE=0x01, etc.) must not
+                # be stored as local contact flags (bit 0 = favourite).  For new
+                # contacts the flags start at 0; for existing contacts
+                # _apply_advert_to_stores restores the persisted value (line 708).
+                contact.flags = 0
+                raw_blob = data.get("raw_advert_packet")
+                if isinstance(raw_blob, (bytes, bytearray)) and len(raw_blob) > 0:
+                    contact.last_advert_packet = bytes(raw_blob)
+                if len(contact.public_key) >= 7 and contact.name:
+                    inbound_path = data.get("inbound_path")
+                    path_len_encoded = data.get("path_len_encoded")
+                    applied = await self._apply_advert_to_stores(
+                        contact, inbound_path, path_len_encoded=path_len_encoded
+                    )
+                    if applied is not None:
+                        # Stored (existing or newly auto-added): persist + app contact update.
+                        await self._fire_callbacks("advert_received", applied)
+                    # Firmware parity (BaseChatMesh::onAdvertRecv -> onDiscoveredContact):
+                    # notify the client for *every* valid advert (stored or not). The frame
+                    # layer decides full NEW_ADVERT vs short ADVERT by whether the contact
+                    # ended up in the store.
+                    disc_contact = applied if applied is not None else contact
+                    await self._fire_callbacks("node_discovered", disc_contact)
+            elif event_type == MeshEvents.TELEMETRY_UPDATED:
+                await self._fire_callbacks("telemetry_response", data)
+        except Exception as e:
+            logger.error("Error handling mesh event %s: %s", event_type, e)
+
+    async def _handle_new_message(self, data: dict) -> None:
+        # Deduplicate by packet hash so reconnects don't queue the same packet multiple times.
+        pkt_hash = data.get("packet_hash")
+        if pkt_hash and self._seen_txt.check_and_add(pkt_hash):
+            return
+
+        sender_key_hex = data.get("contact_pubkey", "")
+        sender_key = bytes.fromhex(sender_key_hex) if sender_key_hex else b""
+        # Handler publishes "message_text"; accept "text" for compatibility
+        message_text = (data.get("message_text") or data.get("text") or "").rstrip("\x00")
+        # Extract SNR/RSSI from network info if available (same as channel path)
+        network_info = data.get("network_info", {})
+        snr = network_info.get("snr")
+        rssi = network_info.get("rssi")
+        # 4-byte author pubkey prefix (TXT_TYPE_SIGNED_PLAIN room server posts)
+        sender_prefix_hex = data.get("sender_prefix", "") or ""
+        try:
+            sender_prefix = bytes.fromhex(sender_prefix_hex)
+        except ValueError:
+            sender_prefix = b""
+        msg = QueuedMessage(
+            sender_key=sender_key,
+            txt_type=data.get("txt_type", data.get("flags", 0)),
+            timestamp=data.get("timestamp", int(time.time())),
+            text=message_text,
+            is_channel=False,
+            path_len=0,
+            snr=snr if snr is not None else 0.0,
+            rssi=rssi if rssi is not None else 0,
+            sender_prefix=sender_prefix,
+        )
+        self.message_queue.push(msg)
+        await self._fire_callbacks(
+            "message_received",
+            sender_key,
+            message_text,
+            msg.timestamp,
+            msg.txt_type,
+            pkt_hash,
+            snr if snr is not None else 0.0,
+            rssi if rssi is not None else 0,
+            sender_prefix,
+        )
+
+    async def _handle_new_channel_message(self, data: dict) -> None:
+        # Do not push our own (outgoing) channel messages to the client as incoming.
+        if data.get("is_outgoing"):
+            return
+
+        # Deduplicate by packet hash so we queue one frame per logical message, matching
+        # firmware: Mesh.cpp only calls onChannelMessageRecv when !_tables->hasSeen(pkt).
+        pkt_hash = data.get("packet_hash")
+        if pkt_hash and self._seen_grp_txt.check_and_add(pkt_hash):
+            return
+
+        path_len = data.get("path_len", 0)
+        channel_name = data.get("channel_name", "")
+        # Resolve channel index so sync_next_message returns correct channel_idx in the frame
+        channel_idx = 0
+        if getattr(self, "channels", None) and hasattr(self.channels, "find_by_name"):
+            idx = self.channels.find_by_name(channel_name)
+            if idx is not None:
+                channel_idx = idx
+        # MeshCore client expects "SenderName: Message" format in text field; it parses to show
+        # sender and message separately. Use full_content (not message_text) so client can split.
+        # Strip trailing nulls so frame matches firmware (exact string length, no padding).
+        display_text = (data.get("full_content", data.get("message_text", "")) or "").rstrip("\x00")
+        # Extract SNR/RSSI from network info if available
+        network_info = data.get("network_info", {})
+        snr = network_info.get("snr")
+        rssi = network_info.get("rssi")
+
+        msg = QueuedMessage(
+            sender_key=b"",
+            txt_type=0,
+            timestamp=data.get("timestamp", int(time.time())),
+            text=display_text,
+            is_channel=True,
+            channel_idx=channel_idx,
+            path_len=path_len,
+            snr=snr if snr is not None else 0.0,
+            rssi=rssi if rssi is not None else 0,
+        )
+        self.message_queue.push(msg)
+
+        await self._fire_callbacks(
+            "channel_message_received",
+            data.get("channel_name", ""),
+            data.get("sender_name", ""),
+            display_text,
+            msg.timestamp,
+            path_len,
+            channel_idx,
+            pkt_hash,
+            snr,
+            rssi,
+        )
+
+    def _get_channel_candidates_by_hash(self, channel_hash: int) -> list[tuple[int, Channel]]:
+        """Return channel candidates that match the 1-byte channel hash."""
+        matches: list[tuple[int, Channel]] = []
+        max_channels = getattr(self.channels, "max_channels", 40)
+        for idx in range(max_channels):
+            channel = self.channels.get(idx)
+            if channel is None:
+                continue
+            if derive_channel_hash(channel.secret) == channel_hash:
+                matches.append((idx, channel))
+        return matches
+
+    async def _handle_group_data_packet(self, packet: Packet) -> None:
+        """Parse and queue incoming PAYLOAD_TYPE_GRP_DATA for sync_next_message."""
+        payload = packet.get_payload()
+        if len(payload) < 4:
+            return
+        packet_hash = packet.calculate_packet_hash().hex().upper()
+        if self._seen_grp_data.check_and_add(packet_hash):
+            return
+
+        channel_hash = payload[0]
+        cipher_mac = payload[1:3]
+        ciphertext = payload[3:]
+        selected_idx: Optional[int] = None
+        plaintext: Optional[bytes] = None
+
+        for idx, channel in self._get_channel_candidates_by_hash(channel_hash):
+            secret = normalize_channel_secret(channel.secret)
+            try:
+                plaintext = CryptoUtils.mac_then_decrypt(
+                    hashlib.sha256(secret).digest(), secret, cipher_mac + ciphertext
+                )
+            except Exception:
+                plaintext = None
+            if plaintext is not None:
+                selected_idx = idx
+                break
+
+        if selected_idx is None or plaintext is None or len(plaintext) < 3:
+            return
+        data_type = struct.unpack_from("<H", plaintext, 0)[0]
+        data_len = plaintext[2]
+        if data_type == 0 or len(plaintext) < 3 + data_len:
+            return
+        blob = bytes(plaintext[3 : 3 + data_len])
+
+        route_type = packet.get_route_type()
+        path_len = (
+            packet.path_len
+            if route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD)
+            else 0xFF
+        )
+        snr = packet.get_snr() if hasattr(packet, "get_snr") else getattr(packet, "_snr", 0.0)
+        rssi = packet.rssi if hasattr(packet, "rssi") else getattr(packet, "_rssi", 0)
+        queued = QueuedMessage(
+            sender_key=b"",
+            txt_type=0,
+            timestamp=0,
+            text="",
+            is_channel=True,
+            channel_idx=selected_idx,
+            path_len=path_len,
+            snr=snr if snr is not None else 0.0,
+            rssi=rssi if rssi is not None else 0,
+            channel_data_type=data_type,
+            channel_data_payload=blob,
+        )
+        self.message_queue.push(queued)
+        await self._fire_callbacks(
+            "channel_data_received",
+            selected_idx,
+            path_len,
+            data_type,
+            blob,
+            packet_hash,
+            snr,
+            rssi,
+        )
