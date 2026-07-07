@@ -13,6 +13,9 @@ from ..protocol.constants import ANON_REQ_TYPE_OWNER  # noqa: F401
 from ..protocol.constants import ANON_REQ_TYPE_REGIONS  # noqa: F401
 from ..protocol.constants import MAX_PATH_SIZE  # noqa: F401
 from ..protocol.constants import PUB_KEY_SIZE  # noqa: F401
+from ..protocol.constants import TXT_TYPE_CLI_DATA  # noqa: F401
+from ..protocol.constants import TXT_TYPE_PLAIN  # noqa: F401
+from ..protocol.constants import TXT_TYPE_SIGNED_PLAIN  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # ADV Types (contact/node classification)
@@ -29,11 +32,10 @@ ADV_TYPE_SENSOR = 4
 MAX_ANON_CONTACTS = 8
 
 # ---------------------------------------------------------------------------
-# Text Types
+# Text Types: TXT_TYPE_PLAIN / _CLI_DATA / _SIGNED_PLAIN are defined in
+# protocol.constants (wire values shared with node.handlers.text) and
+# re-exported at the top of this module.
 # ---------------------------------------------------------------------------
-TXT_TYPE_PLAIN = 0
-TXT_TYPE_CLI_DATA = 1
-TXT_TYPE_SIGNED_PLAIN = 2
 
 # ---------------------------------------------------------------------------
 # Telemetry Modes

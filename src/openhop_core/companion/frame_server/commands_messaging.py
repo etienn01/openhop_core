@@ -35,6 +35,7 @@ from ..constants import (
     TRACE_PER_PATH_BYTE_TIMEOUT_MS,
     TXT_MSG_TIMEOUT_HINT_MS,
     TXT_TYPE_CLI_DATA,
+    TXT_TYPE_SIGNED_PLAIN,
 )
 from ..models import QueuedMessage
 
@@ -336,12 +337,20 @@ class _MessagingCommandsMixin:
         )
         path_len_byte = msg.path_len if msg.path_len < 256 else 0xFF
         text_bytes = msg.text.encode("utf-8", errors="replace")
+        extra = b""
+        if msg.txt_type == TXT_TYPE_SIGNED_PLAIN:
+            # Firmware queueMessage() inserts the 4-byte author pubkey prefix
+            # between the timestamp and the text for signed (room server)
+            # messages; the app consumes these 4 bytes to attribute the author.
+            author = bytes(getattr(msg, "sender_prefix", b"") or b"")
+            extra = author[:4].ljust(4, b"\x00")
         if self._app_target_ver >= 3:
             return (
                 bytes([RESP_CODE_CONTACT_MSG_RECV_V3, snr_byte & 0xFF, 0, 0])
                 + prefix
                 + bytes([path_len_byte, msg.txt_type])
                 + struct.pack("<I", msg.timestamp)
+                + extra
                 + text_bytes
             )
         return (
@@ -349,6 +358,7 @@ class _MessagingCommandsMixin:
             + prefix
             + bytes([path_len_byte, msg.txt_type])
             + struct.pack("<I", msg.timestamp)
+            + extra
             + text_bytes
         )
 

@@ -1498,9 +1498,11 @@ async def test_cmd_sync_next_message_falls_back_to_persistence():
 
 def test_build_message_frame_contact_v1_and_v3():
     server = CompanionFrameServer(Mock(), "hash", port=0)
+    # txt_type=1 (CLI_DATA): any non-signed type — SIGNED_PLAIN (2) adds an
+    # author-prefix field and is covered by its own tests below.
     msg = QueuedMessage(
         sender_key=bytes([0xAA] * 32),
-        txt_type=2,
+        txt_type=1,
         timestamp=1_650_000_000,
         text="hey",
         path_len=3,
@@ -1511,7 +1513,7 @@ def test_build_message_frame_contact_v1_and_v3():
     assert frame == (
         bytes([RESP_CODE_CONTACT_MSG_RECV])
         + bytes([0xAA] * 6)
-        + bytes([3, 2])
+        + bytes([3, 1])
         + struct.pack("<I", 1_650_000_000)
         + b"hey"
     )
@@ -1733,3 +1735,67 @@ async def test_cmd_set_radio_params_validates_ranges():
     await server._cmd_set_radio_params(good)
     assert frames == [bytes([RESP_CODE_OK])]
     bridge.set_radio_params.assert_called_once_with(915_000_000, 250_000, 10, 5)
+
+
+# ---------------------------------------------------------------------------
+# TXT_TYPE_SIGNED_PLAIN (room server posts): author prefix in the frame
+# ---------------------------------------------------------------------------
+
+
+def test_build_message_frame_signed_plain_inserts_author_prefix():
+    """Signed messages carry the 4-byte author prefix between timestamp and
+    text, matching firmware queueMessage(extra=sender_prefix, extra_len=4)."""
+    from openhop_core.companion.constants import TXT_TYPE_SIGNED_PLAIN
+
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    msg = QueuedMessage(
+        sender_key=bytes([0xAA] * 32),
+        txt_type=TXT_TYPE_SIGNED_PLAIN,
+        timestamp=1_650_000_000,
+        text="room post",
+        path_len=2,
+        sender_prefix=b"\xde\xad\xbe\xef",
+    )
+
+    server._app_target_ver = 0
+    frame = server._build_message_frame(msg)
+    assert frame == (
+        bytes([RESP_CODE_CONTACT_MSG_RECV])
+        + bytes([0xAA] * 6)
+        + bytes([2, TXT_TYPE_SIGNED_PLAIN])
+        + struct.pack("<I", 1_650_000_000)
+        + b"\xde\xad\xbe\xef"
+        + b"room post"
+    )
+
+    server._app_target_ver = 3
+    frame_v3 = server._build_message_frame(msg)
+    assert frame_v3[0] == RESP_CODE_CONTACT_MSG_RECV_V3
+    assert frame_v3[4:10] == bytes([0xAA] * 6)
+    assert frame_v3[10] == 2  # path_len
+    assert frame_v3[11] == TXT_TYPE_SIGNED_PLAIN
+    assert frame_v3[12:16] == struct.pack("<I", 1_650_000_000)
+    assert frame_v3[16:20] == b"\xde\xad\xbe\xef"
+    assert frame_v3[20:] == b"room post"
+
+
+def test_build_message_frame_signed_plain_pads_missing_prefix():
+    """A missing author prefix is zero-padded so the app's 4-byte strip never
+    eats message text; plain messages get no extra field at all."""
+    from openhop_core.companion.constants import TXT_TYPE_SIGNED_PLAIN
+
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    server._app_target_ver = 0
+
+    signed = QueuedMessage(
+        sender_key=bytes(32), txt_type=TXT_TYPE_SIGNED_PLAIN, timestamp=7, text="hi"
+    )
+    frame = server._build_message_frame(signed)
+    assert frame[9:13] == struct.pack("<I", 7)
+    assert frame[13:17] == b"\x00\x00\x00\x00"  # padded author prefix
+    assert frame[17:] == b"hi"
+
+    plain = QueuedMessage(sender_key=bytes(32), txt_type=0, timestamp=7, text="hi")
+    frame = server._build_message_frame(plain)
+    assert frame[9:13] == struct.pack("<I", 7)
+    assert frame[13:] == b"hi"  # no extra field for plain

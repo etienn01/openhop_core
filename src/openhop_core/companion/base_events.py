@@ -82,6 +82,12 @@ class _RxEventsMixin:
         network_info = data.get("network_info", {})
         snr = network_info.get("snr")
         rssi = network_info.get("rssi")
+        # 4-byte author pubkey prefix (TXT_TYPE_SIGNED_PLAIN room server posts)
+        sender_prefix_hex = data.get("sender_prefix", "") or ""
+        try:
+            sender_prefix = bytes.fromhex(sender_prefix_hex)
+        except ValueError:
+            sender_prefix = b""
         msg = QueuedMessage(
             sender_key=sender_key,
             txt_type=data.get("txt_type", data.get("flags", 0)),
@@ -91,6 +97,7 @@ class _RxEventsMixin:
             path_len=0,
             snr=snr if snr is not None else 0.0,
             rssi=rssi if rssi is not None else 0,
+            sender_prefix=sender_prefix,
         )
         self.message_queue.push(msg)
         await self._fire_callbacks(
@@ -102,6 +109,7 @@ class _RxEventsMixin:
             pkt_hash,
             snr if snr is not None else 0.0,
             rssi if rssi is not None else 0,
+            sender_prefix,
         )
 
     async def _handle_new_channel_message(self, data: dict) -> None:

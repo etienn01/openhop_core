@@ -1276,3 +1276,105 @@ class TestLoginServerHandler:
         assert plaintext[1] == 0xAA
         assert plaintext[2] == 0xBB
         assert plaintext[3] == PAYLOAD_TYPE_RESPONSE  # extra_type
+
+
+# ---------------------------------------------------------------------------
+# TXT_TYPE_SIGNED_PLAIN (room server posts)
+# ---------------------------------------------------------------------------
+
+
+def _make_signed_room_post(
+    sender,
+    receiver,
+    text=b"room post",
+    author_prefix=b"\xde\xad\xbe\xef",
+    ts=1_700_000_000,
+    attempt=1,
+):
+    """Encrypted TXT_MSG exactly as a room server pushes a post (firmware
+    simple_room_server pushPostToClient): plaintext = timestamp(4) +
+    [(TXT_TYPE_SIGNED_PLAIN << 2) | attempt](1) + author_pubkey_prefix(4) + text."""
+    import struct as _struct
+    from types import SimpleNamespace
+
+    from openhop_core.protocol.constants import TXT_TYPE_SIGNED_PLAIN
+
+    flags = (TXT_TYPE_SIGNED_PLAIN << 2) | (attempt & 3)
+    plaintext = _struct.pack("<I", ts) + bytes([flags]) + author_prefix + text
+    receiver_contact = SimpleNamespace(
+        public_key=receiver.get_public_key().hex(), out_path=[], out_path_len=-1
+    )
+    payload, _secret, _aes = PacketBuilder._create_encrypted_payload(
+        receiver_contact, sender, plaintext
+    )
+    pkt = Packet()
+    pkt.header = PacketBuilder._create_header(PAYLOAD_TYPE_TXT_MSG, "direct", False)
+    pkt.path_len, pkt.path = 0, bytearray()
+    pkt.payload = bytearray(payload)
+    pkt.payload_len = len(payload)
+    return pkt, plaintext
+
+
+class TestSignedPlainMessages:
+    """TXT_TYPE_SIGNED_PLAIN carries a 4-byte author pubkey prefix before the
+    text (BaseChatMesh::onPeerDataRecv -> onSignedMessageRecv(&data[5], &data[9]))."""
+
+    def setup_method(self):
+        self.local_identity = LocalIdentity()
+        self.contacts = MockContactBook()
+        self.log_fn = MagicMock()
+        self.send_packet_fn = AsyncMock()
+        self.event_service = MockEventService()
+        self.handler = TextMessageHandler(
+            self.local_identity,
+            self.contacts,
+            self.log_fn,
+            self.send_packet_fn,
+            self.event_service,
+        )
+
+    @pytest.mark.asyncio
+    async def test_author_prefix_separated_from_text(self):
+        """The 4-byte author prefix must not leak into the message text."""
+        sender = LocalIdentity()
+        prefix = bytes([0xDE, 0xAD, 0xBE, 0xEF])
+        pkt, _ = _make_signed_room_post(sender, self.local_identity, b"room post", prefix)
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="Room")
+        ]
+
+        await self.handler(pkt)
+
+        assert self.event_service.publish_sync.called
+        _event, data = self.event_service.publish_sync.call_args.args
+        # AES block padding (NULs) is stripped downstream (base_events rstrip),
+        # exactly like the PLAIN path; the author prefix must not be in the text.
+        assert data["message_text"].rstrip("\x00") == "room post"
+        assert data["sender_prefix"] == prefix.hex()
+        assert data["txt_type"] == 2
+        assert pkt.decrypted["text"].rstrip("\x00") == "room post"
+
+    @pytest.mark.asyncio
+    async def test_signed_message_acked_with_firmware_hash(self):
+        """Signed messages get the firmware 4-byte ACK keyed with OUR pubkey."""
+        import asyncio
+
+        sender = LocalIdentity()
+        prefix = bytes([1, 2, 3, 4])
+        pkt, plaintext = _make_signed_room_post(sender, self.local_identity, b"hi room", prefix)
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="Room")
+        ]
+
+        await self.handler(pkt)
+        for _ in range(80):
+            if self.send_packet_fn.called:
+                break
+            await asyncio.sleep(0.05)
+
+        assert self.send_packet_fn.called
+        ack_packet = self.send_packet_fn.call_args.args[0]
+        assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
+        # Firmware: sha256(decrypted[0 : 9 + strlen(text)] || our pubkey)[:4]
+        expected = CryptoUtils.sha256(plaintext + self.local_identity.get_public_key())[:4]
+        assert bytes(ack_packet.payload) == expected

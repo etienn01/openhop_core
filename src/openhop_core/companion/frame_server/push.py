@@ -56,7 +56,15 @@ class _PushMixin:
     # -------------------------------------------------------------------------
 
     async def _on_message_received(
-        self, sender_key, text, timestamp, txt_type, packet_hash=None, snr=None, rssi=None
+        self,
+        sender_key,
+        text,
+        timestamp,
+        txt_type,
+        packet_hash=None,
+        snr=None,
+        rssi=None,
+        sender_prefix=b"",
     ):
         msg_dict = {
             "sender_key": sender_key,
@@ -69,6 +77,7 @@ class _PushMixin:
             "packet_hash": packet_hash,
             "snr": snr,
             "rssi": rssi,
+            "sender_prefix": sender_prefix,
         }
         await self._persist_companion_message(msg_dict)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))

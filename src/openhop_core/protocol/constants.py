@@ -128,3 +128,13 @@ TELEM_PERM_ENVIRONMENT = 0x04
 ANON_REQ_TYPE_REGIONS = 0x01  # repeater replies with comma-separated region names
 ANON_REQ_TYPE_OWNER = 0x02  # repeater replies with "name\nowner"
 ANON_REQ_TYPE_BASIC = 0x03  # repeater replies with clock + feature flags
+
+# ---------------------------------------------------------------------------
+# Text message types (upper 6 bits of the TXT_MSG flags byte; firmware
+# TxtDataHelpers.h). Wire values shared by node.handlers.text and companion.
+# ---------------------------------------------------------------------------
+TXT_TYPE_PLAIN = 0  # plain text message
+TXT_TYPE_CLI_DATA = 1  # CLI command/response (no delivery ACK)
+# Signed plain text (e.g. room server posts): a 4-byte author pubkey prefix
+# precedes the text in the decrypted payload.
+TXT_TYPE_SIGNED_PLAIN = 2

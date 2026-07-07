@@ -204,3 +204,6 @@ class QueuedMessage:
     rssi: int = 0
     channel_data_type: int = 0
     channel_data_payload: bytes = b""
+    # 4-byte author pubkey prefix for TXT_TYPE_SIGNED_PLAIN (room server posts);
+    # emitted between timestamp and text in the CONTACT_MSG_RECV frame.
+    sender_prefix: bytes = b""
