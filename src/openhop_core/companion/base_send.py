@@ -8,7 +8,7 @@ import logging
 import random
 import struct
 import time
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from ..protocol import Packet, PacketBuilder
 from ..protocol.constants import (
@@ -668,38 +668,22 @@ class _SendOpsMixin:
             # The login callback fires on any decryptable login response from this
             # repeater (keyed by password/dest_hash, not by tag), so we can resend
             # a freshly-built login packet each attempt and a single event resolves
-            # whichever attempt's reply arrives. Each attempt waits one adaptive
-            # timeout (firmware cadence) instead of a single fixed 10s wait.
-            for attempt in range(DEFAULT_MAX_ATTEMPTS):
-                pkt = PacketBuilder.create_login_packet(
-                    contact=proxy, local_identity=self._identity, password=password
-                )
-                self._apply_path_hash_mode(pkt)
-                timeout_s = self._response_timeout_s(pkt, proxy)
-                logger.debug(
-                    "[PATHDIAG] login -> 0x%02X (%s) route=%s attempt=%d/%d "
-                    "timeout=%.1fs out_path_len=%s; listening for reply",
-                    dest_hash,
-                    contact.name,
-                    "FLOOD" if pkt.is_route_flood() else "DIRECT",
-                    attempt + 1,
-                    DEFAULT_MAX_ATTEMPTS,
-                    timeout_s,
-                    getattr(proxy, "out_path_len", -1),
-                )
-                await self._send_packet(pkt, wait_for_ack=False)
+            # whichever attempt's reply arrives.
+            async def _wait_login(timeout_s: float) -> dict:
                 try:
                     await asyncio.wait_for(login_event.wait(), timeout=timeout_s)
-                    break  # got a response
+                    return {"timeout": False}
                 except asyncio.TimeoutError:
-                    logger.debug(
-                        "[PATHDIAG] login to 0x%02X attempt %d/%d TIMEOUT after %.1fs — "
-                        "no decryptable login response arrived",
-                        dest_hash,
-                        attempt + 1,
-                        DEFAULT_MAX_ATTEMPTS,
-                        timeout_s,
-                    )
+                    return {"timeout": True}
+
+            await self._request_with_retries(
+                lambda: PacketBuilder.create_login_packet(
+                    contact=proxy, local_identity=self._identity, password=password
+                ),
+                _wait_login,
+                proxy,
+                log_label=f"login -> 0x{dest_hash:02X} ({contact.name})",
+            )
             if not login_event.is_set():
                 return {"success": False, "reason": "Login response timeout"}
             data = login_result["data"]
@@ -757,6 +741,51 @@ class _SendOpsMixin:
         except Exception:
             return 5.0  # safe fallback
 
+    async def _request_with_retries(
+        self,
+        build_packet: Callable[[], Packet],
+        wait_for_response: Callable[[float], Awaitable[dict]],
+        proxy: Any,
+        *,
+        total_timeout_s: Optional[float] = None,
+        log_label: str = "request",
+    ) -> dict:
+        """Send a request up to DEFAULT_MAX_ATTEMPTS times until a response lands.
+
+        A fresh packet is built per attempt (dodging repeater flood dedup) and
+        each attempt waits one adaptive timeout (firmware cadence). A late reply
+        that lands between attempts resolves the waiter immediately.
+
+        ``total_timeout_s`` caps the cumulative wait across attempts: the final
+        attempt's wait is clipped to the remaining budget and no new attempt
+        starts once the budget is spent.
+        """
+        result: dict = {"timeout": True}
+        deadline = time.monotonic() + total_timeout_s if total_timeout_s else None
+        for attempt in range(DEFAULT_MAX_ATTEMPTS):
+            pkt = build_packet()
+            self._apply_path_hash_mode(pkt)
+            timeout_s = self._response_timeout_s(pkt, proxy)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                timeout_s = min(timeout_s, remaining)
+            logger.debug(
+                "[PATHDIAG] %s: route=%s attempt=%d/%d timeout=%.1fs out_path_len=%s",
+                log_label,
+                "FLOOD" if pkt.is_route_flood() else "DIRECT",
+                attempt + 1,
+                DEFAULT_MAX_ATTEMPTS,
+                timeout_s,
+                getattr(proxy, "out_path_len", -1),
+            )
+            await self._send_packet(pkt, wait_for_ack=False)
+            result = await wait_for_response(timeout_s)
+            if not result.get("timeout"):
+                break
+        return result
+
     async def _wait_for_path_propagation(self, proxy: Any, request_type: str) -> None:
         """Log the pre-send path; no longer sleeps.
 
@@ -775,7 +804,11 @@ class _SendOpsMixin:
         )
 
     async def send_status_request(self, pub_key: bytes, timeout: float = 15.0) -> dict:
-        """Send a protocol request for repeater status/stats."""
+        """Send a protocol request for repeater status/stats.
+
+        ``timeout`` caps the total wait across retries (seconds); each attempt
+        still uses the adaptive per-attempt timeout.
+        """
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
             return {"success": False, "reason": "Contact not found"}
@@ -795,37 +828,18 @@ class _SendOpsMixin:
             await self._wait_for_path_propagation(proxy, "stats request")
             # Status responses resolve the waiter by contact_hash (not tag), so a
             # fresh REQ each attempt is fine and dodges the repeater's flood dedup.
-            # Each attempt waits one adaptive timeout (firmware cadence); a late
-            # reply that lands between attempts resolves the waiter immediately.
-            result: dict = {"timeout": True}
-            for attempt in range(DEFAULT_MAX_ATTEMPTS):
-                pkt, _ = PacketBuilder.create_protocol_request(
+            result = await self._request_with_retries(
+                lambda: PacketBuilder.create_protocol_request(
                     contact=proxy,
                     local_identity=self._identity,
                     protocol_code=REQ_TYPE_GET_STATUS,
                     data=b"",
-                )
-                self._apply_path_hash_mode(pkt)
-                timeout_s = self._response_timeout_s(pkt, proxy)
-                logger.debug(
-                    "[PATHDIAG] stats REQ: route=%s attempt=%d/%d timeout=%.1fs "
-                    "path_len_byte=0x%02X (hops=%s) path=%s",
-                    "FLOOD" if pkt.is_route_flood() else "DIRECT",
-                    attempt + 1,
-                    DEFAULT_MAX_ATTEMPTS,
-                    timeout_s,
-                    pkt.path_len & 0xFF,
-                    pkt.get_path_hash_count() if pkt.path_len else 0,
-                    (
-                        bytes(pkt.path[: pkt.get_path_byte_len()]).hex()
-                        if pkt.path_len
-                        else "(empty)"
-                    ),
-                )
-                await self._send_packet(pkt, wait_for_ack=False)
-                result = await waiter.wait(timeout_s)
-                if not result.get("timeout"):
-                    break
+                )[0],
+                waiter.wait,
+                proxy,
+                total_timeout_s=timeout,
+                log_label="stats REQ",
+            )
             return {
                 "success": result.get("success", False),
                 "repeater": contact.name,
@@ -847,7 +861,11 @@ class _SendOpsMixin:
         want_environment: bool = True,
         timeout: float = 10.0,
     ) -> dict:
-        """Send a telemetry request to a contact and wait for the response."""
+        """Send a telemetry request to a contact and wait for the response.
+
+        ``timeout`` caps the total wait across retries (seconds); each attempt
+        still uses the adaptive per-attempt timeout.
+        """
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
             return {"success": False, "reason": "Contact not found"}
@@ -868,20 +886,18 @@ class _SendOpsMixin:
             inv = PacketBuilder._compute_inverse_perm_mask(
                 want_base, want_location, want_environment
             )
-            result: dict = {"timeout": True}
-            for attempt in range(DEFAULT_MAX_ATTEMPTS):
-                pkt, _ = PacketBuilder.create_protocol_request(
+            result = await self._request_with_retries(
+                lambda: PacketBuilder.create_protocol_request(
                     contact=proxy,
                     local_identity=self._identity,
                     protocol_code=REQ_TYPE_GET_TELEMETRY_DATA,
                     data=bytes([inv]),
-                )
-                self._apply_path_hash_mode(pkt)
-                timeout_s = self._response_timeout_s(pkt, proxy)
-                await self._send_packet(pkt, wait_for_ack=False)
-                result = await waiter.wait(timeout_s)
-                if not result.get("timeout"):
-                    break
+                )[0],
+                waiter.wait,
+                proxy,
+                total_timeout_s=timeout,
+                log_label="telemetry REQ",
+            )
             telemetry_data = dict(result.get("parsed", {}))
             raw_bytes = telemetry_data.get("raw_bytes", b"")
             if raw_bytes and len(pub_key) >= 6:
@@ -931,20 +947,17 @@ class _SendOpsMixin:
         waiter = ResponseWaiter()
         proto_handler.set_response_callback(contact_hash, waiter.callback)
         try:
-            result: dict = {"timeout": True}
-            for _attempt in range(DEFAULT_MAX_ATTEMPTS):
-                pkt, _ = PacketBuilder.create_protocol_request(
+            result = await self._request_with_retries(
+                lambda: PacketBuilder.create_protocol_request(
                     contact=proxy,
                     local_identity=self._identity,
                     protocol_code=protocol_code,
                     data=data,
-                )
-                self._apply_path_hash_mode(pkt)
-                timeout_s = self._response_timeout_s(pkt, proxy)
-                await self._send_packet(pkt, wait_for_ack=False)
-                result = await waiter.wait(timeout_s)
-                if not result.get("timeout"):
-                    break
+                )[0],
+                waiter.wait,
+                proxy,
+                log_label=f"protocol REQ 0x{protocol_code:02X}",
+            )
             return {
                 "success": result.get("success", False),
                 "response": result.get("text"),

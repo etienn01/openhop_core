@@ -715,3 +715,46 @@ class TestCompanionBridgeDeduplication:
         assert msg is not None
         assert msg.text == "Hello"
         assert bridge.sync_next_message() is None
+
+
+# ---------------------------------------------------------------------------
+# Request retry / total-timeout cap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRequestTimeoutCap:
+    """The `timeout` argument caps the total wait across retries."""
+
+    def _bridge_with_contact(self):
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        contact = _make_peer_contact("Repeater")
+        bridge.contacts.add(contact)
+        return bridge, injector, contact
+
+    async def test_status_request_stops_at_total_timeout(self):
+        bridge, injector, contact = self._bridge_with_contact()
+        # Fixed short per-attempt timeout; no response ever arrives.
+        bridge._response_timeout_s = lambda pkt, proxy: 0.05
+        result = await bridge.send_status_request(contact.public_key, timeout=0.08)
+        assert result["success"] is False
+        # Budget (0.08s) allows the first attempt (0.05s) plus a clipped second
+        # attempt — never all DEFAULT_MAX_ATTEMPTS.
+        assert 1 <= len(injector.calls) <= 2
+
+    async def test_status_request_retries_without_cap_pressure(self):
+        from openhop_core.companion.timing import DEFAULT_MAX_ATTEMPTS
+
+        bridge, injector, contact = self._bridge_with_contact()
+        bridge._response_timeout_s = lambda pkt, proxy: 0.01
+        result = await bridge.send_status_request(contact.public_key, timeout=10.0)
+        assert result["success"] is False
+        assert len(injector.calls) == DEFAULT_MAX_ATTEMPTS
+
+    async def test_telemetry_request_stops_at_total_timeout(self):
+        bridge, injector, contact = self._bridge_with_contact()
+        bridge._response_timeout_s = lambda pkt, proxy: 0.05
+        result = await bridge.send_telemetry_request(contact.public_key, timeout=0.08)
+        assert result["success"] is False
+        assert 1 <= len(injector.calls) <= 2
