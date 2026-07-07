@@ -124,6 +124,13 @@ class CompanionFrameServer(
         self.local_hash = local_hash
         self.stats_getter = stats_getter
         self._control_handler = control_handler
+        # Track discovery tags for no-op callbacks created by this frame server,
+        # so we only clear callbacks we own and never remove repeater-level
+        # discovery callbacks that are still collecting responses.
+        self._companion_discovery_tags: set[int] = set()
+        # Track anon/binary request tags originated by this frame server so only
+        # this virtual companion consumes the matching PUSH_CODE_BINARY_RESPONSE.
+        self._companion_binary_tags: set[int] = set()
         self._heartbeat_interval = heartbeat_interval
         self._client_idle_timeout_sec = client_idle_timeout_sec
         self._server: Optional[asyncio.Server] = None

@@ -124,11 +124,21 @@ class _FrameTransportMixin:
         )
 
     def _write_sent_result(
-        self, result: SentResult, *, default_timeout_ms: int = BINARY_REQ_TIMEOUT_HINT_MS
+        self,
+        result: SentResult,
+        *,
+        default_timeout_ms: int = BINARY_REQ_TIMEOUT_HINT_MS,
+        own_binary_tag: bool = False,
     ) -> None:
-        """Write RESP_CODE_SENT from a SentResult, defaulting a missing tag/timeout."""
+        """Write RESP_CODE_SENT from a SentResult, defaulting a missing tag/timeout.
+
+        When ``own_binary_tag`` is set, the response tag is recorded so that only
+        this virtual companion consumes the matching PUSH_CODE_BINARY_RESPONSE.
+        """
         tag = result.expected_ack if result.expected_ack is not None else 0
         timeout_ms = result.timeout_ms if result.timeout_ms is not None else default_timeout_ms
+        if own_binary_tag and result.expected_ack is not None:
+            self._companion_binary_tags.add(tag)
         self._write_sent_response(result.is_flood, tag, timeout_ms)
 
     # -------------------------------------------------------------------------

@@ -49,7 +49,9 @@ class ControlHandler:
     def payload_type() -> int:
         return PAYLOAD_TYPE_CONTROL
 
-    def set_response_callback(self, tag: int, callback: Callable[[Dict[str, Any]], None]) -> None:
+    def set_response_callback(
+        self, tag: int, callback: Callable[[Dict[str, Any]], None]
+    ) -> None:
         """Set callback for discovery responses with a specific tag."""
         self._response_callbacks[tag] = callback
 
@@ -72,9 +74,13 @@ class ControlHandler:
                 self._log("[ControlHandler] Empty payload, ignoring")
                 return None
 
-            # Check if this is a zero-hop packet (path_len must be 0)
-            if pkt.path_len != 0:
-                self._log(f"[ControlHandler] Non-zero path length ({pkt.path_len}), ignoring")
+            # Check if this is a zero-hop packet. The on-wire path_len byte is
+            # encoded (bits 6-7 carry hash-size mode), so zero-hop can be 0,
+            # 64, or 128 depending on hash-size mode.
+            if pkt.get_path_hash_count() != 0:
+                self._log(
+                    f"[ControlHandler] Non-zero path length ({pkt.path_len}), ignoring"
+                )
                 return None
 
             # Extract control type (upper 4 bits of first byte)
@@ -85,7 +91,9 @@ class ControlHandler:
             elif control_type == CTL_TYPE_NODE_DISCOVER_RESP:
                 return await self._handle_discovery_response(pkt)
             else:
-                self._log(f"[ControlHandler] Unknown control type: 0x{control_type:02X}")
+                self._log(
+                    f"[ControlHandler] Unknown control type: 0x{control_type:02X}"
+                )
                 return None
 
         except Exception as e:
@@ -197,7 +205,9 @@ class ControlHandler:
                         f"[ControlHandler] Called response callback for tag 0x{tag:08X}"
                     )
             else:
-                self._debug_log(f"[ControlHandler] No callback waiting for tag 0x{tag:08X}")
+                self._debug_log(
+                    f"[ControlHandler] No callback waiting for tag 0x{tag:08X}"
+                )
 
             return response_data
 

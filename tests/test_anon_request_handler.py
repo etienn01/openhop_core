@@ -136,6 +136,34 @@ class TestAnonRequestHandler:
         await self.handler(self._build_login(password="", route_type="flood"))
         assert len(self.sent) == 1
 
+    @pytest.mark.asyncio
+    async def test_room_server_login_bypasses_subtype_dispatch(self):
+        """Room-server login payload uses byte 4 as sync_since[0], not anon sub-type."""
+        room_login_handler = LoginServerHandler(
+            local_identity=self.server_identity,
+            log_fn=lambda *_: None,
+            authenticate_callback=self.auth_callback,
+            is_room_server=True,
+        )
+        room_handler = AnonRequestHandler(
+            local_identity=self.server_identity,
+            log_fn=lambda *_: None,
+            login_handler=room_login_handler,
+            anon_limiter=self.limiter,
+            region_names_fn=lambda: "*,VHF,USA",
+            owner_info_fn=lambda: ("repeater-1", "owner@example.com"),
+            features_fn=lambda: 0x80,
+            clock_fn=lambda: 1_700_000_000,
+        )
+        sent = []
+        room_handler.set_send_packet_callback(lambda pkt, delay: sent.append((pkt, delay)))
+
+        # sync_since low byte 0x14 used to be misread as an unknown anon sub-type.
+        plaintext = struct.pack("<II", 4321, 0x12345614) + b"\x00"
+        await room_handler(self._build_packet(plaintext, route_type="flood"))
+
+        assert len(sent) == 1
+
     # -- regions / owner / basic responders --------------------------------
 
     @pytest.mark.asyncio

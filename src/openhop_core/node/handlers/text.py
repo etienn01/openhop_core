@@ -1,6 +1,13 @@
 import asyncio
 
-from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder, PacketTimingUtils, PathUtils
+from ...protocol import (
+    CryptoUtils,
+    Identity,
+    Packet,
+    PacketBuilder,
+    PacketTimingUtils,
+    PathUtils,
+)
 from ...protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_TXT_MSG,
@@ -34,7 +41,9 @@ class TextMessageHandler(BaseHandler):
         self.send_packet = send_packet_fn
         self.event_service = event_service  # Event service for broadcasting
         self.command_response_callback = None  # Callback for command responses
-        self.radio_config = radio_config or {}  # Radio configuration for airtime calculations
+        self.radio_config = (
+            radio_config or {}
+        )  # Radio configuration for airtime calculations
         self.multi_acks = 0  # multi_acks pref (0=off); set via set_multi_acks()
 
     def set_command_response_callback(self, callback):
@@ -104,7 +113,9 @@ class TextMessageHandler(BaseHandler):
         """
 
         def airtime(pkt) -> float:
-            return PacketTimingUtils.estimate_airtime_ms(len(pkt.write_to()), self.radio_config)
+            return PacketTimingUtils.estimate_airtime_ms(
+                len(pkt.write_to()), self.radio_config
+            )
 
         if is_flood:
             incoming_path = list(packet.path if hasattr(packet, "path") else [])
@@ -140,7 +151,9 @@ class TextMessageHandler(BaseHandler):
             # known reverse path (mirrors firmware sendAckTo OUT_PATH_UNKNOWN -> sendFloodScoped;
             # a path-less direct ACK would not be relayed past direct neighbours). The
             # dispatcher applies flood scope at send time.
-            ack_packet = PacketBuilder.create_ack_from_bytes(ack_hash, route_type="flood")
+            ack_packet = PacketBuilder.create_ack_from_bytes(
+                ack_hash, route_type="flood"
+            )
             delay_ms = PacketTimingUtils.calc_flood_timeout_ms(airtime(ack_packet))
             self.log(f"FLOOD ACK timing (no out_path) - delay:{delay_ms:.1f}ms")
             return [(ack_packet, delay_ms / 1000.0)]
@@ -150,17 +163,23 @@ class TextMessageHandler(BaseHandler):
         ack_packet = PacketBuilder.create_ack_from_bytes(
             ack_hash, path=out_path, path_len_encoded=out_path_len
         )
-        base_delay_ms = PacketTimingUtils.calc_direct_timeout_ms(airtime(ack_packet), path_hops)
+        base_delay_ms = PacketTimingUtils.calc_direct_timeout_ms(
+            airtime(ack_packet), path_hops
+        )
 
         if self.multi_acks <= 0:
-            self.log(f"DIRECT ACK timing (routed) - delay:{base_delay_ms:.1f}ms, hops:{path_hops}")
+            self.log(
+                f"DIRECT ACK timing (routed) - delay:{base_delay_ms:.1f}ms, hops:{path_hops}"
+            )
             return [(ack_packet, base_delay_ms / 1000.0)]
 
         # multi-ack fires at the base delay; the normal ACK is staggered later
         multi_packet = PacketBuilder.create_multi_ack(
             ack_hash, remaining=1, path=out_path, path_len_encoded=out_path_len
         )
-        self.log(f"DIRECT multi-ack timing - base_delay:{base_delay_ms:.1f}ms, hops:{path_hops}")
+        self.log(
+            f"DIRECT multi-ack timing - base_delay:{base_delay_ms:.1f}ms, hops:{path_hops}"
+        )
         return [
             (multi_packet, base_delay_ms / 1000.0),
             (ack_packet, (base_delay_ms + MULTI_ACK_STAGGER_MS) / 1000.0),
@@ -172,7 +191,7 @@ class TextMessageHandler(BaseHandler):
         try:
             await self.send_packet(pkt, wait_for_ack=False)
             self.log(
-                f"ACK packet sent successfully (delayed {delay_s*1000:.1f}ms) "
+                f"ACK packet sent successfully (delayed {delay_s * 1000:.1f}ms) "
                 f"for timestamp {timestamp_int}"
             )
         except Exception as ack_send_error:
@@ -245,7 +264,7 @@ class TextMessageHandler(BaseHandler):
             sender_prefix = bytes(decrypted[5:9])
             message_body = decrypted[9:]
 
-        pubkey = self._contact_pubkey_bytes(matched_contact)
+        sender_pubkey = self._contact_pubkey_bytes(matched_contact)
         timestamp_int = int.from_bytes(timestamp, "little")
 
         # Determine message routing type from packet header
@@ -257,10 +276,32 @@ class TextMessageHandler(BaseHandler):
             f"timestamp: {timestamp_int}, txt_type: {txt_type}"
         )
 
+        # Firmware parity (BaseChatMesh::onPeerDataRecv): signed plain traffic
+        # advances the sender contact's sync_since watermark.
+        if txt_type == TXT_TYPE_SIGNED_PLAIN:
+            try:
+                previous_sync = int(getattr(matched_contact, "sync_since", 0) or 0)
+            except Exception:
+                previous_sync = 0
+            if timestamp_int > previous_sync:
+                try:
+                    matched_contact.sync_since = timestamp_int
+                    backing_contact = getattr(matched_contact, "_contact", None)
+                    if backing_contact is not None:
+                        backing_contact.sync_since = timestamp_int
+                        if hasattr(self.contacts, "update"):
+                            self.contacts.update(backing_contact)
+                    self.log(
+                        f"Updated contact sync_since to {timestamp_int} "
+                        f"for {getattr(matched_contact, 'name', '?')}"
+                    )
+                except Exception as sync_err:
+                    self.log(f"Failed to update contact sync_since: {sync_err}")
+
         # Firmware ACKs plain DMs (6-byte, sender-keyed) and signed messages
         # (4-byte, keyed with OUR pubkey); CLI_DATA replies get no delivery ACK.
         ack_hash = self._calc_ack_hash(
-            txt_type, decrypted, message_body, pubkey, timestamp_int, flags
+            txt_type, decrypted, message_body, sender_pubkey, timestamp_int, flags
         )
 
         if ack_hash is not None:
@@ -268,7 +309,7 @@ class TextMessageHandler(BaseHandler):
                 packet=packet,
                 matched_contact=matched_contact,
                 shared_secret=shared_secret,
-                pubkey=pubkey,
+                pubkey=sender_pubkey,
                 ack_hash=ack_hash,
                 is_flood=is_flood,
             )
@@ -276,8 +317,10 @@ class TextMessageHandler(BaseHandler):
             for pkt, delay_s in scheduled:
                 asyncio.create_task(self._send_delayed_ack(pkt, delay_s, timestamp_int))
         else:
-            self.log(f"Skipping ACK for txt_type={txt_type}")
+            self.log(f"Skipping ACK for txt_type={txt_type} (non-delivery-acked type)")
 
+        # For signed plain the 4-byte author prefix was already split off into
+        # ``sender_prefix`` above, so ``message_body`` is the bare text here.
         decoded_msg = message_body.decode("utf-8", "replace")
         self.log(f"Received TXT_MSG: {decoded_msg}")
 
@@ -285,7 +328,9 @@ class TextMessageHandler(BaseHandler):
         if self.command_response_callback:
             try:
                 self.command_response_callback(decoded_msg, matched_contact)
-                self.log(f"Command response captured from {matched_contact.name}: {decoded_msg}")
+                self.log(
+                    f"Command response captured from {matched_contact.name}: {decoded_msg}"
+                )
                 # Don't save command responses to regular message database
                 return
             except Exception as e:
@@ -298,7 +343,8 @@ class TextMessageHandler(BaseHandler):
         # Create message event data for the app to handle storage and deduplication
         normalized_timestamp = (message_timestamp // 1000) * 1000
         content_hash = (
-            hash(f"{matched_contact.name}_{decoded_msg}_{normalized_timestamp}") & 0xFFFFFFFF
+            hash(f"{matched_contact.name}_{decoded_msg}_{normalized_timestamp}")
+            & 0xFFFFFFFF
         )
         message_id = f"rx_{normalized_timestamp}_{content_hash:08x}"
 

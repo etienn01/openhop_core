@@ -159,7 +159,7 @@ class _MessagingCommandsMixin:
         if not result.success:
             self._write_err(ERR_CODE_NOT_FOUND)
             return
-        self._write_sent_result(result)
+        self._write_sent_result(result, own_binary_tag=True)
 
     async def _cmd_send_anon_req(self, data: bytes) -> None:
         if len(data) < PUB_KEY_SIZE + 1:
@@ -182,7 +182,7 @@ class _MessagingCommandsMixin:
             # transient contact" and "send failed" map to ERR_CODE_TABLE_FULL.
             self._write_err(ERR_CODE_TABLE_FULL)
             return
-        self._write_sent_result(result)
+        self._write_sent_result(result, own_binary_tag=True)
 
     async def _cmd_send_control_data(self, data: bytes) -> None:
         if len(data) < 2:
@@ -194,6 +194,7 @@ class _MessagingCommandsMixin:
         # Discovery request: register a no-op response callback
         if self._control_handler and len(data) >= 6 and (data[0] & 0xF0) == 0x80:
             tag = struct.unpack("<I", data[2:6])[0]
+            self._companion_discovery_tags.add(tag)
             self._control_handler.set_response_callback(tag, lambda _: None)
         send_control = getattr(self.bridge, "send_control_data", None)
         if not send_control:

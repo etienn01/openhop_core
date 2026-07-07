@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from typing import Any, Callable, Optional
@@ -213,7 +214,7 @@ class _CallbackMixin:
     async def _fire_callbacks(self, event_name: str, *args: Any) -> None:
         for callback in self._push_callbacks.get(event_name, []):
             try:
-                if asyncio.iscoroutinefunction(callback):
+                if inspect.iscoroutinefunction(callback):
                     await callback(*args)
                 else:
                     callback(*args)

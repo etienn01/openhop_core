@@ -211,6 +211,24 @@ class _PushMixin:
             logger.warning("Persist contact after path update failed: %s", e)
 
     def _on_binary_response(self, tag_bytes, response_data, parsed=None, request_type=None):
+        if isinstance(tag_bytes, bytes):
+            if len(tag_bytes) < 4:
+                return
+            tag_int = struct.unpack("<I", tag_bytes[:4])[0]
+        else:
+            try:
+                tag_int = int(tag_bytes)
+            except (TypeError, ValueError):
+                return
+        if tag_int not in self._companion_binary_tags:
+            # Region discovery replies can be generated outside this
+            # frame-server request path; allow those through for parity
+            # with pre-owner-tag behavior while keeping other responses
+            # isolated to the requesting virtual companion.
+            if not (isinstance(parsed, dict) and parsed.get("type") == "regions"):
+                return
+        else:
+            self._companion_binary_tags.discard(tag_int)
         frame = (
             bytes([PUSH_CODE_BINARY_RESPONSE, 0])
             + (tag_bytes if isinstance(tag_bytes, bytes) else struct.pack("<I", tag_bytes))
@@ -355,10 +373,13 @@ class _PushMixin:
         if self._write_queue is None:
             logger.warning("Push control data skipped: no client connection")
             return
-        # Discovery response (0x90): clear the no-op callback
+        # Discovery response (0x90): clear only no-op callbacks owned by this
+        # frame server (created by CMD_SEND_CONTROL_DATA discovery requests).
         if self._control_handler and len(payload) >= 6 and (payload[0] & 0xF0) == 0x90:
             tag = struct.unpack("<I", payload[2:6])[0]
-            self._control_handler.clear_response_callback(tag)
+            if tag in self._companion_discovery_tags:
+                self._control_handler.clear_response_callback(tag)
+                self._companion_discovery_tags.discard(tag)
         snr_val = snr if isinstance(snr, (int, float)) else 0.0
         rssi_val = rssi if isinstance(rssi, (int, float)) else 0
         snr_byte = max(-128, min(127, int(round(float(snr_val) * 4))))

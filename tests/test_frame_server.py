@@ -6,7 +6,6 @@ import struct
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-
 from openhop_core.companion.constants import (
     CMD_GET_DEVICE_TIME,
     ERR_CODE_BAD_STATE,
@@ -19,6 +18,7 @@ from openhop_core.companion.constants import (
     MAX_PAYLOAD_SIZE,
     PUB_KEY_SIZE,
     PUSH_CODE_ADVERT,
+    PUSH_CODE_BINARY_RESPONSE,
     PUSH_CODE_NEW_ADVERT,
     RESP_CODE_ALLOWED_REPEAT_FREQ,
     RESP_CODE_CHANNEL_DATA_RECV,
@@ -716,10 +716,15 @@ async def test_device_info_includes_path_hash_mode():
 @pytest.mark.asyncio
 async def test_cmd_send_status_req_failure_no_empty_push():
     """Failed status request must NOT send PUSH_CODE_STATUS_RESPONSE (matches firmware)."""
-    from openhop_core.companion.constants import PUSH_CODE_STATUS_RESPONSE, RESP_CODE_SENT
+    from openhop_core.companion.constants import (
+        PUSH_CODE_STATUS_RESPONSE,
+        RESP_CODE_SENT,
+    )
 
     bridge = Mock()
-    bridge.send_status_request = AsyncMock(return_value={"success": False, "reason": "timeout"})
+    bridge.send_status_request = AsyncMock(
+        return_value={"success": False, "reason": "timeout"}
+    )
     server = CompanionFrameServer(bridge, "hash", port=0)
     frames: list[bytes] = []
     server._write_frame = lambda f: frames.append(f)
@@ -735,7 +740,10 @@ async def test_cmd_send_status_req_failure_no_empty_push():
 @pytest.mark.asyncio
 async def test_cmd_send_status_req_empty_raw_bytes_no_push():
     """Status response with empty raw_bytes must NOT send PUSH_CODE_STATUS_RESPONSE."""
-    from openhop_core.companion.constants import PUSH_CODE_STATUS_RESPONSE, RESP_CODE_SENT
+    from openhop_core.companion.constants import (
+        PUSH_CODE_STATUS_RESPONSE,
+        RESP_CODE_SENT,
+    )
 
     bridge = Mock()
     bridge.send_status_request = AsyncMock(
@@ -779,7 +787,10 @@ async def test_cmd_send_status_req_success_sends_push_with_data():
 @pytest.mark.asyncio
 async def test_cmd_send_telemetry_req_failure_no_empty_push():
     """Failed telemetry request must NOT send PUSH_CODE_TELEMETRY_RESPONSE."""
-    from openhop_core.companion.constants import PUSH_CODE_TELEMETRY_RESPONSE, RESP_CODE_SENT
+    from openhop_core.companion.constants import (
+        PUSH_CODE_TELEMETRY_RESPONSE,
+        RESP_CODE_SENT,
+    )
 
     bridge = Mock()
     bridge.send_telemetry_request = AsyncMock(return_value={"success": False})
@@ -927,7 +938,9 @@ async def test_handle_client_connection_reset_disconnects_cleanly(caplog):
     bridge.get_time = Mock(return_value=0)
     server = CompanionFrameServer(bridge, "hash", port=0, client_idle_timeout_sec=None)
 
-    await server._handle_client(_RaisingReader(ConnectionResetError("boom")), _DummyWriter())
+    await server._handle_client(
+        _RaisingReader(ConnectionResetError("boom")), _DummyWriter()
+    )
 
     assert server._client_writer is None
     assert server._client_reader is None
@@ -983,7 +996,10 @@ async def test_cmd_send_raw_packet_too_short():
 def test_parse_binary_response_regions():
     """Anon REGIONS response decodes clock + comma-separated region names."""
     from openhop_core.companion import binary_parsing
-    from openhop_core.companion.constants import ANON_REQ_TYPE_REGIONS, PROTOCOL_CODE_ANON_REQ
+    from openhop_core.companion.constants import (
+        ANON_REQ_TYPE_REGIONS,
+        PROTOCOL_CODE_ANON_REQ,
+    )
 
     # response_data (tag already stripped) = clock(4) + null-terminated name list
     data = struct.pack("<I", 0x11223344) + b"home,usa,*\x00"
@@ -999,7 +1015,10 @@ def test_parse_binary_response_anon_not_mistaken_for_owner_info():
     """A REGIONS anon response must NOT be parsed as REQ owner-info, even though
     both carry numeric type 0x07."""
     from openhop_core.companion import binary_parsing
-    from openhop_core.companion.constants import ANON_REQ_TYPE_REGIONS, PROTOCOL_CODE_ANON_REQ
+    from openhop_core.companion.constants import (
+        ANON_REQ_TYPE_REGIONS,
+        PROTOCOL_CODE_ANON_REQ,
+    )
 
     data = struct.pack("<I", 0) + b"alpha\x00"
     parsed = binary_parsing.parse_binary_response(
@@ -1047,7 +1066,9 @@ async def test_cmd_send_anon_req_success_writes_sent():
     from openhop_core.companion.constants import RESP_CODE_SENT
 
     bridge = _MockBridgeAnonReq(
-        SentResult(success=True, is_flood=False, expected_ack=0x11223344, timeout_ms=4000)
+        SentResult(
+            success=True, is_flood=False, expected_ack=0x11223344, timeout_ms=4000
+        )
     )
     server = CompanionFrameServer(bridge, "hash", port=0)
     frames = []
@@ -1059,6 +1080,58 @@ async def test_cmd_send_anon_req_success_writes_sent():
     assert frames[0][0] == RESP_CODE_SENT
     assert frames[0][1] == 0  # not flood
     assert struct.unpack("<I", frames[0][2:6])[0] == 0x11223344
+    assert 0x11223344 in server._companion_binary_tags
+
+
+def test_binary_response_push_only_for_owned_tag():
+    """Unowned non-region responses are ignored; owned and region responses pass."""
+    bridge = Mock()
+    for cb_name in (
+        "on_message_received",
+        "on_channel_message_received",
+        "on_channel_data_received",
+        "on_send_confirmed",
+        "on_advert_received",
+        "on_node_discovered",
+        "on_contact_path_updated",
+        "on_binary_response",
+        "on_path_discovery_response",
+        "on_contact_deleted",
+        "on_contacts_full",
+        "on_raw_data_received",
+    ):
+        setattr(bridge, cb_name, Mock())
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=16)
+    server._setup_push_callbacks()
+
+    on_binary = bridge.on_binary_response.call_args[0][0]
+    tag = 0x11223344
+    tag_bytes = struct.pack("<I", tag)
+
+    # Unowned response is ignored.
+    on_binary(tag_bytes, b"\xaa\xbb")
+    assert server._write_queue.qsize() == 0
+
+    # Unowned regions response is allowed for compatibility.
+    on_binary(tag_bytes, b"\xaa\xbb", {"type": "regions"}, 7)
+    assert server._write_queue.qsize() == 1
+    compat_frame = server._write_queue.get_nowait()
+    compat_payload = compat_frame[3:]
+    assert compat_payload[0] == PUSH_CODE_BINARY_RESPONSE
+    assert compat_payload[2:6] == tag_bytes
+    assert compat_payload[6:] == b"\xaa\xbb"
+
+    # Owned response is pushed and tag ownership is consumed.
+    server._companion_binary_tags.add(tag)
+    on_binary(tag_bytes, b"\xaa\xbb")
+    assert server._write_queue.qsize() == 1
+    frame = server._write_queue.get_nowait()
+    payload = frame[3:]  # strip outbound frame prefix+len
+    assert payload[0] == PUSH_CODE_BINARY_RESPONSE
+    assert payload[2:6] == tag_bytes
+    assert payload[6:] == b"\xaa\xbb"
+    assert tag not in server._companion_binary_tags
 
 
 @pytest.mark.asyncio
@@ -1144,7 +1217,9 @@ async def test_cmd_send_txt_msg_threads_host_timestamp():
 
     host_ts = 1700000000
     # data: txt_type(1) + attempt(1) + msg_timestamp(4, LE) + pubkey_prefix(6) + text
-    data = bytes([TXT_TYPE_PLAIN, 0]) + struct.pack("<I", host_ts) + pubkey[:6] + b"hello"
+    data = (
+        bytes([TXT_TYPE_PLAIN, 0]) + struct.pack("<I", host_ts) + pubkey[:6] + b"hello"
+    )
     await server._cmd_send_txt_msg(data)
 
     bridge.send_text_message.assert_awaited_once()
@@ -1152,7 +1227,9 @@ async def test_cmd_send_txt_msg_threads_host_timestamp():
 
     # CLI_DATA mints a fresh timestamp (timestamp=None), matching firmware's RTC override.
     bridge.send_text_message.reset_mock()
-    data_cli = bytes([TXT_TYPE_CLI_DATA, 0]) + struct.pack("<I", host_ts) + pubkey[:6] + b"cmd"
+    data_cli = (
+        bytes([TXT_TYPE_CLI_DATA, 0]) + struct.pack("<I", host_ts) + pubkey[:6] + b"cmd"
+    )
     await server._cmd_send_txt_msg(data_cli)
     assert bridge.send_text_message.call_args.kwargs["timestamp"] is None
 
@@ -1172,7 +1249,9 @@ async def test_cmd_send_txt_msg_zero_host_timestamp_mints_fresh():
     pubkey = peer.get_public_key()
     bridge.contacts.add(Contact(public_key=pubkey, name="Peer"))
     bridge.send_text_message = AsyncMock(
-        return_value=SentResult(success=True, is_flood=False, expected_ack=0, timeout_ms=5000)
+        return_value=SentResult(
+            success=True, is_flood=False, expected_ack=0, timeout_ms=5000
+        )
     )
 
     server = CompanionFrameServer(bridge, "hash", port=0)
