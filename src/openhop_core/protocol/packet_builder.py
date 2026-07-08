@@ -719,6 +719,7 @@ class PacketBuilder:
         message: str,
         sender_name: str = "Unknown",
         channels_config: Optional[Any] = None,
+        timestamp: Optional[int] = None,
     ) -> Packet:
         """
         Create an encrypted group message for a specified channel.
@@ -779,7 +780,7 @@ class PacketBuilder:
         channel_hash = hashlib.sha256(hash_input).digest()[0]
         secret_bytes = (secret_bytes + b"\x00" * 32)[:32]
 
-        timestamp, flags = PacketBuilder._get_timestamp(), 0x00
+        timestamp, flags = (timestamp if timestamp is not None else PacketBuilder._get_timestamp()), 0x00
         content = f"{sender_name}: {message}".encode("utf-8")
         plaintext = PacketBuilder._pack_timestamp_data(timestamp, flags, content)
 

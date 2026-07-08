@@ -84,6 +84,7 @@ class _MessagingCommandsMixin:
             return
         txt_type = data[0]
         channel_idx = data[1]
+        msg_timestamp = struct.unpack("<I", data[2:6])[0]
         text = data[6:].decode("utf-8", errors="replace").rstrip("\x00")
         if txt_type != 0:
             self._write_err(ERR_CODE_UNSUPPORTED_CMD)
@@ -91,7 +92,7 @@ class _MessagingCommandsMixin:
         if self.bridge.get_channel(channel_idx) is None:
             self._write_err(ERR_CODE_NOT_FOUND)
             return
-        ok = await self.bridge.send_channel_message(channel_idx, text)
+        ok = await self.bridge.send_channel_message(channel_idx, text, timestamp=msg_timestamp)
         self._write_ok() if ok else self._write_err(ERR_CODE_BAD_STATE)
 
     async def _cmd_send_channel_data(self, data: bytes) -> None:
