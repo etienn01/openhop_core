@@ -1497,6 +1497,13 @@ async def test_cmd_send_channel_txt_msg_paths():
     await server._cmd_send_channel_txt_msg(bytes([0, 9]) + struct.pack("<I", 0) + b"x")
     assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_NOT_FOUND])]
 
+    # Send failure: firmware reports NOT_FOUND (not BAD_STATE) for channel sends
+    bridge.get_channel = Mock(return_value=Channel(name="general", secret=bytes(16)))
+    bridge.send_channel_message = AsyncMock(return_value=False)
+    frames.clear()
+    await server._cmd_send_channel_txt_msg(bytes([0, 1]) + struct.pack("<I", 0) + b"x")
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_NOT_FOUND])]
+
 
 # ---------------------------------------------------------------------------
 # CMD_SEND_BINARY_REQ

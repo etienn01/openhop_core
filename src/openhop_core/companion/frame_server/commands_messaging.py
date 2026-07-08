@@ -93,7 +93,9 @@ class _MessagingCommandsMixin:
             self._write_err(ERR_CODE_NOT_FOUND)
             return
         ok = await self.bridge.send_channel_message(channel_idx, text, timestamp=msg_timestamp)
-        self._write_ok() if ok else self._write_err(ERR_CODE_BAD_STATE)
+        # Firmware reports any channel-send failure as NOT_FOUND (MyMesh.cpp
+        # CMD_SEND_CHANNEL_TXT_MSG), so strictly-compatible clients expect it.
+        self._write_ok() if ok else self._write_err(ERR_CODE_NOT_FOUND)
 
     async def _cmd_send_channel_data(self, data: bytes) -> None:
         """Handle CMD_SEND_CHANNEL_DATA (62)."""
