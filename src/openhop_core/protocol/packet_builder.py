@@ -18,6 +18,7 @@ from .constants import (
     MAX_ADVERT_DATA_SIZE,
     MAX_PACKET_PAYLOAD,
     MAX_PATH_SIZE,
+    MAX_TEXT_LEN,
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_ANON_REQ,
@@ -87,9 +88,7 @@ class PacketBuilder:
         return PacketDataUtils.hash_bytes(pubkey, local_identity.get_public_key())
 
     @staticmethod
-    def _encrypt_payload(
-        aes_key: bytes, shared_secret: bytes, plaintext: bytes
-    ) -> bytes:
+    def _encrypt_payload(aes_key: bytes, shared_secret: bytes, plaintext: bytes) -> bytes:
         """Encrypt plaintext payload using AES key and shared secret."""
         return CryptoUtils.encrypt_then_mac(aes_key, shared_secret, plaintext)
 
@@ -125,9 +124,7 @@ class PacketBuilder:
         """Calculate shared secret and AES key from contact - reduces duplication."""
         pubkey = bytes.fromhex(contact.public_key)
         peer_identity = Identity(pubkey)
-        shared_secret = peer_identity.calc_shared_secret(
-            local_identity.get_private_key()
-        )
+        shared_secret = peer_identity.calc_shared_secret(local_identity.get_private_key())
         aes_key = shared_secret[:16]
         return shared_secret, aes_key
 
@@ -147,13 +144,10 @@ class PacketBuilder:
         contact: Any, local_identity: LocalIdentity, plaintext: bytes
     ) -> tuple[bytes, bytes, bytes]:
         """Create encrypted payload for contact-based packets with authentication."""
-        shared_secret, aes_key = PacketBuilder._calc_shared_secret_and_key(
-            contact, local_identity
-        )
+        shared_secret, aes_key = PacketBuilder._calc_shared_secret_and_key(contact, local_identity)
         encrypted = PacketBuilder._encrypt_payload(aes_key, shared_secret, plaintext)
         payload = (
-            PacketBuilder._hash_bytes(bytes.fromhex(contact.public_key), local_identity)
-            + encrypted
+            PacketBuilder._hash_bytes(bytes.fromhex(contact.public_key), local_identity) + encrypted
         )
         return payload, shared_secret, aes_key
 
@@ -254,9 +248,7 @@ class PacketBuilder:
             if isinstance(text, str)
             else bytes(text).strip(b"\x00")
         )
-        ack_hash = PacketBuilder.calc_text_ack_hash(
-            pubkey, timestamp, attempt, text_bytes
-        )
+        ack_hash = PacketBuilder.calc_text_ack_hash(pubkey, timestamp, attempt, text_bytes)
         return PacketBuilder.create_ack_from_bytes(ack_hash)
 
     @staticmethod
@@ -292,9 +284,7 @@ class PacketBuilder:
             bytes: 6-byte ACK hash.
         """
         text_bytes = text.encode("utf-8") if isinstance(text, str) else bytes(text)
-        temp = PacketBuilder._pack_timestamp_data(
-            timestamp, flags_byte & 0xFF, text_bytes
-        )
+        temp = PacketBuilder._pack_timestamp_data(timestamp, flags_byte & 0xFF, text_bytes)
         digest = CryptoUtils.sha256(temp + pubkey)
         last_byte = os.urandom(1) if randomize else b"\x00"
         return digest[:4] + bytes([ext_attempt & 0xFF]) + last_byte
@@ -358,9 +348,7 @@ class PacketBuilder:
         header = PacketBuilder._create_header(
             PAYLOAD_TYPE_MULTIPART, route_type="direct", has_routing_path=has_path
         )
-        payload = bytes([((remaining & 0x0F) << 4) | PAYLOAD_TYPE_ACK]) + bytes(
-            ack_bytes
-        )
+        payload = bytes([((remaining & 0x0F) << 4) | PAYLOAD_TYPE_ACK]) + bytes(ack_bytes)
         pkt = PacketBuilder._create_packet(header, payload)
         if has_path:
             pkt.set_path(bytes(path), path_len_encoded)
@@ -448,9 +436,7 @@ class PacketBuilder:
         timestamp = PacketBuilder._get_timestamp()
         pubkey = local_identity.get_public_key()
         ts_bytes = struct.pack("<I", timestamp)
-        appdata = PacketBuilder._encode_advert_data(
-            name, lat, lon, feature1, feature2, flags
-        )
+        appdata = PacketBuilder._encode_advert_data(name, lat, lon, feature1, feature2, flags)
         if len(appdata) > MAX_ADVERT_DATA_SIZE:
             raise ValueError(
                 f"advert appdata too large: {len(appdata)} bytes (max {MAX_ADVERT_DATA_SIZE})"
@@ -537,9 +523,7 @@ class PacketBuilder:
 
         aes_key = secret[:16]
         cipher = PacketBuilder._encrypt_payload(aes_key, secret, plaintext)
-        payload = (
-            PacketBuilder._hash_bytes(dest.get_public_key(), local_identity) + cipher
-        )
+        payload = PacketBuilder._hash_bytes(dest.get_public_key(), local_identity) + cipher
 
         header = PacketBuilder._create_header(ptype, route_type)
         pkt = PacketBuilder._create_packet(header, payload)
@@ -616,9 +600,7 @@ class PacketBuilder:
         plaintext = PacketBuilder._pack_timestamp_data(timestamp, req_data)
 
         contact_pubkey = bytes.fromhex(contact.public_key)
-        shared_secret, aes_key = PacketBuilder._calc_shared_secret_and_key(
-            contact, local_identity
-        )
+        shared_secret, aes_key = PacketBuilder._calc_shared_secret_and_key(contact, local_identity)
         cipher = PacketBuilder._encrypt_payload(aes_key, shared_secret, plaintext)
         dest_hash = PacketBuilder._hash_byte(contact_pubkey)
         payload = bytearray([dest_hash]) + local_identity.get_public_key() + cipher
@@ -637,9 +619,9 @@ class PacketBuilder:
         if route_type == "direct" and len(out_path) > 0:
             path_bytes = out_path[:MAX_PATH_SIZE]
             encoded_len = None
-            if PathUtils.is_valid_path_len(
+            if PathUtils.is_valid_path_len(out_path_len) and PathUtils.get_path_byte_len(
                 out_path_len
-            ) and PathUtils.get_path_byte_len(out_path_len) <= len(path_bytes):
+            ) <= len(path_bytes):
                 encoded_len = out_path_len
             elif len(path_bytes) == 64:
                 path_bytes = path_bytes[:63]
@@ -648,9 +630,7 @@ class PacketBuilder:
         return packet, timestamp
 
     @staticmethod
-    def create_login_packet(
-        contact: Any, local_identity: LocalIdentity, password: str
-    ) -> Packet:
+    def create_login_packet(contact: Any, local_identity: LocalIdentity, password: str) -> Packet:
         """
         Create a login packet for repeater authentication.
 
@@ -672,9 +652,7 @@ class PacketBuilder:
         is_room = getattr(contact, "type", 0) == CONTACT_TYPE_ROOM_SERVER
 
         if is_room:
-            sync_since = getattr(
-                contact, "sync_since", 0
-            )  # Use contact's sync_since or 0
+            sync_since = getattr(contact, "sync_since", 0)  # Use contact's sync_since or 0
             plaintext = PacketBuilder._pack_timestamp_data(
                 timestamp, struct.pack("<I", sync_since), password_bytes
             )
@@ -683,9 +661,7 @@ class PacketBuilder:
 
         contact_pubkey = bytes.fromhex(contact.public_key)
         contact_identity = Identity(contact_pubkey)
-        shared_secret = contact_identity.calc_shared_secret(
-            local_identity.get_private_key()
-        )
+        shared_secret = contact_identity.calc_shared_secret(local_identity.get_private_key())
 
         out_path_len = getattr(contact, "out_path_len", -1)
         if out_path_len < 0:
@@ -702,9 +678,9 @@ class PacketBuilder:
             if out_path:
                 path_bytes = out_path[:MAX_PATH_SIZE]
                 encoded_len = None
-                if PathUtils.is_valid_path_len(
+                if PathUtils.is_valid_path_len(out_path_len) and PathUtils.get_path_byte_len(
                     out_path_len
-                ) and PathUtils.get_path_byte_len(out_path_len) <= len(path_bytes):
+                ) <= len(path_bytes):
                     encoded_len = out_path_len
                 elif len(path_bytes) == 64:
                     path_bytes = path_bytes[:63]
@@ -756,9 +732,7 @@ class PacketBuilder:
                 "channels_config parameter is required - protocol layer cannot access database"
             )
 
-        channel = next(
-            (ch for ch in channels_config if ch.get("name") == group_name), None
-        )
+        channel = next((ch for ch in channels_config if ch.get("name") == group_name), None)
         if not channel:
             raise ValueError(f"Channel '{group_name}' not in provided channels_config")
 
@@ -780,8 +754,18 @@ class PacketBuilder:
         channel_hash = hashlib.sha256(hash_input).digest()[0]
         secret_bytes = (secret_bytes + b"\x00" * 32)[:32]
 
-        timestamp, flags = (timestamp if timestamp is not None else PacketBuilder._get_timestamp()), 0x00
-        content = f"{sender_name}: {message}".encode("utf-8")
+        if timestamp is None:
+            timestamp = PacketBuilder._get_timestamp()
+        flags = 0x00
+        # Firmware sendGroupMessage caps "<sender>: <text>" at MAX_TEXT_LEN bytes,
+        # truncating the text (never the prefix). Re-encode after the byte cut so a
+        # multi-byte UTF-8 sequence split at the boundary is dropped, not corrupted.
+        prefix = f"{sender_name}: ".encode("utf-8")
+        text_bytes = message.encode("utf-8")
+        max_text = max(MAX_TEXT_LEN - len(prefix), 0)
+        if len(text_bytes) > max_text:
+            text_bytes = text_bytes[:max_text].decode("utf-8", errors="ignore").encode("utf-8")
+        content = prefix + text_bytes
         plaintext = PacketBuilder._pack_timestamp_data(timestamp, flags, content)
 
         ciphertext = CryptoUtils._aes_encrypt(secret_bytes[:16], plaintext)
@@ -863,9 +847,7 @@ class PacketBuilder:
 
         # Create packet with proper structure
         pkt = Packet()
-        pkt.header = PacketBuilder._create_header(
-            PAYLOAD_TYPE_TRACE, route_type="direct"
-        )
+        pkt.header = PacketBuilder._create_header(PAYLOAD_TYPE_TRACE, route_type="direct")
         pkt.path_len = 0  # No routing path in packet path field
         pkt.path = bytearray()  # Empty routing path
         pkt.payload = bytearray(payload)
@@ -884,9 +866,7 @@ class PacketBuilder:
             raise ValueError(
                 f"Raw data length {len(data)} exceeds MAX_PACKET_PAYLOAD ({MAX_PACKET_PAYLOAD})"
             )
-        header = PacketBuilder._create_header(
-            PAYLOAD_TYPE_RAW_CUSTOM, route_type="direct"
-        )
+        header = PacketBuilder._create_header(PAYLOAD_TYPE_RAW_CUSTOM, route_type="direct")
         return PacketBuilder._create_packet(header, data)
 
     @staticmethod
@@ -931,9 +911,7 @@ class PacketBuilder:
         if len(path) + len(extra) + 5 > (MAX_PACKET_PAYLOAD - 2 - CIPHER_BLOCK_SIZE):
             raise ValueError("Combined path/extra too long")
 
-        if path_len_encoded is not None and PathUtils.is_valid_path_len(
-            path_len_encoded
-        ):
+        if path_len_encoded is not None and PathUtils.is_valid_path_len(path_len_encoded):
             expected_len = PathUtils.get_path_byte_len(path_len_encoded)
             if len(path) != expected_len:
                 raise ValueError(
@@ -1004,14 +982,10 @@ class PacketBuilder:
         attempt &= 0x03
         txt_type &= 0x3F
         flags_byte = (txt_type << 2) | attempt
-        timestamp = (
-            timestamp if timestamp is not None else PacketBuilder._get_timestamp()
-        )
+        timestamp = timestamp if timestamp is not None else PacketBuilder._get_timestamp()
 
         signed_sender_prefix = (
-            local_identity.get_public_key()[:4]
-            if txt_type == TXT_TYPE_SIGNED_PLAIN
-            else b""
+            local_identity.get_public_key()[:4] if txt_type == TXT_TYPE_SIGNED_PLAIN else b""
         )
 
         # Use  timestamp+data packing
@@ -1035,18 +1009,14 @@ class PacketBuilder:
 
         # Use  path validation
         routing_path = (
-            out_path
-            if out_path is not None
-            else (contact.out_path if contact.out_path else [])
+            out_path if out_path is not None else (contact.out_path if contact.out_path else [])
         )
         routing_path = PacketBuilder._validate_routing_path(routing_path)
 
         # Create packet with validated path
         pkt = Packet()
         has_path = bool(routing_path and len(routing_path) > 0)
-        pkt.header = PacketBuilder._create_header(
-            PAYLOAD_TYPE_TXT_MSG, message_type, has_path
-        )
+        pkt.header = PacketBuilder._create_header(PAYLOAD_TYPE_TXT_MSG, message_type, has_path)
 
         if routing_path and len(routing_path) > 0:
             if len(routing_path) > MAX_PATH_SIZE:
@@ -1092,9 +1062,7 @@ class PacketBuilder:
             f"{route_type_names.get(header_route_type, 'UNKNOWN')})"
         )
         logger.debug(f"  Path: {list(pkt.path)} (len={pkt.path_len})")
-        logger.debug(
-            f"  Payload: {len(pkt.payload)} bytes, first 10: {list(pkt.payload[:10])}"
-        )
+        logger.debug(f"  Payload: {len(pkt.payload)} bytes, first 10: {list(pkt.payload[:10])}")
         logger.debug(
             f"  Message: '{message}', attempt={attempt}, txt_type={txt_type}, "
             f"flags=0x{flags_byte:02X}, timestamp={timestamp}"
@@ -1163,9 +1131,9 @@ class PacketBuilder:
         if route_type == "direct" and len(out_path) > 0:
             path_bytes = out_path[:MAX_PATH_SIZE]
             encoded_len = None
-            if PathUtils.is_valid_path_len(
+            if PathUtils.is_valid_path_len(out_path_len) and PathUtils.get_path_byte_len(
                 out_path_len
-            ) and PathUtils.get_path_byte_len(out_path_len) <= len(path_bytes):
+            ) <= len(path_bytes):
                 encoded_len = out_path_len
             elif len(path_bytes) == 64:
                 path_bytes = path_bytes[:63]
@@ -1174,9 +1142,7 @@ class PacketBuilder:
         return packet, timestamp
 
     @staticmethod
-    def create_logout_packet(
-        contact: Any, local_identity: LocalIdentity
-    ) -> tuple[Packet, int]:
+    def create_logout_packet(contact: Any, local_identity: LocalIdentity) -> tuple[Packet, int]:
         """
         Create a logout packet for repeater authentication.
 
@@ -1255,9 +1221,7 @@ class PacketBuilder:
             # Returns: 4
             ```
         """
-        inv = PacketBuilder._compute_inverse_perm_mask(
-            want_base, want_location, want_environment
-        )
+        inv = PacketBuilder._compute_inverse_perm_mask(want_base, want_location, want_environment)
 
         return PacketBuilder.create_protocol_request(
             contact=contact,
@@ -1318,9 +1282,7 @@ class PacketBuilder:
 
         # Create packet with direct routing (will be sent as zero-hop)
         pkt = Packet()
-        pkt.header = PacketBuilder._create_header(
-            PAYLOAD_TYPE_CONTROL, route_type="direct"
-        )
+        pkt.header = PacketBuilder._create_header(PAYLOAD_TYPE_CONTROL, route_type="direct")
         pkt.path_len = 0
         pkt.path = bytearray()
         pkt.payload = payload
@@ -1382,9 +1344,7 @@ class PacketBuilder:
 
         # Create packet with direct routing (will be sent as zero-hop)
         pkt = Packet()
-        pkt.header = PacketBuilder._create_header(
-            PAYLOAD_TYPE_CONTROL, route_type="direct"
-        )
+        pkt.header = PacketBuilder._create_header(PAYLOAD_TYPE_CONTROL, route_type="direct")
         pkt.path_len = 0
         pkt.path = bytearray()
         pkt.payload = payload

@@ -56,6 +56,7 @@ PATH_HASH_SIZE_SHIFT = 6  # bits 6-7 of encoded path_len
 CIPHER_MAC_SIZE = 32  # SHA‑256 HMAC
 CIPHER_BLOCK_SIZE = 16
 MAX_PACKET_PAYLOAD = 256  # firmware's default
+MAX_TEXT_LEN = 10 * CIPHER_BLOCK_SIZE  # firmware BaseChatMesh.h message text cap (160)
 
 MAX_PATH_SIZE = 64
 MAX_PACKET_PAYLOAD = 256
@@ -115,9 +116,7 @@ CONTACT_TYPE_HYBRID = 4
 # Protocol Request Types
 REQ_TYPE_GET_STATUS = 0x01  # Get repeater stats (RepeaterStats struct)
 REQ_TYPE_GET_TELEMETRY_DATA = 0x03  # Get telemetry data (CayenneLPP)
-REQ_TYPE_GET_OWNER_INFO = (
-    0x07  # Variable-length: tag(4) + "version\nname\nowner" (simple_repeater)
-)
+REQ_TYPE_GET_OWNER_INFO = 0x07  # Variable-length: tag(4) + "version\nname\nowner" (simple_repeater)
 TELEM_PERM_BASE = 0x01
 TELEM_PERM_LOCATION = 0x02
 TELEM_PERM_ENVIRONMENT = 0x04

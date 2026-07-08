@@ -2,6 +2,7 @@ from openhop_core import LocalIdentity
 from openhop_core.protocol import CryptoUtils
 from openhop_core.protocol.constants import (
     MAX_PACKET_PAYLOAD,
+    MAX_TEXT_LEN,
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_ANON_REQ,
@@ -498,3 +499,52 @@ def test_create_text_message_uses_explicit_timestamp():
         contact, sender, text, attempt=attempt, message_type="direct"
     )
     assert crc3 != crc
+
+
+def _decrypt_group_content(pkt: Packet, secret: bytes) -> bytes:
+    """Return the '<sender>: <text>' content of a group datagram payload."""
+    # Payload layout: channel_hash (1) + MAC (2) + ciphertext
+    ciphertext = bytes(pkt.payload[3:])
+    plaintext = CryptoUtils._aes_decrypt(secret[:16], ciphertext)
+    # Skip timestamp (4) + flags (1); strip AES zero-padding like receivers do.
+    return plaintext[5:].rstrip(b"\x00")
+
+
+def test_create_group_datagram_truncates_content_to_max_text_len():
+    """Firmware sendGroupMessage caps '<sender>: <text>' at MAX_TEXT_LEN bytes."""
+    secret = b"\x11" * 16
+    channels = [{"name": "general", "secret": secret}]
+    sender = "Alice"
+
+    pkt = PacketBuilder.create_group_datagram(
+        "general", LocalIdentity(), "x" * 500, sender, channels
+    )
+
+    content = _decrypt_group_content(pkt, secret)
+    assert len(content) == MAX_TEXT_LEN
+    prefix = f"{sender}: "
+    assert content.decode("utf-8") == prefix + "x" * (MAX_TEXT_LEN - len(prefix))
+
+
+def test_create_group_datagram_short_message_not_truncated():
+    secret = b"\x11" * 16
+    channels = [{"name": "general", "secret": secret}]
+
+    pkt = PacketBuilder.create_group_datagram(
+        "general", LocalIdentity(), "hello", "Alice", channels
+    )
+
+    assert _decrypt_group_content(pkt, secret) == b"Alice: hello"
+
+
+def test_create_group_datagram_truncation_keeps_utf8_valid():
+    """A multi-byte char split at the byte cap is dropped, not corrupted."""
+    secret = b"\x11" * 16
+    channels = [{"name": "general", "secret": secret}]
+
+    # Prefix "A: " is 3 bytes; 157 remaining is odd, so a 2-byte char straddles the cut.
+    pkt = PacketBuilder.create_group_datagram("general", LocalIdentity(), "é" * 200, "A", channels)
+
+    content = _decrypt_group_content(pkt, secret)
+    assert len(content) <= MAX_TEXT_LEN
+    assert content.decode("utf-8") == "A: " + "é" * ((MAX_TEXT_LEN - 3) // 2)
