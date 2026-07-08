@@ -9,7 +9,6 @@ import pytest
 
 from openhop_core.companion.constants import (
     CMD_GET_DEVICE_TIME,
-    ERR_CODE_BAD_STATE,
     ERR_CODE_ILLEGAL_ARG,
     ERR_CODE_NOT_FOUND,
     ERR_CODE_TABLE_FULL,
@@ -1462,7 +1461,8 @@ async def test_cmd_send_txt_msg_unknown_contact_and_failure():
     server, frames = _make_capture_server(_txt_bridge(contact, SentResult(False)))
     data = bytes([0, 0]) + struct.pack("<I", 1) + contact.public_key[:6] + b"hi"
     await server._cmd_send_txt_msg(data)
-    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_BAD_STATE])]
+    # Firmware maps MSG_SEND_FAILED to TABLE_FULL (not BAD_STATE)
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL])]
 
     server, frames = _make_capture_server(_txt_bridge(contact, SentResult(True)))
     await server._cmd_send_txt_msg(b"\x00\x00")  # too short
