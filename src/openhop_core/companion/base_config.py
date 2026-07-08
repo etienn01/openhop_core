@@ -10,7 +10,13 @@ from typing import Any, Optional
 from ..protocol import Packet
 from ..protocol.constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
 from ..protocol.transport_keys import calc_transport_code, get_auto_key_for
-from .constants import MAX_SIGN_DATA_SIZE, STATS_TYPE_CORE, STATS_TYPE_PACKETS, STATS_TYPE_RADIO
+from .constants import (
+    MAX_SIGN_DATA_SIZE,
+    STATS_TYPE_CORE,
+    STATS_TYPE_PACKETS,
+    STATS_TYPE_RADIO,
+    ZERO_FLOOD_SCOPE_KEY,
+)
 from .models import NodePrefs
 
 logger = logging.getLogger("CompanionBase")
@@ -181,22 +187,25 @@ class _DeviceConfigMixin:
     # -------------------------------------------------------------------------
 
     def set_flood_scope(self, transport_key: Optional[bytes] = None) -> None:
-        """Set or clear the flood transport key for scoped flooding.
+        """Set or clear the transient flood scope override.
 
         Also cancels any pending explicit-unscoped request (firmware sets
         ``send_unscoped = false`` whenever a scope override is set or reset).
         """
-        if transport_key and len(transport_key) >= 16:
-            self._flood_transport_key = transport_key[:16]
-        else:
-            self._flood_transport_key = None
         self._flood_unscoped = False
 
-    def set_flood_unscoped(self) -> None:
-        """Force the next flood to be unscoped, bypassing the default scope.
+        if transport_key and len(transport_key) >= 16:
+            key = bytes(transport_key[:16])
+            self._flood_transport_key = None if key == ZERO_FLOOD_SCOPE_KEY else key
+            return
 
-        Mirrors firmware CMD_SET_FLOOD_SCOPE_KEY mode 1 (FW PR #2492): a one-shot
-        flag consumed by the next flood-routed packet in _apply_flood_scope.
+        self._flood_transport_key = None
+
+    def set_flood_unscoped(self) -> None:
+        """Force following floods to be unscoped, bypassing the default scope.
+
+        Mirrors firmware CMD_SET_FLOOD_SCOPE_KEY mode 1 (FW PR #2492): a sticky
+        flag cleared by the next scope override/reset.
         """
         self._flood_unscoped = True
 
@@ -233,17 +242,19 @@ class _DeviceConfigMixin:
 
         Derives the 16-byte transport key automatically via SHA-256 of the
         region name.  A leading ``#`` is added if not already present.
-        Pass ``None`` to clear the scope (flood to all).
+        Pass ``None`` to clear this transient region override.
         """
         if region_name:
             if not region_name.startswith("#"):
                 region_name = f"#{region_name}"
             self._flood_transport_key = get_auto_key_for(region_name)
+            self._flood_unscoped = False
         else:
             self._flood_transport_key = None
+            self._flood_unscoped = False
 
     def _resolve_flood_transport_key(self) -> Optional[bytes]:
-        """Resolve effective flood key: transient key first, then persisted default."""
+        """Resolve effective flood key: transient override first, then default."""
         if self._flood_transport_key is not None:
             return self._flood_transport_key
         default_scope = self.get_default_flood_scope()
@@ -265,9 +276,7 @@ class _DeviceConfigMixin:
             return  # only scope flood packets, not direct
         if self._flood_unscoped:
             # App explicitly requested unscoped (FW #2492): leave as plain flood,
-            # ignoring any default scope. One-shot — consumed here, as firmware
-            # resets send_unscoped after each flood.
-            self._flood_unscoped = False
+            # ignoring any default scope until a scope override/reset.
             return
         effective_key = self._resolve_flood_transport_key()
         if effective_key is None:

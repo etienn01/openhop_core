@@ -123,6 +123,7 @@ CONTACT_NAME_SIZE = 32
 CHANNEL_NAME_SIZE = 32  # channel name field width (CHANNEL_INFO / SET_CHANNEL)
 MAX_SIGN_DATA_SIZE = 8192  # 8KB signing buffer (matches firmware)
 MAX_PENDING_ACK_CRCS = 64
+ZERO_FLOOD_SCOPE_KEY = b"\x00" * 16  # firmware's null scope override (send_scope.isNull())
 
 # ---------------------------------------------------------------------------
 # Response-timeout hints (ms) returned in RESP_CODE_SENT frames. The firmware

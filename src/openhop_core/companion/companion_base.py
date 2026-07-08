@@ -101,8 +101,8 @@ class CompanionBase(
         self._custom_vars: dict[str, str] = {}
         self._sign_buffer: Optional[bytearray] = None
         self._flood_transport_key: Optional[bytes] = None
-        # One-shot "force unscoped flood" flag (FW PR #2492 / FIRMWARE_VER_CODE 12+):
-        # when set, the next flood ignores the default scope and floods unscoped.
+        # Sticky "force unscoped flood" flag (FW PR #2492 / FIRMWARE_VER_CODE 12+):
+        # when set, floods ignore the default scope until a scope override/reset.
         self._flood_unscoped: bool = False
         self._time_offset: float = 0.0
 
