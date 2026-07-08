@@ -1481,10 +1481,11 @@ async def test_cmd_send_channel_txt_msg_paths():
     bridge.send_channel_message = AsyncMock(return_value=True)
     server, frames = _make_capture_server(bridge)
 
-    data = bytes([0, 1]) + struct.pack("<I", 0) + b"hello"
+    # App-supplied timestamp is passed through to the bridge (PR #93)
+    data = bytes([0, 1]) + struct.pack("<I", 1234) + b"hello"
     await server._cmd_send_channel_txt_msg(data)
     assert frames == [bytes([RESP_CODE_OK])]
-    bridge.send_channel_message.assert_awaited_once_with(1, "hello")
+    bridge.send_channel_message.assert_awaited_once_with(1, "hello", timestamp=1234)
 
     # Non-plain txt_type is rejected before channel lookup
     frames.clear()
