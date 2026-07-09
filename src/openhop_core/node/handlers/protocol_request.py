@@ -304,7 +304,6 @@ class ProtocolRequestHandler:
                 hasattr(client, "out_path_len")
                 and client.out_path_len >= 0
                 and hasattr(client, "out_path")
-                and len(client.out_path) > 0
                 and PathUtils.is_valid_path_len(client.out_path_len)
             ):
                 route_type = "direct"
