@@ -70,7 +70,9 @@ class _SendOpsMixin:
             flags=flags,
             route_type=route,
         )
-        self._apply_flood_scope(pkt)
+        # Firmware CMD_SEND_SELF_ADVERT always scopes flood adverts with the
+        # persisted default scope, never the transient send_scope override.
+        self._apply_default_flood_scope(pkt)
         self._apply_path_hash_mode(pkt)
         success = await self._send_packet(pkt, wait_for_ack=False)
         if success:

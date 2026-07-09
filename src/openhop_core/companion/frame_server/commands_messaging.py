@@ -8,7 +8,6 @@ import struct
 from ...protocol.constants import TELEM_PERM_BASE, TELEM_PERM_ENVIRONMENT, TELEM_PERM_LOCATION
 from ...protocol.packet_utils import PathUtils
 from ..constants import (
-    ERR_CODE_BAD_STATE,
     ERR_CODE_ILLEGAL_ARG,
     ERR_CODE_NOT_FOUND,
     ERR_CODE_TABLE_FULL,
@@ -76,7 +75,9 @@ class _MessagingCommandsMixin:
         if result.success:
             self._write_sent_result(result, default_timeout_ms=TXT_MSG_TIMEOUT_HINT_MS)
         else:
-            self._write_err(ERR_CODE_BAD_STATE)
+            # Firmware maps MSG_SEND_FAILED to TABLE_FULL (MyMesh.cpp
+            # CMD_SEND_TXT_MSG), so strictly-compatible clients expect it.
+            self._write_err(ERR_CODE_TABLE_FULL)
 
     async def _cmd_send_channel_txt_msg(self, data: bytes) -> None:
         if len(data) < 6:
@@ -93,7 +94,9 @@ class _MessagingCommandsMixin:
             self._write_err(ERR_CODE_NOT_FOUND)
             return
         ok = await self.bridge.send_channel_message(channel_idx, text, timestamp=msg_timestamp)
-        self._write_ok() if ok else self._write_err(ERR_CODE_BAD_STATE)
+        # Firmware reports any channel-send failure as NOT_FOUND (MyMesh.cpp
+        # CMD_SEND_CHANNEL_TXT_MSG), so strictly-compatible clients expect it.
+        self._write_ok() if ok else self._write_err(ERR_CODE_NOT_FOUND)
 
     async def _cmd_send_channel_data(self, data: bytes) -> None:
         """Handle CMD_SEND_CHANNEL_DATA (62)."""

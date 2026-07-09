@@ -168,6 +168,16 @@ class CompanionRadio(CompanionBase):
         super().set_flood_region(region_name)
         self.node.dispatcher.flood_transport_key = self._flood_transport_key
 
+    def set_flood_unscoped(self) -> None:
+        """Force unscoped floods; clear the dispatcher's scope mirror too.
+
+        Firmware's send_unscoped flag suppresses scoping on every flood send,
+        so the node-level mirror must not keep applying a stale override key.
+        The next set_flood_scope()/set_flood_region() re-syncs the mirror.
+        """
+        super().set_flood_unscoped()
+        self.node.dispatcher.flood_transport_key = None
+
     def set_path_hash_mode(self, mode: int) -> None:
         """Set path hash mode and sync to dispatcher default."""
         super().set_path_hash_mode(mode)

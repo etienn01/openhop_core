@@ -115,6 +115,7 @@ class Packet:
         "drop_reason",
         "_tx_metadata",
         "_path_hash_mode_applied",
+        "_flood_scope_applied",
         "_injected_for_tx",
     )
 
@@ -139,6 +140,9 @@ class Packet:
         self._do_not_retransmit = False
         self.drop_reason = None  # Optional: reason for dropping packet
         self._path_hash_mode_applied = False
+        # Set once the companion layer has decided this flood packet's scoping
+        # (scoped or deliberately plain); the dispatcher must not re-scope it.
+        self._flood_scope_applied = False
         self._injected_for_tx = False  # Set by repeater inject path; skip engine on route
 
     def get_route_type(self) -> int:
