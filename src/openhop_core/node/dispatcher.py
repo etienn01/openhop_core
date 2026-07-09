@@ -475,8 +475,14 @@ class Dispatcher:
         If ``flood_transport_key`` is set and the packet uses flood routing,
         calculates the transport code, attaches it to the packet, and
         switches the route type to ``ROUTE_TYPE_TRANSPORT_FLOOD``.
+
+        Packets the companion layer already scoped (or deliberately left as
+        plain flood, e.g. explicit-unscoped mode or default-scoped adverts)
+        are marked ``_flood_scope_applied`` and skipped here.
         """
         if self.flood_transport_key is None:
+            return
+        if getattr(pkt, "_flood_scope_applied", False):
             return
         route_type = pkt.get_route_type()
         if route_type != ROUTE_TYPE_FLOOD:

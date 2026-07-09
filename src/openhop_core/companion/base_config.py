@@ -278,11 +278,15 @@ class _DeviceConfigMixin:
         calculates the transport code, attaches it to the packet, and changes
         the route type to ``ROUTE_TYPE_TRANSPORT_FLOOD``.
 
-        Matches firmware ``sendFloodScoped()`` in ``BaseChatMesh.cpp``.
+        Matches firmware ``sendFloodScoped()`` in ``BaseChatMesh.cpp``.  Marks
+        the packet scope-applied even when it stays a plain flood (unscoped
+        request, or no key configured) so the dispatcher's node-level scope
+        cannot override that decision.
         """
         route_type = pkt.get_route_type()
         if route_type != ROUTE_TYPE_FLOOD:
             return  # only scope flood packets, not direct
+        pkt._flood_scope_applied = True
         if self._flood_unscoped:
             # App explicitly requested unscoped (FW #2492): leave as plain flood,
             # ignoring any default scope until a scope override/reset.

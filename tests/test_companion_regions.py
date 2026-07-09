@@ -196,6 +196,69 @@ class TestRadioDispatcherSync:
         companion.set_flood_scope(None)
         assert companion.node.dispatcher.flood_transport_key is None
 
+    def test_set_flood_unscoped_clears_dispatcher_mirror(self):
+        companion = _make_companion()
+        companion.set_flood_scope(b"\x01" * 16)
+        companion.set_flood_unscoped()
+        assert companion.node.dispatcher.flood_transport_key is None
+
+
+# ---------------------------------------------------------------------------
+# Explicit-unscoped mode (firmware CMD_SET_FLOOD_SCOPE_KEY mode 1, FW #2492)
+# ---------------------------------------------------------------------------
+
+
+class TestFloodUnscoped:
+    def test_unscoped_leaves_plain_flood_and_marks_packet(self):
+        companion = _make_companion()
+        companion.set_flood_scope(b"\x01" * 16)
+        companion.set_flood_unscoped()
+        pkt = _make_flood_packet()
+
+        companion._apply_flood_scope(pkt)
+
+        assert pkt.get_route_type() == ROUTE_TYPE_FLOOD
+        assert pkt.transport_codes == [0, 0]
+        assert pkt._flood_scope_applied
+
+    def test_dispatcher_skips_companion_marked_packet(self):
+        """A stale dispatcher-level key must not re-scope a packet the
+        companion layer deliberately left as plain flood."""
+        companion = _make_companion()
+        dispatcher = companion.node.dispatcher
+        dispatcher.flood_transport_key = b"\x01" * 16
+        pkt = _make_flood_packet()
+        pkt._flood_scope_applied = True
+
+        dispatcher._apply_flood_scope(pkt)
+
+        assert pkt.get_route_type() == ROUTE_TYPE_FLOOD
+        assert pkt.transport_codes == [0, 0]
+
+    @pytest.mark.asyncio
+    async def test_unscoped_send_stays_plain_flood_end_to_end(self):
+        """set_flood_scope(K) then unscoped mode: the transmitted packet must
+        be a plain flood (firmware checks send_unscoped before send_scope)."""
+        radio = MockRadio()
+        identity = LocalIdentity()
+        companion = CompanionRadio(radio=radio, identity=identity, node_name="unscoped")
+        companion.channels.set(0, Channel(name="test-ch", secret=b"\xAB" * 16))
+        companion.set_flood_region("usa")
+        companion.set_flood_unscoped()
+
+        await companion.start()
+        try:
+            await companion.send_channel_message(0, "hello")
+        finally:
+            await companion.stop()
+
+        assert len(radio.sent) > 0
+        raw = radio.sent[-1]
+        pkt = Packet()
+        pkt.read_from(raw)
+        assert pkt.get_route_type() == ROUTE_TYPE_FLOOD
+        assert pkt.transport_codes == [0, 0]
+
 
 # ---------------------------------------------------------------------------
 # Default flood scope semantics
