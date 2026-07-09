@@ -229,13 +229,18 @@ class _DeviceConfigMixin:
         return True
 
     def get_default_flood_scope(self) -> Optional[tuple[str, bytes]]:
-        """Return (name, key) for persisted default scope, or None if unset."""
+        """Return (name, key) for persisted default scope, or None if unset.
+
+        A non-empty name means "set" even when the key is all zeros: firmware
+        CMD_GET_DEFAULT_FLOOD_SCOPE checks only ``strlen(default_scope_name)``
+        and echoes the stored key as-is.  The null-key check happens at send
+        time instead (``TransportKey::isNull()``).
+        """
         name = (getattr(self.prefs, "default_scope_name", "") or "").strip()
-        key = getattr(self.prefs, "default_scope_key", b"") or b""
-        key = bytes(key[:16]).ljust(16, b"\x00") if key else b""
-        if not name or key == b"\x00" * 16:
+        if not name:
             return None
-        return (name, key)
+        key = getattr(self.prefs, "default_scope_key", b"") or b""
+        return (name, bytes(key[:16]).ljust(16, b"\x00"))
 
     def set_flood_region(self, region_name: Optional[str] = None) -> None:
         """Set flood scope from a region name (e.g., ``'#usa'``) or clear it.
@@ -253,14 +258,18 @@ class _DeviceConfigMixin:
             self._flood_transport_key = None
             self._flood_unscoped = False
 
+    def _default_scope_key(self) -> Optional[bytes]:
+        """Default scope key for sends, or None when unset or null (all zeros)."""
+        default_scope = self.get_default_flood_scope()
+        if default_scope is None or default_scope[1] == ZERO_FLOOD_SCOPE_KEY:
+            return None
+        return default_scope[1]
+
     def _resolve_flood_transport_key(self) -> Optional[bytes]:
         """Resolve effective flood key: transient override first, then default."""
         if self._flood_transport_key is not None:
             return self._flood_transport_key
-        default_scope = self.get_default_flood_scope()
-        if default_scope is None:
-            return None
-        return default_scope[1]
+        return self._default_scope_key()
 
     def _apply_flood_scope(self, pkt: Packet) -> None:
         """Apply flood scope transport codes to a packet in-place.

@@ -198,6 +198,38 @@ class TestRadioDispatcherSync:
 
 
 # ---------------------------------------------------------------------------
+# Default flood scope semantics
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultFloodScope:
+    def test_zero_key_default_is_reported_but_null_at_send(self):
+        """Firmware persists and echoes a named default with an all-zero key
+        (GET checks only the name); the null-key check happens at send time."""
+        companion = _make_companion()
+        companion.set_default_flood_scope("usa", b"\x00" * 16)
+
+        assert companion.get_default_flood_scope() == ("usa", b"\x00" * 16)
+        assert companion._resolve_flood_transport_key() is None
+
+        pkt = _make_flood_packet()
+        companion._apply_flood_scope(pkt)
+        assert pkt.get_route_type() == ROUTE_TYPE_FLOOD
+
+    def test_default_scope_used_when_no_override(self):
+        companion = _make_companion()
+        key = get_auto_key_for("#usa")
+        companion.set_default_flood_scope("usa", key)
+        pkt = _make_flood_packet()
+
+        expected_code = calc_transport_code(key, pkt)
+        companion._apply_flood_scope(pkt)
+
+        assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert pkt.transport_codes[0] == expected_code
+
+
+# ---------------------------------------------------------------------------
 # Integration: advertise with flood scope
 # ---------------------------------------------------------------------------
 
