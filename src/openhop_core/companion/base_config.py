@@ -271,6 +271,12 @@ class _DeviceConfigMixin:
             return self._flood_transport_key
         return self._default_scope_key()
 
+    def _scope_packet(self, pkt: Packet, key: bytes) -> None:
+        """Attach transport codes for ``key`` and switch FLOOD -> TRANSPORT_FLOOD."""
+        pkt.transport_codes[0] = calc_transport_code(key, pkt)
+        pkt.transport_codes[1] = 0  # reserved for home region (firmware TODO)
+        pkt.header = (pkt.header & ~0x03) | ROUTE_TYPE_TRANSPORT_FLOOD
+
     def _apply_flood_scope(self, pkt: Packet) -> None:
         """Apply flood scope transport codes to a packet in-place.
 
@@ -294,11 +300,22 @@ class _DeviceConfigMixin:
         effective_key = self._resolve_flood_transport_key()
         if effective_key is None:
             return
-        code = calc_transport_code(effective_key, pkt)
-        pkt.transport_codes[0] = code
-        pkt.transport_codes[1] = 0  # reserved for home region (firmware TODO)
-        # Switch route type from FLOOD -> TRANSPORT_FLOOD
-        pkt.header = (pkt.header & ~0x03) | ROUTE_TYPE_TRANSPORT_FLOOD
+        self._scope_packet(pkt, effective_key)
+
+    def _apply_default_flood_scope(self, pkt: Packet) -> None:
+        """Scope a flood packet with the persisted default scope only.
+
+        Firmware CMD_SEND_SELF_ADVERT builds the scope directly from
+        ``prefs.default_scope_key``, bypassing both the transient send_scope
+        override and the send_unscoped flag; a null default means plain flood.
+        """
+        if pkt.get_route_type() != ROUTE_TYPE_FLOOD:
+            return
+        pkt._flood_scope_applied = True
+        key = self._default_scope_key()
+        if key is None:
+            return
+        self._scope_packet(pkt, key)
 
     def _apply_path_hash_mode(self, pkt: Packet) -> None:
         """Encode the device's path_hash_mode in originated packets.

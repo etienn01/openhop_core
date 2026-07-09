@@ -291,6 +291,30 @@ class TestDefaultFloodScope:
         assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
         assert pkt.transport_codes[0] == expected_code
 
+    def test_apply_default_flood_scope_ignores_override(self):
+        companion = _make_companion()
+        default_key = get_auto_key_for("#usa")
+        companion.set_default_flood_scope("usa", default_key)
+        companion.set_flood_region("europe")  # transient override
+        pkt = _make_flood_packet()
+
+        expected_code = calc_transport_code(default_key, pkt)
+        companion._apply_default_flood_scope(pkt)
+
+        assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert pkt.transport_codes[0] == expected_code
+
+    def test_apply_default_flood_scope_null_default_stays_plain(self):
+        companion = _make_companion()
+        companion.set_flood_region("europe")  # transient override, no default
+        pkt = _make_flood_packet()
+
+        companion._apply_default_flood_scope(pkt)
+
+        assert pkt.get_route_type() == ROUTE_TYPE_FLOOD
+        assert pkt.transport_codes == [0, 0]
+        assert pkt._flood_scope_applied
+
 
 # ---------------------------------------------------------------------------
 # Integration: advertise with flood scope
@@ -299,11 +323,13 @@ class TestDefaultFloodScope:
 
 class TestAdvertiseWithFloodScope:
     @pytest.mark.asyncio
-    async def test_advertise_flood_with_scope_sends_transport_flood(self):
+    async def test_advertise_flood_uses_default_scope(self):
+        """Flood adverts are scoped with the persisted default scope (firmware
+        CMD_SEND_SELF_ADVERT builds the scope from prefs.default_scope_key)."""
         radio = MockRadio()
         identity = LocalIdentity()
         companion = CompanionRadio(radio=radio, identity=identity, node_name="scoped")
-        companion.set_flood_region("usa")
+        companion.set_default_flood_scope("usa", get_auto_key_for("#usa"))
 
         await companion.start()
         try:
@@ -311,7 +337,6 @@ class TestAdvertiseWithFloodScope:
         finally:
             await companion.stop()
 
-        # Verify the sent packet has transport codes
         assert len(radio.sent) > 0
         raw = radio.sent[-1]
         pkt = Packet()
@@ -319,6 +344,28 @@ class TestAdvertiseWithFloodScope:
         assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
         assert pkt.transport_codes[0] != 0
         assert pkt.transport_codes[1] == 0
+
+    @pytest.mark.asyncio
+    async def test_advertise_flood_ignores_transient_override(self):
+        """Firmware flood adverts bypass the transient send_scope override:
+        with an override set but no default scope, the advert stays plain."""
+        radio = MockRadio()
+        identity = LocalIdentity()
+        companion = CompanionRadio(radio=radio, identity=identity, node_name="scoped")
+        companion.set_flood_region("usa")  # transient override only
+
+        await companion.start()
+        try:
+            await companion.advertise(flood=True)
+        finally:
+            await companion.stop()
+
+        assert len(radio.sent) > 0
+        raw = radio.sent[-1]
+        pkt = Packet()
+        pkt.read_from(raw)
+        assert pkt.get_route_type() == ROUTE_TYPE_FLOOD
+        assert pkt.transport_codes == [0, 0]
 
     @pytest.mark.asyncio
     async def test_advertise_flood_without_scope_sends_normal_flood(self):
