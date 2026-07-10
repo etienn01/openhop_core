@@ -1606,11 +1606,11 @@ class SX1262Radio(LoRaRadio):
         """Set custom CAD thresholds that override the defaults.
 
         Args:
-            peak: CAD detection peak threshold (0-31)
-            min_val: CAD detection minimum threshold (0-31)
+            peak: CAD detection peak threshold (0-255)
+            min_val: CAD detection minimum threshold (0-255)
         """
-        if not (0 <= peak <= 31) or not (0 <= min_val <= 31):
-            raise ValueError("CAD thresholds must be between 0 and 31")
+        if not (0 <= peak <= 255) or not (0 <= min_val <= 255):
+            raise ValueError("CAD thresholds must be between 0 and 255")
 
         self._custom_cad_peak = peak
         self._custom_cad_min = min_val

@@ -1406,7 +1406,7 @@ class TestCADThresholds:
 
     def test_custom_thresholds_out_of_range_raises(self, radio):
         with pytest.raises(ValueError):
-            radio.set_custom_cad_thresholds(peak=32, min_val=0)
+            radio.set_custom_cad_thresholds(peak=256, min_val=0)
         with pytest.raises(ValueError):
             radio.set_custom_cad_thresholds(peak=10, min_val=-1)
 
