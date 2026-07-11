@@ -98,7 +98,11 @@ def _make_mock_lora() -> MagicMock:
     lora.CRC_ON = 1
     lora.IQ_STANDARD = 0
     lora.RX_GAIN_BOOSTED = 1
-    lora.CAD_ON_2_SYMB = 0
+    lora.CAD_ON_1_SYMB = 0
+    lora.CAD_ON_2_SYMB = 1
+    lora.CAD_ON_4_SYMB = 2
+    lora.CAD_ON_8_SYMB = 3
+    lora.CAD_ON_16_SYMB = 4
     lora.CAD_EXIT_STDBY = 0
     lora.REGULATOR_DC_DC = 0
     lora.TCXO_DELAY_5 = 5
@@ -714,9 +718,25 @@ class TestCADAndLBT:
         result = await radio.perform_cad(timeout=1.0, calibration=True)
         assert isinstance(result, dict)
         assert "detected" in result
+        assert "cad_done" in result
         assert "det_peak" in result
         assert "sf" in result
         assert "timestamp" in result
+    async def test_perform_cad_calibration_reports_done_without_detected(self, radio):
+        asyncio.get_running_loop().create_task(
+            self._fire_cad_event(radio, detected=False, delay=0.01)
+        )
+        result = await radio.perform_cad(timeout=1.0, calibration=True)
+        assert result["cad_done"] is True
+        assert result["detected"] is False
+
+    async def test_perform_cad_calibration_reports_done_and_detected(self, radio):
+        asyncio.get_running_loop().create_task(
+            self._fire_cad_event(radio, detected=True, delay=0.01)
+        )
+        result = await radio.perform_cad(timeout=1.0, calibration=True)
+        assert result["cad_done"] is True
+        assert result["detected"] is True
 
     async def test_perform_cad_calibration_timeout_returns_dict_with_timeout_key(
         self, radio, mock_lora
@@ -725,6 +745,25 @@ class TestCADAndLBT:
         result = await radio.perform_cad(timeout=0.05, calibration=True)
         assert isinstance(result, dict)
         assert result.get("timeout") is True
+        assert result.get("cad_done") is False
+
+    async def test_perform_cad_symbol_mapping_uses_requested_symbol_count(
+        self, radio, mock_lora
+    ):
+        asyncio.get_running_loop().create_task(
+            self._fire_cad_event(radio, detected=False, delay=0.01)
+        )
+        await radio.perform_cad(timeout=1.0, calibration=True, cad_symbol_num=8)
+        mock_lora.setCadParams.assert_called()
+        cad_symbol_arg = mock_lora.setCadParams.call_args[0][0]
+        assert cad_symbol_arg == mock_lora.CAD_ON_8_SYMB
+
+    async def test_perform_cad_invalid_symbol_count_returns_error_in_calibration_mode(
+        self, radio
+    ):
+        result = await radio.perform_cad(timeout=0.05, calibration=True, cad_symbol_num=3)
+        assert "error" in result
+        assert "cad_symbol_num must be one of" in result["error"]
 
     async def test_perform_cad_exception_returns_false(self, radio, mock_lora):
         mock_lora.setStandby.side_effect = RuntimeError("hardware fault")
