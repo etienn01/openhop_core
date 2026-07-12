@@ -180,6 +180,7 @@ class SX1262Radio(LoRaRadio):
         # Custom CAD thresholds (None means use defaults)
         self._custom_cad_peak = None
         self._custom_cad_min = None
+        self._custom_cad_symbol_num = None
 
         # Noise floor sampling
         self._noise_floor = -99.0
@@ -1043,6 +1044,9 @@ class SX1262Radio(LoRaRadio):
                     backoff_ms = min(backoff_ms, 5000)
 
                     lbt_backoff_delays.append(float(backoff_ms))
+                    # Keep TX lock held for thread safety while this send() owns TX sequencing,
+                    # but restore RX during backoff so standby time is limited to CAD windows.
+                    await self._restore_rx_for_cad_backoff()
 
                     _trace(
                         f"CAD backoff - waiting {backoff_ms}ms before retry "
@@ -1072,6 +1076,31 @@ class SX1262Radio(LoRaRadio):
                 return False, lbt_backoff_delays
 
         return True, lbt_backoff_delays
+
+    async def _restore_rx_for_cad_backoff(self) -> None:
+        """Restore RX_CONTINUOUS between busy CAD retries."""
+        # Deterministic transition sequence:
+        # clear IRQs -> standby -> disable IRQ routes -> set RX IRQ routes -> RX_CONTINUOUS.
+        # This keeps receive downtime minimal while preserving a fresh CAD immediately
+        # before each transmit attempt.
+        self.lora.clearIrqStatus(0xFFFF)
+        self.lora.setStandby(self.lora.STANDBY_RC)
+        await asyncio.sleep(self.RADIO_TIMING_DELAY)
+        self.lora.setDioIrqParams(
+            self.lora.IRQ_NONE,
+            self.lora.IRQ_NONE,
+            self.lora.IRQ_NONE,
+            self.lora.IRQ_NONE,
+        )
+        await asyncio.sleep(0.001)
+        self.lora.clearIrqStatus(0xFFFF)
+        rx_mask = self._get_rx_irq_mask()
+        self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
+        await asyncio.sleep(0.001)
+        self._control_tx_rx_pins(tx_mode=False)
+        self.lora.request(self.lora.RX_CONTINUOUS)
+        await asyncio.sleep(self.RADIO_TIMING_DELAY)
+        self.lora.clearIrqStatus(0xFFFF)
 
     def _control_tx_rx_pins(self, tx_mode: bool) -> None:
         """Control TXEN/RXEN pins for the E22 module (simple and deterministic)."""
@@ -1622,6 +1651,13 @@ class SX1262Radio(LoRaRadio):
         self._custom_cad_min = None
         logger.info("Custom CAD thresholds cleared, reverting to defaults")
 
+    def set_custom_cad_symbol_num(self, cad_symbol_num: int) -> None:
+        """Set custom CAD symbol count that overrides the default runtime value."""
+        if cad_symbol_num not in {1, 2, 4, 8, 16}:
+            raise ValueError("cad_symbol_num must be one of: 1, 2, 4, 8, 16")
+        self._custom_cad_symbol_num = int(cad_symbol_num)
+        logger.info("Custom CAD symbol count set: symbols=%s", self._custom_cad_symbol_num)
+
     def _get_thresholds_for_current_settings(self) -> tuple[int, int]:
         """Fetch CAD thresholds for the current spreading factor.
         Returns (cadDetPeak, cadDetMin).
@@ -1661,7 +1697,7 @@ class SX1262Radio(LoRaRadio):
         det_min: Optional[int] = None,
         timeout: float = 1.0,
         calibration: bool = False,
-        cad_symbol_num: int = 2,
+        cad_symbol_num: Optional[int] = None,
         respect_tx_lock: bool = True,
     ) -> Union[bool, dict]:
         """
@@ -1684,7 +1720,10 @@ class SX1262Radio(LoRaRadio):
             det_peak, det_min = self._get_thresholds_for_current_settings()
         if not (0 <= int(det_peak) <= 255 and 0 <= int(det_min) <= 255):
             raise ValueError("CAD thresholds must be between 0 and 255")
-        cad_symbol_constant = self._resolve_cad_symbol_constant(int(cad_symbol_num))
+        if cad_symbol_num is None:
+            cad_symbol_num = self._custom_cad_symbol_num or 2
+        cad_symbol_num = int(cad_symbol_num)
+        cad_symbol_constant = self._resolve_cad_symbol_constant(cad_symbol_num)
         acquired_tx_lock = False
         try:
             if respect_tx_lock:
