@@ -262,9 +262,11 @@ class TextMessageHandler(BaseHandler):
         sender_pubkey = self._contact_pubkey_bytes(matched_contact)
         timestamp_int = int.from_bytes(timestamp, "little")
 
-        # Determine message routing type from packet header
+        # Determine message routing type from packet header. Both plain flood
+        # (ROUTE_TYPE_FLOOD) and transport-scoped flood (ROUTE_TYPE_TRANSPORT_FLOOD)
+        # count as flood, matching MeshCore Packet::isRouteFlood.
         route_type = packet.get_route_type()
-        is_flood = route_type == 1  # ROUTE_TYPE_FLOOD = 1
+        is_flood = packet.is_route_flood()
 
         self.log(
             f"Processing message - route_type: {route_type}, is_flood: {is_flood}, "
