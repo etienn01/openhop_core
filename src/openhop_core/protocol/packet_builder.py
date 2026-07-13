@@ -924,7 +924,13 @@ class PacketBuilder:
         else:
             first_byte = len(path)
 
-        inner = bytes([first_byte]) + bytes(path) + bytes([extra_type]) + extra
+        if extra:
+            inner = bytes([first_byte]) + bytes(path) + bytes([extra_type]) + extra
+        else:
+            # No extra payload: MeshCore Mesh::createPathReturn appends 0xFF and
+            # four RNG bytes so repeated PATH returns for the same path do not
+            # encrypt to identical packets (and identical packet hashes).
+            inner = bytes([first_byte]) + bytes(path) + b"\xff" + os.urandom(4)
         aes_key = secret[:16]
         cipher = PacketBuilder._encrypt_payload(aes_key, secret, inner)
         payload = bytearray([dest_hash, src_hash]) + cipher

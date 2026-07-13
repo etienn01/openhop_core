@@ -218,6 +218,26 @@ def test_packet_builder_create_path_return_no_encoded_uses_len_path():
     decrypted = CryptoUtils.mac_then_decrypt(aes_key, secret, bytes(pkt.payload[2:]))
     assert decrypted[0] == 3
     assert decrypted[1:4] == bytes(path)
+    # No extra payload: 0xFF dummy type followed by 4 random uniqueness bytes.
+    assert decrypted[4] == 0xFF
+    assert len(decrypted) >= 4 + 1 + 4
+
+
+def test_packet_builder_create_path_return_empty_extra_is_unique():
+    """Two identical empty-extra PATH returns must differ (random filler),
+    matching MeshCore Mesh::createPathReturn."""
+    path = [0x11, 0x22, 0x33]
+    secret = bytes(32)
+    kwargs = dict(dest_hash=0x01, src_hash=0x02, secret=secret, path=path, extra=b"")
+    a = PacketBuilder.create_path_return(**kwargs)
+    b = PacketBuilder.create_path_return(**kwargs)
+    assert bytes(a.payload) != bytes(b.payload)
+    # Both remain valid and decrypt with the shared secret.
+    for pkt in (a, b):
+        dec = CryptoUtils.mac_then_decrypt(secret[:16], secret, bytes(pkt.payload[2:]))
+        assert dec[0] == 3
+        assert dec[1:4] == bytes(path)
+        assert dec[4] == 0xFF
 
 
 def test_create_text_message_cli_data_flags_byte():
