@@ -59,9 +59,12 @@ class _SendOpsMixin:
         flags |= ADVERT_FLAG_HAS_NAME
         lat, lon = 0.0, 0.0
         if self.prefs.advert_loc_policy == ADVERT_LOC_SHARE:
+            # The location-sharing policy decides inclusion, not the coordinate
+            # value: (0.0, 0.0) is a valid position and must be advertised when
+            # sharing is enabled (matches MeshCore CommonCLI::buildAdvertData,
+            # which serializes the coordinate for any non-NONE policy).
             lat, lon = self.prefs.latitude, self.prefs.longitude
-            if lat != 0.0 or lon != 0.0:
-                flags |= ADVERT_FLAG_HAS_LOCATION
+            flags |= ADVERT_FLAG_HAS_LOCATION
         route = "flood" if flood else "direct"
         pkt = PacketBuilder.create_advert(
             local_identity=self._identity,
