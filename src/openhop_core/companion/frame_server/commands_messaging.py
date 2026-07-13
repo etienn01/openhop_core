@@ -15,6 +15,7 @@ from ..constants import (
     FIRMWARE_VER_CODE,
     LOGIN_TIMEOUT_HINT_MS,
     MAX_CHANNEL_DATA_LENGTH,
+    MAX_GROUP_DATA_LENGTH,
     MAX_PATH_SIZE,
     OUT_PATH_UNKNOWN,
     PUB_KEY_SIZE,
@@ -125,7 +126,7 @@ class _MessagingCommandsMixin:
             return
         data_type = int.from_bytes(data[offset : offset + 2], "little")
         payload = data[offset + 2 :]
-        if data_type == 0 or len(payload) > MAX_CHANNEL_DATA_LENGTH:
+        if data_type == 0 or len(payload) > MAX_GROUP_DATA_LENGTH:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         send_channel_data = getattr(self.bridge, "send_channel_data", None)

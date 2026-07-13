@@ -31,6 +31,7 @@ from .constants import (
     ADV_TYPE_NONE,
     ADVERT_LOC_SHARE,
     DEFAULT_RESPONSE_TIMEOUT_MS,
+    MAX_GROUP_DATA_LENGTH,
     MAX_PENDING_ACK_CRCS,
     PROTOCOL_CODE_ANON_REQ,
     PROTOCOL_CODE_BINARY_REQ,
@@ -453,7 +454,7 @@ class _SendOpsMixin:
         if not channel or data_type <= 0 or data_type > 0xFFFF:
             return False
         payload = bytes(payload or b"")
-        if len(payload) > 255:
+        if len(payload) > MAX_GROUP_DATA_LENGTH:
             return False
         try:
             secret_bytes = bytes(channel.secret or b"")

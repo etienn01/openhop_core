@@ -298,6 +298,9 @@ MAX_FRAME_SIZE = 176
 MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE - 3  # max bytes after prefix + 2-byte length
 # Firmware companion command parser uses MAX_FRAME_SIZE - 9 for channel binary payloads.
 MAX_CHANNEL_DATA_LENGTH = MAX_FRAME_SIZE - 9
+# Firmware MeshCore.h: MAX_GROUP_DATA_LENGTH = MAX_PACKET_PAYLOAD(184) - CIPHER_BLOCK_SIZE(16) - 3.
+# BaseChatMesh::sendGroupData rejects group application data longer than this.
+MAX_GROUP_DATA_LENGTH = 165
 OUT_PATH_UNKNOWN = 0xFF
 # PUB_KEY_SIZE and MAX_PATH_SIZE are re-exported from protocol.constants at
 # the top of this module.
