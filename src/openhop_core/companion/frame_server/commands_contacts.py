@@ -37,7 +37,11 @@ class _ContactCommandsMixin:
     async def _cmd_get_contacts(self, data: bytes) -> None:
         since = struct.unpack("<I", data[:4])[0] if len(data) >= 4 else 0
         contacts = self.bridge.get_contacts(since=since)
-        self._write_frame(bytes([RESP_CODE_CONTACTS_START]) + struct.pack("<I", len(contacts)))
+        # Firmware reports the total contact-table count here (MyMesh
+        # CMD_GET_CONTACTS uses getNumContacts()), independent of the 'since'
+        # filter; only the emitted frames and the end watermark are filtered.
+        total = len(contacts) if since == 0 else len(self.bridge.get_contacts(since=0))
+        self._write_frame(bytes([RESP_CODE_CONTACTS_START]) + struct.pack("<I", total))
         for i, c in enumerate(contacts):
             self._write_contact_frame(c)
         most_recent = max((c.lastmod for c in contacts), default=0)

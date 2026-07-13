@@ -1345,17 +1345,21 @@ def _contact(name="alice", first_byte=0x42, **overrides) -> Contact:
 async def test_cmd_get_contacts_start_body_end_sequence():
     c1 = _contact("alice", 0x42, lastmod=100)
     c2 = _contact("bob", 0x43, lastmod=200)
+    c3 = _contact("carol", 0x44, lastmod=300)
+    # The 'since' filter narrows the emitted frames, but CONTACTS_START must
+    # report the total table count (firmware getNumContacts()), not the count
+    # of the filtered result.
     bridge = Mock()
-    bridge.get_contacts = Mock(return_value=[c1, c2])
+    bridge.get_contacts = Mock(side_effect=lambda since=0: [c2, c3] if since else [c1, c2, c3])
     server, frames = _make_capture_server(bridge)
 
     await server._cmd_get_contacts(struct.pack("<I", 50))
 
-    bridge.get_contacts.assert_called_once_with(since=50)
-    assert frames[0] == bytes([RESP_CODE_CONTACTS_START]) + struct.pack("<I", 2)
+    assert frames[0] == bytes([RESP_CODE_CONTACTS_START]) + struct.pack("<I", 3)
     assert frames[1][0] == RESP_CODE_CONTACT
     assert frames[2][0] == RESP_CODE_CONTACT
-    assert frames[3] == bytes([RESP_CODE_END_OF_CONTACTS]) + struct.pack("<I", 200)
+    assert len(frames) == 4
+    assert frames[3] == bytes([RESP_CODE_END_OF_CONTACTS]) + struct.pack("<I", 300)
 
 
 @pytest.mark.asyncio
