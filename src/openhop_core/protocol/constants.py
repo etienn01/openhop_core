@@ -47,7 +47,7 @@ MAX_SUPPORTED_PAYLOAD_VERSION = PAYLOAD_VER_2  # Accept versions 0-1
 # ---------------------------------------------------------------------------
 # Misc sizes
 # ---------------------------------------------------------------------------
-MAX_ADVERT_DATA_SIZE = 96
+MAX_ADVERT_DATA_SIZE = 32  # firmware MeshCore.h MAX_ADVERT_DATA_SIZE
 PUB_KEY_SIZE = 32
 SIGNATURE_SIZE = 64
 PATH_HASH_SIZE = 1  # Legacy default; see PathUtils for multi-byte path support
