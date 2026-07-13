@@ -35,8 +35,12 @@ class _DeviceCommandsMixin:
     """Device and configuration _cmd_* handlers of :class:`CompanionFrameServer`."""
 
     async def _cmd_app_start(self, data: bytes) -> None:
-        if len(data) >= 1:
-            self._app_target_ver = data[0]
+        # MeshCore CMD_APP_START requires the full 7-byte reserved prefix (total
+        # frame len >= 8). Those bytes are reserved for future use, not a version:
+        # the protocol version is negotiated only through DEVICE_QUERY.
+        if len(data) < 7:
+            self._write_err(ERR_CODE_ILLEGAL_ARG)
+            return
         prefs = self.bridge.get_self_info()
         pubkey = self.bridge.get_public_key()
         name = prefs.node_name.encode("utf-8", errors="replace")

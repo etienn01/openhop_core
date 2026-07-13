@@ -1306,8 +1306,10 @@ async def test_cmd_app_start_self_info_layout():
     bridge.get_self_info = Mock(return_value=prefs)
     bridge.get_public_key = Mock(return_value=pubkey)
     server, frames = _make_capture_server(bridge)
+    # Version is negotiated only via DEVICE_QUERY; APP_START must not change it.
+    server._app_target_ver = 5
 
-    await server._cmd_app_start(bytes([1]))
+    await server._cmd_app_start(bytes(7) + b"TestApp")
 
     (frame,) = frames
     assert frame[0] == RESP_CODE_SELF_INFO
@@ -1316,7 +1318,19 @@ async def test_cmd_app_start_self_info_layout():
     assert lat == int(12.5 * 1e6)
     assert lon == int(-3.25 * 1e6)
     assert frame.endswith(b"TestNode")
-    assert server._app_target_ver == 1
+    assert server._app_target_ver == 5
+
+
+@pytest.mark.asyncio
+async def test_cmd_app_start_rejects_short_frame():
+    bridge = Mock()
+    server, frames = _make_capture_server(bridge)
+    server._write_err = Mock()
+
+    await server._cmd_app_start(bytes(6))
+
+    server._write_err.assert_called_once_with(ERR_CODE_ILLEGAL_ARG)
+    assert frames == []
 
 
 # ---------------------------------------------------------------------------
