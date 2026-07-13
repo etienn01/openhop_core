@@ -186,8 +186,14 @@ class _ContactCommandsMixin:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         pubkey = data[:PUB_KEY_SIZE]
+        # NOT_FOUND only when the contact is absent; an existing contact whose
+        # advert cannot be built or sent is TABLE_FULL, matching MeshCore
+        # CMD_SHARE_CONTACT / shareContactZeroHop.
+        if self.bridge.get_contact_by_key(pubkey) is None:
+            self._write_err(ERR_CODE_NOT_FOUND)
+            return
         ok = await self.bridge.share_contact(pubkey)
-        self._write_ok() if ok else self._write_err(ERR_CODE_NOT_FOUND)
+        self._write_ok() if ok else self._write_err(ERR_CODE_TABLE_FULL)
 
     async def _cmd_export_contact(self, data: bytes) -> None:
         if len(data) < PUB_KEY_SIZE:
