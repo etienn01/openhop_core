@@ -48,14 +48,26 @@ class RegionMap:
     # ------------------------------------------------------------------
     def _iter_region_keys(self, region: RegionEntry) -> Iterable[bytes]:
         """Yield all transport keys for a region."""
-        # Private regions: caller supplies explicit keys (e.g. from secure store)
+        name = region.name or ""
+
+        # Private region ($): only stored keys are ever used. A private region
+        # with no stored key yields nothing and is never auto-hashed, matching
+        # MeshCore RegionMap::getTransportKeysFor. Falling through to name
+        # hashing would silently turn an unusable private region into a
+        # deterministic public "#$name" scope.
+        if name.startswith("$"):
+            for key in region.private_keys or ():
+                if len(key) == 16:
+                    yield key
+            return
+
+        # Other regions: caller may supply explicit keys (e.g. from secure store)
         if region.private_keys:
             for key in region.private_keys:
                 if len(key) == 16:
                     yield key
             return
 
-        name = region.name or ""
         if not name:
             return
 
