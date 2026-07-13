@@ -17,6 +17,7 @@ from ..constants import (
     ERR_CODE_NOT_FOUND,
     ERR_CODE_TABLE_FULL,
     MAX_PATH_SIZE,
+    OUT_PATH_UNKNOWN,
     PUB_KEY_SIZE,
     RESP_CODE_ADVERT_PATH,
     RESP_CODE_CONTACT,
@@ -68,7 +69,13 @@ class _ContactCommandsMixin:
         pubkey = data[0:PUB_KEY_SIZE]
         adv_type = data[32]
         flags = data[33]
-        out_path_len = struct.unpack_from("<b", data, 34)[0]
+        # The wire byte is uint8_t (MeshCore CMD_ADD_UPDATE_CONTACT): its top two
+        # bits encode the per-hop hash width, so values 0x80-0xFE are valid paths.
+        # Read it unsigned and map only the 0xFF sentinel to the internal
+        # unknown-path representation (-1).
+        out_path_len = struct.unpack_from("<B", data, 34)[0]
+        if out_path_len == OUT_PATH_UNKNOWN:
+            out_path_len = -1
         out_path_end = 35 + MAX_PATH_SIZE
         if len(data) >= out_path_end:
             out_path = data[35:out_path_end].rstrip(b"\x00")
