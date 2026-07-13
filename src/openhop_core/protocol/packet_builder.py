@@ -646,8 +646,10 @@ class PacketBuilder:
             Packet: Encrypted login packet ready for transmission.
         """
         timestamp = PacketBuilder._get_timestamp()
-        password_truncated = password[:15]
-        password_bytes = password_truncated.encode("utf-8")
+        # Firmware BaseChatMesh::sendLogin bounds the password at 15 *bytes* of the
+        # encoded buffer (strlen + memcpy). Encode first, then truncate so a
+        # multibyte character cannot push the field past the wire limit.
+        password_bytes = password.encode("utf-8")[:15]
 
         is_room = getattr(contact, "type", 0) == CONTACT_TYPE_ROOM_SERVER
 
