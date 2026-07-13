@@ -94,13 +94,14 @@ class _FrameTransportMixin:
         if self._write_queue is None:
             return
         if len(data) > MAX_PAYLOAD_SIZE:
+            # Firmware writeFrame() refuses (returns 0) rather than truncating; a
+            # truncated frame would corrupt the response. Drop it instead.
             logger.warning(
-                "Outbound frame payload truncated from %s to %s (MAX_FRAME_SIZE=%s)",
+                "Outbound frame payload too large (%s > %s); dropping frame",
                 len(data),
                 MAX_PAYLOAD_SIZE,
-                MAX_FRAME_SIZE,
             )
-            data = data[:MAX_PAYLOAD_SIZE]
+            return
         frame = bytes([FRAME_OUTBOUND_PREFIX]) + struct.pack("<H", len(data)) + data
         try:
             self._write_queue.put_nowait(frame)

@@ -1176,7 +1176,7 @@ def test_max_frame_size_is_176():
     )
 
     assert MAX_FRAME_SIZE == 176
-    assert MAX_PAYLOAD_SIZE == 173
+    assert MAX_PAYLOAD_SIZE == 176
     assert MAX_CHANNEL_DATA_LENGTH == 167
 
 
@@ -1747,10 +1747,19 @@ def test_enqueue_frame_header_format():
     assert raw == bytes([FRAME_OUTBOUND_PREFIX]) + struct.pack("<H", 3) + b"\x01\x02\x03"
 
 
-def test_enqueue_frame_truncates_oversize_payload():
+def test_enqueue_frame_drops_oversize_payload():
     server = CompanionFrameServer(Mock(), "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=8)
-    server._enqueue_frame(bytes(MAX_PAYLOAD_SIZE + 50))
+    # Firmware writeFrame refuses an over-size frame; we drop rather than
+    # truncate (a truncated frame would corrupt the response).
+    server._enqueue_frame(bytes(MAX_PAYLOAD_SIZE + 1))
+    assert server._write_queue.empty()
+
+
+def test_enqueue_frame_allows_max_payload():
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=8)
+    server._enqueue_frame(bytes(MAX_PAYLOAD_SIZE))
     raw = server._write_queue.get_nowait()
     assert struct.unpack("<H", raw[1:3])[0] == MAX_PAYLOAD_SIZE
 

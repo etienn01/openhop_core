@@ -295,7 +295,10 @@ FRAME_INBOUND_PREFIX = 0x3C  # '<'
 # is set to this (e.g. BLEDevice::setMTU(MAX_FRAME_SIZE)). Frame = prefix(1) + len(2) + payload.
 # 176 since MeshCore PR #2022 (+4 over the old 172 for region-scoping transport codes).
 MAX_FRAME_SIZE = 176
-MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE - 3  # max bytes after prefix + 2-byte length
+# Firmware writeFrame() accepts up to MAX_FRAME_SIZE payload bytes and writes the
+# 3-byte serial prefix (">", len_lsb, len_msb) *in addition*. So the framed
+# payload maximum equals MAX_FRAME_SIZE, not MAX_FRAME_SIZE - 3.
+MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE
 # Firmware companion command parser uses MAX_FRAME_SIZE - 9 for channel binary payloads.
 MAX_CHANNEL_DATA_LENGTH = MAX_FRAME_SIZE - 9
 # Firmware MeshCore.h: MAX_GROUP_DATA_LENGTH = MAX_PACKET_PAYLOAD(184) - CIPHER_BLOCK_SIZE(16) - 3.
