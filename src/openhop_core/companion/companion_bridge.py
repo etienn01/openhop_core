@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterable, Optional
 from ..node.handlers import create_core_handlers
 from ..node.handlers.crypto_helpers import iter_decrypt_by_src_hash
 from ..node.handlers.login_server import LoginServerHandler
+from ..node.handlers.result import HandlerResult
 from ..protocol import LocalIdentity, Packet
 from ..protocol.constants import (
     PAYLOAD_TYPE_ACK,
@@ -290,8 +291,20 @@ class CompanionBridge(CompanionBase):
     # RX Entry Point
     # -------------------------------------------------------------------------
 
-    async def process_received_packet(self, packet: Packet) -> None:
-        """Process a packet destined for this companion."""
+    async def process_received_packet(self, packet: Packet) -> HandlerResult:
+        """Process a packet destined for this companion.
+
+        Returns an authenticated HandlerResult only when a handler authenticated
+        (MAC-verified/decrypted) the packet for this companion identity and
+        consumed it. Returns a not-for-us result when no handler claimed it —
+        e.g. a one-byte dest-hash collision where the packet actually belongs to
+        another node — so the caller may still forward it instead of swallowing it.
+
+        Note: handlers that report authenticated ownership (text, login/anon)
+        return a HandlerResult; broadcast-style handlers (advert, ack, group,
+        path, response) return None and are treated here as non-authoritative for
+        the caller's forwarding decision.
+        """
         ptype = packet.get_payload_type()
         route_type = packet.get_route_type()
         is_flood = route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD)
@@ -300,9 +313,11 @@ class CompanionBridge(CompanionBase):
         handler = self._handlers.get(ptype)
         if handler:
             try:
-                await handler(packet)
+                result = await handler(packet)
+                return result if isinstance(result, HandlerResult) else HandlerResult.not_for_us()
             except Exception as e:
                 logger.error("Handler error for type %02X: %s", ptype, e)
+                return HandlerResult.not_for_us()
         elif ptype == PAYLOAD_TYPE_GRP_DATA:
             try:
                 await self._handle_group_data_packet(packet)
@@ -313,6 +328,7 @@ class CompanionBridge(CompanionBase):
         # via PathHandler.__call__ (path.py), which runs as the handler above.
         # No duplicate call here — it would cause double decryption and could
         # deliver the result to response waiters twice.
+        return HandlerResult.not_for_us()
 
     # -------------------------------------------------------------------------
     # Abstract method implementations

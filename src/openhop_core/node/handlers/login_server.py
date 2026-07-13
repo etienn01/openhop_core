@@ -18,6 +18,7 @@ from typing import Callable, Optional
 from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder
 from ...protocol.constants import PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_RESPONSE
 from .base import BaseHandler
+from .result import HandlerResult
 
 # Response codes
 RESP_SERVER_LOGIN_OK = 0x00  # Login successful
@@ -85,8 +86,19 @@ class LoginServerHandler(BaseHandler):
         """Set callback for sending response packets."""
         self._send_packet_callback = callback
 
-    async def __call__(self, packet: Packet) -> None:
-        """Handle ANON_REQ login packet from client."""
+    async def __call__(self, packet: Packet) -> HandlerResult:
+        """Handle ANON_REQ login packet from client.
+
+        Returns an authenticated HandlerResult when the request was decrypted for
+        this identity — i.e. it is genuinely addressed to us and the caller should
+        consume it (a failed password is still ours to reject, not a collision).
+        Returns a not-for-us result when it was not for us (wrong dest hash, or an
+        HMAC failure from a dest-hash collision), so the caller may forward/re-flood
+        it instead of dropping it.
+        """
+        # Flipped to True once decryption succeeds; used by the outer handler so a
+        # post-decrypt error still counts as "for us" while a pre-decrypt error forwards.
+        for_us = False
         try:
             # Debug: Log packet routing info
             path_data = packet.get_path_hashes_hex() if packet.path_len > 0 else []
@@ -98,7 +110,7 @@ class LoginServerHandler(BaseHandler):
             # Parse ANON_REQ structure: dest_hash(1) + client_pubkey(32) + encrypted_data
             if len(packet.payload) < 34:
                 self.log("[LoginServer] ANON_REQ packet too short")
-                return
+                return HandlerResult.not_for_us()
 
             dest_hash = packet.payload[0]
             client_pubkey = bytes(packet.payload[1:33])
@@ -107,7 +119,7 @@ class LoginServerHandler(BaseHandler):
             # Verify this is for us
             our_hash = self.local_identity.get_public_key()[0]
             if dest_hash != our_hash:
-                return  # Not for us
+                return HandlerResult.not_for_us()  # Not for us
 
             # Create client identity and calculate shared secret
             client_identity = Identity(client_pubkey)
@@ -118,16 +130,18 @@ class LoginServerHandler(BaseHandler):
 
             # Decrypt the login request
             try:
-                plaintext = CryptoUtils.mac_then_decrypt(
-                    aes_key, shared_secret, encrypted_data
-                )
+                plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_data)
             except Exception as e:
                 self.log(f"[LoginServer] Failed to decrypt login request: {e}")
-                return
+                return HandlerResult.not_for_us()
+
+            # Decryption succeeded: this ANON_REQ is genuinely for us. Consume it
+            # from here on regardless of parse/auth outcome.
+            for_us = True
 
             if len(plaintext) < 4:
                 self.log("[LoginServer] Decrypted data too short")
-                return
+                return HandlerResult.consumed()
 
             # Parse plaintext - two formats:
             # Repeater format: timestamp(4) + password(variable) + null
@@ -143,10 +157,8 @@ class LoginServerHandler(BaseHandler):
             if self.is_room_server:
                 # Room server format: sync_since(4) + password
                 if len(plaintext) < 8:
-                    self.log(
-                        "[LoginServer] Room server packet too short for sync_since field"
-                    )
-                    return
+                    self.log("[LoginServer] Room server packet too short for sync_since field")
+                    return HandlerResult.consumed()
                 sync_since = struct.unpack("<I", plaintext[4:8])[0]
 
                 # Find null terminator AFTER sync_since field (starting from byte 8)
@@ -171,9 +183,7 @@ class LoginServerHandler(BaseHandler):
                     null_idx = len(plaintext)
 
                 password_bytes = plaintext[4:null_idx]
-                self.log(
-                    f"[LoginServer] Repeater format: password from byte 4 to {null_idx}"
-                )
+                self.log(f"[LoginServer] Repeater format: password from byte 4 to {null_idx}")
 
             # Null-terminate password
             null_idx = password_bytes.find(b"\x00")
@@ -221,8 +231,11 @@ class LoginServerHandler(BaseHandler):
                 # Optionally send failure response (or just ignore)
                 # Most implementations just ignore failed attempts
 
+            return HandlerResult.consumed()
+
         except Exception as e:
             self.log(f"[LoginServer] Error handling login packet: {e}")
+            return HandlerResult(authenticated=for_us)
 
     async def _send_login_response(
         self,
@@ -251,9 +264,7 @@ class LoginServerHandler(BaseHandler):
             # is_admin: check if permission bits include admin bit (0x02)
             reply_data[6] = 1 if (permissions & 0x02) else 0
             reply_data[7] = permissions  # full permissions byte
-            struct.pack_into(
-                "<I", reply_data, 8, random.randint(0, 0xFFFFFFFF)
-            )  # random blob
+            struct.pack_into("<I", reply_data, 8, random.randint(0, 0xFFFFFFFF))  # random blob
             reply_data[12] = FIRMWARE_VER_LEVEL  # firmware version
 
             # Create response packet
@@ -303,9 +314,7 @@ class LoginServerHandler(BaseHandler):
                     route_type="flood",
                 )
                 packet_type_name = "RESPONSE(flood)"
-                self.log(
-                    "[LoginServer] Creating RESPONSE datagram (direct login, flood reply)"
-                )
+                self.log("[LoginServer] Creating RESPONSE datagram (direct login, flood reply)")
 
             # Debug: Log packet details
             self.log(
