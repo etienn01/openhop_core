@@ -193,8 +193,11 @@ class _SendOpsMixin:
             self._pending_binary_requests.pop(tag_hex, None)
             return SentResult(success=False)
         return SentResult(
+            # Only OUT_PATH_UNKNOWN (-1) floods; out_path_len == 0 is a known
+            # zero-hop direct route, matching the builder's route selection and
+            # MeshCore sendRequest.
             success=True,
-            is_flood=contact.out_path_len <= 0,
+            is_flood=contact.out_path_len < 0,
             expected_ack=tag_int,
             timeout_ms=DEFAULT_RESPONSE_TIMEOUT_MS,
         )
