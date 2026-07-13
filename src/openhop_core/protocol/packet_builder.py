@@ -984,6 +984,13 @@ class PacketBuilder:
         flags_byte = (txt_type << 2) | attempt
         timestamp = timestamp if timestamp is not None else PacketBuilder._get_timestamp()
 
+        # Firmware BaseChatMesh::composeMsgPacket rejects text longer than
+        # MAX_TEXT_LEN (measured in bytes). Match it on the UTF-8 encoded length
+        # so a valid MeshCore peer can build the same packet.
+        text_len = len(message.encode("utf-8"))
+        if text_len > MAX_TEXT_LEN:
+            raise ValueError(f"text message too long: {text_len} bytes (max {MAX_TEXT_LEN})")
+
         signed_sender_prefix = (
             local_identity.get_public_key()[:4] if txt_type == TXT_TYPE_SIGNED_PLAIN else b""
         )
