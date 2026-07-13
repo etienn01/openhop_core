@@ -805,7 +805,7 @@ class PacketBuilder:
         if ptype not in (PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_GRP_DATA):
             raise ValueError("invalid payload type")
 
-        aes_key = CryptoUtils.sha256(secret)
+        aes_key = secret[:16]
         cipher = PacketBuilder._encrypt_payload(aes_key, secret, plaintext)
         payload = bytearray([channel_hash]) + cipher
 

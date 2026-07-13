@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import struct
 import time
@@ -197,7 +196,7 @@ class _RxEventsMixin:
             secret = normalize_channel_secret(channel.secret)
             try:
                 plaintext = CryptoUtils.mac_then_decrypt(
-                    hashlib.sha256(secret).digest(), secret, cipher_mac + ciphertext
+                    secret[:16], secret, cipher_mac + ciphertext
                 )
             except Exception:
                 plaintext = None
