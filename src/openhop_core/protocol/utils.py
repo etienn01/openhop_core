@@ -139,8 +139,13 @@ def decode_appdata(appdata: bytes) -> dict:
 
     if flags & 0x80:  # has_name
         if len(appdata) > offset:
+            # MeshCore AdvertDataParser stores the name as a bounded C string:
+            # the remaining app_data bytes up to the first NUL terminator. It does
+            # not strip transmitted leading/trailing spaces, so neither do we —
+            # trimming would make distinct names collide in name-based lookups.
+            name_bytes = appdata[offset:].split(b"\x00", 1)[0]
             try:
-                name = appdata[offset:].decode("utf-8").rstrip("\x00").strip()
+                name = name_bytes.decode("utf-8")
                 if name:  # Only add if non-empty
                     result["node_name"] = name
             except UnicodeDecodeError:
