@@ -1,3 +1,5 @@
+import pytest
+
 from openhop_core import LocalIdentity
 from openhop_core.protocol import CryptoUtils
 from openhop_core.protocol.constants import (
@@ -271,6 +273,58 @@ def test_create_text_message_cli_data_flags_byte():
     assert dec_p[4] == 0x01  # PLAIN: (0 << 2) | attempt 1
     assert dec_c[4] == 0x05  # CLI_DATA: (1 << 2) | attempt 1
     assert crc_plain != crc_cli
+
+
+def test_create_text_message_extended_attempt_hidden_in_tail():
+    """attempt > 3 hides the full attempt byte after the text's NUL terminator so
+    retries whose low two bits repeat still produce a unique packet (composeMsgPacket)."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = type(
+        "Contact",
+        (),
+        {"public_key": other.get_public_key().hex(), "out_path": [], "out_path_len": -1},
+    )()
+    peer_pub = local.get_public_key()
+    secret = Identity(peer_pub).calc_shared_secret(other.get_private_key())
+    aes_key = secret[:16]
+
+    def _dec(p):
+        return CryptoUtils.mac_then_decrypt(aes_key, secret, bytes(p.payload[2:]))
+
+    text = "hi"
+    ts = 1000  # pin the timestamp so attempt 0 and 4 are comparable
+    pkt4, crc4 = PacketBuilder.create_text_message(
+        contact, local, text, 4, "direct", None, 0, timestamp=ts
+    )
+    dec4 = _dec(pkt4)
+    # Low two bits of attempt live in the flag byte: 4 & 3 == 0
+    assert dec4[4] == 0x00
+    # Layout: timestamp(4) + flags(1) + text + NUL + attempt
+    tail_start = 5 + len(text.encode("utf-8"))
+    assert dec4[tail_start] == 0x00  # C-string terminator
+    assert dec4[tail_start + 1] == 4  # hidden full attempt byte
+
+    # attempt <= 3 carries no hidden attempt byte (only the terminator + padding).
+    pkt0, crc0 = PacketBuilder.create_text_message(
+        contact, local, text, 0, "direct", None, 0, timestamp=ts
+    )
+    dec0 = _dec(pkt0)
+    assert dec0[tail_start] == 0x00
+    assert dec0[tail_start + 1] == 0x00  # AES zero padding, not an attempt byte
+
+    # The ACK CRC is computed over timestamp+flags+text only, so attempt 0 and 4
+    # (same low bits, same text) expect the same ACK, but the packets differ.
+    assert crc0 == crc4
+    assert bytes(pkt0.payload) != bytes(pkt4.payload)
+
+    # Extended attempt shrinks the text budget by two bytes.
+    long_text = "x" * (MAX_TEXT_LEN - 1)
+    with pytest.raises(ValueError):
+        PacketBuilder.create_text_message(contact, local, long_text, 4, "direct", None, 0)
+    # The same length is still fine for attempt <= 3.
+    ok_pkt, _ = PacketBuilder.create_text_message(contact, local, long_text, 1, "direct", None, 0)
+    assert ok_pkt is not None
 
 
 def test_create_text_message_truncated_path_path_len_consistency():

@@ -987,25 +987,38 @@ class PacketBuilder:
             # Returns: 0
             ```
         """
-        attempt &= 0x03
+        # Firmware composeMsgPacket stores only the low two bits of the attempt in
+        # the flag byte (temp[4] = attempt & 3); the full attempt is preserved for
+        # the tail below so retries above three still produce unique packets.
+        attempt_full = attempt & 0xFF
         txt_type &= 0x3F
-        flags_byte = (txt_type << 2) | attempt
+        flags_byte = (txt_type << 2) | (attempt_full & 0x03)
         timestamp = timestamp if timestamp is not None else PacketBuilder._get_timestamp()
 
         # Firmware BaseChatMesh::composeMsgPacket rejects text longer than
         # MAX_TEXT_LEN (measured in bytes). Match it on the UTF-8 encoded length
-        # so a valid MeshCore peer can build the same packet.
+        # so a valid MeshCore peer can build the same packet. For attempt > 3 the
+        # tail carries an extra NUL + attempt byte, so the text budget shrinks by
+        # two (composeMsgPacket: attempt > 3 && text_len > MAX_TEXT_LEN-2).
         text_len = len(message.encode("utf-8"))
         if text_len > MAX_TEXT_LEN:
             raise ValueError(f"text message too long: {text_len} bytes (max {MAX_TEXT_LEN})")
+        if attempt_full > 3 and text_len > MAX_TEXT_LEN - 2:
+            raise ValueError(
+                f"text message too long for extended attempt: {text_len} bytes "
+                f"(max {MAX_TEXT_LEN - 2})"
+            )
 
         signed_sender_prefix = (
             local_identity.get_public_key()[:4] if txt_type == TXT_TYPE_SIGNED_PLAIN else b""
         )
 
-        # Use  timestamp+data packing
+        # Body is packed as a C string (text + NUL). When attempt > 3 the firmware
+        # hides the full attempt byte after that terminator so retries whose low
+        # two bits repeat (4 → 0, 5 → 1, …) still hash uniquely.
+        tail = b"\x00" + bytes([attempt_full]) if attempt_full > 3 else b"\x00"
         plaintext = PacketBuilder._pack_timestamp_data(
-            timestamp, flags_byte, signed_sender_prefix, message, b"\x00"
+            timestamp, flags_byte, signed_sender_prefix, message, tail
         )
 
         # Use  encryption and payload creation
