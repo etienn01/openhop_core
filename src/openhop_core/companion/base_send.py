@@ -651,6 +651,7 @@ class _SendOpsMixin:
         deadline: Optional[float],
         log_label: str,
         cleanup: Optional[Callable[[], None]],
+        response_tag_registered: Optional[Callable[[int], None]],
     ) -> dict:
         """Finish a request after its first packet has already been sent."""
         try:
@@ -659,7 +660,9 @@ class _SendOpsMixin:
                 return result
 
             for attempt in range(1, DEFAULT_MAX_ATTEMPTS):
-                pkt, _ = build_packet()
+                pkt, packet_tag = build_packet()
+                if response_tag_registered is not None and packet_tag is not None:
+                    response_tag_registered(packet_tag)
                 self._apply_path_hash_mode(pkt)
                 timeout_s = self._response_timeout_s(pkt, proxy)
                 if deadline is not None:
@@ -699,11 +702,14 @@ class _SendOpsMixin:
         log_label: str,
         sent_tag: Optional[int] = None,
         cleanup: Optional[Callable[[], None]] = None,
+        response_tag_registered: Optional[Callable[[int], None]] = None,
     ) -> dict:
         """Send the first packet and return its metadata plus a waiter task."""
         deadline = time.monotonic() + total_timeout_s if total_timeout_s is not None else None
         try:
             pkt, packet_tag = build_packet()
+            if response_tag_registered is not None and packet_tag is not None:
+                response_tag_registered(packet_tag)
             self._apply_path_hash_mode(pkt)
             estimated_timeout_s = self._response_timeout_s(pkt, proxy)
             wait_timeout_s = estimated_timeout_s
@@ -735,6 +741,7 @@ class _SendOpsMixin:
                     deadline=deadline,
                     log_label=log_label,
                     cleanup=cleanup,
+                    response_tag_registered=response_tag_registered,
                 ),
                 f"{log_label} response",
             )
@@ -893,12 +900,13 @@ class _SendOpsMixin:
 
     async def _request_with_retries(
         self,
-        build_packet: Callable[[], Packet],
+        build_packet: Callable[[], tuple[Packet, Optional[int]]],
         wait_for_response: Callable[[float], Awaitable[dict]],
         proxy: Any,
         *,
         total_timeout_s: Optional[float] = None,
         log_label: str = "request",
+        response_tag_registered: Optional[Callable[[int], None]] = None,
     ) -> dict:
         """Send a request up to DEFAULT_MAX_ATTEMPTS times until a response lands.
 
@@ -913,7 +921,9 @@ class _SendOpsMixin:
         result: dict = {"timeout": True}
         deadline = time.monotonic() + total_timeout_s if total_timeout_s else None
         for attempt in range(DEFAULT_MAX_ATTEMPTS):
-            pkt = build_packet()
+            pkt, packet_tag = build_packet()
+            if response_tag_registered is not None and packet_tag is not None:
+                response_tag_registered(packet_tag)
             self._apply_path_hash_mode(pkt)
             timeout_s = self._response_timeout_s(pkt, proxy)
             if deadline is not None:
@@ -976,9 +986,17 @@ class _SendOpsMixin:
                 "error": "bad_state",
                 "reason": "Protocol handler not available",
             }
-        contact_hash = proxy.dest_hash
         waiter = ResponseWaiter()
-        proto_handler.set_response_callback(contact_hash, waiter.callback)
+        request_tags: set[int] = set()
+
+        def _register_response_tag(request_tag: int) -> None:
+            request_tags.add(request_tag)
+            proto_handler.set_response_callback(pub_key, request_tag, waiter.callback)
+
+        def _clear_response_tags() -> None:
+            for request_tag in request_tags:
+                proto_handler.clear_response_callback(pub_key, request_tag)
+
         try:
             await self._wait_for_path_propagation(proxy, log_label)
 
@@ -996,7 +1014,8 @@ class _SendOpsMixin:
                 proxy,
                 total_timeout_s=timeout,
                 log_label=log_label,
-                cleanup=lambda: proto_handler.clear_response_callback(contact_hash),
+                cleanup=_clear_response_tags,
+                response_tag_registered=_register_response_tag,
             )
             if not started.get("success"):
                 return started
@@ -1044,7 +1063,7 @@ class _SendOpsMixin:
                 )
             return started
         except Exception as e:
-            proto_handler.clear_response_callback(contact_hash)
+            _clear_response_tags()
             logger.error("%s request error: %s", log_label, e)
             return {"success": False, "error": "bad_state", "reason": str(e)}
 
@@ -1126,9 +1145,13 @@ class _SendOpsMixin:
         proto_handler = self._get_protocol_response_handler()
         if not proto_handler:
             return {"success": False, "reason": "Protocol handler not available"}
-        contact_hash = proxy.dest_hash
         waiter = ResponseWaiter()
-        proto_handler.set_response_callback(contact_hash, waiter.callback)
+        request_tags: set[int] = set()
+
+        def _register_response_tag(request_tag: int) -> None:
+            request_tags.add(request_tag)
+            proto_handler.set_response_callback(pub_key, request_tag, waiter.callback)
+
         try:
             result = await self._request_with_retries(
                 lambda: PacketBuilder.create_protocol_request(
@@ -1136,10 +1159,11 @@ class _SendOpsMixin:
                     local_identity=self._identity,
                     protocol_code=protocol_code,
                     data=data,
-                )[0],
+                ),
                 waiter.wait,
                 proxy,
                 log_label=f"protocol REQ 0x{protocol_code:02X}",
+                response_tag_registered=_register_response_tag,
             )
             return {
                 "success": result.get("success", False),
@@ -1151,7 +1175,8 @@ class _SendOpsMixin:
             logger.error("Protocol request error: %s", e)
             return {"success": False, "reason": str(e)}
         finally:
-            proto_handler.clear_response_callback(contact_hash)
+            for request_tag in request_tags:
+                proto_handler.clear_response_callback(pub_key, request_tag)
 
     async def send_repeater_command(
         self, pub_key: bytes, command: str, parameters: Optional[str] = None
