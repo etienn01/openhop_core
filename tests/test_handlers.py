@@ -282,6 +282,35 @@ class TestTextMessageHandler:
         assert len(ack_packet.payload) == 6
         assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
 
+    @pytest.mark.asyncio
+    async def test_received_text_stops_at_first_nul(self):
+        """The delivered message text ends at the first NUL: AES zero padding and the
+        hidden extended-attempt byte (attempt > 3) must not leak into the content."""
+        from openhop_core.protocol.packet_builder import PacketBuilder
+
+        sender = LocalIdentity()
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        receiver_contact = _SendContact(self.local_identity.get_public_key().hex())
+        # attempt=4 appends NUL + attempt byte after the text, on top of AES padding.
+        packet, _ = PacketBuilder.create_text_message(
+            receiver_contact, sender, "hello", attempt=4, message_type="direct"
+        )
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        ]
+
+        await self.handler(packet)
+
+        assert self.event_service.publish_sync.called
+        message_data = self.event_service.publish_sync.call_args.args[1]
+        assert message_data["message_text"] == "hello"
+
     # -- consume-vs-forward return contract (#353) --------------------------
 
     def _build_dm_to_self(self, sender, text="hi", route="flood"):

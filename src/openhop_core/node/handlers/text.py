@@ -318,7 +318,12 @@ class TextMessageHandler(BaseHandler):
 
         # For signed plain the 4-byte author prefix was already split off into
         # ``sender_prefix`` above, so ``message_body`` is the bare text here.
-        decoded_msg = message_body.decode("utf-8", "replace")
+        # Firmware treats the body as a C string (BaseChatMesh::onPeerDataRecv):
+        # the visible text ends at the first NUL. Everything after it — the AES
+        # zero padding and, for attempt > 3, the hidden extended-attempt byte —
+        # is not message content and must not be delivered to the app.
+        visible_len = self._text_len(message_body)
+        decoded_msg = message_body[:visible_len].decode("utf-8", "replace")
         self.log(f"Received TXT_MSG: {decoded_msg}")
 
         # Check if this is a command response (if callback is set)
