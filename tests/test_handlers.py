@@ -1181,6 +1181,94 @@ class TestProtocolRequestHandler:
 
         assert result.authenticated is False
 
+    def _req_handler_with_client(self, request_handlers=None):
+        """Build a handler wired to one ACL-style client that shares last_timestamp."""
+        from openhop_core.node.handlers.protocol_request import REQ_TYPE_GET_STATUS
+        from openhop_core.protocol.identity import Identity
+
+        peer = LocalIdentity()
+        secret = Identity(peer.get_public_key()).calc_shared_secret(
+            self.local_identity.get_private_key()
+        )
+
+        class Client:
+            pass
+
+        client = Client()
+        client.id = Identity(peer.get_public_key())
+        client.public_key = peer.get_public_key()
+        client.shared_secret = secret
+        client.last_timestamp = 0
+        client.last_activity = 0
+        client.out_path = b""
+        client.out_path_len = -1
+
+        handler = ProtocolRequestHandler(
+            self.local_identity,
+            self.contacts,
+            get_clients_fn=lambda h: [client],
+            request_handlers=request_handlers
+            or {REQ_TYPE_GET_STATUS: lambda c, ts, data: b"\x02\x02"},
+            log_fn=self.log_fn,
+        )
+
+        our_hash = self.local_identity.get_public_key()[0]
+        src_hash = peer.get_public_key()[0]
+
+        def build_req(ts, req_type=REQ_TYPE_GET_STATUS):
+            plaintext = struct.pack("<I", ts) + bytes([req_type])
+            enc = CryptoUtils.encrypt_then_mac(secret[:16], secret, plaintext)
+            pkt = Packet()
+            pkt.header = (ROUTE_TYPE_DIRECT & 0x03) | (PAYLOAD_TYPE_REQ << 2)
+            pkt.path_len = 0
+            pkt.path = bytearray()
+            pkt.payload = bytes([our_hash, src_hash]) + enc
+            pkt.payload_len = len(pkt.payload)
+            return pkt
+
+        return handler, client, build_req
+
+    @pytest.mark.asyncio
+    async def test_req_replay_is_rejected(self):
+        """A REQ is accepted only when strictly newer than the client's last accepted
+        timestamp; replays and older timestamps are rejected (firmware parity)."""
+        handler, client, build_req = self._req_handler_with_client()
+
+        r1 = await handler(build_req(1000))
+        assert r1.authenticated is True
+        assert r1.response is not None
+        assert client.last_timestamp == 1000
+
+        # Exact replay: rejected, no response, watermark unchanged.
+        r2 = await handler(build_req(1000))
+        assert r2.authenticated is True
+        assert r2.response is None
+        assert client.last_timestamp == 1000
+
+        # Older timestamp: rejected.
+        r3 = await handler(build_req(999))
+        assert r3.response is None
+        assert client.last_timestamp == 1000
+
+        # Strictly newer: accepted, watermark advances.
+        r4 = await handler(build_req(1001))
+        assert r4.response is not None
+        assert client.last_timestamp == 1001
+
+    @pytest.mark.asyncio
+    async def test_req_invalid_command_does_not_advance_watermark(self):
+        """An unhandled request type produces no reply and must not move the watermark,
+        so a later valid request with a lower timestamp is still accepted."""
+        handler, client, build_req = self._req_handler_with_client()
+
+        r = await handler(build_req(1000, req_type=0x99))  # no handler for 0x99
+        assert r.response is None
+        assert client.last_timestamp == 0
+
+        r = await handler(build_req(500))  # default req_type has a handler
+        assert r.response is not None
+        assert client.last_timestamp == 500
+
     def test_flood_req_returns_path_packet(self):
         """REQ via flood → path-return PATH packet (firmware createPathReturn + sendFlood)."""
         peer_identity = LocalIdentity()
