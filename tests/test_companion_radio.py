@@ -1,5 +1,7 @@
 """Tests for CompanionRadio (stand-alone companion with radio)."""
 
+import asyncio
+
 import pytest
 
 from openhop_core.companion import CompanionRadio
@@ -209,6 +211,43 @@ class TestCompanionRadioSendText:
         assert len(radio.sent) >= 1
         # success may be False if no ACK (mock radio doesn't echo ACK)
         assert result.success is False or result.success is True
+
+    async def test_send_text_message_waits_for_meshcore_ack_hash(self):
+        radio = MockRadio()
+        identity = LocalIdentity()
+        comp = CompanionRadio(radio, identity)
+        contact = _make_peer_contact("Alice")
+        comp.contacts.add(contact)
+        comp.node.dispatcher.tx_delay = 0
+
+        proxy = comp.contacts.get_proxy_by_key(contact.public_key)
+        expected_packet, expected_ack = PacketBuilder.create_text_message(
+            contact=proxy,
+            local_identity=identity,
+            message="Hello",
+            attempt=1,
+            message_type="flood",
+            timestamp=123456,
+        )
+        assert expected_ack != expected_packet.get_crc()
+
+        send_task = asyncio.create_task(
+            comp.send_text_message(contact.public_key, "Hello", timestamp=123456)
+        )
+        while not radio.sent:
+            await asyncio.sleep(0)
+
+        sent_packet = Packet()
+        assert sent_packet.read_from(radio.sent[0])
+        assert expected_ack != sent_packet.get_crc()
+
+        ack_packet = PacketBuilder.create_ack_from_bytes(
+            expected_ack.to_bytes(4, "little") + b"\x00\x7f"
+        )
+        await comp.node.dispatcher._dispatch(ack_packet)
+
+        result = await asyncio.wait_for(send_task, timeout=0.5)
+        assert result.success is True
 
 
 # ---------------------------------------------------------------------------

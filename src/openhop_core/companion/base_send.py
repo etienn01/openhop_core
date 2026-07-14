@@ -376,7 +376,7 @@ class _SendOpsMixin:
             if txt_type != TXT_TYPE_CLI_DATA:
                 self._track_pending_ack(ack_crc)
             if effective_wait_ack:
-                success = await self._send_packet(pkt, wait_for_ack=True)
+                success = await self._send_packet(pkt, wait_for_ack=True, expected_crc=ack_crc)
                 if success:
                     self.stats.record_tx(is_flood=is_flood)
                 else:

@@ -170,7 +170,12 @@ class CompanionBase(
     # -------------------------------------------------------------------------
 
     @abstractmethod
-    async def _send_packet(self, pkt: Packet, wait_for_ack: bool = False) -> bool:
+    async def _send_packet(
+        self,
+        pkt: Packet,
+        wait_for_ack: bool = False,
+        expected_crc: Optional[int] = None,
+    ) -> bool:
         """Send a packet via the subclass transport (radio or packet_injector)."""
 
     @abstractmethod

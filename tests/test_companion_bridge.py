@@ -1,6 +1,7 @@
 """Tests for CompanionBridge (repeater-integrated companion with packet_injector)."""
 
 import asyncio
+from typing import Optional
 
 import pytest
 
@@ -34,9 +35,13 @@ class MockPacketInjector:
 
     def __init__(self):
         self.calls: list[tuple] = []
+        self.expected_crcs: list[Optional[int]] = []
 
-    async def __call__(self, pkt: Packet, wait_for_ack: bool = False) -> bool:
+    async def __call__(
+        self, pkt: Packet, wait_for_ack: bool = False, expected_crc: Optional[int] = None
+    ) -> bool:
         self.calls.append((pkt, wait_for_ack))
+        self.expected_crcs.append(expected_crc)
         return True
 
 
@@ -240,10 +245,11 @@ class TestCompanionBridgeSendAndShare:
         bridge = CompanionBridge(LocalIdentity(), injector)
         contact = _make_peer_contact("Alice")
         bridge.contacts.add(contact)
-        await bridge.send_text_message(contact.public_key, "Hello")
+        result = await bridge.send_text_message(contact.public_key, "Hello")
         assert len(injector.calls) >= 1
         pkt, _ = injector.calls[0]
         assert (pkt.header >> 2) & 0x0F == PAYLOAD_TYPE_TXT_MSG
+        assert injector.expected_crcs[0] == result.expected_ack
 
     async def test_share_contact_not_found(self):
         injector = MockPacketInjector()
