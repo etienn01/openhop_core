@@ -791,37 +791,22 @@ async def test_set_other_params_preserves_omitted_fields():
 
 
 # ---------------------------------------------------------------------------
-# CMD_SEND_STATUS_REQ / CMD_SEND_TELEMETRY_REQ — no empty push on failure
+# CMD_SEND_STATUS_REQ / CMD_SEND_TELEMETRY_REQ — send result and response push
 # ---------------------------------------------------------------------------
+
+
+async def _return_result(result: dict) -> dict:
+    return result
 
 
 @pytest.mark.asyncio
 async def test_cmd_send_status_req_failure_no_empty_push():
-    """Failed status request must NOT send PUSH_CODE_STATUS_RESPONSE (matches firmware)."""
-    from openhop_core.companion.constants import PUSH_CODE_STATUS_RESPONSE, RESP_CODE_SENT
+    """A failed status send returns an error and no SENT frame."""
+    from openhop_core.companion.constants import PUSH_CODE_STATUS_RESPONSE
 
     bridge = Mock()
-    bridge.send_status_request = AsyncMock(return_value={"success": False, "reason": "timeout"})
-    server = CompanionFrameServer(bridge, "hash", port=0)
-    frames: list[bytes] = []
-    server._write_frame = lambda f: frames.append(f)
-
-    pubkey = bytes(range(32))
-    await server._cmd_send_status_req(pubkey)
-
-    # Should have sent RESP_CODE_SENT but NOT PUSH_CODE_STATUS_RESPONSE
-    assert any(f[0] == RESP_CODE_SENT for f in frames)
-    assert not any(f[0] == PUSH_CODE_STATUS_RESPONSE for f in frames)
-
-
-@pytest.mark.asyncio
-async def test_cmd_send_status_req_empty_raw_bytes_no_push():
-    """Status response with empty raw_bytes must NOT send PUSH_CODE_STATUS_RESPONSE."""
-    from openhop_core.companion.constants import PUSH_CODE_STATUS_RESPONSE, RESP_CODE_SENT
-
-    bridge = Mock()
-    bridge.send_status_request = AsyncMock(
-        return_value={"success": True, "stats": {"raw_bytes": b""}}
+    bridge._start_status_request = AsyncMock(
+        return_value={"success": False, "error": "send_failed", "reason": "Send failed"}
     )
     server = CompanionFrameServer(bridge, "hash", port=0)
     frames: list[bytes] = []
@@ -830,7 +815,34 @@ async def test_cmd_send_status_req_empty_raw_bytes_no_push():
     pubkey = bytes(range(32))
     await server._cmd_send_status_req(pubkey)
 
-    assert any(f[0] == RESP_CODE_SENT for f in frames)
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL])]
+    assert not any(f[0] == PUSH_CODE_STATUS_RESPONSE for f in frames)
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_status_req_empty_raw_bytes_no_push():
+    """Status response with empty raw_bytes must NOT send PUSH_CODE_STATUS_RESPONSE."""
+    from openhop_core.companion.constants import PUSH_CODE_STATUS_RESPONSE
+
+    bridge = Mock()
+    bridge._start_status_request = AsyncMock(
+        return_value={
+            "success": True,
+            "sent": SentResult(success=True, is_flood=False, expected_ack=0x1122, timeout_ms=9000),
+            "task": asyncio.create_task(
+                _return_result({"success": True, "stats": {"raw_bytes": b""}})
+            ),
+        }
+    )
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    frames: list[bytes] = []
+    server._write_frame = lambda f: frames.append(f)
+
+    pubkey = bytes(range(32))
+    await server._cmd_send_status_req(pubkey)
+    await asyncio.sleep(0)
+
+    assert frames == [bytes([RESP_CODE_SENT, 0]) + struct.pack("<II", 0x1122, 9000)]
     assert not any(f[0] == PUSH_CODE_STATUS_RESPONSE for f in frames)
 
 
@@ -841,8 +853,14 @@ async def test_cmd_send_status_req_success_sends_push_with_data():
 
     raw = b"\x01" * 56
     bridge = Mock()
-    bridge.send_status_request = AsyncMock(
-        return_value={"success": True, "stats": {"raw_bytes": raw}}
+    bridge._start_status_request = AsyncMock(
+        return_value={
+            "success": True,
+            "sent": SentResult(success=True, is_flood=True, expected_ack=0x3344, timeout_ms=7000),
+            "task": asyncio.create_task(
+                _return_result({"success": True, "stats": {"raw_bytes": raw}})
+            ),
+        }
     )
     server = CompanionFrameServer(bridge, "hash", port=0)
     frames: list[bytes] = []
@@ -850,8 +868,10 @@ async def test_cmd_send_status_req_success_sends_push_with_data():
 
     pubkey = bytes(range(32))
     await server._cmd_send_status_req(pubkey)
+    await asyncio.sleep(0)
 
     status_frames = [f for f in frames if f[0] == PUSH_CODE_STATUS_RESPONSE]
+    assert frames[0] == bytes([RESP_CODE_SENT, 1]) + struct.pack("<II", 0x3344, 7000)
     assert len(status_frames) == 1
     # Frame: cmd(1) + reserved(1) + pubkey_prefix(6) + raw_bytes(56) = 64
     assert len(status_frames[0]) == 64
@@ -860,11 +880,13 @@ async def test_cmd_send_status_req_success_sends_push_with_data():
 
 @pytest.mark.asyncio
 async def test_cmd_send_telemetry_req_failure_no_empty_push():
-    """Failed telemetry request must NOT send PUSH_CODE_TELEMETRY_RESPONSE."""
-    from openhop_core.companion.constants import PUSH_CODE_TELEMETRY_RESPONSE, RESP_CODE_SENT
+    """A failed telemetry send returns an error and no SENT frame."""
+    from openhop_core.companion.constants import PUSH_CODE_TELEMETRY_RESPONSE
 
     bridge = Mock()
-    bridge.send_telemetry_request = AsyncMock(return_value={"success": False})
+    bridge._start_telemetry_request = AsyncMock(
+        return_value={"success": False, "error": "send_failed", "reason": "Send failed"}
+    )
     server = CompanionFrameServer(bridge, "hash", port=0)
     frames: list[bytes] = []
     server._write_frame = lambda f: frames.append(f)
@@ -874,7 +896,7 @@ async def test_cmd_send_telemetry_req_failure_no_empty_push():
     data = bytes(3) + pubkey
     await server._cmd_send_telemetry_req(data)
 
-    assert any(f[0] == RESP_CODE_SENT for f in frames)
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL])]
     assert not any(f[0] == PUSH_CODE_TELEMETRY_RESPONSE for f in frames)
 
 

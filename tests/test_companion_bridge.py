@@ -985,6 +985,35 @@ class TestRequestTimeoutCap:
         assert result["success"] is False
         assert 1 <= len(injector.calls) <= 2
 
+    async def test_started_status_request_reports_meshcore_sent_metadata(self):
+        bridge, injector, contact = self._bridge_with_contact()
+        contact.out_path_len = 0
+        bridge.contacts.update(contact)
+        bridge._response_timeout_s = lambda pkt, proxy: 0.01
+
+        started = await bridge._start_status_request(contact.public_key)
+
+        assert started["success"] is True
+        sent = started["sent"]
+        assert sent.is_flood is False
+        assert sent.expected_ack is not None
+        assert sent.timeout_ms == 10
+        result = await started["task"]
+        assert result["success"] is False
+
+    async def test_started_status_request_reports_send_failure(self):
+        from unittest.mock import AsyncMock
+
+        injector = AsyncMock(return_value=False)
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        contact = _make_peer_contact("Repeater")
+        bridge.contacts.add(contact)
+
+        started = await bridge._start_status_request(contact.public_key)
+
+        assert started == {"success": False, "error": "send_failed", "reason": "Send failed"}
+        injector.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # Room server posts (TXT_TYPE_SIGNED_PLAIN) end-to-end

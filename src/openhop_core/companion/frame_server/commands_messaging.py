@@ -8,6 +8,7 @@ import struct
 from ...protocol.constants import TELEM_PERM_BASE, TELEM_PERM_ENVIRONMENT, TELEM_PERM_LOCATION
 from ...protocol.packet_utils import PathUtils
 from ..constants import (
+    ERR_CODE_BAD_STATE,
     ERR_CODE_ILLEGAL_ARG,
     ERR_CODE_NOT_FOUND,
     ERR_CODE_TABLE_FULL,
@@ -44,6 +45,23 @@ logger = logging.getLogger("CompanionFrameServer")
 
 class _MessagingCommandsMixin:
     """Messaging and request _cmd_* handlers of :class:`CompanionFrameServer`."""
+
+    def _spawn_request_task(self, coro, label: str) -> asyncio.Task:
+        """Track request completion on a real companion, with a test-safe fallback."""
+        spawn = getattr(self.bridge, "_spawn_background_task", None)
+        if getattr(spawn, "__self__", None) is self.bridge:
+            return spawn(coro, label)
+        return asyncio.create_task(coro)
+
+    def _write_request_start_error(self, started: dict) -> None:
+        error = started.get("error")
+        if error == "not_found":
+            code = ERR_CODE_NOT_FOUND
+        elif error == "send_failed":
+            code = ERR_CODE_TABLE_FULL
+        else:
+            code = ERR_CODE_BAD_STATE
+        self._write_err(code)
 
     async def _cmd_send_txt_msg(self, data: bytes) -> None:
         if len(data) < 12:
@@ -387,47 +405,63 @@ class _MessagingCommandsMixin:
             if len(data) > PUB_KEY_SIZE
             else ""
         )
-        self._write_sent_response(True, 0, LOGIN_TIMEOUT_HINT_MS)
-        result = await self.bridge.send_login(pubkey, password)
-        if result.get("success"):
-            # Layout matches MeshCore companion_radio onContactResponse
-            fw_level = result.get("firmware_ver_level")
-            if fw_level is None:
-                fw_level = FIRMWARE_VER_CODE  # fallback so app sees >= 2 for owner info
-            self._write_frame(
-                bytes(
-                    [
-                        PUSH_CODE_LOGIN_SUCCESS,
-                        1 if result.get("is_admin") else 0,
-                    ]
+        started = await self.bridge._start_login_request(pubkey, password)
+        if not started.get("success"):
+            self._write_request_start_error(started)
+            return
+        self._write_sent_result(started["sent"], default_timeout_ms=LOGIN_TIMEOUT_HINT_MS)
+
+        async def _write_login_result() -> None:
+            result = await started["task"]
+            if result.get("success"):
+                # Layout matches MeshCore companion_radio onContactResponse
+                fw_level = result.get("firmware_ver_level")
+                if fw_level is None:
+                    fw_level = FIRMWARE_VER_CODE  # fallback so app sees >= 2 for owner info
+                self._write_frame(
+                    bytes(
+                        [
+                            PUSH_CODE_LOGIN_SUCCESS,
+                            1 if result.get("is_admin") else 0,
+                        ]
+                    )
+                    + pubkey[:6]
+                    + struct.pack("<I", result.get("tag", 0))
+                    + bytes([result.get("acl_permissions", 0)])
+                    + bytes([min(255, max(0, int(fw_level)))])
                 )
-                + pubkey[:6]
-                + struct.pack("<I", result.get("tag", 0))
-                + bytes([result.get("acl_permissions", 0)])
-                + bytes([min(255, max(0, int(fw_level)))])
-            )
-        else:
-            self._write_frame(bytes([PUSH_CODE_LOGIN_FAIL, 0]) + pubkey[:6])
+            else:
+                self._write_frame(bytes([PUSH_CODE_LOGIN_FAIL, 0]) + pubkey[:6])
+
+        self._spawn_request_task(_write_login_result(), "companion login response")
 
     async def _cmd_send_status_req(self, data: bytes) -> None:
         if len(data) < PUB_KEY_SIZE:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         pubkey = data[0:PUB_KEY_SIZE]
-        self._write_sent_response(False, 0, STATUS_TIMEOUT_HINT_MS)
-        result = await self.bridge.send_status_request(pubkey)
-        if not result.get("success"):
-            logger.debug("Status request failed for %s; no push sent)", pubkey[:6].hex())
+        started = await self.bridge._start_status_request(pubkey)
+        if not started.get("success"):
+            self._write_request_start_error(started)
             return
-        stats_data = result.get("stats", {})
-        raw_bytes = stats_data.get("raw_bytes", b"")
-        if not raw_bytes:
-            logger.debug(
-                "Status response had no raw_bytes for %s; no push sent",
-                pubkey[:6].hex(),
-            )
-            return
-        self._write_frame(bytes([PUSH_CODE_STATUS_RESPONSE, 0]) + pubkey[:6] + raw_bytes)
+        self._write_sent_result(started["sent"], default_timeout_ms=STATUS_TIMEOUT_HINT_MS)
+
+        async def _write_status_result() -> None:
+            result = await started["task"]
+            if not result.get("success"):
+                logger.debug("Status request failed for %s; no push sent", pubkey[:6].hex())
+                return
+            stats_data = result.get("stats", {})
+            raw_bytes = stats_data.get("raw_bytes", b"")
+            if not raw_bytes:
+                logger.debug(
+                    "Status response had no raw_bytes for %s; no push sent",
+                    pubkey[:6].hex(),
+                )
+                return
+            self._write_frame(bytes([PUSH_CODE_STATUS_RESPONSE, 0]) + pubkey[:6] + raw_bytes)
+
+        self._spawn_request_task(_write_status_result(), "companion status response")
 
     async def _cmd_send_telemetry_req(self, data: bytes) -> None:
         # Protocol: CMD_SEND_TELEMETRY_REQ has reserved bytes(3) then pub_key bytes(32).
@@ -441,26 +475,34 @@ class _MessagingCommandsMixin:
         want_base = bool(flags & TELEM_PERM_BASE)
         want_location = bool(flags & TELEM_PERM_LOCATION)
         want_environment = bool(flags & TELEM_PERM_ENVIRONMENT)
-        self._write_sent_response(False, 0, TELEMETRY_TIMEOUT_HINT_MS)
-        result = await self.bridge.send_telemetry_request(
+        started = await self.bridge._start_telemetry_request(
             pubkey,
             want_base=want_base,
             want_location=want_location,
             want_environment=want_environment,
         )
-        if not result.get("success"):
-            logger.debug("Telemetry request failed for %s; no push sent", pubkey[:6].hex())
+        if not started.get("success"):
+            self._write_request_start_error(started)
             return
-        telem_data = result.get("telemetry_data", {})
-        raw_bytes = telem_data.get("raw_bytes", b"")
-        if not raw_bytes:
-            logger.debug(
-                "Telemetry response had no raw_bytes for %s; no push sent",
-                pubkey[:6].hex(),
-            )
-            return
-        self._write_frame(bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + pubkey[:6] + raw_bytes)
-        logger.info("Telemetry push sent to client: %d bytes LPP", len(raw_bytes))
+        self._write_sent_result(started["sent"], default_timeout_ms=TELEMETRY_TIMEOUT_HINT_MS)
+
+        async def _write_telemetry_result() -> None:
+            result = await started["task"]
+            if not result.get("success"):
+                logger.debug("Telemetry request failed for %s; no push sent", pubkey[:6].hex())
+                return
+            telem_data = result.get("telemetry_data", {})
+            raw_bytes = telem_data.get("raw_bytes", b"")
+            if not raw_bytes:
+                logger.debug(
+                    "Telemetry response had no raw_bytes for %s; no push sent",
+                    pubkey[:6].hex(),
+                )
+                return
+            self._write_frame(bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + pubkey[:6] + raw_bytes)
+            logger.info("Telemetry push sent to client: %d bytes LPP", len(raw_bytes))
+
+        self._spawn_request_task(_write_telemetry_result(), "companion telemetry response")
 
     async def _cmd_logout(self, data: bytes) -> None:
         if len(data) < PUB_KEY_SIZE:

@@ -491,3 +491,21 @@ class TestCompanionLoginRetry:
         assert result["success"] is False
         assert "timeout" in result["reason"].lower()
         assert calls["n"] == DEFAULT_MAX_ATTEMPTS  # tried the full budget
+
+    async def test_started_login_request_reports_meshcore_sent_metadata(self, monkeypatch):
+        radio = MockRadio()
+        comp = CompanionRadio(radio, LocalIdentity())
+        contact = _make_peer_contact("Rpt")
+        contact.out_path_len = 0
+        comp.contacts.add(contact)
+        monkeypatch.setattr(comp, "_response_timeout_s", lambda pkt, proxy: 0.01)
+
+        started = await comp._start_login_request(contact.public_key, "pw")
+
+        assert started["success"] is True
+        sent = started["sent"]
+        assert sent.is_flood is False
+        assert sent.expected_ack == int.from_bytes(contact.public_key[:4], "little")
+        assert sent.timeout_ms == 10
+        result = await started["task"]
+        assert result["success"] is False
