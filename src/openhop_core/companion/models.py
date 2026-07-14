@@ -148,6 +148,9 @@ class NodePrefs:
     telemetry_mode_environment: int = 0
     manual_add_contacts: int = 0
     autoadd_config: int = 0
+    # Max hops away an advert may be for automatic contact creation. 0 = no
+    # limit; N rejects adverts N or more hops away (firmware getAutoAddMaxHops).
+    autoadd_max_hops: int = 0
     rx_delay_base: float = 0.0
     airtime_factor: float = 0.0
     # Reported in CMD_DEVICE_QUERY device info frame (byte 80).

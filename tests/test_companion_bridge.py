@@ -556,6 +556,62 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         assert contact.last_advert_timestamp == 2000
         assert advert_received_calls == []
 
+    async def test_autoadd_max_hops_rejects_distant_new_contact(self):
+        """A new contact whose advert is at least autoadd_max_hops away is not
+        auto-added, but the client is still notified (firmware onAdvertRecv)."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        bridge.prefs.autoadd_max_hops = 2
+        peer = LocalIdentity()
+        node_discovered_calls = []
+        bridge.on_node_discovered(node_discovered_calls.append)
+        event = self._advert_event(peer, name="Faraway", advert_timestamp=1000)
+        event["path_len_encoded"] = PathUtils.encode_path_len(1, 2)  # 2 hops
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event)
+        assert bridge.contacts.get_by_key(peer.get_public_key()) is None
+        assert len(node_discovered_calls) == 1
+
+    async def test_autoadd_max_hops_allows_closer_new_contact(self):
+        """A new contact within the hop limit is auto-added."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        bridge.prefs.autoadd_max_hops = 2
+        peer = LocalIdentity()
+        event = self._advert_event(peer, name="Nearby", advert_timestamp=1000)
+        event["path_len_encoded"] = PathUtils.encode_path_len(1, 1)  # 1 hop
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event)
+        assert bridge.contacts.get_by_key(peer.get_public_key()) is not None
+
+    async def test_autoadd_max_hops_zero_means_no_limit(self):
+        """max_hops == 0 disables the distance test (default behavior)."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        bridge.prefs.autoadd_max_hops = 0
+        peer = LocalIdentity()
+        event = self._advert_event(peer, name="Distant", advert_timestamp=1000)
+        event["path_len_encoded"] = PathUtils.encode_path_len(1, 10)  # 10 hops
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event)
+        assert bridge.contacts.get_by_key(peer.get_public_key()) is not None
+
+    async def test_autoadd_max_hops_does_not_block_existing_contact_update(self):
+        """An existing contact is still updated even when the advert is beyond the
+        hop limit (the cap only gates new auto-adds)."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        peer = LocalIdentity()
+        # First advert (0 hops) adds the contact while the cap is off.
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Original", advert_timestamp=1000),
+        )
+        bridge.prefs.autoadd_max_hops = 1  # direct-only from now on
+        event = self._advert_event(peer, name="Renamed", advert_timestamp=2000)
+        event["path_len_encoded"] = PathUtils.encode_path_len(1, 5)  # 5 hops away
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event)
+        contact = bridge.contacts.get_by_key(peer.get_public_key())
+        assert contact is not None
+        assert contact.name == "Renamed"
+
     async def test_path_packet_updates_contact_path_and_fires_contact_path_updated_once(self):
         """PATH packet that decrypts updates contact out_path and fires contact_path_updated."""
         injector = MockPacketInjector()

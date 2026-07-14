@@ -708,6 +708,39 @@ async def test_device_info_includes_path_hash_mode():
     assert frame[81] == 2  # path_hash_mode at last byte
 
 
+@pytest.mark.asyncio
+async def test_autoadd_config_set_and_get_round_trips_max_hops():
+    """CMD_SET_AUTOADD_CONFIG stores the optional max-hop byte (capped at 64) and
+    CMD_GET_AUTOADD_CONFIG returns config + max_hops (firmware parity)."""
+    from openhop_core.companion.companion_bridge import CompanionBridge
+    from openhop_core.companion.constants import RESP_CODE_AUTOADD_CONFIG
+    from openhop_core.protocol import LocalIdentity
+
+    bridge = CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+    frames = []
+    server._write_frame = lambda f: frames.append(f)
+
+    # data excludes the command byte: [config, max_hops]
+    await server._cmd_set_autoadd_config(bytes([0x06, 3]))
+    server._write_ok.assert_called_once()
+    assert bridge.prefs.autoadd_config == 0x06
+    assert bridge.prefs.autoadd_max_hops == 3
+
+    await server._cmd_get_autoadd_config(b"")
+    assert frames == [bytes([RESP_CODE_AUTOADD_CONFIG, 0x06, 3])]
+
+    # max-hop byte is capped at 64.
+    await server._cmd_set_autoadd_config(bytes([0x06, 200]))
+    assert bridge.prefs.autoadd_max_hops == 64
+
+    # config-only frame leaves the stored max-hop value unchanged.
+    await server._cmd_set_autoadd_config(bytes([0x02]))
+    assert bridge.prefs.autoadd_config == 0x02
+    assert bridge.prefs.autoadd_max_hops == 64
+
+
 # ---------------------------------------------------------------------------
 # CMD_SEND_STATUS_REQ / CMD_SEND_TELEMETRY_REQ — no empty push on failure
 # ---------------------------------------------------------------------------

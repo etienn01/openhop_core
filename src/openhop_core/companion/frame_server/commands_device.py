@@ -366,12 +366,16 @@ class _DeviceCommandsMixin:
         if len(data) < 1:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
-        self.bridge.set_autoadd_config(data[0])
+        # Firmware CMD_SET_AUTOADD_CONFIG: config byte plus an optional max-hop
+        # byte (capped at 64 by the setter).
+        max_hops = data[1] if len(data) >= 2 else None
+        self.bridge.set_autoadd_config(data[0], max_hops)
         self._write_ok()
 
     async def _cmd_get_autoadd_config(self, data: bytes) -> None:
         config = self.bridge.get_autoadd_config()
-        self._write_frame(bytes([RESP_CODE_AUTOADD_CONFIG, config & 0xFF]))
+        max_hops = self.bridge.get_autoadd_max_hops()
+        self._write_frame(bytes([RESP_CODE_AUTOADD_CONFIG, config & 0xFF, max_hops & 0xFF]))
 
     async def _cmd_set_other_params(self, data: bytes) -> None:
         """Handle CMD_SET_OTHER_PARAMS (0x26). Mirrors MyMesh.cpp:1290-1305."""

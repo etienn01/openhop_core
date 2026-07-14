@@ -6,6 +6,7 @@ import logging
 import time
 from typing import Optional
 
+from ..protocol.packet_utils import PathUtils
 from .binary_parsing import decode_exported_contact, encode_exported_contact
 from .constants import (
     ADV_TYPE_CHAT,
@@ -156,9 +157,19 @@ class _ContactChannelMixin:
         """Return the current auto-add configuration bitmask."""
         return self.prefs.autoadd_config
 
-    def set_autoadd_config(self, config: int) -> None:
-        """Set the auto-add configuration bitmask."""
+    def get_autoadd_max_hops(self) -> int:
+        """Return the auto-add maximum-hop limit (0 = no limit)."""
+        return self.prefs.autoadd_max_hops
+
+    def set_autoadd_config(self, config: int, max_hops: Optional[int] = None) -> None:
+        """Set the auto-add configuration bitmask and optional max-hop limit.
+
+        Mirrors firmware CMD_SET_AUTOADD_CONFIG: the config byte is always
+        stored; the max-hop byte is optional and capped at 64 when present.
+        """
         self.prefs.autoadd_config = config
+        if max_hops is not None:
+            self.prefs.autoadd_max_hops = min(max_hops, 64)
         self._save_prefs()
 
     # Map ADV_TYPE_* → AUTOADD_* bitmask bits (mirrors C++ shouldAutoAddContactType)
@@ -231,6 +242,20 @@ class _ContactChannelMixin:
             if not self.should_auto_add_contact_type(contact.adv_type):
                 logger.debug("Auto-add filtered: type %d not allowed", contact.adv_type)
                 return None
+            # Hop-count cap (BaseChatMesh::onAdvertRecv): for a new contact, reject
+            # auto-add when the advert is at least ``autoadd_max_hops`` hops away.
+            # 0 = no limit; 1 = direct only (0 hops). Existing contacts are updated
+            # above regardless. The caller still notifies the client for every
+            # valid advert, matching the firmware's onDiscoveredContact.
+            max_hops = self.prefs.autoadd_max_hops
+            if max_hops > 0:
+                if path_len_encoded is not None:
+                    hop_count = PathUtils.get_path_hash_count(path_len_encoded)
+                else:
+                    hop_count = len(inbound_path)
+                if hop_count >= max_hops:
+                    logger.debug("Auto-add filtered: %d hops >= max_hops %d", hop_count, max_hops)
+                    return None
             if self.should_overwrite_when_full() and self.contacts.is_full():
                 ok, overwritten = self.contacts.add_or_overwrite(contact)
                 if ok and overwritten:
