@@ -7,6 +7,7 @@ from ...protocol import Packet
 from ...protocol.constants import PAYLOAD_TYPE_ACK
 from ...protocol.packet_utils import PathUtils
 from .base import BaseHandler
+from .crypto_helpers import iter_decrypt_by_src_hash
 
 
 class AckHandler(BaseHandler):
@@ -14,7 +15,7 @@ class AckHandler(BaseHandler):
     ACK handler that processes all ACK variants:
     1. Discrete ACK packets (payload type 1)
     2. Bundled ACKs in PATH packets
-    3. Encrypted ACK responses (20-byte PATH packets)
+    3. Encrypted ACK responses carried by PATH packets
     """
 
     @staticmethod
@@ -73,98 +74,67 @@ class AckHandler(BaseHandler):
         self.log(f"Processing PATH packet for ACKs: payload_len={len(payload)}")
         self.log(f"PATH payload (hex): {payload.hex().upper()}")
 
-        # Check for encrypted ACK responses (20-byte PATH packets addressed to us)
+        # PATH returns are encrypted as dest_hash + src_hash + MAC + ciphertext.
+        # Their outer length varies with the returned path, so do not restrict this
+        # to the 20-byte (single AES-block) form.
         if (
-            len(payload) == 20
-            and self.dispatcher._waiting_acks
+            self.dispatcher._waiting_acks
             and self.dispatcher.local_identity
             and self.dispatcher.contact_book
             and len(payload) >= 2
             and payload[0] == self.dispatcher.local_identity.get_public_key()[0]
         ):
-            self.log("Checking 20-byte PATH packet for encrypted ACK response")
+            self.log("Checking encrypted PATH packet for ACK response")
             ack_crc = await self._try_decrypt_encrypted_ack(payload)
             if ack_crc is not None:
                 self.log(f"Found encrypted ACK response: CRC={ack_crc:08X}")
                 return ack_crc
 
-        # Check for bundled ACKs in returned path messages
-        bundled_crc = await self._process_bundled_ack_in_path(payload)
-        if bundled_crc is not None:
-            self.log(f"Found bundled ACK: CRC={bundled_crc:08X}")
-            return bundled_crc
-
         return None
 
     async def _try_decrypt_encrypted_ack(self, payload: bytes) -> Optional[int]:
-        """Try to decrypt a 20-byte PATH packet as an encrypted ACK response."""
-        try:
-            # dest_hash = payload[0]  # Not currently used
-            src_hash = payload[1]
+        """Decrypt an addressed PATH return and extract its ACK extra, if any.
 
-            # Find contact for decryption
-            contact = await self.dispatcher._find_contact_by_hash(src_hash)
-            if not contact:
+        A PATH source hash is only one byte, so it identifies a candidate set rather
+        than a unique contact.  A valid MAC identifies the actual sender.  After a
+        successful decrypt, decode the inner PATH layout instead of searching its
+        path or non-ACK extra bytes for a value that happens to match a pending CRC.
+        """
+        if len(payload) < 2:
+            return None
+
+        src_hash = payload[1]
+        encrypted = bytes(payload[2:])
+        contacts = getattr(self.dispatcher.contact_book, "contacts", ())
+
+        for _contact, _pubkey, _secret, decrypted in iter_decrypt_by_src_hash(
+            contacts, src_hash, self.dispatcher.local_identity, encrypted
+        ):
+            # MeshCore treats a successfully authenticated PATH as belonging to
+            # that matched contact.  Reject a malformed inner PATH rather than
+            # interpreting arbitrary bytes as an ACK.
+            if not decrypted or not PathUtils.is_valid_path_len(decrypted[0]):
+                self.log("Encrypted PATH ACK has an invalid path length")
                 return None
 
-            from ...protocol import CryptoUtils, Identity
-
-            peer_id = Identity(bytes.fromhex(contact.public_key))
-            shared_secret = peer_id.calc_shared_secret(
-                self.dispatcher.local_identity.get_private_key()
-            )
-            aes_key = shared_secret[:16]
-
-            # Decrypt (skip dest_hash and src_hash)
-            mac_and_ciphertext = payload[2:]
-            decrypted = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, mac_and_ciphertext)
-
-            if not decrypted or len(decrypted) < 4:
+            path_byte_len = PathUtils.get_path_byte_len(decrypted[0])
+            extra_start = 1 + path_byte_len
+            if len(decrypted) < extra_start + 1:
+                self.log("Encrypted PATH ACK is truncated before its extra type")
                 return None
 
-            # Look for expected CRC in decrypted data
-            expected_crcs = set(self.dispatcher._waiting_acks.keys())
-            for i in range(len(decrypted) - 3):
-                crc_bytes = decrypted[i : i + 4]
-                crc_le = int.from_bytes(crc_bytes, "little")
-                # crc_be = int.from_bytes(crc_bytes, "big")
+            extra_type = decrypted[extra_start] & 0x0F
+            if extra_type != PAYLOAD_TYPE_ACK:
+                return None
 
-                if crc_le in expected_crcs:
-                    return crc_le
-                # if crc_be in expected_crcs:
-                #     return crc_be
+            if len(decrypted) < extra_start + 5:
+                self.log("Encrypted PATH ACK extra is shorter than its CRC")
+                return None
 
-            return None
-
-        except Exception as e:
-            self.log(f"Error decrypting encrypted ACK: {e}")
-            return None
-
-    async def _process_bundled_ack_in_path(self, payload: bytes) -> Optional[int]:
-        """Process bundled ACKs in returned path messages according to protocol spec."""
-        if len(payload) < 1:
-            return None
-
-        path_length = payload[0]
-        path_byte_len = PathUtils.get_path_byte_len(path_length)
-
-        # Check if we have enough data for: path_byte_len + path + extra_type + extra
-        min_required = 1 + path_byte_len + 1 + 4  # +4 for ACK CRC
-        if len(payload) < min_required:
-            return None
-
-        # Extract extra section
-        extra_start = 1 + path_byte_len
-        extra_type = payload[extra_start]
-        extra_payload = payload[extra_start + 1 :]
-
-        # Check if extra type is ACK
-        if extra_type == PAYLOAD_TYPE_ACK:
-            if len(extra_payload) >= 4:
-                crc = int.from_bytes(extra_payload[:4], "little")
+            crc = int.from_bytes(decrypted[extra_start + 1 : extra_start + 5], "little")
+            if crc in self.dispatcher._waiting_acks:
                 return crc
-            else:
-                self.log(f"Bundled ACK too short: {len(extra_payload)} bytes")
+            return None
 
         return None
 
