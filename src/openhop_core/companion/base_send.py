@@ -825,7 +825,11 @@ class _SendOpsMixin:
         async def _format_login_result() -> dict:
             await raw_task
             if not login_event.is_set():
-                return {"success": False, "reason": "Login response timeout"}
+                return {
+                    "success": False,
+                    "timeout": True,
+                    "reason": "Login response timeout",
+                }
             data = login_result["data"]
             return {
                 "success": login_result["success"],

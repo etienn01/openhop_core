@@ -413,6 +413,9 @@ class _MessagingCommandsMixin:
 
         async def _write_login_result() -> None:
             result = await started["task"]
+            if result.get("timeout"):
+                logger.debug("Login request timed out for %s; no login push sent", pubkey[:6].hex())
+                return
             if result.get("success"):
                 # Layout matches MeshCore companion_radio onContactResponse
                 fw_level = result.get("firmware_ver_level")

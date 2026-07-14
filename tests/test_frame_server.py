@@ -800,6 +800,34 @@ async def _return_result(result: dict) -> dict:
 
 
 @pytest.mark.asyncio
+async def test_cmd_send_login_timeout_does_not_emit_failure_push():
+    from openhop_core.companion.constants import PUSH_CODE_LOGIN_FAIL
+
+    pubkey = bytes(range(32))
+    bridge = Mock()
+    bridge._start_login_request = AsyncMock(
+        return_value={
+            "success": True,
+            "sent": SentResult(success=True, is_flood=True, expected_ack=0x1122, timeout_ms=9000),
+            "task": asyncio.create_task(
+                _return_result(
+                    {"success": False, "timeout": True, "reason": "Login response timeout"}
+                )
+            ),
+        }
+    )
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    frames: list[bytes] = []
+    server._write_frame = lambda f: frames.append(f)
+
+    await server._cmd_send_login(pubkey + b"pw")
+    await asyncio.sleep(0)
+
+    assert frames == [bytes([RESP_CODE_SENT, 1]) + struct.pack("<II", 0x1122, 9000)]
+    assert not any(frame[0] == PUSH_CODE_LOGIN_FAIL for frame in frames)
+
+
+@pytest.mark.asyncio
 async def test_cmd_send_status_req_failure_no_empty_push():
     """A failed status send returns an error and no SENT frame."""
     from openhop_core.companion.constants import PUSH_CODE_STATUS_RESPONSE
