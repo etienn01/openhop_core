@@ -16,7 +16,9 @@ from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_RAW_CUSTOM,
     PAYLOAD_TYPE_RESPONSE,
     PAYLOAD_TYPE_TXT_MSG,
+    REQ_TYPE_GET_TELEMETRY_DATA,
     ROUTE_TYPE_FLOOD,
+    TELEM_PERM_BASE,
 )
 from openhop_core.protocol.packet_utils import PathUtils
 
@@ -334,6 +336,46 @@ class TestCompanionBridgePathAndControl:
         assert result.success is True
         assert len(injector.calls) == 1
         assert result.timeout_ms == 10000
+
+    async def test_send_path_discovery_req_matches_wire_tag_and_response(self, monkeypatch):
+        injector = MockPacketInjector()
+        local_identity = LocalIdentity()
+        peer_identity = LocalIdentity()
+        bridge = CompanionBridge(local_identity, injector)
+        contact = Contact(public_key=peer_identity.get_public_key(), name="Target")
+        bridge.contacts.add(contact)
+        monkeypatch.setattr(
+            "openhop_core.companion.base_send.random.getrandbits",
+            lambda bits: 0xA1B2C3D4,
+        )
+
+        callbacks = []
+        bridge.on_path_discovery_response(lambda *args: callbacks.append(args))
+        result = await bridge.send_path_discovery_req(contact.public_key)
+
+        assert result.success is True
+        assert result.expected_ack is not None
+        packet, _ = injector.calls[0]
+        shared_secret = Identity(peer_identity.get_public_key()).calc_shared_secret(
+            local_identity.get_private_key()
+        )
+        plaintext = CryptoUtils.mac_then_decrypt(
+            shared_secret[:16], shared_secret, bytes(packet.payload[2:])
+        )
+        expected_request = (
+            result.expected_ack.to_bytes(4, "little")
+            + bytes([REQ_TYPE_GET_TELEMETRY_DATA, (~TELEM_PERM_BASE) & 0xFF, 0, 0, 0])
+            + bytes.fromhex("d4c3b2a1")
+        )
+        assert plaintext[: len(expected_request)] == expected_request
+
+        handled = await bridge._try_handle_path_discovery(
+            result.expected_ack.to_bytes(4, "little"),
+            (b"\x01", b"\x02", contact.public_key),
+        )
+        assert handled is True
+        assert len(callbacks) == 1
+        assert callbacks[0][0] == result.expected_ack.to_bytes(4, "little")
 
     async def test_send_trace_path_raw(self):
         injector = MockPacketInjector()

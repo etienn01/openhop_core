@@ -304,16 +304,16 @@ class _SendOpsMixin:
         proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
             return SentResult(success=False)
-        tag_int = random.randint(0, 0xFFFFFFFF)
-        tag_bytes = tag_int.to_bytes(4, "little")
         inv_perm = 0xFF & ~TELEM_PERM_BASE
-        req_payload = tag_bytes + bytes([REQ_TYPE_GET_TELEMETRY_DATA, inv_perm, 0, 0, 0])
+        req_data = bytes([REQ_TYPE_GET_TELEMETRY_DATA, inv_perm, 0, 0, 0]) + random.getrandbits(
+            32
+        ).to_bytes(4, "little")
         try:
-            pkt, _ = PacketBuilder.create_protocol_request(
+            pkt, tag_int = PacketBuilder.create_protocol_request(
                 contact=proxy,
                 local_identity=self._identity,
-                protocol_code=REQ_TYPE_GET_TELEMETRY_DATA,
-                data=req_payload,
+                protocol_code=req_data[0],
+                data=req_data[1:],
                 route_type="flood",
             )
             self._apply_flood_scope(pkt)
