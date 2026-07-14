@@ -16,7 +16,12 @@ from .constants import (
     SIGNATURE_SIZE,
     TIMESTAMP_SIZE,
 )
-from .packet_utils import PacketDataUtils, PacketHashingUtils, PacketValidationUtils, PathUtils
+from .packet_utils import (
+    PacketDataUtils,
+    PacketHashingUtils,
+    PacketValidationUtils,
+    PathUtils,
+)
 
 """
 ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -35,9 +40,9 @@ from .packet_utils import PacketDataUtils, PacketHashingUtils, PacketValidationU
 ╠════════════════════╬══════════════════════════════════════════════════════╣
 ║ Path (N bytes)     ║ Node hashes (1-3 bytes each), N = count × hash_size  ║
 ╠════════════════════╬══════════════════════════════════════════════════════╣
-║ Payload (N bytes)  ║ Actual encrypted or plain payload. Max: 254 bytes    ║
+║ Payload (N bytes)  ║ Actual encrypted or plain payload. Max: 184 bytes    ║
 ╠════════════════════╬══════════════════════════════════════════════════════╣
-║ Total Size         ║ <= 256 bytes (hard limit)                            ║
+║ Total Size         ║ Bounded by MAX_PACKET_PAYLOAD for the payload field   ║
 ╚════════════════════╩══════════════════════════════════════════════════════╝
 
 Header Layout (1 byte):
@@ -56,7 +61,7 @@ Header Layout (1 byte):
 Notes:
 - `write_to()` and `read_from()` enforce the exact structure used in firmware.
 - Transport codes are included only for route types 0x00 and 0x03.
-- Payload size must be ≤ MAX_PACKET_PAYLOAD (typically 254).
+- Payload size must be ≤ MAX_PACKET_PAYLOAD (currently 184).
 - `calculate_packet_hash()` includes payload type + path_len (only for TRACE).
 """
 
@@ -143,7 +148,9 @@ class Packet:
         # Set once the companion layer has decided this flood packet's scoping
         # (scoped or deliberately plain); the dispatcher must not re-scope it.
         self._flood_scope_applied = False
-        self._injected_for_tx = False  # Set by repeater inject path; skip engine on route
+        self._injected_for_tx = (
+            False  # Set by repeater inject path; skip engine on route
+        )
 
     def get_route_type(self) -> int:
         """
@@ -193,7 +200,10 @@ class Packet:
                 routing, which includes 4 bytes of transport codes after the header.
         """
         route_type = self.get_route_type()
-        return route_type == ROUTE_TYPE_TRANSPORT_FLOOD or route_type == ROUTE_TYPE_TRANSPORT_DIRECT
+        return (
+            route_type == ROUTE_TYPE_TRANSPORT_FLOOD
+            or route_type == ROUTE_TYPE_TRANSPORT_DIRECT
+        )
 
     def is_route_flood(self) -> bool:
         """
@@ -203,7 +213,9 @@ class Packet:
             bool: True if the packet uses any form of flood routing.
         """
         route_type = self.get_route_type()
-        return route_type == ROUTE_TYPE_TRANSPORT_FLOOD or route_type == ROUTE_TYPE_FLOOD
+        return (
+            route_type == ROUTE_TYPE_TRANSPORT_FLOOD or route_type == ROUTE_TYPE_FLOOD
+        )
 
     def is_route_direct(self) -> bool:
         """
@@ -213,7 +225,9 @@ class Packet:
             bool: True if the packet uses any form of direct routing.
         """
         route_type = self.get_route_type()
-        return route_type == ROUTE_TYPE_TRANSPORT_DIRECT or route_type == ROUTE_TYPE_DIRECT
+        return (
+            route_type == ROUTE_TYPE_TRANSPORT_DIRECT or route_type == ROUTE_TYPE_DIRECT
+        )
 
     def get_path_hash_size(self) -> int:
         """Extract per-hop hash size (1, 2, or 3) from the encoded path_len byte."""
@@ -355,10 +369,15 @@ class Packet:
             ValueError: If any declared length doesn't match the actual buffer length.
         """
         PacketValidationUtils.validate_buffer_lengths(
-            self.get_path_byte_len(), len(self.path), self.payload_len, len(self.payload)
+            self.get_path_byte_len(),
+            len(self.path),
+            self.payload_len,
+            len(self.payload),
         )
 
-    def _check_bounds(self, idx: int, required: int, data_len: int, error_msg: str) -> None:
+    def _check_bounds(
+        self, idx: int, required: int, data_len: int, error_msg: str
+    ) -> None:
         """
         Check if we have enough data remaining for the requested operation.
 

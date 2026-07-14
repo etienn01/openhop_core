@@ -8,14 +8,18 @@ from enum import IntEnum
 # Wire-level values shared with the node/protocol layers live in
 # protocol.constants; they are re-exported here so existing
 # ``openhop_core.companion.constants`` imports keep working.
-from ..protocol.constants import ANON_REQ_TYPE_BASIC  # noqa: F401
-from ..protocol.constants import ANON_REQ_TYPE_OWNER  # noqa: F401
-from ..protocol.constants import ANON_REQ_TYPE_REGIONS  # noqa: F401
-from ..protocol.constants import MAX_PATH_SIZE  # noqa: F401
-from ..protocol.constants import PUB_KEY_SIZE  # noqa: F401
-from ..protocol.constants import TXT_TYPE_CLI_DATA  # noqa: F401
-from ..protocol.constants import TXT_TYPE_PLAIN  # noqa: F401
-from ..protocol.constants import TXT_TYPE_SIGNED_PLAIN  # noqa: F401
+from ..protocol.constants import (
+    ANON_REQ_TYPE_BASIC,  # noqa: F401
+    ANON_REQ_TYPE_OWNER,  # noqa: F401
+    ANON_REQ_TYPE_REGIONS,  # noqa: F401
+    CIPHER_BLOCK_SIZE,  # noqa: F401
+    MAX_PACKET_PAYLOAD,  # noqa: F401
+    MAX_PATH_SIZE,  # noqa: F401
+    PUB_KEY_SIZE,  # noqa: F401
+    TXT_TYPE_CLI_DATA,  # noqa: F401
+    TXT_TYPE_PLAIN,  # noqa: F401
+    TXT_TYPE_SIGNED_PLAIN,  # noqa: F401
+)
 
 # ---------------------------------------------------------------------------
 # ADV Types (contact/node classification)
@@ -123,7 +127,9 @@ CONTACT_NAME_SIZE = 32
 CHANNEL_NAME_SIZE = 32  # channel name field width (CHANNEL_INFO / SET_CHANNEL)
 MAX_SIGN_DATA_SIZE = 8192  # 8KB signing buffer (matches firmware)
 MAX_PENDING_ACK_CRCS = 64
-ZERO_FLOOD_SCOPE_KEY = b"\x00" * 16  # firmware's null scope override (send_scope.isNull())
+ZERO_FLOOD_SCOPE_KEY = (
+    b"\x00" * 16
+)  # firmware's null scope override (send_scope.isNull())
 
 # ---------------------------------------------------------------------------
 # Response-timeout hints (ms) returned in RESP_CODE_SENT frames. The firmware
@@ -301,9 +307,9 @@ MAX_FRAME_SIZE = 176
 MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE
 # Firmware companion command parser uses MAX_FRAME_SIZE - 9 for channel binary payloads.
 MAX_CHANNEL_DATA_LENGTH = MAX_FRAME_SIZE - 9
-# Firmware MeshCore.h: MAX_GROUP_DATA_LENGTH = MAX_PACKET_PAYLOAD(184) - CIPHER_BLOCK_SIZE(16) - 3.
+# Firmware MeshCore.h: MAX_GROUP_DATA_LENGTH = MAX_PACKET_PAYLOAD - CIPHER_BLOCK_SIZE - 3.
 # BaseChatMesh::sendGroupData rejects group application data longer than this.
-MAX_GROUP_DATA_LENGTH = 165
+MAX_GROUP_DATA_LENGTH = MAX_PACKET_PAYLOAD - CIPHER_BLOCK_SIZE - 3
 OUT_PATH_UNKNOWN = 0xFF
 # PUB_KEY_SIZE and MAX_PATH_SIZE are re-exported from protocol.constants at
 # the top of this module.
