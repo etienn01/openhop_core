@@ -145,9 +145,15 @@ class CompanionFrameServer(
         if device_version is None:
             # At least 2 chars so client substring(0, 2) etc. doesn't RangeError
             device_version = f"{FIRMWARE_VER_CODE}.0"
-        self._build_date_bytes = (build_date.encode("utf-8") + b"\x00")[:12].ljust(12, b"\x00")
-        self._model_bytes = (device_model.encode("utf-8") + b"\x00")[:40].ljust(40, b"\x00")
-        self._version_bytes = (device_version.encode("utf-8") + b"\x00")[:20].ljust(20, b"\x00")
+        self._build_date_bytes = (build_date.encode("utf-8") + b"\x00")[:12].ljust(
+            12, b"\x00"
+        )
+        self._model_bytes = (device_model.encode("utf-8") + b"\x00")[:40].ljust(
+            40, b"\x00"
+        )
+        self._version_bytes = (device_version.encode("utf-8") + b"\x00")[:20].ljust(
+            20, b"\x00"
+        )
 
         # Command dispatch registry: cmd byte -> async handler(data)
         self._cmd_handlers = {
@@ -256,7 +262,7 @@ class CompanionFrameServer(
             return
         cmd = payload[0]
         data = payload[1:]
-        logger.info("Companion cmd 0x%02x (%s) len=%s", cmd, cmd, len(payload))
+        logger.debug("Companion cmd 0x%02x (%s) len=%s", cmd, cmd, len(payload))
         if cmd in (CMD_GET_CHANNEL, CMD_SET_CHANNEL):
             logger.debug(
                 "Companion cmd 0x%02x (%s), payload_len=%s",
