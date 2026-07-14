@@ -308,17 +308,13 @@ class _SendOpsMixin:
         tag_bytes = tag_int.to_bytes(4, "little")
         inv_perm = 0xFF & ~TELEM_PERM_BASE
         req_payload = tag_bytes + bytes([REQ_TYPE_GET_TELEMETRY_DATA, inv_perm, 0, 0, 0])
-        old_path_len = contact.out_path_len
-        old_path = contact.out_path
-        contact.out_path_len = -1
-        contact.out_path = b""
-        self.contacts.update(contact)
         try:
             pkt, _ = PacketBuilder.create_protocol_request(
                 contact=proxy,
                 local_identity=self._identity,
                 protocol_code=REQ_TYPE_GET_TELEMETRY_DATA,
                 data=req_payload,
+                route_type="flood",
             )
             self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
@@ -334,12 +330,6 @@ class _SendOpsMixin:
         except Exception as e:
             logger.error("Error in path discovery: %s", e)
             return SentResult(success=False)
-        finally:
-            current = self.contacts.get_by_key(pub_key)
-            if current and current.out_path_len == -1:
-                current.out_path_len = old_path_len
-                current.out_path = old_path
-                self.contacts.update(current)
 
     async def send_text_message(
         self,

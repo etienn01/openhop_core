@@ -269,6 +269,25 @@ class TestCompanionRadioPathAndControl:
         assert result.success is True
         assert len(radio.sent) == 1
 
+    async def test_send_path_discovery_req_floods_known_path_without_mutating_contact(self):
+        radio = MockRadio()
+        comp = CompanionRadio(radio, LocalIdentity())
+        contact = _make_peer_contact("Target")
+        contact.out_path_len = 3
+        contact.out_path = b"\x01\x02\x03"
+        comp.contacts.add(contact)
+
+        result = await comp.send_path_discovery_req(contact.public_key)
+
+        assert result.success is True
+        assert result.is_flood is True
+        sent = Packet()
+        assert sent.read_from(radio.sent[0]) is True
+        assert sent.is_route_flood()
+        stored = comp.contacts.get_by_key(contact.public_key)
+        assert stored.out_path_len == 3
+        assert stored.out_path == b"\x01\x02\x03"
+
     async def test_send_trace_path_raw(self):
         radio = MockRadio()
         comp = CompanionRadio(radio, LocalIdentity())

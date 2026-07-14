@@ -508,6 +508,21 @@ def test_create_protocol_request_unknown_path_is_flood():
     assert pkt.is_route_flood()
 
 
+def test_create_protocol_request_can_force_flood_for_known_path():
+    """A request may explicitly flood without changing the stored contact path."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    path = b"\x01\x02\x03"
+    contact = _make_contact(other, out_path=path, out_path_len=3)
+    pkt, _ = PacketBuilder.create_protocol_request(contact, local, 0x01, b"", route_type="flood")
+
+    assert pkt.is_route_flood()
+    assert pkt.path_len == 0
+    assert bytes(pkt.path) == b""
+    assert contact.out_path_len == 3
+    assert contact.out_path == path
+
+
 def test_get_timestamp_is_strictly_monotonic_within_same_second():
     """Back-to-back tags must strictly increase even within one wall-clock second.
 

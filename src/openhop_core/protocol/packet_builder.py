@@ -1106,6 +1106,7 @@ class PacketBuilder:
         protocol_code: int,
         data: bytes = b"",
         timestamp: Optional[int] = None,
+        route_type: Optional[str] = None,
     ) -> tuple[Packet, int]:
         """
         Create a protocol request packet for repeater commands.
@@ -1119,6 +1120,8 @@ class PacketBuilder:
             protocol_code: The protocol command code.
             data: Additional binary data for the request.
             timestamp: Optional timestamp (uses current time if None).
+            route_type: Optional explicit routing mode ("direct" or "flood").
+                When omitted, routing is selected from the contact's known path.
 
         Returns:
             tuple: (packet, timestamp) - The created packet and the timestamp used.
@@ -1151,7 +1154,7 @@ class PacketBuilder:
         # path is known; flood only when the out_path is unknown (-1). Mirrors
         # create_anon_request and firmware sendRequest (OUT_PATH_UNKNOWN -> flood,
         # else sendDirect, which works with a 0-length path).
-        route_type = "direct" if out_path_len >= 0 else "flood"
+        route_type = route_type or ("direct" if out_path_len >= 0 else "flood")
 
         header = PacketBuilder._create_header(PAYLOAD_TYPE_REQ, route_type)
         packet = PacketBuilder._create_packet(header, payload)
