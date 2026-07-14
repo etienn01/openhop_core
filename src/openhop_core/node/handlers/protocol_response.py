@@ -14,6 +14,7 @@ from ...protocol.crypto import CIPHER_BLOCK_SIZE, CIPHER_MAC_SIZE
 from ...protocol.packet_builder import PacketBuilder
 from ...protocol.packet_utils import PathUtils
 from .crypto_helpers import iter_decrypt_by_src_hash
+from .result import HandlerResult
 
 # ---------------------------------------------------------------------------
 # Built-in CayenneLPP decoder (no external dependency)
@@ -212,35 +213,28 @@ class ProtocolResponseHandler:
         path_info = (out_path, in_path, contact_pubkey) for path-return format."""
         self._binary_response_callback = callback
 
-    async def __call__(self, pkt: Packet) -> None:
-        """Handle incoming PATH or RESPONSE packet that might be a protocol response."""
+    async def __call__(self, pkt: Packet) -> HandlerResult:
+        """Handle PATH/RESPONSE and report ownership after MAC verification."""
+        authenticated = False
         try:
             # Check if this looks like an encrypted protocol response
             if len(pkt.payload) < 4:
-                return  # Too short for protocol response
+                return HandlerResult.not_for_us()  # Too short for protocol response
 
             # Both PATH and RESPONSE packets share the same structure:
             # dest_hash(1) + src_hash(1) + encrypted_data(N)
+            dest_hash = pkt.payload[0]
             src_hash = pkt.payload[1]
             pkt_type = pkt.get_payload_type()
+            if dest_hash != self._local_identity.get_public_key()[0]:
+                return HandlerResult.not_for_us()
+
             route_label = "FLOOD" if pkt.is_route_flood() else "DIRECT"
             if pkt_type == PAYLOAD_TYPE_RESPONSE:
                 self._log(
                     f"[ProtocolResponse] Received RESPONSE (0x01) from 0x{src_hash:02X} "
                     f"({route_label}, {len(pkt.payload)}B)"
                 )
-
-            # Proceed if we have a callback for this source or the binary (path-discovery)
-            # callback. PATH packets always proceed regardless of waiters so that the
-            # firmware-equivalent path learning in _decrypt_protocol_response
-            # (_update_contact_path + reciprocal PATH) runs for the login PATH-return,
-            # which arrives before any stats/telemetry waiter is registered.
-            if (
-                src_hash not in self._response_callbacks
-                and self._binary_response_callback is None
-                and pkt_type != PAYLOAD_TYPE_PATH
-            ):
-                return
 
             # Try to decrypt the response
             (
@@ -249,6 +243,11 @@ class ProtocolResponseHandler:
                 parsed_data,
                 raw_decrypted,
             ) = await self._decrypt_protocol_response(pkt, src_hash)
+            if raw_decrypted is None:
+                return HandlerResult.not_for_us()
+            # A valid MAC establishes ownership even if higher-level parsing or
+            # callback delivery later fails.
+            authenticated = True
 
             # If an explicit response callback is waiting for this source (e.g. telemetry,
             # stats, repeater command), deliver there first.  The binary/path-discovery
@@ -259,11 +258,11 @@ class ProtocolResponseHandler:
             # or other short responses and delay stats load after login.
             if src_hash in self._response_callbacks:
                 if not success:
-                    return
+                    return HandlerResult.consumed()
                 if self._is_login_response(pkt, raw_decrypted):
                     # Login responses are handled by LoginResponseHandler; do not deliver to
                     # stats/telemetry waiter.
-                    return
+                    return HandlerResult.consumed()
                 callback = self._response_callbacks[src_hash]
                 if callback:
                     if parsed_data.get("type") == "telemetry":
@@ -272,7 +271,7 @@ class ProtocolResponseHandler:
                             f"(src=0x{src_hash:02X}, {parsed_data.get('sensor_count', 0)} sensors)"
                         )
                     callback(success, decoded_text, parsed_data)
-                return
+                return HandlerResult.consumed()
 
             # If binary response callback set, parse and invoke (tag+data or path-return)
             if (
@@ -321,7 +320,7 @@ class ProtocolResponseHandler:
                 # tag(4) + response_code(1) + keep_alive(1) + is_admin(1) + ...
                 # = 13 bytes total, with response_code 0x00 or 0x01.
                 if len(response_data) == 9 and response_data[0] in (0x00, 0x01):
-                    return
+                    return HandlerResult.consumed()
 
                 try:
                     cb_result = self._binary_response_callback(tag_bytes, response_data, path_info)
@@ -329,10 +328,13 @@ class ProtocolResponseHandler:
                         await cb_result
                 except Exception as e:
                     self._log(f"[ProtocolResponse] Binary response callback error: {e}")
-                return
+                return HandlerResult.consumed()
+
+            return HandlerResult.consumed()
 
         except Exception as e:
             self._log(f"[ProtocolResponse] Error processing protocol response: {e}")
+            return HandlerResult(authenticated=authenticated)
 
     def _is_login_response(self, pkt: Packet, raw_decrypted: Optional[bytes]) -> bool:
         """True if a login is currently pending for the source contact.
@@ -516,6 +518,16 @@ class ProtocolResponseHandler:
             # Determine the actual response data based on packet type.
             response_data = decrypted
             if pkt_type == PAYLOAD_TYPE_PATH:
+                if len(decrypted) < 1 or not PathUtils.is_valid_path_len(decrypted[0]):
+                    self._log(f"[ProtocolResponse] PATH format invalid for hash 0x{src_hash:02X}")
+                    continue
+                path_len_byte = decrypted[0]
+                path_byte_len = PathUtils.get_path_byte_len(path_len_byte)
+                inner_offset = 1 + path_byte_len + 1
+                if len(decrypted) < inner_offset:
+                    self._log(f"[ProtocolResponse] PATH data truncated for hash 0x{src_hash:02X}")
+                    continue
+
                 outer_path = bytes(pkt.path[: pkt.get_path_byte_len()]) if pkt.path_len else b""
                 self._log(
                     f"[PATHDIAG] PATH rx src=0x{src_hash:02X} "
@@ -525,49 +537,39 @@ class ProtocolResponseHandler:
                     f"outer_path={outer_path.hex() or '(empty)'} "
                     f"inner_path_len_byte=0x{(decrypted[0] if decrypted else 0):02X}"
                 )
-                if len(decrypted) >= 2:
-                    path_len_byte = decrypted[0]
-                    path_byte_len = PathUtils.get_path_byte_len(path_len_byte)
-                    inner_offset = 1 + path_byte_len + 1
-                    if (
-                        PathUtils.is_valid_path_len(path_len_byte)
-                        and len(decrypted) >= inner_offset
-                    ):
-                        extra_type = decrypted[1 + path_byte_len] & 0x0F
-                        if extra_type == PAYLOAD_TYPE_RESPONSE and len(decrypted) > inner_offset:
-                            response_data = decrypted[inner_offset:]
-                        elif extra_type != PAYLOAD_TYPE_RESPONSE:
-                            self._log(
-                                f"[ProtocolResponse] PATH format: extra_type=0x{extra_type:02X}, "
-                                f"not RESPONSE"
-                            )
+                extra_type = decrypted[1 + path_byte_len] & 0x0F
+                if extra_type == PAYLOAD_TYPE_RESPONSE and len(decrypted) > inner_offset:
+                    response_data = decrypted[inner_offset:]
+                elif extra_type != PAYLOAD_TYPE_RESPONSE:
+                    self._log(
+                        f"[ProtocolResponse] PATH format: extra_type=0x{extra_type:02X}, "
+                        f"not RESPONSE"
+                    )
 
-                    # Firmware pattern (onContactPathRecv): update contact out_path
-                    # so subsequent requests use sendDirect() instead of sendFlood().
-                    out_path_bytes = bytes(decrypted[1 : 1 + path_byte_len])
-                    if self._update_contact_path(
-                        contact_pubkey, src_hash, path_len_byte, decrypted
-                    ):
-                        if self._contact_path_updated_callback is not None:
-                            cb_result = self._contact_path_updated_callback(
-                                contact_pubkey, path_len_byte, out_path_bytes
-                            )
-                            if asyncio.iscoroutine(cb_result):
-                                await cb_result
-
-                    # Firmware pattern (Mesh.cpp:168-169): send reciprocal PATH back
-                    # to the sender so it learns the route to us.  Without this, the
-                    # remote repeater has no out_path for us and must fall back to
-                    # plain FLOOD for responses — which intermediate repeaters may
-                    # drop due to transport-code region filtering.
-                    if pkt.is_route_flood():
-                        await self._send_reciprocal_path(
-                            src_hash,
-                            shared_secret,
-                            pkt,
-                            decrypted,
-                            path_len_byte,
+                # Firmware pattern (onContactPathRecv): update contact out_path
+                # so subsequent requests use sendDirect() instead of sendFlood().
+                out_path_bytes = bytes(decrypted[1 : 1 + path_byte_len])
+                if self._update_contact_path(contact_pubkey, src_hash, path_len_byte, decrypted):
+                    if self._contact_path_updated_callback is not None:
+                        cb_result = self._contact_path_updated_callback(
+                            contact_pubkey, path_len_byte, out_path_bytes
                         )
+                        if asyncio.iscoroutine(cb_result):
+                            await cb_result
+
+                # Firmware pattern (Mesh.cpp:168-169): send reciprocal PATH back
+                # to the sender so it learns the route to us.  Without this, the
+                # remote repeater has no out_path for us and must fall back to
+                # plain FLOOD for responses — which intermediate repeaters may
+                # drop due to transport-code region filtering.
+                if pkt.is_route_flood():
+                    await self._send_reciprocal_path(
+                        src_hash,
+                        shared_secret,
+                        pkt,
+                        decrypted,
+                        path_len_byte,
+                    )
 
             success, text, parsed = self._parse_protocol_response(response_data)
             return success, text, parsed, decrypted

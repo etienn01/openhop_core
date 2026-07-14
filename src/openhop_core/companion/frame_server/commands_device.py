@@ -39,6 +39,7 @@ class _DeviceCommandsMixin:
         # frame len >= 8). Those bytes are reserved for future use, not a version:
         # the protocol version is negotiated only through DEVICE_QUERY.
         if len(data) < 7:
+            # OpenHop deliberately uses ILLEGAL_ARG here; firmware falls through to UNSUPPORTED_CMD.
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         prefs = self.bridge.get_self_info()

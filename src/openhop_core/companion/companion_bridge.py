@@ -300,10 +300,10 @@ class CompanionBridge(CompanionBase):
         e.g. a one-byte dest-hash collision where the packet actually belongs to
         another node — so the caller may still forward it instead of swallowing it.
 
-        Note: handlers that report authenticated ownership (text, login/anon)
-        return a HandlerResult; broadcast-style handlers (advert, ack, group,
-        path, response) return None and are treated here as non-authoritative for
-        the caller's forwarding decision.
+        Handlers that successfully MAC-verify packets for this identity return an
+        authenticated HandlerResult, including PATH and RESPONSE handlers.
+        Broadcast-style handlers (advert, ack, group) remain non-authoritative
+        for the caller's forwarding decision.
         """
         ptype = packet.get_payload_type()
         route_type = packet.get_route_type()

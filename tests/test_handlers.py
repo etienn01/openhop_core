@@ -19,6 +19,7 @@ from openhop_core.node.handlers import (
     TraceHandler,
 )
 from openhop_core.node.handlers.login_server import FIRMWARE_VER_LEVEL
+from openhop_core.node.handlers.result import HandlerResult
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
@@ -577,6 +578,18 @@ class TestPathHandler:
         assert self.handler._ack_handler == self.ack_handler
         assert self.handler._protocol_response_handler == self.protocol_response_handler
 
+    @pytest.mark.asyncio
+    async def test_authenticated_subhandler_result_marks_path_consumed(self):
+        protocol_handler = AsyncMock(return_value=HandlerResult.consumed())
+        login_handler = AsyncMock(return_value=HandlerResult.not_for_us())
+        ack_handler = MagicMock()
+        ack_handler.process_path_ack_variants = AsyncMock(return_value=None)
+        handler = PathHandler(self.log_fn, ack_handler, protocol_handler, login_handler)
+
+        result = await handler(Packet())
+
+        assert result.authenticated is True
+
 
 # Group Text Handler Tests
 class TestGroupTextHandler:
@@ -771,6 +784,91 @@ class TestProtocolResponseHandler:
         assert callback_calls[0][0] == peer_pubkey
         assert callback_calls[0][1] == path_len_byte
         assert callback_calls[0][2] == path_bytes
+
+    @pytest.mark.asyncio
+    async def test_response_authenticates_without_pending_callback(self):
+        """A valid RESPONSE MAC proves ownership even when no waiter is registered."""
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.companion.models import Contact
+
+        local_identity = LocalIdentity()
+        peer_identity = LocalIdentity()
+        peer_pubkey = peer_identity.get_public_key()
+        contacts = ContactStore(5)
+        contacts.add(Contact(public_key=peer_pubkey, name="Peer"))
+        handler = ProtocolResponseHandler(MagicMock(), local_identity, contacts)
+
+        shared_secret = Identity(peer_pubkey).calc_shared_secret(local_identity.get_private_key())
+        encrypted = CryptoUtils.encrypt_then_mac(
+            shared_secret[:16], shared_secret, b"\x01\x02\x03\x04\x99"
+        )
+        pkt = Packet()
+        pkt.header = PAYLOAD_TYPE_RESPONSE << 2
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(
+            bytes([local_identity.get_public_key()[0], peer_pubkey[0]]) + encrypted
+        )
+        pkt.payload_len = len(pkt.payload)
+
+        result = await handler(pkt)
+
+        assert isinstance(result, HandlerResult)
+        assert result.authenticated is True
+
+    @pytest.mark.asyncio
+    async def test_response_with_wrong_destination_is_forwardable(self):
+        """A valid MAC for another destination must not be consumed locally."""
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.companion.models import Contact
+
+        local_identity = LocalIdentity()
+        peer_identity = LocalIdentity()
+        peer_pubkey = peer_identity.get_public_key()
+        contacts = ContactStore(5)
+        contacts.add(Contact(public_key=peer_pubkey, name="Peer"))
+        handler = ProtocolResponseHandler(MagicMock(), local_identity, contacts)
+
+        shared_secret = Identity(peer_pubkey).calc_shared_secret(local_identity.get_private_key())
+        encrypted = CryptoUtils.encrypt_then_mac(shared_secret[:16], shared_secret, b"response")
+        pkt = Packet()
+        pkt.header = PAYLOAD_TYPE_RESPONSE << 2
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(bytes([0xFF, peer_pubkey[0]]) + encrypted)
+        pkt.payload_len = len(pkt.payload)
+
+        result = await handler(pkt)
+
+        assert result.authenticated is False
+
+    @pytest.mark.asyncio
+    async def test_authenticated_path_with_invalid_envelope_remains_forwardable(self):
+        """MAC success is not enough when a PATH envelope is malformed."""
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.companion.models import Contact
+
+        local_identity = LocalIdentity()
+        peer_identity = LocalIdentity()
+        peer_pubkey = peer_identity.get_public_key()
+        contacts = ContactStore(5)
+        contacts.add(Contact(public_key=peer_pubkey, name="Peer"))
+        handler = ProtocolResponseHandler(MagicMock(), local_identity, contacts)
+
+        shared_secret = Identity(peer_pubkey).calc_shared_secret(local_identity.get_private_key())
+        encrypted = CryptoUtils.encrypt_then_mac(shared_secret[:16], shared_secret, b"\x7f")
+        pkt = Packet()
+        pkt.header = PAYLOAD_TYPE_PATH << 2
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(
+            bytes([local_identity.get_public_key()[0], peer_pubkey[0]]) + encrypted
+        )
+        pkt.payload_len = len(pkt.payload)
+
+        result = await handler(pkt)
+
+        assert result.authenticated is False
 
     @pytest.mark.asyncio
     async def test_contact_path_updated_with_2byte_hashes(self):

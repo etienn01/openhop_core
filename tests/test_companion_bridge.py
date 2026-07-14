@@ -511,8 +511,9 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
             path_updated_calls.append(contact)
 
         bridge.on_contact_path_updated(on_path_updated)
-        await bridge.process_received_packet(pkt)
+        result = await bridge.process_received_packet(pkt)
 
+        assert result.authenticated is True
         assert len(path_updated_calls) == 1
         assert path_updated_calls[0].public_key == peer_pubkey
         assert path_updated_calls[0].out_path_len == path_len_byte

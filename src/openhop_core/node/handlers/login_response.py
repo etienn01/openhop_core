@@ -6,6 +6,7 @@ from ...protocol import CryptoUtils, Identity, Packet
 from ...protocol.constants import PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_RESPONSE
 from ...protocol.packet_utils import PathUtils
 from .base import BaseHandler
+from .result import HandlerResult
 
 # Response codes from C++ server
 RESP_SERVER_LOGIN_OK = 0x80
@@ -62,10 +63,10 @@ class LoginResponseHandler(BaseHandler):
         if dest_hash in self._active_login_passwords:
             del self._active_login_passwords[dest_hash]
 
-    async def __call__(self, packet: Packet) -> None:
-        """Handle RESPONSE or ANON_REQ packets for login authentication."""
+    async def __call__(self, packet: Packet) -> HandlerResult:
+        """Handle RESPONSE/ANON_REQ packets and report MAC ownership."""
         if len(packet.payload) < 4:
-            return
+            return HandlerResult.not_for_us()
 
         # Determine packet structure: ANON_REQ has our pubkey at bytes 1-33
         if (
@@ -83,10 +84,9 @@ class LoginResponseHandler(BaseHandler):
             encrypted_start = 2
             lookup_hash = src_hash  # For RESPONSE, look up by source hash
 
-            # Check if this response is for us
-            our_hash = self.local_identity.get_public_key()[0]
-            if dest_hash != our_hash and src_hash != our_hash:
-                return
+        # Check the on-air destination before trying any candidate secret.
+        if dest_hash != self.local_identity.get_public_key()[0]:
+            return HandlerResult.not_for_us()
 
         # Find stored password and matching contact(s)
         if lookup_hash not in self._active_login_passwords:
@@ -96,15 +96,18 @@ class LoginResponseHandler(BaseHandler):
             if self._protocol_response_handler:
                 pkt_type = packet.get_payload_type()
                 if pkt_type == PAYLOAD_TYPE_PATH:
-                    return  # PathHandler already invoked protocol_response_handler for this packet
+                    # PathHandler already invoked protocol_response_handler for this packet.
+                    return HandlerResult.not_for_us()
                 try:
-                    await self._protocol_response_handler(packet)
-                    return
+                    result = await self._protocol_response_handler(packet)
+                    return (
+                        result if isinstance(result, HandlerResult) else HandlerResult.not_for_us()
+                    )
                 except Exception as e:
                     self.log(
                         "Error forwarding RESPONSE packet to " f"protocol response handler: {e}"
                     )
-            return
+            return HandlerResult.not_for_us()
 
         # Collect all contacts whose public_key first byte matches (hash collision / multiple peers)
         candidates = []
@@ -126,27 +129,35 @@ class LoginResponseHandler(BaseHandler):
                         % lookup_hash
                     },
                 )
-            return
+            return HandlerResult.not_for_us()
 
         # Try each candidate until one decrypts successfully (same shared-secret as firmware)
+        authenticated = False
         response_data = None
         matched_contact = None
         for contact in candidates:
-            response_data = await self._decrypt_response(packet, contact, encrypted_start)
-            if response_data:
+            authenticated, response_data = await self._decrypt_response(
+                packet, contact, encrypted_start
+            )
+            if authenticated:
                 matched_contact = contact
                 break
 
-        if response_data and matched_contact:
+        if authenticated and matched_contact:
+            if response_data is None:
+                self.log("Authenticated login response had invalid or incomplete contents")
+                return HandlerResult.consumed()
             await self._process_login_response(response_data, matched_contact)
             self.clear_login_password(lookup_hash)
+            return HandlerResult.consumed()
         elif self.login_callback:
             await self._safe_callback(False, {"error": "Failed to decrypt login response"})
+        return HandlerResult.not_for_us()
 
     async def _decrypt_response(
         self, packet: Packet, contact, encrypted_start: int = 2
-    ) -> Optional[dict]:
-        """Decrypt the login response using the contact's password."""
+    ) -> tuple[bool, Optional[dict]]:
+        """Decrypt the login response and separately report MAC authentication."""
         try:
             # Extract encrypted portion (skip the header part)
             encrypted_data = packet.payload[encrypted_start:]
@@ -164,23 +175,27 @@ class LoginResponseHandler(BaseHandler):
             plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_data)
 
             if not plaintext:
-                return None
+                return False, None
 
             # If this is a PATH packet, unwrap the path-return envelope to get
             # the inner response.  PATH format after decryption:
             #   path_len(1) + path(N) + extra_type(1) + extra_data(M)
             pkt_type = packet.get_payload_type()
-            if pkt_type == PAYLOAD_TYPE_PATH and len(plaintext) >= 2:
+            if pkt_type == PAYLOAD_TYPE_PATH:
+                if len(plaintext) < 1 or not PathUtils.is_valid_path_len(plaintext[0]):
+                    return False, None
                 path_len_byte = plaintext[0]
                 path_byte_len = PathUtils.get_path_byte_len(path_len_byte)
                 inner_offset = 1 + path_byte_len + 1  # skip path_len + path + extra_type
-                if PathUtils.is_valid_path_len(path_len_byte) and len(plaintext) >= inner_offset:
-                    extra_type = plaintext[1 + path_byte_len] & 0x0F
-                    if extra_type == PAYLOAD_TYPE_RESPONSE and len(plaintext) > inner_offset:
-                        plaintext = plaintext[inner_offset:]
+                if len(plaintext) < inner_offset:
+                    return False, None
+                extra_type = plaintext[1 + path_byte_len] & 0x0F
+                if extra_type != PAYLOAD_TYPE_RESPONSE or len(plaintext) <= inner_offset:
+                    return True, None
+                plaintext = plaintext[inner_offset:]
 
             if len(plaintext) < 12:
-                return None
+                return True, None
 
             # Parse the C++ response format (handleLoginReq reply_data):
             # timestamp(4) + response_code(1) + keep_alive(1) + is_admin(1) +
@@ -191,7 +206,7 @@ class LoginResponseHandler(BaseHandler):
             random_blob = plaintext[8:12]
             firmware_ver_level = int(plaintext[12]) if len(plaintext) >= 13 else None
 
-            return {
+            return True, {
                 "timestamp": timestamp,
                 "response_code": response_code,
                 "keep_alive_interval": keep_alive,
@@ -203,7 +218,7 @@ class LoginResponseHandler(BaseHandler):
             }
 
         except Exception:
-            return None
+            return False, None
 
     async def _process_login_response(self, response_data: dict, contact):
         """Process the decrypted login response."""
