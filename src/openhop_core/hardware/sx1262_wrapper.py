@@ -428,8 +428,7 @@ class SX1262Radio(LoRaRadio):
             try:
                 if pending_irq & self.lora.IRQ_CRC_ERR:
                     self.crc_error_count += 1
-
-                if pending_irq & self.lora.IRQ_RX_DONE:
+                elif pending_irq & self.lora.IRQ_RX_DONE:
                     payloadLengthRx, rxStartBufferPointer = (
                         self.lora.getRxBufferStatus()
                     )
@@ -509,6 +508,16 @@ class SX1262Radio(LoRaRadio):
                             async with self._rx_lock:
                                 # Use the IRQ status stored by the interrupt handler
                                 irqStat = self._last_irq_status
+
+                                # Claim and clear the corresponding software latch bits here
+                                # so pre-TX/CAD drain cannot consume the same RX terminal event.
+                                consumed_latch_mask = irqStat & (
+                                    self.lora.IRQ_RX_DONE
+                                    | self.lora.IRQ_CRC_ERR
+                                    | self.lora.IRQ_HEADER_ERR
+                                )
+                                if consumed_latch_mask:
+                                    self._pending_rx_irq_status &= ~consumed_latch_mask
 
                                 if irqStat & self.lora.IRQ_CRC_ERR:
                                     self.crc_error_count += 1
@@ -1806,7 +1815,6 @@ class SX1262Radio(LoRaRadio):
         acquired_tx_lock = False
         try:
             cad_symbol_constant = self._resolve_cad_symbol_constant(cad_symbol_num)
-            await self._drain_pending_rx_irq_before_buffer_reuse()
 
             if respect_tx_lock:
                 try:
@@ -1830,6 +1838,8 @@ class SX1262Radio(LoRaRadio):
                             "error": "cad_waited_for_tx_lock_timeout",
                         }
                     return False
+
+            await self._drain_pending_rx_irq_before_buffer_reuse()
             # Critical sequence to prevent interrupt race conditions during CAD
 
             # Step 1: Put radio in standby mode before CAD configuration

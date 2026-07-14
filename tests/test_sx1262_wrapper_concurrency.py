@@ -1264,6 +1264,69 @@ class TestEventOrdering:
         )
         assert read_idx < write_idx
 
+    async def test_background_rx_processing_claims_and_clears_pending_latch(
+        self, radio, mock_lora
+    ):
+        received = []
+        radio.set_rx_callback(received.append)
+
+        mock_lora.getRxBufferStatus.return_value = (4, 0x80)
+        mock_lora.readBuffer.return_value = list(b"test")
+        mock_lora.getIrqStatus.return_value = mock_lora.IRQ_RX_DONE
+
+        radio._handle_interrupt()
+        assert radio._pending_rx_irq_status & mock_lora.IRQ_RX_DONE
+
+        task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
+        await _wait_condition(lambda: received == [b"test"], timeout=1.0)
+
+        # The RX consumer must claim and clear the corresponding software latch,
+        # preventing the pre-TX drain from delivering the same packet again.
+        assert (radio._pending_rx_irq_status & mock_lora.IRQ_RX_DONE) == 0
+
+        await radio._drain_pending_rx_irq_before_buffer_reuse()
+        assert received == [b"test"]
+
+        radio._initialized = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def test_standalone_cad_acquires_tx_lock_before_pending_rx_drain(
+        self, radio, mock_lora
+    ):
+        drain_lock_states = []
+
+        async def _drain_spy():
+            drain_lock_states.append(radio._tx_lock.locked())
+
+        radio._drain_pending_rx_irq_before_buffer_reuse = AsyncMock(
+            side_effect=_drain_spy
+        )
+        mock_lora.getIrqStatus.return_value = IRQ_NONE
+
+        result = await radio.perform_cad(timeout=0.05)
+        assert result is False
+        assert drain_lock_states == [True]
+
+    async def test_pending_drain_crc_and_rx_done_uses_crc_branch_only(
+        self, radio, mock_lora
+    ):
+        received = []
+        radio.set_rx_callback(received.append)
+
+        radio._pending_rx_irq_status = mock_lora.IRQ_CRC_ERR | mock_lora.IRQ_RX_DONE
+        start_crc_errors = radio.crc_error_count
+
+        mock_lora.getRxBufferStatus.return_value = (4, 0x80)
+        mock_lora.readBuffer.return_value = list(b"test")
+
+        await radio._drain_pending_rx_irq_before_buffer_reuse()
+
+        assert radio.crc_error_count == start_crc_errors + 1
+        mock_lora.readBuffer.assert_not_called()
+        assert received == []
+
     async def test_stale_cad_detected_not_inherited_by_next_cad(self, radio):
         """
         A 'detected=True' result left from a previous CAD must not contaminate
