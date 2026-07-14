@@ -99,13 +99,18 @@ class _RxEventsMixin:
             sender_prefix = bytes.fromhex(sender_prefix_hex)
         except ValueError:
             sender_prefix = b""
+        # MeshCore queueMessage() writes the packet's encoded path length for
+        # floods and 0xFF for direct routes.  TextMessageHandler supplies that
+        # byte; retain the old zero default for third-party event producers
+        # that have not supplied route metadata.
+        path_len = data.get("path_len", 0)
         msg = QueuedMessage(
             sender_key=sender_key,
             txt_type=data.get("txt_type", data.get("flags", 0)),
             timestamp=data.get("timestamp", int(time.time())),
             text=message_text,
             is_channel=False,
-            path_len=0,
+            path_len=path_len,
             snr=snr if snr is not None else 0.0,
             rssi=rssi if rssi is not None else 0,
             sender_prefix=sender_prefix,
@@ -121,6 +126,7 @@ class _RxEventsMixin:
             snr if snr is not None else 0.0,
             rssi if rssi is not None else 0,
             sender_prefix,
+            path_len,
         )
 
     async def _handle_new_channel_message(self, data: dict) -> None:

@@ -893,11 +893,12 @@ await companion.send_channel_message(0, "Emergency broadcast")
 
 Register callbacks to receive asynchronous events. Both sync and async functions are supported.
 Callbacks for `on_message_received` and `on_channel_message_received` receive optional trailing args
-`(packet_hash, snr, rssi)` when available; use `*args` to ignore them.
+when available; use `*args` to ignore them. For direct messages, `path_len` is the
+companion-format route byte: the encoded flood path length, or `0xFF` for a direct route.
 
 | Registration Method | Callback Signature |
 |---|---|
-| `on_message_received` | `(sender_key: bytes, text: str, timestamp: int, txt_type: int [, packet_hash, snr, rssi])` |
+| `on_message_received` | `(sender_key: bytes, text: str, timestamp: int, txt_type: int [, packet_hash, snr, rssi, sender_prefix, path_len])` |
 | `on_channel_message_received` | `(channel_name: str, sender_name: str, text: str, timestamp: int, path_len: int, channel_idx: int [, packet_hash, snr, rssi])` |
 | `on_advert_received` | `(contact: Contact)` |
 | `on_contact_path_updated` | `(contact: Contact)` |

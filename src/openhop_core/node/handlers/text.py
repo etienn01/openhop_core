@@ -368,6 +368,11 @@ class TextMessageHandler(BaseHandler):
                     "is_outgoing": False,
                     "timestamp": message_timestamp,
                     "delivery_status": "received",
+                    # Companion queueMessage() preserves the encoded flood path
+                    # length, but marks every direct route as unknown (0xFF).
+                    # Keep the encoded byte rather than deriving a byte count
+                    # from packet.path: the high bits carry the hash width.
+                    "path_len": packet.path_len if is_flood else 0xFF,
                     "network_info": {
                         "rssi": packet.rssi,
                         "snr": packet.snr,

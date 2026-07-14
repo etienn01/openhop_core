@@ -65,6 +65,7 @@ class _PushMixin:
         snr=None,
         rssi=None,
         sender_prefix=b"",
+        path_len=0,
     ):
         msg_dict = {
             "sender_key": sender_key,
@@ -73,7 +74,7 @@ class _PushMixin:
             "txt_type": txt_type,
             "is_channel": False,
             "channel_idx": 0,
-            "path_len": 0,
+            "path_len": path_len,
             "packet_hash": packet_hash,
             "snr": snr,
             "rssi": rssi,

@@ -30,6 +30,12 @@ class _CallbackMixin:
             self._push_callbacks[key].clear()
 
     def on_message_received(self, callback: Callable) -> None:
+        """Register a direct-message callback.
+
+        Callbacks receive the established message fields followed by optional
+        metadata: ``packet_hash``, ``snr``, ``rssi``, ``sender_prefix``, and
+        the companion-format ``path_len`` byte.
+        """
         self._push_callbacks["message_received"].append(callback)
 
     def on_channel_message_received(self, callback: Callable) -> None:

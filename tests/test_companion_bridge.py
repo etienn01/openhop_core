@@ -942,6 +942,32 @@ class TestCompanionBridgeDeduplication:
         assert msg.text == "Hello"
         assert bridge.sync_next_message() is None
 
+    @pytest.mark.parametrize("path_len", [0xFF, 0x01, 0x42, 0x83])
+    async def test_message_path_len_reaches_queue_and_callback(self, path_len):
+        """The companion-format route byte survives event fan-out unchanged."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        key_hex = LocalIdentity().get_public_key().hex()
+        callback_paths = []
+        bridge.on_message_received(lambda *args: callback_paths.append(args[-1]))
+
+        await bridge._handle_mesh_event(
+            MeshEvents.NEW_MESSAGE,
+            {
+                "contact_pubkey": key_hex,
+                "message_text": "direct",
+                "timestamp": 1000,
+                "txt_type": 0,
+                "packet_hash": "B1C2D3E4",
+                "path_len": path_len,
+            },
+        )
+
+        queued = bridge.sync_next_message()
+        assert queued is not None
+        assert queued.path_len == path_len
+        assert callback_paths == [path_len]
+
 
 # ---------------------------------------------------------------------------
 # Request retry / total-timeout cap

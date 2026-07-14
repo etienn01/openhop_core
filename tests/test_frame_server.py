@@ -1782,6 +1782,45 @@ def test_build_message_frame_contact_v1_and_v3():
     assert frame_v3.endswith(b"hey")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path_len", [0xFF, 0x01, 0x42, 0x83])
+async def test_message_push_preserves_path_len_for_persistence(path_len):
+    """The message push callback must persist the route byte unchanged."""
+    bridge = Mock()
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    persisted = []
+
+    async def persist(msg_dict):
+        persisted.append(msg_dict)
+
+    server._persist_companion_message = persist
+    server._enqueue_frame = Mock()
+
+    await server._on_message_received(
+        b"\x01" * 32,
+        "direct",
+        1234,
+        0,
+        path_len=path_len,
+    )
+
+    assert persisted == [
+        {
+            "sender_key": b"\x01" * 32,
+            "text": "direct",
+            "timestamp": 1234,
+            "txt_type": 0,
+            "is_channel": False,
+            "channel_idx": 0,
+            "path_len": path_len,
+            "packet_hash": None,
+            "snr": None,
+            "rssi": None,
+            "sender_prefix": b"",
+        }
+    ]
+
+
 def test_build_message_frame_channel_v1_and_v3():
     server = CompanionFrameServer(Mock(), "hash", port=0)
     msg = QueuedMessage(

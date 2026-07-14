@@ -41,6 +41,7 @@ from openhop_core.protocol.constants import (
     PUB_KEY_SIZE,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
+    ROUTE_TYPE_TRANSPORT_FLOOD,
     SIGNATURE_SIZE,
     TIMESTAMP_SIZE,
 )
@@ -397,6 +398,54 @@ class TestTextMessageHandler:
         assert self.event_service.publish_sync.called
         message_data = self.event_service.publish_sync.call_args.args[1]
         assert message_data["message_text"] == "hello"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("route", "path", "path_len"),
+        [
+            pytest.param("direct", b"", 0xFF, id="direct-out-path-unknown-ff"),
+            pytest.param("flood", b"\xAA", 0x01, id="flood-one-byte-hash-01"),
+            pytest.param(
+                "flood",
+                b"\xAA\xBB\xCC\xDD",
+                0x42,
+                id="flood-two-byte-hashes-42",
+            ),
+            pytest.param(
+                "transport_flood",
+                b"\xAA\xBB\xCC\xDD\xEE\xFF\x10\x20\x30",
+                0x83,
+                id="transport-flood-three-byte-hashes-83",
+            ),
+        ],
+    )
+    async def test_received_text_publishes_companion_route_path_len(
+        self, route, path, path_len
+    ):
+        """Firmware-compatible companion route-byte vectors reach the event.
+
+        MeshCore's queueMessage() passes a flood packet's encoded path_len
+        unchanged and uses OUT_PATH_UNKNOWN (0xFF) for any direct route.
+        The literal vectors include hash-width bits, so a conversion to raw
+        path bytes would fail this compatibility check.
+        """
+        sender = LocalIdentity()
+        packet_route = "flood" if path else route
+        packet = self._build_dm_to_self(sender, route=packet_route)
+        if route == "transport_flood":
+            route_type = packet.header & ~0x03
+            packet.header = route_type | ROUTE_TYPE_TRANSPORT_FLOOD
+        if path:
+            packet.set_path(path, path_len)
+        sender_key = sender.get_public_key().hex()
+        self.contacts.contacts = [
+            MockContact(public_key=sender_key, name="sender")
+        ]
+
+        await self.handler(packet)
+
+        message_data = self.event_service.publish_sync.call_args.args[1]
+        assert message_data["path_len"] == path_len
 
     # -- consume-vs-forward return contract (#353) --------------------------
 
