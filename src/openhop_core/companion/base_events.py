@@ -115,7 +115,7 @@ class _RxEventsMixin:
             rssi=rssi if rssi is not None else 0,
             sender_prefix=sender_prefix,
         )
-        self.message_queue.push(msg)
+        was_queued = self.message_queue.push(msg)
         await self._fire_callbacks(
             "message_received",
             sender_key,
@@ -127,6 +127,7 @@ class _RxEventsMixin:
             rssi if rssi is not None else 0,
             sender_prefix,
             path_len,
+            was_queued,
         )
 
     async def _handle_new_channel_message(self, data: dict) -> None:
@@ -168,7 +169,7 @@ class _RxEventsMixin:
             snr=snr if snr is not None else 0.0,
             rssi=rssi if rssi is not None else 0,
         )
-        self.message_queue.push(msg)
+        was_queued = self.message_queue.push(msg)
 
         await self._fire_callbacks(
             "channel_message_received",
@@ -181,6 +182,7 @@ class _RxEventsMixin:
             pkt_hash,
             snr,
             rssi,
+            was_queued,
         )
 
     def _get_channel_candidates_by_hash(self, channel_hash: int) -> list[tuple[int, Channel]]:
@@ -238,7 +240,7 @@ class _RxEventsMixin:
         )
         snr = packet.get_snr() if hasattr(packet, "get_snr") else getattr(packet, "_snr", 0.0)
         rssi = packet.rssi if hasattr(packet, "rssi") else getattr(packet, "_rssi", 0)
-        queued = QueuedMessage(
+        queued_message = QueuedMessage(
             sender_key=b"",
             txt_type=0,
             timestamp=0,
@@ -251,7 +253,7 @@ class _RxEventsMixin:
             channel_data_type=data_type,
             channel_data_payload=blob,
         )
-        self.message_queue.push(queued)
+        was_queued = self.message_queue.push(queued_message)
         await self._fire_callbacks(
             "channel_data_received",
             selected_idx,
@@ -261,4 +263,5 @@ class _RxEventsMixin:
             packet_hash,
             snr,
             rssi,
+            was_queued,
         )

@@ -34,7 +34,8 @@ class _CallbackMixin:
 
         Callbacks receive the established message fields followed by optional
         metadata: ``packet_hash``, ``snr``, ``rssi``, ``sender_prefix``, and
-        the companion-format ``path_len`` byte.
+        the companion-format ``path_len`` byte. The final ``queued`` flag is
+        false when the protected offline queue could not retain the message.
         """
         self._push_callbacks["message_received"].append(callback)
 

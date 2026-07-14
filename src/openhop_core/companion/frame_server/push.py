@@ -66,6 +66,7 @@ class _PushMixin:
         rssi=None,
         sender_prefix=b"",
         path_len=0,
+        queued=True,
     ):
         msg_dict = {
             "sender_key": sender_key,
@@ -80,7 +81,8 @@ class _PushMixin:
             "rssi": rssi,
             "sender_prefix": sender_prefix,
         }
-        await self._persist_companion_message(msg_dict)
+        if queued:
+            await self._persist_companion_message(msg_dict)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))
 
     async def _on_channel_message_received(
@@ -94,6 +96,7 @@ class _PushMixin:
         packet_hash=None,
         snr=None,
         rssi=None,
+        queued=True,
     ):
         msg_dict = {
             "sender_key": b"",
@@ -107,7 +110,8 @@ class _PushMixin:
             "snr": snr,
             "rssi": rssi,
         }
-        await self._persist_companion_message(msg_dict)
+        if queued:
+            await self._persist_companion_message(msg_dict)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))
 
     async def _on_channel_data_received(
@@ -119,6 +123,7 @@ class _PushMixin:
         packet_hash=None,
         snr=None,
         rssi=None,
+        queued=True,
     ):
         msg_dict = {
             "sender_key": b"",
@@ -134,7 +139,8 @@ class _PushMixin:
             "channel_data_type": data_type,
             "channel_data_payload": bytes(payload or b""),
         }
-        await self._persist_companion_message(msg_dict)
+        if queued:
+            await self._persist_companion_message(msg_dict)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))
 
     def _on_send_confirmed(self, crc, trip_ms=0):

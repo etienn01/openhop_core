@@ -19,6 +19,7 @@ from openhop_core.companion.constants import (
     PUB_KEY_SIZE,
     PUSH_CODE_ADVERT,
     PUSH_CODE_BINARY_RESPONSE,
+    PUSH_CODE_MSG_WAITING,
     PUSH_CODE_NEW_ADVERT,
     RESP_CODE_ALLOWED_REPEAT_FREQ,
     RESP_CODE_CHANNEL_DATA_RECV,
@@ -1819,6 +1820,26 @@ async def test_message_push_preserves_path_len_for_persistence(path_len):
             "sender_prefix": b"",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_rejected_message_push_skips_persistence_but_notifies_client():
+    """A rejected protected-queue insertion must not evict an older message."""
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    persist = AsyncMock()
+    server._persist_companion_message = persist
+    server._enqueue_frame = Mock()
+
+    await server._on_message_received(
+        b"\x01" * 32,
+        "rejected",
+        1234,
+        0,
+        queued=False,
+    )
+
+    persist.assert_not_awaited()
+    server._enqueue_frame.assert_called_once_with(bytes([PUSH_CODE_MSG_WAITING]))
 
 
 def test_build_message_frame_channel_v1_and_v3():

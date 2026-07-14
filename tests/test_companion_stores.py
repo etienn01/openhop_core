@@ -1,6 +1,12 @@
 """Tests for companion stores and models: ContactStore, ChannelStore, MessageQueue, PathCache."""
 
-from openhop_core.companion import ChannelStore, ContactStore, MessageQueue, PathCache, StatsCollector
+from openhop_core.companion import (
+    ChannelStore,
+    ContactStore,
+    MessageQueue,
+    PathCache,
+    StatsCollector,
+)
 from openhop_core.companion.models import (
     AdvertPath,
     Channel,
@@ -349,15 +355,38 @@ class TestMessageQueue:
         assert q.count == 0
         assert q.pop() is None
 
-    def test_maxlen_drops_oldest(self):
+    def test_full_direct_queue_rejects_new_message(self):
         q = MessageQueue(max_size=2)
         q.push(QueuedMessage(sender_key=b"\x01" * 32, text="1"))
         q.push(QueuedMessage(sender_key=b"\x02" * 32, text="2"))
-        q.push(QueuedMessage(sender_key=b"\x03" * 32, text="3"))
+        assert q.push(QueuedMessage(sender_key=b"\x03" * 32, text="3")) is False
         assert q.count == 2
         first = q.pop()
-        assert first.text == "2"
-        assert q.pop().text == "3"
+        assert first.text == "1"
+        assert q.pop().text == "2"
+
+    def test_full_queue_evicts_oldest_channel_message(self):
+        q = MessageQueue(max_size=3)
+        direct_one = QueuedMessage(sender_key=b"\x01" * 32, text="direct one")
+        channel_one = QueuedMessage(sender_key=b"", is_channel=True, text="channel one")
+        direct_two = QueuedMessage(sender_key=b"\x02" * 32, text="direct two")
+        incoming = QueuedMessage(sender_key=b"\x03" * 32, text="incoming direct")
+
+        assert q.push(direct_one) is True
+        assert q.push(channel_one) is True
+        assert q.push(direct_two) is True
+        assert q.push(incoming) is True
+
+        assert [q.pop().text for _ in range(3)] == [
+            "direct one",
+            "direct two",
+            "incoming direct",
+        ]
+
+    def test_zero_capacity_rejects_message(self):
+        q = MessageQueue(max_size=0)
+        assert q.push(QueuedMessage(sender_key=b"", text="not retained")) is False
+        assert q.is_empty() is True
 
     def test_clear(self):
         q = MessageQueue(max_size=5)

@@ -948,8 +948,8 @@ class TestCompanionBridgeDeduplication:
         injector = MockPacketInjector()
         bridge = CompanionBridge(LocalIdentity(), injector)
         key_hex = LocalIdentity().get_public_key().hex()
-        callback_paths = []
-        bridge.on_message_received(lambda *args: callback_paths.append(args[-1]))
+        callback_metadata = []
+        bridge.on_message_received(lambda *args: callback_metadata.append(args[-2:]))
 
         await bridge._handle_mesh_event(
             MeshEvents.NEW_MESSAGE,
@@ -966,7 +966,33 @@ class TestCompanionBridgeDeduplication:
         queued = bridge.sync_next_message()
         assert queued is not None
         assert queued.path_len == path_len
-        assert callback_paths == [path_len]
+        assert callback_metadata == [(path_len, True)]
+
+    async def test_rejected_message_is_reported_without_displacing_direct_message(self):
+        """Queue rejection is visible to persistence callbacks and callers."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector, offline_queue_size=1)
+        key_hex = LocalIdentity().get_public_key().hex()
+        queue_results = []
+        bridge.on_message_received(lambda *args: queue_results.append(args[-1]))
+
+        for packet_hash, text in (("A1B2C3D4", "first"), ("B1C2D3E4", "second")):
+            await bridge._handle_mesh_event(
+                MeshEvents.NEW_MESSAGE,
+                {
+                    "contact_pubkey": key_hex,
+                    "message_text": text,
+                    "timestamp": 1000,
+                    "txt_type": 0,
+                    "packet_hash": packet_hash,
+                    "path_len": 0xFF,
+                },
+            )
+
+        assert queue_results == [True, False]
+        retained = bridge.sync_next_message()
+        assert retained is not None
+        assert retained.text == "first"
 
 
 # ---------------------------------------------------------------------------
