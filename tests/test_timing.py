@@ -12,6 +12,13 @@ def test_estimate_airtime_matches_semtech_formula():
     assert math.isclose(air, 185.3, rel_tol=0.02)
 
 
+def test_estimate_airtime_accepts_denominator_and_index_cr_formats():
+    """CR 1 (legacy index) and CR 5 (public denominator) must mean the same 4/5 rate."""
+    by_index = timing.estimate_airtime_ms(48, sf=10, bw_hz=250000, cr=1)
+    by_denom = timing.estimate_airtime_ms(48, sf=10, bw_hz=250000, cr=5)
+    assert math.isclose(by_index, by_denom, rel_tol=1e-9)
+
+
 def test_airtime_grows_with_spreading_factor():
     """Higher SF => much longer airtime (each +1 SF roughly doubles symbol time)."""
     a_sf8 = timing.estimate_airtime_ms(40, sf=8, bw_hz=250000, cr=1)

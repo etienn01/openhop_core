@@ -941,7 +941,13 @@ class SX1262Radio(LoRaRadio):
         """
         sf = self.spreading_factor
         bw_hz = int(self.bandwidth)  # your class already stores Hz
-        cr = self.coding_rate  # 1→4/5, 2→4/6, 3→4/7, 4→4/8
+        # coding_rate is stored as denominator (5..8) for 4/5..4/8.
+        # Accept legacy index values (1..4) for compatibility.
+        cr_val = int(self.coding_rate)
+        if 1 <= cr_val <= 4:
+            cr_denom = cr_val + 4
+        else:
+            cr_denom = max(5, min(8, cr_val))
         preamble = self.preamble_length
         crc_on = True  # you always enable CRC
         explicit_header = True  # you always use explicit header
@@ -956,7 +962,7 @@ class SX1262Radio(LoRaRadio):
         denom = 4 * (sf - 2 * low_dr_opt)
 
         if tmp > 0:
-            payload_symbols = 8 + max(math.ceil(tmp / denom) * (cr + 4), 0)
+            payload_symbols = 8 + max(math.ceil(tmp / denom) * cr_denom, 0)
         else:
             payload_symbols = 8
 
@@ -967,7 +973,7 @@ class SX1262Radio(LoRaRadio):
 
         _trace(
             f"TX timing SF{sf}/{bw_hz / 1000:.1f}kHz "
-            f"CR4/{cr} {packet_length}B: "
+            f"CR4/{cr_denom} {packet_length}B: "
             f"symbol={symbol_time * 1000:.3f}ms, "
             f"preamble={preamble_time * 1000:.1f}ms, "
             f"tmp={tmp}, "
@@ -1026,7 +1032,9 @@ class SX1262Radio(LoRaRadio):
 
         while lbt_attempts < max_lbt_attempts:
             try:
-                channel_busy = await self.perform_cad(timeout=0.5, respect_tx_lock=False)
+                channel_busy = await self.perform_cad(
+                    timeout=0.5, respect_tx_lock=False
+                )
                 if not channel_busy:
                     _trace(
                         f"CAD check clear - channel available after {lbt_attempts + 1} attempts"
@@ -1095,7 +1103,9 @@ class SX1262Radio(LoRaRadio):
         await asyncio.sleep(0.001)
         self.lora.clearIrqStatus(0xFFFF)
         rx_mask = self._get_rx_irq_mask()
-        self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
+        self.lora.setDioIrqParams(
+            rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE
+        )
         await asyncio.sleep(0.001)
         self._control_tx_rx_pins(tx_mode=False)
         self.lora.request(self.lora.RX_CONTINUOUS)
@@ -1656,7 +1666,9 @@ class SX1262Radio(LoRaRadio):
         if cad_symbol_num not in {1, 2, 4, 8, 16}:
             raise ValueError("cad_symbol_num must be one of: 1, 2, 4, 8, 16")
         self._custom_cad_symbol_num = int(cad_symbol_num)
-        logger.info("Custom CAD symbol count set: symbols=%s", self._custom_cad_symbol_num)
+        logger.info(
+            "Custom CAD symbol count set: symbols=%s", self._custom_cad_symbol_num
+        )
 
     def _get_thresholds_for_current_settings(self) -> tuple[int, int]:
         """Fetch CAD thresholds for the current spreading factor.
