@@ -4,13 +4,7 @@ import logging
 import struct
 import time
 
-from ...protocol.constants import (
-    ADVERT_FLAG_HAS_LOCATION,
-    ADVERT_FLAG_HAS_NAME,
-    ADVERT_FLAG_IS_CHAT_NODE,
-)
 from ...protocol.packet_utils import PathUtils
-from ..binary_parsing import decode_exported_contact
 from ..constants import (
     CONTACT_NAME_SIZE,
     ERR_CODE_ILLEGAL_ARG,
@@ -198,51 +192,9 @@ class _ContactCommandsMixin:
         self._write_ok() if ok else self._write_err(ERR_CODE_TABLE_FULL)
 
     async def _cmd_export_contact(self, data: bytes) -> None:
-        if len(data) < PUB_KEY_SIZE:
-            raw = self.bridge.export_contact(None)
-            if raw is None:
-                self._write_err(ERR_CODE_NOT_FOUND)
-                return
-            parsed = decode_exported_contact(raw)
-            if parsed is None:
-                self._write_err(ERR_CODE_NOT_FOUND)
-                return
-            pubkey = parsed["public_key"]
-            name_raw = parsed["name_raw"]
-            lat, lon = parsed["lat_microdeg"], parsed["lon_microdeg"]
-            flags = ADVERT_FLAG_IS_CHAT_NODE
-            loc_bytes = b""
-            if lat != 0 or lon != 0:
-                flags |= ADVERT_FLAG_HAS_LOCATION
-                loc_bytes = struct.pack("<ii", lat, lon)
-            max_name = 32 - 1 - len(loc_bytes)
-            name_bytes = name_raw[:max_name]
-            if name_bytes:
-                flags |= ADVERT_FLAG_HAS_NAME
-            appdata = bytes([flags]) + loc_bytes + name_bytes
-            timestamp = int(time.time()) & 0xFFFFFFFF
-            ts_bytes = struct.pack("<I", timestamp)
-            to_sign = pubkey + ts_bytes + appdata
-            try:
-                sig = self.bridge._identity.sign(to_sign)
-                if not sig or len(sig) != 64:
-                    self._write_err(ERR_CODE_NOT_FOUND)
-                    return
-            except Exception as e:
-                logger.warning("export_contact: signing failed: %s", e)
-                self._write_err(ERR_CODE_NOT_FOUND)
-                return
-            packet = bytes([0x11, 0x00]) + pubkey + ts_bytes + sig + appdata
-            self._write_frame(bytes([RESP_CODE_EXPORT_CONTACT]) + packet)
-        else:
-            raw = self.bridge.export_contact(data[:PUB_KEY_SIZE])
-            if raw is None:
-                self._write_err(ERR_CODE_NOT_FOUND)
-                return
-            try:
-                sig = self.bridge._identity.sign(raw)
-                if sig and len(sig) == 64:
-                    raw = raw + sig
-            except Exception as e:
-                logger.warning("export_contact: signing failed: %s", e)
-            self._write_frame(bytes([RESP_CODE_EXPORT_CONTACT]) + raw)
+        pubkey = data[:PUB_KEY_SIZE] if len(data) >= PUB_KEY_SIZE else None
+        raw = self.bridge.export_contact(pubkey)
+        if raw is None:
+            self._write_err(ERR_CODE_NOT_FOUND)
+            return
+        self._write_frame(bytes([RESP_CODE_EXPORT_CONTACT]) + raw)

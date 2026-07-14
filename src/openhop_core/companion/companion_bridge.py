@@ -287,6 +287,10 @@ class CompanionBridge(CompanionBase):
         """Return the group text handler for name sync."""
         return self._handlers.get(PAYLOAD_TYPE_GRP_TXT)
 
+    def _get_advert_handler(self):
+        """Return the normal ADVERT handler used for contact-import loopback."""
+        return self._handlers.get(PAYLOAD_TYPE_ADVERT)
+
     # -------------------------------------------------------------------------
     # RX Entry Point
     # -------------------------------------------------------------------------

@@ -15,7 +15,12 @@ from typing import Any, Iterable, Optional
 
 from ..node.node import MeshNode
 from ..protocol import LocalIdentity, Packet
-from ..protocol.constants import PAYLOAD_TYPE_GRP_DATA, ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
+from ..protocol.constants import (
+    PAYLOAD_TYPE_ADVERT,
+    PAYLOAD_TYPE_GRP_DATA,
+    ROUTE_TYPE_FLOOD,
+    ROUTE_TYPE_TRANSPORT_FLOOD,
+)
 from .companion_base import CompanionBase
 from .constants import (
     ADV_TYPE_CHAT,
@@ -122,6 +127,9 @@ class CompanionRadio(CompanionBase):
 
     def _get_text_handler(self) -> Any:
         return self.node.dispatcher.text_message_handler
+
+    def _get_advert_handler(self) -> Any:
+        return self.node.dispatcher._handler_instances.get(PAYLOAD_TYPE_ADVERT)
 
     # -------------------------------------------------------------------------
     # Lifecycle

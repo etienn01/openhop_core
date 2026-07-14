@@ -8,7 +8,7 @@ from openhop_core.companion import CompanionRadio
 from openhop_core.companion.constants import ADV_TYPE_CHAT
 from openhop_core.companion.models import Contact
 from openhop_core.protocol import LocalIdentity, Packet, PacketBuilder
-from openhop_core.protocol.constants import PAYLOAD_TYPE_ACK
+from openhop_core.protocol.constants import PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_ADVERT, ROUTE_TYPE_FLOOD
 
 
 def _make_peer_contact(name: str) -> Contact:
@@ -144,16 +144,13 @@ class TestCompanionRadioContacts:
         assert comp.get_contact_by_key(key).name == "Bob"
         assert comp.get_contact_by_name("Bob") is not None
 
-    def test_import_contact_packet_data(self):
+    def test_import_contact_rejects_legacy_packet_data(self):
         radio = MockRadio()
         comp = CompanionRadio(radio, LocalIdentity())
-        # 73 bytes: 32 key + 1 adv_type + 32 name (padded) + 4 lat + 4 lon
+        # The former custom 73-byte record is not a signed MeshCore ADVERT.
         name_padded = b"Charlie\x00" * 4  # 32 bytes
         packet_data = b"\x03" * 32 + bytes([1]) + name_padded + (0).to_bytes(4, "little") * 2
-        assert comp.import_contact(packet_data) is True
-        contacts = comp.get_contacts()
-        assert len(contacts) == 1
-        assert contacts[0].name.startswith("Charlie")
+        assert comp.import_contact(packet_data) is False
 
     def test_export_contact_self(self):
         radio = MockRadio()
@@ -162,7 +159,11 @@ class TestCompanionRadioContacts:
         data = comp.export_contact(None)
         assert data is not None
         assert len(data) >= 73
-        assert data[:32] == identity.get_public_key()
+        packet = Packet()
+        assert packet.read_from(data)
+        assert packet.get_payload_type() == PAYLOAD_TYPE_ADVERT
+        assert packet.get_route_type() == ROUTE_TYPE_FLOOD
+        assert packet.get_payload()[:32] == identity.get_public_key()
 
 
 # ---------------------------------------------------------------------------
