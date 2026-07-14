@@ -1356,8 +1356,6 @@ class SX1262Radio(LoRaRadio):
                 # Airtime is the timeout minus the 1000ms margin we add
                 airtime_ms = final_timeout_ms - 1000
 
-                self._prepare_packet_transmission(data_list, length)
-
                 _trace(
                     f"Setting TX timeout: {final_timeout_ms}ms "
                     f"(tOut={driver_timeout}) for {length} bytes"
@@ -1367,6 +1365,8 @@ class SX1262Radio(LoRaRadio):
                 tx_ready, lbt_backoff_delays = await self._prepare_radio_for_tx()
                 if not tx_ready:
                     raise RuntimeError("Radio not ready for TX")
+
+                self._prepare_packet_transmission(data_list, length)
 
                 # Setup TX interrupts AFTER CAD checks (CAD changes interrupt config)
                 self._setup_tx_interrupts()
