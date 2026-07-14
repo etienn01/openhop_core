@@ -476,6 +476,86 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         )
         assert (contact.flags & 0x01) == 0, "Contact must not be marked as favourite after auto-add"
 
+    @staticmethod
+    def _advert_event(peer, *, name, advert_timestamp, lat=0.0, lon=0.0):
+        return {
+            "public_key": peer.get_public_key().hex(),
+            "name": name,
+            "contact_type": ADV_TYPE_CHAT,
+            "lat": lat,
+            "lon": lon,
+            "advert_timestamp": advert_timestamp,
+            "timestamp": advert_timestamp,
+            "snr": 0.0,
+            "rssi": 0,
+        }
+
+    async def test_newer_advert_updates_existing_contact(self):
+        """An advert with a strictly newer timestamp updates the stored contact."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        peer = LocalIdentity()
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Original", advert_timestamp=1000),
+        )
+        advert_received_calls = []
+        bridge.on_advert_received(advert_received_calls.append)
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Renamed", advert_timestamp=2000),
+        )
+        contact = bridge.contacts.get_by_key(peer.get_public_key())
+        assert contact is not None
+        assert contact.name == "Renamed"
+        assert contact.last_advert_timestamp == 2000
+        assert len(advert_received_calls) == 1
+
+    async def test_equal_timestamp_advert_is_rejected_as_replay(self):
+        """An advert with a timestamp equal to the stored one is ignored (replay)."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        peer = LocalIdentity()
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Original", advert_timestamp=1000),
+        )
+        advert_received_calls = []
+        node_discovered_calls = []
+        bridge.on_advert_received(advert_received_calls.append)
+        bridge.on_node_discovered(node_discovered_calls.append)
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Replayed", advert_timestamp=1000),
+        )
+        contact = bridge.contacts.get_by_key(peer.get_public_key())
+        assert contact is not None
+        assert contact.name == "Original"
+        assert contact.last_advert_timestamp == 1000
+        assert advert_received_calls == []
+        assert node_discovered_calls == []
+
+    async def test_older_advert_is_rejected_as_replay(self):
+        """An advert with an older timestamp cannot overwrite a newer contact."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        peer = LocalIdentity()
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Newer", advert_timestamp=2000, lat=52.0),
+        )
+        advert_received_calls = []
+        bridge.on_advert_received(advert_received_calls.append)
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Stale", advert_timestamp=1000, lat=10.0),
+        )
+        contact = bridge.contacts.get_by_key(peer.get_public_key())
+        assert contact is not None
+        assert contact.name == "Newer"
+        assert contact.last_advert_timestamp == 2000
+        assert advert_received_calls == []
+
     async def test_path_packet_updates_contact_path_and_fires_contact_path_updated_once(self):
         """PATH packet that decrypts updates contact out_path and fires contact_path_updated."""
         injector = MockPacketInjector()
@@ -655,8 +735,10 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         assert bridge.contacts.get_count() == 1
         assert len(advert_received_calls) == 1
         assert advert_received_calls[0].name == "AdvertNode"
-        # Second event (same contact): update, still one contact, advert_received again
-        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event_data)
+        # Second event (same contact, newer timestamp): update, still one contact,
+        # advert_received again. A newer timestamp is required to pass replay protection.
+        newer_event = {**event_data, "advert_timestamp": 2000, "timestamp": 2000}
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, newer_event)
         assert bridge.contacts.get_count() == 1
         assert len(advert_received_calls) == 2
 

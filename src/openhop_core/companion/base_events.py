@@ -48,6 +48,18 @@ class _RxEventsMixin:
                 if isinstance(raw_blob, (bytes, bytearray)) and len(raw_blob) > 0:
                     contact.last_advert_packet = bytes(raw_blob)
                 if len(contact.public_key) >= 7 and contact.name:
+                    # Replay protection (BaseChatMesh::onAdvertRecv): for a contact we
+                    # already know, ignore any advert whose timestamp is not strictly
+                    # newer than the stored one. This prevents a delayed or replayed
+                    # advert from overwriting newer name/location/type/app data (and
+                    # from downgrading the cached path). Matches the firmware's early
+                    # return, so no store update and no client notification fire.
+                    existing = self.contacts.get_by_key(contact.public_key)
+                    if (
+                        existing is not None
+                        and contact.last_advert_timestamp <= existing.last_advert_timestamp
+                    ):
+                        return
                     inbound_path = data.get("inbound_path")
                     path_len_encoded = data.get("path_len_encoded")
                     applied = await self._apply_advert_to_stores(
