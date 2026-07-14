@@ -282,6 +282,83 @@ class TestTextMessageHandler:
         assert len(ack_packet.payload) == 6
         assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
 
+    def test_ack_response_delays_use_fixed_txt_ack_delay(self):
+        """Receiver ACK responses use the firmware TXT_ACK_DELAY (200 ms), with the
+        multi-ack staggered +300 ms — not an airtime/route-timeout estimate."""
+        import types
+
+        from openhop_core.node.handlers.text import MULTI_ACK_STAGGER_MS, TXT_ACK_DELAY_MS
+        from openhop_core.protocol.packet_utils import PathUtils
+
+        ack_hash = bytes(range(6))
+        base = TXT_ACK_DELAY_MS / 1000.0
+
+        # DIRECT with a known out_path, no multi-ack: single ACK at 200 ms.
+        contact = types.SimpleNamespace(
+            out_path_len=PathUtils.encode_path_len(1, 1), out_path=b"\x05"
+        )
+        self.handler.multi_acks = 0
+        res = self.handler._build_ack_responses(
+            packet=Packet(),
+            matched_contact=contact,
+            shared_secret=b"\x00" * 32,
+            pubkey=b"\x01" * 32,
+            ack_hash=ack_hash,
+            is_flood=False,
+        )
+        assert len(res) == 1
+        assert res[0][1] == base
+
+        # DIRECT known path with multi-ack: multi at 200 ms, ACK at 500 ms.
+        self.handler.multi_acks = 1
+        res = self.handler._build_ack_responses(
+            packet=Packet(),
+            matched_contact=contact,
+            shared_secret=b"\x00" * 32,
+            pubkey=b"\x01" * 32,
+            ack_hash=ack_hash,
+            is_flood=False,
+        )
+        assert len(res) == 2
+        assert res[0][1] == base
+        assert res[1][1] == (TXT_ACK_DELAY_MS + MULTI_ACK_STAGGER_MS) / 1000.0
+
+        # DIRECT with unknown out_path: flooded ACK at 200 ms.
+        self.handler.multi_acks = 0
+        contact_nopath = types.SimpleNamespace(out_path_len=-1, out_path=b"")
+        res = self.handler._build_ack_responses(
+            packet=Packet(),
+            matched_contact=contact_nopath,
+            shared_secret=b"\x00" * 32,
+            pubkey=b"\x01" * 32,
+            ack_hash=ack_hash,
+            is_flood=False,
+        )
+        assert len(res) == 1
+        assert res[0][1] == base
+
+    def test_flood_ack_response_uses_txt_ack_delay(self):
+        """A flood DM's PATH-return ACK is scheduled at TXT_ACK_DELAY (200 ms)."""
+        from openhop_core.node.handlers.text import TXT_ACK_DELAY_MS
+
+        sender = LocalIdentity()
+        shared = Identity(sender.get_public_key()).calc_shared_secret(
+            self.local_identity.get_private_key()
+        )
+        pkt = Packet()
+        pkt.path = bytearray([0x01, 0x02])
+        pkt.path_len = 2
+        res = self.handler._build_ack_responses(
+            packet=pkt,
+            matched_contact=MockContact(public_key=sender.get_public_key().hex()),
+            shared_secret=shared,
+            pubkey=sender.get_public_key(),
+            ack_hash=bytes(range(6)),
+            is_flood=True,
+        )
+        assert len(res) == 1
+        assert res[0][1] == TXT_ACK_DELAY_MS / 1000.0
+
     @pytest.mark.asyncio
     async def test_received_text_stops_at_first_nul(self):
         """The delivered message text ends at the first NUL: AES zero padding and the

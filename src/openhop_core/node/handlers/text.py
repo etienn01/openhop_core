@@ -1,6 +1,6 @@
 import asyncio
 
-from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder, PacketTimingUtils, PathUtils
+from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder, PathUtils
 from ...protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_TXT_MSG,
@@ -9,6 +9,12 @@ from ...protocol.constants import (
 )
 from .base import BaseHandler
 from .result import HandlerResult
+
+# Fixed delay before a received DM's ACK response is transmitted, mirroring the
+# firmware TXT_ACK_DELAY (BaseChatMesh.cpp). This is the receiver's response delay
+# and is deliberately independent of the sender's airtime/route-timeout ACK-wait
+# estimation.
+TXT_ACK_DELAY_MS = 200
 
 # Stagger between a multi-ack and the normal ACK on a known direct route, mirroring the
 # firmware's `d += 300` in BaseChatMesh::sendAckTo.
@@ -104,9 +110,6 @@ class TextMessageHandler(BaseHandler):
           sender without a known reverse path).
         """
 
-        def airtime(pkt) -> float:
-            return PacketTimingUtils.estimate_airtime_ms(len(pkt.write_to()), self.radio_config)
-
         if is_flood:
             incoming_path = list(packet.path if hasattr(packet, "path") else [])
             path_len_encoded = (
@@ -123,9 +126,10 @@ class TextMessageHandler(BaseHandler):
                 extra=ack_hash,
                 path_len_encoded=path_len_encoded,
             )
-            delay_ms = PacketTimingUtils.calc_flood_timeout_ms(airtime(ack_packet))
-            self.log(f"FLOOD ACK timing - delay:{delay_ms:.1f}ms")
-            return [(ack_packet, delay_ms / 1000.0)]
+            # Firmware sends the flood PATH-return (carrying the ACK) via
+            # sendFloodScoped(from, path, TXT_ACK_DELAY).
+            self.log(f"FLOOD ACK timing - delay:{TXT_ACK_DELAY_MS}ms")
+            return [(ack_packet, TXT_ACK_DELAY_MS / 1000.0)]
 
         # DIRECT
         out_path_len = getattr(matched_contact, "out_path_len", -1)
@@ -142,26 +146,28 @@ class TextMessageHandler(BaseHandler):
             # a path-less direct ACK would not be relayed past direct neighbours). The
             # dispatcher applies flood scope at send time.
             ack_packet = PacketBuilder.create_ack_from_bytes(ack_hash, route_type="flood")
-            delay_ms = PacketTimingUtils.calc_flood_timeout_ms(airtime(ack_packet))
-            self.log(f"FLOOD ACK timing (no out_path) - delay:{delay_ms:.1f}ms")
-            return [(ack_packet, delay_ms / 1000.0)]
+            # Firmware sendAckTo with OUT_PATH_UNKNOWN floods the ACK at TXT_ACK_DELAY.
+            self.log(f"FLOOD ACK timing (no out_path) - delay:{TXT_ACK_DELAY_MS}ms")
+            return [(ack_packet, TXT_ACK_DELAY_MS / 1000.0)]
 
         out_path = bytes(out_path_raw)
         path_hops = PathUtils.get_path_hash_count(out_path_len)
         ack_packet = PacketBuilder.create_ack_from_bytes(
             ack_hash, path=out_path, path_len_encoded=out_path_len
         )
-        base_delay_ms = PacketTimingUtils.calc_direct_timeout_ms(airtime(ack_packet), path_hops)
+        # Firmware sendAckTo (known out_path) sends the routed ACK at TXT_ACK_DELAY.
+        base_delay_ms = TXT_ACK_DELAY_MS
 
         if self.multi_acks <= 0:
-            self.log(f"DIRECT ACK timing (routed) - delay:{base_delay_ms:.1f}ms, hops:{path_hops}")
+            self.log(f"DIRECT ACK timing (routed) - delay:{base_delay_ms}ms, hops:{path_hops}")
             return [(ack_packet, base_delay_ms / 1000.0)]
 
-        # multi-ack fires at the base delay; the normal ACK is staggered later
+        # multi-ack fires at TXT_ACK_DELAY; the normal ACK is staggered +300ms later
+        # (firmware sendAckTo: d = TXT_ACK_DELAY, then d += 300 for the second send).
         multi_packet = PacketBuilder.create_multi_ack(
             ack_hash, remaining=1, path=out_path, path_len_encoded=out_path_len
         )
-        self.log(f"DIRECT multi-ack timing - base_delay:{base_delay_ms:.1f}ms, hops:{path_hops}")
+        self.log(f"DIRECT multi-ack timing - base_delay:{base_delay_ms}ms, hops:{path_hops}")
         return [
             (multi_packet, base_delay_ms / 1000.0),
             (ack_packet, (base_delay_ms + MULTI_ACK_STAGGER_MS) / 1000.0),
