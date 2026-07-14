@@ -686,6 +686,37 @@ class TestGroupTextHandler:
         assert self.handler.send_packet == self.send_packet_fn
         assert self.handler.our_node_name == "InitialName"
 
+    def _grp_plaintext(self, flag_byte: int, text: bytes, pad: int = 0) -> bytes:
+        """timestamp(4) + flag byte + text (+ optional trailing NUL padding)."""
+        return (1234).to_bytes(4, "little") + bytes([flag_byte]) + text + b"\x00" * pad
+
+    def test_group_parse_ignores_attempt_low_bits(self):
+        """The low two bits of the group flag byte are an attempt number, not a
+        subtype: values 1, 2, 3 are still plain text (firmware onGroupDataRecv)."""
+        for attempt in range(4):
+            parsed = self.handler._parse_plaintext_message(
+                self._grp_plaintext(attempt, b"Alice: hi", pad=3)
+            )
+            assert parsed is not None
+            assert parsed["message_type"] == "plain_text"
+            assert parsed["content"] == "Alice: hi"
+
+    def test_group_parse_drops_unsupported_type(self):
+        """A flag byte with any of the upper six bits set is an unsupported group
+        text type and is dropped, matching the firmware."""
+        parsed = self.handler._parse_plaintext_message(
+            self._grp_plaintext(0x04, b"Alice: hi")  # (1 << 2): upper bits non-zero
+        )
+        assert parsed is None
+
+    def test_group_parse_stops_at_first_nul(self):
+        """Visible group text ends at the first NUL (no trailing padding leaks)."""
+        parsed = self.handler._parse_plaintext_message(
+            self._grp_plaintext(0x00, b"Bob: hey", pad=7)
+        )
+        assert parsed is not None
+        assert parsed["content"] == "Bob: hey"
+
 
 # Login Response Handler Tests
 class TestLoginResponseHandler:

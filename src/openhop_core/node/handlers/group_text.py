@@ -147,28 +147,28 @@ class GroupTextHandler(BaseHandler):
         try:
             timestamp = int.from_bytes(plaintext[:4], "little")
             flags = plaintext[4]
-            # Decode and strip trailing null (AES decrypt is block-aligned)
-            raw = plaintext[5:].decode("utf-8", errors="replace")
-            message_content = raw.rstrip("\x00")
+            # Firmware onGroupDataRecv: only plain group text is supported. The
+            # upper six bits of the flag byte must be zero; a non-zero value is an
+            # unsupported type and the packet is dropped. The low two bits are an
+            # attempt number and carry no display meaning (group text has no CLI
+            # or signed subtypes and no binary sender prefix — the sender name is
+            # embedded in the text itself).
+            if (flags >> 2) != 0:
+                self.log(f"Dropping unsupported group text type: {flags}")
+                return None
 
-            # Parse message flags according to spec
-            message_type = "unknown"
-            if flags == 0x00:
-                message_type = "plain_text"
-            elif flags == 0x01:
-                message_type = "cli_command"
-            elif flags == 0x02:
-                message_type = "signed_text"
-                # For signed messages, first two bytes are sender prefix
-                if len(plaintext) >= 7:
-                    # sender_prefix = plaintext[5:7]  # Unused for now
-                    raw = plaintext[7:].decode("utf-8", errors="replace")
-                    message_content = raw.rstrip("\x00")
+            # Body is a C string: the visible text ends at the first NUL (the rest
+            # is AES zero padding).
+            body = plaintext[5:]
+            nul = body.find(b"\x00")
+            if nul >= 0:
+                body = body[:nul]
+            message_content = body.decode("utf-8", errors="replace")
 
             return {
                 "timestamp": timestamp,
                 "flags": flags,
-                "message_type": message_type,
+                "message_type": "plain_text",
                 "content": message_content,
             }
 
