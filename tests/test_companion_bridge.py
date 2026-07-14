@@ -728,6 +728,30 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         assert len(send_confirmed_calls) == 1
         assert send_confirmed_calls[0] == ack_crc_3
 
+    async def test_pending_ack_table_evicts_oldest_when_full(self):
+        """When the pending-ACK table is full, the oldest entry is evicted so a
+        current send is always tracked (firmware circular expected_ack_table)."""
+        from openhop_core.companion.constants import MAX_PENDING_ACK_CRCS
+
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        for crc in range(MAX_PENDING_ACK_CRCS):
+            bridge._track_pending_ack(crc)
+        assert len(bridge._pending_ack_crcs) == MAX_PENDING_ACK_CRCS
+
+        # One more send evicts the oldest (crc 0), never the newest.
+        newest = MAX_PENDING_ACK_CRCS
+        bridge._track_pending_ack(newest)
+        assert len(bridge._pending_ack_crcs) == MAX_PENDING_ACK_CRCS
+        assert 0 not in bridge._pending_ack_crcs
+        assert newest in bridge._pending_ack_crcs
+
+        # The newest send can still be confirmed.
+        confirmed = []
+        bridge.on_send_confirmed(confirmed.append)
+        assert await bridge._try_confirm_send(newest) is True
+        assert confirmed == [newest]
+
     async def test_node_discovered_fires_node_discovered_even_when_filtered(self):
         injector = MockPacketInjector()
         bridge = CompanionBridge(LocalIdentity(), injector)

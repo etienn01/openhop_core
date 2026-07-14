@@ -1040,15 +1040,22 @@ class _SendOpsMixin:
             text_handler.set_command_response_callback(None)
 
     def _track_pending_ack(self, ack_crc: int) -> None:
-        """Track pending ACK CRC for send_confirmed (capped)."""
-        if len(self._pending_ack_crcs) < MAX_PENDING_ACK_CRCS:
-            self._pending_ack_crcs.add(ack_crc)
+        """Record a pending expected ACK with its send time (send_confirmed).
+
+        Bounded circular table (firmware expected_ack_table): when full, the
+        oldest entry is evicted rather than dropping the newest, so a current
+        send is never silently untracked in favour of a stale one.
+        """
+        # Re-inserting refreshes both position and send time for a resend.
+        self._pending_ack_crcs.pop(ack_crc, None)
+        self._pending_ack_crcs[ack_crc] = time.monotonic()
+        while len(self._pending_ack_crcs) > MAX_PENDING_ACK_CRCS:
+            self._pending_ack_crcs.popitem(last=False)  # evict oldest
 
     async def _try_confirm_send(self, crc: int) -> bool:
         """If CRC is pending, discard it and fire send_confirmed. Returns True if fired."""
-        if crc not in self._pending_ack_crcs:
+        if self._pending_ack_crcs.pop(crc, None) is None:
             return False
-        self._pending_ack_crcs.discard(crc)
         await self._fire_callbacks("send_confirmed", crc)
         return True
 

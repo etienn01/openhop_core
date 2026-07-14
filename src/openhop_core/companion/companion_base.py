@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from typing import Any, Callable, Iterable, Optional
 
 from ..node.events import EventService, EventSubscriber
@@ -116,8 +117,11 @@ class CompanionBase(
         self._pending_binary_requests: dict[str, dict] = {}
         # Pending path discovery tags for matching responses
         self._pending_discovery_tags: set[int] = set()
-        # Pending ACK CRCs for send_confirmed (Bridge and Radio)
-        self._pending_ack_crcs: set[int] = set()
+        # Pending expected ACKs for send_confirmed (Bridge and Radio), mapping
+        # ACK CRC -> monotonic send time. Bounded circular table mirroring the
+        # firmware expected_ack_table (AckTableEntry.msg_sent + ack): when full,
+        # the oldest entry is evicted so a current send is never dropped.
+        self._pending_ack_crcs: "OrderedDict[int, float]" = OrderedDict()
         # Fire-and-forget tasks kept alive until done (see _spawn_background_task)
         self._background_tasks: set[asyncio.Task] = set()
 
