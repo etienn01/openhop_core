@@ -17,6 +17,48 @@ from openhop_core.protocol.constants import (
 from openhop_core.protocol.packet_filter import PacketFilter
 from openhop_core.protocol.packet_utils import PathUtils
 
+# Literal MeshCore Packet::writeTo vectors: header | [transport codes] |
+# path_len | path | payload.  Keep path_len literal rather than deriving it
+# through OpenHop's PathUtils so these stay independent firmware fixtures.
+FIRMWARE_MAX_DIRECT_PATH_VECTORS = (
+    pytest.param(
+        b"\x0A\x3F" + b"\xAB" + b"\x11" * 62 + b"\xA1",
+        0x0A,
+        0x3F,
+        b"\xAB" + b"\x11" * 62,
+        1,
+        63,
+        id="direct-1-byte-63-hop-0x3f",
+    ),
+    pytest.param(
+        b"\x0A\x60" + b"\xAB\xCD" + b"\x11" * 62 + b"\xA2",
+        0x0A,
+        0x60,
+        b"\xAB\xCD" + b"\x11" * 62,
+        2,
+        32,
+        id="direct-2-byte-32-hop-0x60",
+    ),
+    pytest.param(
+        b"\x0A\x95" + b"\xAB\xCD\xEF" + b"\x11" * 60 + b"\xA3",
+        0x0A,
+        0x95,
+        b"\xAB\xCD\xEF" + b"\x11" * 60,
+        3,
+        21,
+        id="direct-3-byte-21-hop-0x95",
+    ),
+    pytest.param(
+        b"\x0B\x34\x12\x78\x56\x60" + b"\xAB\xCD" + b"\x11" * 62 + b"\xA4",
+        0x0B,
+        0x60,
+        b"\xAB\xCD" + b"\x11" * 62,
+        2,
+        32,
+        id="transport-direct-2-byte-32-hop-0x60",
+    ),
+)
+
 
 def create_test_packet(payload_type: int, payload: bytes) -> bytes:
     """Create a simple test packet bytes for testing."""
@@ -602,8 +644,14 @@ class TestDispatcherCallbacks:
         assert received_data == packet_data
 
     @pytest.mark.asyncio
-    async def test_full_hop_count_packet_marked_do_not_retransmit(self, dispatcher):
-        """Packet with path at max hops for its encoding is marked do not retransmit."""
+    @pytest.mark.parametrize(
+        "packet_data,header,path_len,expected_path,hash_size,hop_count",
+        FIRMWARE_MAX_DIRECT_PATH_VECTORS,
+    )
+    async def test_firmware_maximum_direct_path_is_not_marked_do_not_retransmit(
+        self, dispatcher, packet_data, header, path_len, expected_path, hash_size, hop_count
+    ):
+        """MeshCore direct frames at every valid maximum remain forwardable."""
         received_packet = None
 
         def capture(packet, data, analysis):
@@ -612,46 +660,15 @@ class TestDispatcherCallbacks:
 
         dispatcher.set_raw_packet_callback(capture)
 
-        # 1-byte hashes: max 63 hops
-        pkt = Packet()
-        pkt.header = (1 << 6) | (PAYLOAD_TYPE_TXT_MSG << 2)
-        pkt.path_len = PathUtils.encode_path_len(1, 63)
-        pkt.path = bytearray(bytes(63))
-        pkt.payload = bytearray(b"x")
-        pkt.payload_len = 1
-        packet_data = pkt.write_to()
-
         await dispatcher._process_received_packet(packet_data)
 
         assert received_packet is not None
-        assert received_packet.is_marked_do_not_retransmit() is True
-        assert received_packet.get_path_hash_count() == 63
-
-    @pytest.mark.asyncio
-    async def test_2byte_path_at_max_hops_marked_do_not_retransmit(self, dispatcher):
-        """Packet with 2-byte path at 32 hops (64 bytes) is marked do not retransmit."""
-        received_packet = None
-
-        def capture(packet, data, analysis):
-            nonlocal received_packet
-            received_packet = packet
-
-        dispatcher.set_raw_packet_callback(capture)
-
-        pkt = Packet()
-        pkt.header = (1 << 6) | (PAYLOAD_TYPE_TXT_MSG << 2)
-        pkt.path_len = PathUtils.encode_path_len(2, 32)
-        pkt.path = bytearray(64)  # 32 * 2
-        pkt.payload = bytearray(b"x")
-        pkt.payload_len = 1
-        packet_data = pkt.write_to()
-
-        await dispatcher._process_received_packet(packet_data)
-
-        assert received_packet is not None
-        assert received_packet.is_marked_do_not_retransmit() is True
-        assert received_packet.get_path_hash_count() == 32
-        assert received_packet.get_path_byte_len() == 64
+        assert received_packet.is_marked_do_not_retransmit() is False
+        assert received_packet.header == header
+        assert received_packet.path_len == path_len
+        assert received_packet.get_path_hash_count() == hop_count
+        assert received_packet.get_path_byte_len() == hash_size * hop_count
+        assert bytes(received_packet.path) == expected_path
 
     @pytest.mark.asyncio
     async def test_async_callback(self, dispatcher):
