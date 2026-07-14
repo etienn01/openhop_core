@@ -1221,7 +1221,7 @@ class PacketBuilder:
         want_location: bool = True,
         want_environment: bool = True,
         include_entropy: bool = True,
-        route_type: str = "direct",
+        route_type: Optional[str] = None,
     ) -> tuple[Packet, int]:
         """
         Create a telemetry request packet for sensor data collection.
@@ -1236,7 +1236,8 @@ class PacketBuilder:
             want_location: Include location/GPS data.
             want_environment: Include environmental sensors.
             include_entropy: Include entropy/randomness data.
-            route_type: Routing method ("direct" or "flood").
+            route_type: Optional routing override ("direct" or "flood").
+                When omitted, routing is selected from the contact's known path.
 
         Returns:
             tuple: (packet, timestamp) - The telemetry request packet and timestamp.
@@ -1259,6 +1260,7 @@ class PacketBuilder:
             local_identity=local_identity,
             protocol_code=REQ_TYPE_GET_TELEMETRY_DATA,
             data=bytes([inv]),  # Just the permission mask as additional data
+            route_type=route_type,
         )
 
     # ---------- Control/Discovery Packets ----------

@@ -523,6 +523,19 @@ def test_create_protocol_request_can_force_flood_for_known_path():
     assert contact.out_path == path
 
 
+def test_create_telem_request_honors_explicit_route_type():
+    """Telemetry requests use the same explicit routing override as protocol requests."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = _make_contact(other, out_path=b"\x01\x02\x03", out_path_len=3)
+
+    pkt, _ = PacketBuilder.create_telem_request(contact, local, route_type="flood")
+
+    assert pkt.is_route_flood()
+    assert pkt.path_len == 0
+    assert bytes(pkt.path) == b""
+
+
 def test_get_timestamp_is_strictly_monotonic_within_same_second():
     """Back-to-back tags must strictly increase even within one wall-clock second.
 
