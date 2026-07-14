@@ -42,6 +42,7 @@ from openhop_core.companion.constants import (
 )
 from openhop_core.companion.frame_server import CompanionFrameServer, _build_advert_push_frames
 from openhop_core.companion.models import Channel, Contact, NodePrefs, QueuedMessage, SentResult
+from openhop_core.protocol.packet_utils import PathUtils
 
 
 def test_build_advert_push_frames_short_only_when_no_name():
@@ -360,6 +361,40 @@ async def test_cmd_add_update_contact_writes_single_ok_response():
     assert frames == [bytes([RESP_CODE_OK])]
     server._write_err.assert_not_called()
     server._save_contacts.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("encoded_path_len", "path"),
+    [
+        (PathUtils.encode_path_len(1, 2), b"\xA1\x00"),
+        (PathUtils.encode_path_len(2, 2), b"\x10\x00\x20\x00"),
+        (PathUtils.encode_path_len(3, 2), b"\x30\x00\x32\x40\x41\x00"),
+        (0, b""),
+        (0xFF, b""),
+    ],
+)
+async def test_cmd_add_update_contact_preserves_exact_encoded_path_bytes(encoded_path_len, path):
+    """The 64-byte field is padded, but zero bytes inside its encoded path are data."""
+    bridge = Mock()
+    bridge.add_update_contact = Mock(return_value=True)
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._save_contacts = AsyncMock()
+    server._write_frame = Mock()
+
+    data = (
+        bytes(range(32))
+        + bytes([1, 0x01, encoded_path_len])
+        + path.ljust(MAX_PATH_SIZE, b"\x00")
+        + b"Alice".ljust(32, b"\x00")
+        + struct.pack("<IiiI", 123, int(52.5 * 1e6), int(-1.7 * 1e6), 456)
+    )
+
+    await server._cmd_add_update_contact(data)
+
+    contact = bridge.add_update_contact.call_args.args[0]
+    assert contact.out_path_len == (-1 if encoded_path_len == 0xFF else encoded_path_len)
+    assert contact.out_path == path
 
 
 @pytest.mark.asyncio

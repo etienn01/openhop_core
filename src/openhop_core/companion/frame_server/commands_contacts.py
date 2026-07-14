@@ -81,10 +81,12 @@ class _ContactCommandsMixin:
         if out_path_len == OUT_PATH_UNKNOWN:
             out_path_len = -1
         out_path_end = 35 + MAX_PATH_SIZE
-        if len(data) >= out_path_end:
-            out_path = data[35:out_path_end].rstrip(b"\x00")
-        else:
-            out_path = data[35 : len(data)].rstrip(b"\x00") if len(data) > 35 else b""
+        path_field = data[35 : min(len(data), out_path_end)]
+        # MeshCore copies all 64 bytes from the frame, but only the byte count
+        # encoded in out_path_len is part of the route. A zero byte within that
+        # range is a valid hash byte, not fixed-field padding.
+        path_byte_len = PathUtils.get_path_byte_len(out_path_len) if out_path_len >= 0 else 0
+        out_path = path_field[:path_byte_len]
         name_start = 35 + MAX_PATH_SIZE
         name_end = name_start + CONTACT_NAME_SIZE
         if len(data) >= name_end:
