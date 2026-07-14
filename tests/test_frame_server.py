@@ -741,6 +741,55 @@ async def test_autoadd_config_set_and_get_round_trips_max_hops():
     assert bridge.prefs.autoadd_max_hops == 64
 
 
+@pytest.mark.asyncio
+async def test_set_other_params_preserves_omitted_fields():
+    """CMD_SET_OTHER_PARAMS is backward-compatible: a short frame updates only the
+    fields it carries and leaves newer, omitted fields untouched (firmware parity)."""
+    from openhop_core.companion.companion_bridge import CompanionBridge
+    from openhop_core.protocol import LocalIdentity
+
+    bridge = CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+    # Seed non-default values for every optional field.
+    bridge.prefs.manual_add_contacts = 0
+    bridge.prefs.telemetry_mode_base = 1
+    bridge.prefs.telemetry_mode_location = 2
+    bridge.prefs.telemetry_mode_environment = 3
+    bridge.prefs.advert_loc_policy = 7
+    bridge.prefs.multi_acks = 4
+
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+    server._write_err = Mock()
+
+    # data excludes the command byte. len==1: only manual_add changes.
+    await server._cmd_set_other_params(bytes([1]))
+    server._write_ok.assert_called_once()
+    assert bridge.prefs.manual_add_contacts == 1
+    assert bridge.prefs.telemetry_mode_base == 1
+    assert bridge.prefs.telemetry_mode_location == 2
+    assert bridge.prefs.telemetry_mode_environment == 3
+    assert bridge.prefs.advert_loc_policy == 7
+    assert bridge.prefs.multi_acks == 4
+
+    # len==2: telemetry byte present (base=2, loc=1, env=0), others preserved.
+    telem = (2 & 0x03) | ((1 & 0x03) << 2) | ((0 & 0x03) << 4)
+    await server._cmd_set_other_params(bytes([1, telem]))
+    assert bridge.prefs.telemetry_mode_base == 2
+    assert bridge.prefs.telemetry_mode_location == 1
+    assert bridge.prefs.telemetry_mode_environment == 0
+    assert bridge.prefs.advert_loc_policy == 7  # still preserved
+    assert bridge.prefs.multi_acks == 4  # still preserved
+
+    # len==3: advert_loc_policy present; multi_acks preserved.
+    await server._cmd_set_other_params(bytes([1, telem, 9]))
+    assert bridge.prefs.advert_loc_policy == 9
+    assert bridge.prefs.multi_acks == 4  # still preserved
+
+    # len==4: multi_acks present.
+    await server._cmd_set_other_params(bytes([1, telem, 9, 5]))
+    assert bridge.prefs.multi_acks == 5
+
+
 # ---------------------------------------------------------------------------
 # CMD_SEND_STATUS_REQ / CMD_SEND_TELEMETRY_REQ — no empty push on failure
 # ---------------------------------------------------------------------------

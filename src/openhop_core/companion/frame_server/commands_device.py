@@ -382,10 +382,23 @@ class _DeviceCommandsMixin:
         if len(data) < 1:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
+        # Firmware CMD_SET_OTHER_PARAMS is backward-compatible: manual_add is
+        # always set, but the telemetry byte, advert-location policy, and
+        # multi-acks are only updated when their bytes are present. A short frame
+        # from an older client must leave the newer fields untouched, so read the
+        # current preferences and only override each optional field when supplied.
+        prefs = self.bridge.get_self_info()
         manual_add = data[0]
-        telemetry_modes = data[1] if len(data) >= 2 else 0
-        advert_loc_policy = data[2] if len(data) >= 3 else 0
-        multi_acks = data[3] if len(data) >= 4 else 0
+        if len(data) >= 2:
+            telemetry_modes = data[1]
+        else:
+            telemetry_modes = (
+                (getattr(prefs, "telemetry_mode_base", 0) & 0x03)
+                | ((getattr(prefs, "telemetry_mode_location", 0) & 0x03) << 2)
+                | ((getattr(prefs, "telemetry_mode_environment", 0) & 0x03) << 4)
+            )
+        advert_loc_policy = data[2] if len(data) >= 3 else getattr(prefs, "advert_loc_policy", 0)
+        multi_acks = data[3] if len(data) >= 4 else getattr(prefs, "multi_acks", 0)
         self.bridge.set_other_params(manual_add, telemetry_modes, advert_loc_policy, multi_acks)
         self._write_ok()
 
