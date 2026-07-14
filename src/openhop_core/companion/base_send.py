@@ -26,7 +26,7 @@ from ..protocol.constants import (
     ROUTE_TYPE_DIRECT,
     TELEM_PERM_BASE,
 )
-from .base_support import ResponseWaiter, _fmt_path, adv_type_to_flags
+from .base_support import ResponseWaiter, _fmt_path, _fmt_path_len, adv_type_to_flags
 from .constants import (
     ADV_TYPE_NONE,
     ADVERT_LOC_SHARE,
@@ -790,7 +790,7 @@ class _SendOpsMixin:
                 attempt + 1,
                 DEFAULT_MAX_ATTEMPTS,
                 timeout_s,
-                getattr(proxy, "out_path_len", -1),
+                _fmt_path_len(getattr(proxy, "out_path_len", -1)),
             )
             await self._send_packet(pkt, wait_for_ack=False)
             result = await wait_for_response(timeout_s)

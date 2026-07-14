@@ -44,6 +44,24 @@ def _fmt_path(out_path_len: int, out_path: Any) -> str:
     )
 
 
+def _fmt_path_len(out_path_len: Any) -> str:
+    """Render the firmware-encoded path_len byte in decoded form for [PATHDIAG] logs.
+
+    ``out_path_len`` is neither a hop count nor a byte count: the top 2 bits are
+    (hash_size - 1) and the low 6 bits are the hop count. E.g. 0x42 -> 2-byte
+    hashes, 2 hops, 4 path bytes. -1 means the out_path is unknown (flood), so
+    the raw byte value is never mistaken for a hop count.
+    """
+    if out_path_len is None or out_path_len < 0:
+        return "-1 (unknown, flood)"
+    return (
+        f"0x{out_path_len & 0xFF:02X} "
+        f"({PathUtils.get_path_hash_count(out_path_len)} hops, "
+        f"{PathUtils.get_path_hash_size(out_path_len)}B hashes, "
+        f"{PathUtils.get_path_byte_len(out_path_len)} bytes)"
+    )
+
+
 PUSH_CALLBACK_KEYS = [
     "message_received",
     "channel_message_received",
