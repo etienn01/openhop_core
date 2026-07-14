@@ -722,6 +722,7 @@ class TestCADAndLBT:
         assert "det_peak" in result
         assert "sf" in result
         assert "timestamp" in result
+
     async def test_perform_cad_calibration_reports_done_without_detected(self, radio):
         asyncio.get_running_loop().create_task(
             self._fire_cad_event(radio, detected=False, delay=0.01)
@@ -761,7 +762,9 @@ class TestCADAndLBT:
     async def test_perform_cad_invalid_symbol_count_returns_error_in_calibration_mode(
         self, radio
     ):
-        result = await radio.perform_cad(timeout=0.05, calibration=True, cad_symbol_num=3)
+        result = await radio.perform_cad(
+            timeout=0.05, calibration=True, cad_symbol_num=3
+        )
         assert "error" in result
         assert "cad_symbol_num must be one of" in result["error"]
 
@@ -1191,6 +1194,75 @@ class TestEventOrdering:
             await task
         except (asyncio.CancelledError, Exception):
             pass
+
+    async def test_completed_rx_packet_is_not_lost_when_send_starts(
+        self, radio, mock_lora
+    ):
+        received = []
+        radio.set_rx_callback(received.append)
+
+        # Simulate a fully received packet whose IRQ handler has run,
+        # but whose background RX task has not consumed it yet.
+        mock_lora.getIrqStatus.return_value = mock_lora.IRQ_RX_DONE
+        radio._handle_interrupt()
+
+        mock_lora.getRxBufferStatus.return_value = (4, 0x80)
+        mock_lora.readBuffer.return_value = list(b"test")
+
+        _make_tx_succeed(radio, mock_lora)
+        await radio.send(b"outbound")
+
+        assert received == [b"test"]
+
+        read_idx = next(
+            i
+            for i, c in enumerate(mock_lora.mock_calls)
+            if c == call.readBuffer(0x80, 4)
+        )
+        write_idx = next(
+            i
+            for i, c in enumerate(mock_lora.mock_calls)
+            if c == call.writeBuffer(0x00, list(b"outbound"), len(b"outbound"))
+        )
+        assert read_idx < write_idx
+
+    async def test_rx_done_while_tx_lock_held_is_latched_and_drained_before_tx_reuse(
+        self, radio, mock_lora
+    ):
+        received = []
+        radio.set_rx_callback(received.append)
+
+        await radio._tx_lock.acquire()
+        try:
+            # IRQ arrives while TX lock is held: hardware IRQ is cleared and
+            # background RX task is not woken, so software latch must preserve it.
+            mock_lora.getIrqStatus.return_value = mock_lora.IRQ_RX_DONE
+            radio._handle_interrupt()
+        finally:
+            radio._tx_lock.release()
+
+        assert radio._pending_rx_irq_status & mock_lora.IRQ_RX_DONE
+        assert not radio._rx_done_event.is_set()
+
+        mock_lora.getRxBufferStatus.return_value = (4, 0x80)
+        mock_lora.readBuffer.return_value = list(b"test")
+
+        _make_tx_succeed(radio, mock_lora)
+        await radio.send(b"outbound")
+
+        assert received == [b"test"]
+
+        read_idx = next(
+            i
+            for i, c in enumerate(mock_lora.mock_calls)
+            if c == call.readBuffer(0x80, 4)
+        )
+        write_idx = next(
+            i
+            for i, c in enumerate(mock_lora.mock_calls)
+            if c == call.writeBuffer(0x00, list(b"outbound"), len(b"outbound"))
+        )
+        assert read_idx < write_idx
 
     async def test_stale_cad_detected_not_inherited_by_next_cad(self, radio):
         """
