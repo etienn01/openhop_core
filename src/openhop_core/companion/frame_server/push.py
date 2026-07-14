@@ -136,12 +136,14 @@ class _PushMixin:
         await self._persist_companion_message(msg_dict)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))
 
-    def _on_send_confirmed(self, crc):
+    def _on_send_confirmed(self, crc, trip_ms=0):
+        # Final 4 bytes are the elapsed milliseconds from send to ACK (firmware
+        # processAck writes trip_time here); 0 only when the send time is unknown.
         data = struct.pack(
             "<B4sI",
             PUSH_CODE_SEND_CONFIRMED,
             struct.pack("<I", crc)[:4],
-            0,
+            int(trip_ms) & 0xFFFFFFFF,
         )
         self._enqueue_frame(data)
 

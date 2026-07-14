@@ -693,7 +693,7 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
             return pkt
 
         send_confirmed_calls = []
-        bridge.on_send_confirmed(send_confirmed_calls.append)
+        bridge.on_send_confirmed(lambda crc, *a: send_confirmed_calls.append(crc))
         bridge._track_pending_ack(ack_crc_expected)
 
         # 2-byte path hash: 1 hop -> 2 path bytes (encoded 0x41)
@@ -748,9 +748,24 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
 
         # The newest send can still be confirmed.
         confirmed = []
-        bridge.on_send_confirmed(confirmed.append)
+        bridge.on_send_confirmed(lambda crc, *a: confirmed.append(crc))
         assert await bridge._try_confirm_send(newest) is True
         assert confirmed == [newest]
+
+    async def test_send_confirmed_reports_trip_time(self):
+        """send_confirmed passes the round-trip time (now - send time) in ms."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        calls = []
+        bridge.on_send_confirmed(lambda crc, trip_ms=0: calls.append((crc, trip_ms)))
+        crc = 0x1234ABCD
+        bridge._track_pending_ack(crc)
+        # Backdate the recorded send time by ~50 ms so the trip is measurable.
+        bridge._pending_ack_crcs[crc] -= 0.05
+        assert await bridge._try_confirm_send(crc) is True
+        assert len(calls) == 1
+        assert calls[0][0] == crc
+        assert calls[0][1] >= 50
 
     async def test_node_discovered_fires_node_discovered_even_when_filtered(self):
         injector = MockPacketInjector()

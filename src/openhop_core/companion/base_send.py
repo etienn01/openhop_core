@@ -1053,10 +1053,16 @@ class _SendOpsMixin:
             self._pending_ack_crcs.popitem(last=False)  # evict oldest
 
     async def _try_confirm_send(self, crc: int) -> bool:
-        """If CRC is pending, discard it and fire send_confirmed. Returns True if fired."""
-        if self._pending_ack_crcs.pop(crc, None) is None:
+        """If CRC is pending, discard it and fire send_confirmed. Returns True if fired.
+
+        Passes the round-trip time in milliseconds (now - send time), mirroring
+        firmware processAck (trip_time = getMillis() - expected_ack_table[i].msg_sent).
+        """
+        sent_at = self._pending_ack_crcs.pop(crc, None)
+        if sent_at is None:
             return False
-        await self._fire_callbacks("send_confirmed", crc)
+        trip_ms = max(0, int(round((time.monotonic() - sent_at) * 1000)))
+        await self._fire_callbacks("send_confirmed", crc, trip_ms)
         return True
 
     def sync_next_message(self) -> Optional[QueuedMessage]:

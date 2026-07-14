@@ -1829,6 +1829,20 @@ def test_enqueue_frame_header_format():
     assert raw == bytes([FRAME_OUTBOUND_PREFIX]) + struct.pack("<H", 3) + b"\x01\x02\x03"
 
 
+def test_send_confirmed_push_includes_trip_time():
+    """PUSH_CODE_SEND_CONFIRMED carries the elapsed ms after the 4-byte CRC."""
+    from openhop_core.companion.constants import PUSH_CODE_SEND_CONFIRMED
+
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=8)
+    server._on_send_confirmed(0xAABBCCDD, 1234)
+    raw = server._write_queue.get_nowait()
+    payload = raw[3:]  # strip FRAME_OUTBOUND_PREFIX + uint16 length
+    assert payload[0] == PUSH_CODE_SEND_CONFIRMED
+    assert payload[1:5] == struct.pack("<I", 0xAABBCCDD)
+    assert struct.unpack("<I", payload[5:9])[0] == 1234
+
+
 def test_enqueue_frame_drops_oversize_payload():
     server = CompanionFrameServer(Mock(), "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=8)
