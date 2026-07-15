@@ -8,6 +8,8 @@ from openhop_core.protocol import Packet
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
+    PAYLOAD_TYPE_GRP_DATA,
+    PAYLOAD_TYPE_GRP_TXT,
     PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_TRACE,
     PAYLOAD_TYPE_TXT_MSG,
@@ -610,6 +612,18 @@ class TestDispatcherSendPacket:
         packet.path_len = 0
 
         assert dispatcher._is_own_packet(packet) is True
+
+    @pytest.mark.parametrize("payload_type", [PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_GRP_DATA])
+    def test_group_packet_mac_is_not_treated_as_a_sender_hash(self, dispatcher, payload_type):
+        """Group payload byte 1 is MAC data, not an authenticated sender hash."""
+        our_hash = dispatcher.local_identity.get_public_key()[0]
+        packet = Packet()
+        packet.header = payload_type << 2
+        packet.payload = bytearray([0x42, our_hash, 0x00, 0x99])
+        packet.payload_len = len(packet.payload)
+        packet.path_len = 0
+
+        assert dispatcher._is_own_packet(packet) is False
 
 
 class TestDispatcherCallbacks:

@@ -1,6 +1,6 @@
 import time
 
-from openhop_core.protocol.packet_filter import PacketFilter
+from openhop_core.protocol.packet_filter import PacketFilter, PacketHashCache
 
 
 class TestPacketFilter:
@@ -152,3 +152,29 @@ class TestPacketFilter:
         pf_zero.track_packet("hash1")
         # With zero window, should not be considered duplicate immediately
         assert not pf_zero.is_duplicate("hash1")
+
+
+class TestPacketHashCache:
+    def test_uses_full_hash_keys(self):
+        cache = PacketHashCache(ttl_seconds=60, max_entries=4)
+        full_hash = "ab" * 32
+        same_prefix_different_hash = "ab" * 8 + "cd" * 24
+
+        assert cache.check_and_add(full_hash) is False
+        assert cache.check_and_add(same_prefix_different_hash) is False
+        assert cache.check_and_add(full_hash) is True
+
+    def test_evicts_oldest_entry_at_capacity(self):
+        cache = PacketHashCache(ttl_seconds=60, max_entries=2)
+
+        assert cache.check_and_add("first") is False
+        assert cache.check_and_add("second") is False
+        assert cache.check_and_add("third") is False
+        assert cache.check_and_add("first") is False
+
+    def test_evicts_expired_entries_on_insert(self):
+        cache = PacketHashCache(ttl_seconds=60, max_entries=4)
+        cache._entries["expired"] = time.monotonic() - 61
+
+        assert cache.check_and_add("fresh") is False
+        assert list(cache._entries) == ["fresh"]

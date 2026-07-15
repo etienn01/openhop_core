@@ -10,6 +10,8 @@ from ..protocol import Packet
 from ..protocol.constants import (  # Payload types
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
+    PAYLOAD_TYPE_GRP_DATA,
+    PAYLOAD_TYPE_GRP_TXT,
     PAYLOAD_TYPE_TRACE,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
@@ -289,6 +291,11 @@ class Dispatcher:
         our_hash = our_pubkey[0] if len(our_pubkey) > 0 else 0
 
         ptype = pkt.get_payload_type()
+        if ptype in (PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_GRP_DATA):
+            # Group payloads begin with a channel hash and MAC; they do not
+            # carry a sender public-key hash. Companion group-packet caches
+            # suppress their local echoes by exact packet hash instead.
+            return False
         if ptype == PAYLOAD_TYPE_ADVERT:
             if len(pkt.payload) < 1:
                 return False

@@ -203,8 +203,6 @@ class _RxEventsMixin:
         if len(payload) < 4:
             return
         packet_hash = packet.calculate_packet_hash().hex().upper()
-        if self._seen_grp_data.check_and_add(packet_hash):
-            return
 
         channel_hash = payload[0]
         cipher_mac = payload[1:3]
@@ -231,6 +229,11 @@ class _RxEventsMixin:
         if data_type == 0 or len(plaintext) < 3 + data_len:
             return
         blob = bytes(plaintext[3 : 3 + data_len])
+
+        # Cache only validated group data. Outbound packets are recorded
+        # before injection, so a locally looped-back packet stops here.
+        if self._check_and_track_group_packet(packet):
+            return
 
         route_type = packet.get_route_type()
         path_len = (

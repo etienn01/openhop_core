@@ -309,6 +309,55 @@ class TestCompanionBridgeSendAndShare:
         assert (pkt.header >> 2) & 0x0F == PAYLOAD_TYPE_TXT_MSG
         assert injector.expected_crcs[0] == result.expected_ack
 
+    async def test_peer_with_matching_display_name_is_queued(self):
+        """Group traffic has no sender identity, so a matching name is still inbound."""
+        bridge = CompanionBridge(LocalIdentity(), MockPacketInjector(), node_name="Twin")
+        assert bridge.set_channel(0, "Public", b"\x11" * 16)
+        packet = PacketBuilder.create_group_datagram(
+            "Public",
+            LocalIdentity(),
+            "hello",
+            "Twin",
+            bridge.channels.get_channels(),
+            timestamp=1_700_000_000,
+        )
+
+        await bridge.process_received_packet(packet)
+
+        queued = bridge.sync_next_message()
+        assert queued is not None
+        assert queued.is_channel is True
+        assert queued.channel_idx == 0
+        assert queued.text == "Twin: hello"
+
+    async def test_outgoing_group_message_is_marked_before_injector_loopback(self):
+        """A bridge's locally injected packet must not reappear as an inbound message."""
+        bridge: CompanionBridge
+
+        async def loopback_injector(packet: Packet, **_kwargs) -> bool:
+            await bridge.process_received_packet(packet)
+            return True
+
+        bridge = CompanionBridge(LocalIdentity(), loopback_injector, node_name="Self")
+        assert bridge.set_channel(0, "Public", b"\x11" * 16)
+
+        assert await bridge.send_channel_message(0, "hello", timestamp=1_700_000_000)
+        assert bridge.message_queue.count == 0
+
+    async def test_outgoing_group_data_is_marked_before_injector_loopback(self):
+        """Binary channel data follows the same loopback suppression rule."""
+        bridge: CompanionBridge
+
+        async def loopback_injector(packet: Packet, **_kwargs) -> bool:
+            await bridge.process_received_packet(packet)
+            return True
+
+        bridge = CompanionBridge(LocalIdentity(), loopback_injector, node_name="Self")
+        assert bridge.set_channel(0, "Public", b"\x11" * 16)
+
+        assert await bridge.send_channel_data(0, 0x1234, b"\xaa\xbb")
+        assert bridge.message_queue.count == 0
+
     async def test_share_contact_not_found(self):
         injector = MockPacketInjector()
         bridge = CompanionBridge(LocalIdentity(), injector)

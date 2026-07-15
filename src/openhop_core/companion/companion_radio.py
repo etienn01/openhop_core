@@ -98,6 +98,9 @@ class CompanionRadio(CompanionBase):
             channel_db=self.channels,
             event_service=self._event_service,
         )
+        self.node.dispatcher.group_text_handler.set_packet_seen_callback(
+            self._check_and_track_group_packet
+        )
         self._setup_packet_callbacks()
 
     # -------------------------------------------------------------------------
@@ -216,10 +219,6 @@ class CompanionRadio(CompanionBase):
     def set_advert_name(self, name: str) -> None:
         super().set_advert_name(name)
         self.node.node_name = self.prefs.node_name
-
-    def _get_group_text_handler(self):
-        """Return the group text handler for name sync."""
-        return self.node.dispatcher.group_text_handler
 
     def supports_radio_params_mutation(self) -> bool:
         """Whether the owned backend can reconfigure radio parameters."""

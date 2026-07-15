@@ -423,6 +423,9 @@ class _SendOpsMixin:
             )
             self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
+            # Record before awaiting the transport because Repeater can queue
+            # a local transmission back through its companion bridges first.
+            self._check_and_track_group_packet(pkt)
             success = await self._send_packet(pkt, wait_for_ack=False)
             if success:
                 self.stats.record_tx(is_flood=True)
@@ -480,6 +483,7 @@ class _SendOpsMixin:
                 pkt.set_path(path or b"", path_len_encoded=path_len_encoded)
             self._apply_path_hash_mode(pkt)
 
+            self._check_and_track_group_packet(pkt)
             success = await self._send_packet(pkt, wait_for_ack=False)
             if success:
                 self.stats.record_tx(is_flood=is_flood)

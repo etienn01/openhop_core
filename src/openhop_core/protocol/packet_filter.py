@@ -9,6 +9,7 @@ This handles only the essential routing concerns:
 
 import hashlib
 import time
+from collections import OrderedDict
 from typing import Dict, Set
 
 
@@ -66,3 +67,38 @@ class PacketFilter:
         """Clear all tracked data."""
         self._packet_hashes.clear()
         self._blacklist.clear()
+
+
+class PacketHashCache:
+    """Bounded TTL cache for full packet-hash keys.
+
+    This is intended for application-level message de-duplication, where a
+    full hash avoids treating two distinct packets as the same message.
+    """
+
+    def __init__(self, ttl_seconds: float = 60.0, max_entries: int = 4096):
+        if ttl_seconds < 0:
+            raise ValueError("ttl_seconds must be non-negative")
+        if max_entries <= 0:
+            raise ValueError("max_entries must be positive")
+        self.ttl_seconds = ttl_seconds
+        self.max_entries = max_entries
+        self._entries: OrderedDict[str, float] = OrderedDict()
+
+    def _evict_expired(self, now: float) -> None:
+        while self._entries:
+            _, seen_at = next(iter(self._entries.items()))
+            if now - seen_at <= self.ttl_seconds:
+                break
+            self._entries.popitem(last=False)
+
+    def check_and_add(self, packet_hash: str) -> bool:
+        """Return whether *packet_hash* is still cached, otherwise store it."""
+        now = time.monotonic()
+        self._evict_expired(now)
+        if packet_hash in self._entries:
+            return True
+        self._entries[packet_hash] = now
+        if len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+        return False

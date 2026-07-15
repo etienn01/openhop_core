@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from ..node.events import EventService, EventSubscriber
 from ..protocol import LocalIdentity, Packet
+from ..protocol.packet_filter import PacketHashCache
 from .base_callbacks import _CallbackMixin
 from .base_config import _DeviceConfigMixin
 from .base_contacts import _ContactChannelMixin
@@ -128,12 +129,13 @@ class CompanionBase(
         # Fire-and-forget tasks kept alive until done (see _spawn_background_task)
         self._background_tasks: set[asyncio.Task] = set()
 
-        # Per-payload-type dedup caches keyed by packet hash, matching Mesh.cpp
-        # (!_tables->hasSeen(pkt)): the companion queues one frame per logical
-        # message and reconnects don't re-queue the same packet.
-        self._seen_grp_txt = _SeenCache()
+        # Event-level de-dup caches keep reconnects from re-queuing text.
+        self._seen_grp_txt = _SeenCache(ttl=60.0, max_size=4096)
         self._seen_txt = _SeenCache()
-        self._seen_grp_data = _SeenCache()
+        # Group packets have no sender identity.  Keep full packet hashes for
+        # the short period in which a local transmission can loop back or be
+        # repeated by the mesh; the capacity is a safety limit for untrusted RX.
+        self._seen_group_packets = PacketHashCache(ttl_seconds=60.0, max_entries=4096)
 
         # Allow subclasses to restore persisted preferences on startup.
         self._load_prefs()
@@ -141,6 +143,10 @@ class CompanionBase(
         # Optional bulk load of contacts (e.g. from persistence on boot).
         if initial_contacts is not None:
             self.contacts.load_from(initial_contacts)
+
+    def _check_and_track_group_packet(self, packet: Packet) -> bool:
+        """Record a group packet and report whether it was recently seen."""
+        return self._seen_group_packets.check_and_add(packet.calculate_packet_hash().hex())
 
     # -------------------------------------------------------------------------
     # Preference Persistence Hooks

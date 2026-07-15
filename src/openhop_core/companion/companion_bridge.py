@@ -228,6 +228,7 @@ class CompanionBridge(CompanionBase):
             node_name=node_name,
             radio_config=self._radio_config,
             ack_handler=ack_handler,
+            group_packet_seen_callback=self._check_and_track_group_packet,
         )
 
         # Bridge-specific: LoginServerHandler for incoming login requests
@@ -384,10 +385,6 @@ class CompanionBridge(CompanionBase):
     def set_tx_power(self, power_dbm: int) -> bool:
         """Reject shared-radio TX-power changes without mutating preferences."""
         return False
-
-    def _get_group_text_handler(self):
-        """Return the group text handler for name sync."""
-        return self._handlers.get(PAYLOAD_TYPE_GRP_TXT)
 
     def _get_advert_handler(self):
         """Return the normal ADVERT handler used for contact-import loopback."""

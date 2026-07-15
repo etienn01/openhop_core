@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 from ...protocol import Packet
 from ...protocol.constants import PAYLOAD_TYPE_GRP_TXT, ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
 from ...protocol.crypto import CryptoUtils
+from ...protocol.packet_filter import PacketHashCache
 from ...protocol.utils import derive_channel_hash
 from .base import BaseHandler
 
@@ -22,7 +23,7 @@ class GroupTextHandler(BaseHandler):
         send_packet_fn,
         channel_db=None,
         event_service=None,
-        our_node_name=None,
+        packet_seen_callback: Optional[Callable[[Packet], bool]] = None,
     ):
         self.local_identity = local_identity
         self.contacts = contacts
@@ -30,11 +31,34 @@ class GroupTextHandler(BaseHandler):
         self.send_packet = send_packet_fn
         self.channel_db = channel_db  # Live database instead of static config
         self.event_service = event_service
-        self.our_node_name = our_node_name  # Store our node name for echo detection
+        self._packet_seen_callback = packet_seen_callback
+        self._seen_group_packets = PacketHashCache(ttl_seconds=60.0, max_entries=4096)
 
-    def set_our_node_name(self, name: str | None) -> None:
-        """Update the node name used for echo detection (e.g. after set_advert_name)."""
-        self.our_node_name = name
+    @staticmethod
+    def _packet_hash(packet: Packet) -> str:
+        """Return the full packet hash used for application-level de-duplication."""
+        return packet.calculate_packet_hash().hex()
+
+    def set_packet_seen_callback(self, callback: Optional[Callable[[Packet], bool]]) -> None:
+        """Share the companion's group-packet cache when one is available."""
+        self._packet_seen_callback = callback
+
+    def mark_outgoing_packet(self, packet: Packet) -> None:
+        """Record a locally-originated group text before it can loop back.
+
+        Group text has no authenticated sender identity. MeshCore marks the
+        packet in its seen table before transmission, so an echoed packet is
+        identified by its packet hash rather than its display-name prefix.
+        """
+        if packet.get_payload_type() != PAYLOAD_TYPE_GRP_TXT:
+            return
+        self._is_duplicate_packet(packet)
+
+    def _is_duplicate_packet(self, packet: Packet) -> bool:
+        """Record a packet and report whether its full hash was recently seen."""
+        if self._packet_seen_callback is not None:
+            return self._packet_seen_callback(packet)
+        return self._seen_group_packets.check_and_add(self._packet_hash(packet))
 
     def _get_channel_by_hash(self, channel_hash: int) -> Optional[dict]:
         """Find a channel by its hash (first byte of SHA256) from database.
@@ -184,26 +208,6 @@ class GroupTextHandler(BaseHandler):
                 return parts[0], parts[1]
         return "Unknown", message_content
 
-    def _is_own_message(self, packet: Packet) -> bool:
-        """Check if this packet originated from us by comparing sender name."""
-        # Get decrypted data from the packet
-        group_data = packet.decrypted.get("group_text_data", {})
-        if "sender_name" not in group_data:
-            return False
-
-        sender_name = group_data["sender_name"]
-
-        # Debug logging
-        self.log(f"[Echo Check] Sender: '{sender_name}', Our node: '{self.our_node_name}'")
-
-        # Check against our stored node name only
-        if self.our_node_name and sender_name == self.our_node_name:
-            self.log("[Echo Check] Match found - this is our own message")
-            return True
-
-        self.log("[Echo Check] No match - this is from another node")
-        return False
-
     async def __call__(self, packet: Packet) -> None:
         """Handle incoming group text messages according to the specification."""
         try:
@@ -253,11 +257,16 @@ class GroupTextHandler(BaseHandler):
                 self.log("Failed to parse decrypted message")
                 return
 
+            # Cache only authenticated, parseable traffic. Unlike firmware,
+            # invalid packets cannot evict useful application-level entries.
+            if self._is_duplicate_packet(packet):
+                self.log("Duplicate group message ignored by packet hash")
+                return
+
             # Extract sender and message from the content
             sender_name, message_body = self._extract_sender_from_message(parsed_message["content"])
 
-            # Store the message content in the packet for echo detection
-            # Use the existing decrypted dictionary to store our data
+            # Store the parsed message for event consumers.
             packet.decrypted["group_text_data"] = {
                 "text": message_body,
                 "sender_name": sender_name,
@@ -269,13 +278,6 @@ class GroupTextHandler(BaseHandler):
                 "full_content": parsed_message["content"],
             }
 
-            # Check if this message is from ourselves using sender name (echo detection)
-            is_own = self._is_own_message(packet)
-            if is_own:
-                self.log(
-                    f"Own echo detected (skip publish to client): {sender_name}: {message_body}"
-                )
-
             # Log the group message
             self.log(f"<<< Channel [{channel_name}] {sender_name}: {message_body} >>>")
 
@@ -286,7 +288,6 @@ class GroupTextHandler(BaseHandler):
                 message_body,
                 channel_name,
                 parsed_message["timestamp"],
-                is_outgoing=is_own,
             )
 
             # Note: Group messages are unverified according to spec, so no ACK needed
@@ -298,16 +299,11 @@ class GroupTextHandler(BaseHandler):
             self.log(f"Traceback: {traceback.format_exc()}")
 
     async def _save_and_broadcast_group_message(
-        self, packet, sender_name, message_body, channel_name, timestamp, is_outgoing: bool = False
+        self, packet, sender_name, message_body, channel_name, timestamp
     ):
         """Save the group message to database and broadcast via WebSocket."""
         try:
             message_id = packet.get_packet_hash_hex(16)
-
-            # Do not publish NEW_CHANNEL_MESSAGE for our own messages (inject + echoes).
-            # The client already has the sent message; publishing per echo would spam the event.
-            if is_outgoing:
-                return
 
             # Publish channel message event if available
             if self.event_service:
@@ -340,7 +336,7 @@ class GroupTextHandler(BaseHandler):
                         "full_content": packet.decrypted.get("group_text_data", {}).get(
                             "full_content"
                         ),
-                        "is_outgoing": bool(is_outgoing),
+                        "is_outgoing": False,
                         "path": path,
                         "network_info": {
                             "header": f"0x{packet.header:02X}",
