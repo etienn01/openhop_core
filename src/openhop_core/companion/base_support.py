@@ -63,9 +63,12 @@ def _fmt_path_len(out_path_len: Any) -> str:
 
 
 PUSH_CALLBACK_KEYS = [
-    "message_received",
-    "channel_message_received",
-    "channel_data_received",
+    # Message events carry a single event object (MessageEvent,
+    # ChannelMessageEvent, ChannelDataEvent); the legacy positional
+    # on_*_received registrations adapt onto these same lists.
+    "message_event",
+    "channel_message_event",
+    "channel_data_event",
     "advert_received",
     "contact_path_updated",
     "send_confirmed",

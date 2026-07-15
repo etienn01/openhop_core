@@ -23,7 +23,7 @@ from ..constants import (
     PUSH_CODE_SEND_CONFIRMED,
     PUSH_CODE_TRACE_DATA,
 )
-from ..models import Contact
+from ..models import ChannelDataEvent, ChannelMessageEvent, Contact, MessageEvent
 from .frames import _build_advert_push_frames
 
 logger = logging.getLogger("CompanionFrameServer")
@@ -38,9 +38,9 @@ class _PushMixin:
         # Clear any callbacks registered by a previous connection so they
         # don't accumulate across reconnections.
         self.bridge.clear_push_callbacks()
-        self.bridge.on_message_received(self._on_message_received)
-        self.bridge.on_channel_message_received(self._on_channel_message_received)
-        self.bridge.on_channel_data_received(self._on_channel_data_received)
+        self.bridge.on_message_event(self._on_message_event)
+        self.bridge.on_channel_message_event(self._on_channel_message_event)
+        self.bridge.on_channel_data_event(self._on_channel_data_event)
         self.bridge.on_send_confirmed(self._on_send_confirmed)
         self.bridge.on_advert_received(self._on_advert_received)
         self.bridge.on_node_discovered(self._on_node_discovered)
@@ -55,91 +55,57 @@ class _PushMixin:
     # Bridge event callbacks (registered by _setup_push_callbacks)
     # -------------------------------------------------------------------------
 
-    async def _on_message_received(
-        self,
-        sender_key,
-        text,
-        timestamp,
-        txt_type,
-        packet_hash=None,
-        snr=None,
-        rssi=None,
-        sender_prefix=b"",
-        path_len=0,
-        queued=True,
-    ):
+    async def _on_message_event(self, event: MessageEvent):
         msg_dict = {
-            "sender_key": sender_key,
-            "text": text,
-            "timestamp": timestamp,
-            "txt_type": txt_type,
+            "sender_key": event.sender_key,
+            "text": event.text,
+            "timestamp": event.timestamp,
+            "txt_type": event.txt_type,
             "is_channel": False,
             "channel_idx": 0,
-            "path_len": path_len,
-            "packet_hash": packet_hash,
-            "snr": snr,
-            "rssi": rssi,
-            "sender_prefix": sender_prefix,
+            "path_len": event.path_len,
+            "packet_hash": event.packet_hash,
+            "snr": event.snr,
+            "rssi": event.rssi,
+            "sender_prefix": event.sender_prefix,
         }
-        if queued:
+        if event.queued:
             await self._persist_companion_message(msg_dict)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))
 
-    async def _on_channel_message_received(
-        self,
-        channel_name,
-        sender_name,
-        message_text,
-        timestamp,
-        path_len=0,
-        channel_idx=0,
-        packet_hash=None,
-        snr=None,
-        rssi=None,
-        queued=True,
-    ):
+    async def _on_channel_message_event(self, event: ChannelMessageEvent):
         msg_dict = {
             "sender_key": b"",
-            "text": message_text,
-            "timestamp": timestamp,
+            "text": event.text,
+            "timestamp": event.timestamp,
             "txt_type": 0,
             "is_channel": True,
-            "channel_idx": channel_idx,
-            "path_len": path_len,
-            "packet_hash": packet_hash,
-            "snr": snr,
-            "rssi": rssi,
+            "channel_idx": event.channel_idx,
+            "path_len": event.path_len,
+            "packet_hash": event.packet_hash,
+            "snr": event.snr,
+            "rssi": event.rssi,
         }
-        if queued:
+        if event.queued:
             await self._persist_companion_message(msg_dict)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))
 
-    async def _on_channel_data_received(
-        self,
-        channel_idx,
-        path_len,
-        data_type,
-        payload,
-        packet_hash=None,
-        snr=None,
-        rssi=None,
-        queued=True,
-    ):
+    async def _on_channel_data_event(self, event: ChannelDataEvent):
         msg_dict = {
             "sender_key": b"",
             "text": "",
             "timestamp": 0,
             "txt_type": 0,
             "is_channel": True,
-            "channel_idx": channel_idx,
-            "path_len": path_len,
-            "packet_hash": packet_hash,
-            "snr": snr,
-            "rssi": rssi,
-            "channel_data_type": data_type,
-            "channel_data_payload": bytes(payload or b""),
+            "channel_idx": event.channel_idx,
+            "path_len": event.path_len,
+            "packet_hash": event.packet_hash,
+            "snr": event.snr,
+            "rssi": event.rssi,
+            "channel_data_type": event.data_type,
+            "channel_data_payload": bytes(event.payload or b""),
         }
-        if queued:
+        if event.queued:
             await self._persist_companion_message(msg_dict)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))
 

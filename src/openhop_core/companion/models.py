@@ -211,3 +211,56 @@ class QueuedMessage:
     # 4-byte author pubkey prefix for TXT_TYPE_SIGNED_PLAIN (room server posts);
     # emitted between timestamp and text in the CONTACT_MSG_RECV frame.
     sender_prefix: bytes = b""
+
+
+@dataclass(frozen=True)
+class MessageEvent:
+    """A received direct message with its delivery metadata.
+
+    Passed as the single argument to ``on_message_event`` callbacks so new
+    metadata fields never change the callback signature. ``queued`` is False
+    when the protected offline queue could not retain the message.
+    """
+
+    sender_key: bytes  # 32 bytes
+    text: str
+    timestamp: int
+    txt_type: int
+    packet_hash: Optional[str] = None
+    snr: Optional[float] = None
+    rssi: Optional[int] = None
+    # 4-byte author pubkey prefix for TXT_TYPE_SIGNED_PLAIN (room server posts).
+    sender_prefix: bytes = b""
+    # Companion-format route byte: encoded path_len for floods, 0xFF for direct.
+    path_len: int = 0
+    queued: bool = True
+
+
+@dataclass(frozen=True)
+class ChannelMessageEvent:
+    """A received channel text message (single ``on_channel_message_event`` argument)."""
+
+    channel_name: str
+    sender_name: str
+    text: str
+    timestamp: int
+    path_len: int = 0
+    channel_idx: int = 0
+    packet_hash: Optional[str] = None
+    snr: Optional[float] = None
+    rssi: Optional[int] = None
+    queued: bool = True
+
+
+@dataclass(frozen=True)
+class ChannelDataEvent:
+    """A received binary channel payload (single ``on_channel_data_event`` argument)."""
+
+    channel_idx: int
+    path_len: int
+    data_type: int
+    payload: bytes
+    packet_hash: Optional[str] = None
+    snr: Optional[float] = None
+    rssi: Optional[int] = None
+    queued: bool = True

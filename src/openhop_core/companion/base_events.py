@@ -12,7 +12,14 @@ from ..protocol import Packet
 from ..protocol.constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
 from ..protocol.crypto import CryptoUtils
 from ..protocol.utils import derive_channel_hash, normalize_channel_secret
-from .models import Channel, Contact, QueuedMessage
+from .models import (
+    Channel,
+    ChannelDataEvent,
+    ChannelMessageEvent,
+    Contact,
+    MessageEvent,
+    QueuedMessage,
+)
 
 logger = logging.getLogger("CompanionBase")
 
@@ -117,17 +124,19 @@ class _RxEventsMixin:
         )
         was_queued = self.message_queue.push(msg)
         await self._fire_callbacks(
-            "message_received",
-            sender_key,
-            message_text,
-            msg.timestamp,
-            msg.txt_type,
-            pkt_hash,
-            snr if snr is not None else 0.0,
-            rssi if rssi is not None else 0,
-            sender_prefix,
-            path_len,
-            was_queued,
+            "message_event",
+            MessageEvent(
+                sender_key=sender_key,
+                text=message_text,
+                timestamp=msg.timestamp,
+                txt_type=msg.txt_type,
+                packet_hash=pkt_hash,
+                snr=snr if snr is not None else 0.0,
+                rssi=rssi if rssi is not None else 0,
+                sender_prefix=sender_prefix,
+                path_len=path_len,
+                queued=was_queued,
+            ),
         )
 
     async def _handle_new_channel_message(self, data: dict) -> None:
@@ -172,17 +181,19 @@ class _RxEventsMixin:
         was_queued = self.message_queue.push(msg)
 
         await self._fire_callbacks(
-            "channel_message_received",
-            data.get("channel_name", ""),
-            data.get("sender_name", ""),
-            display_text,
-            msg.timestamp,
-            path_len,
-            channel_idx,
-            pkt_hash,
-            snr,
-            rssi,
-            was_queued,
+            "channel_message_event",
+            ChannelMessageEvent(
+                channel_name=data.get("channel_name", ""),
+                sender_name=data.get("sender_name", ""),
+                text=display_text,
+                timestamp=msg.timestamp,
+                path_len=path_len,
+                channel_idx=channel_idx,
+                packet_hash=pkt_hash,
+                snr=snr,
+                rssi=rssi,
+                queued=was_queued,
+            ),
         )
 
     def _get_channel_candidates_by_hash(self, channel_hash: int) -> list[tuple[int, Channel]]:
@@ -258,13 +269,15 @@ class _RxEventsMixin:
         )
         was_queued = self.message_queue.push(queued_message)
         await self._fire_callbacks(
-            "channel_data_received",
-            selected_idx,
-            path_len,
-            data_type,
-            blob,
-            packet_hash,
-            snr,
-            rssi,
-            was_queued,
+            "channel_data_event",
+            ChannelDataEvent(
+                channel_idx=selected_idx,
+                path_len=path_len,
+                data_type=data_type,
+                payload=blob,
+                packet_hash=packet_hash,
+                snr=snr,
+                rssi=rssi,
+                queued=was_queued,
+            ),
         )

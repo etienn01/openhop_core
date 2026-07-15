@@ -8,7 +8,7 @@ import pytest
 
 from openhop_core.companion import CompanionBridge
 from openhop_core.companion.constants import ADV_TYPE_CHAT, AUTOADD_CHAT
-from openhop_core.companion.models import Contact
+from openhop_core.companion.models import Contact, MessageEvent
 from openhop_core.node.events import MeshEvents
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
 from openhop_core.protocol.constants import (
@@ -1124,6 +1124,77 @@ class TestCompanionBridgeDeduplication:
         retained = bridge.sync_next_message()
         assert retained is not None
         assert retained.text == "first"
+
+    async def test_message_event_callback_receives_single_event_object(self):
+        """New-style subscribers get one MessageEvent instead of positional args."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        key_hex = LocalIdentity().get_public_key().hex()
+        events = []
+        bridge.on_message_event(events.append)
+
+        await bridge._handle_mesh_event(
+            MeshEvents.NEW_MESSAGE,
+            {
+                "contact_pubkey": key_hex,
+                "message_text": "hello",
+                "timestamp": 1000,
+                "txt_type": 0,
+                "packet_hash": "C1D2E3F4",
+                "path_len": 0x42,
+            },
+        )
+
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, MessageEvent)
+        assert event.text == "hello"
+        assert event.timestamp == 1000
+        assert event.packet_hash == "C1D2E3F4"
+        assert event.path_len == 0x42
+        assert event.queued is True
+
+    async def test_legacy_async_message_callback_receives_positional_form(self):
+        """The deprecated on_message_received adapter preserves the positional
+        signature (sender_key, text, timestamp, txt_type, packet_hash, snr,
+        rssi, sender_prefix, path_len, queued) and awaits async callbacks."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        sender = LocalIdentity()
+        key_hex = sender.get_public_key().hex()
+        received = []
+
+        async def legacy_callback(*args):
+            received.append(args)
+
+        bridge.on_message_received(legacy_callback)
+
+        await bridge._handle_mesh_event(
+            MeshEvents.NEW_MESSAGE,
+            {
+                "contact_pubkey": key_hex,
+                "message_text": "legacy",
+                "timestamp": 2000,
+                "txt_type": 0,
+                "packet_hash": "D1E2F3A4",
+                "path_len": 0xFF,
+            },
+        )
+
+        assert received == [
+            (
+                sender.get_public_key(),
+                "legacy",
+                2000,
+                0,
+                "D1E2F3A4",
+                0.0,
+                0,
+                b"",
+                0xFF,
+                True,
+            )
+        ]
 
 
 # ---------------------------------------------------------------------------

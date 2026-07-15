@@ -51,7 +51,14 @@ from openhop_core.companion.constants import (
     STATS_TYPE_PACKETS,
 )
 from openhop_core.companion.frame_server import CompanionFrameServer, _build_advert_push_frames
-from openhop_core.companion.models import Channel, Contact, NodePrefs, QueuedMessage, SentResult
+from openhop_core.companion.models import (
+    Channel,
+    Contact,
+    MessageEvent,
+    NodePrefs,
+    QueuedMessage,
+    SentResult,
+)
 from openhop_core.protocol.packet_utils import PathUtils
 
 
@@ -1243,9 +1250,9 @@ def test_binary_response_push_only_for_owned_tag():
     """Unowned non-region responses are ignored; owned and region responses pass."""
     bridge = Mock()
     for cb_name in (
-        "on_message_received",
-        "on_channel_message_received",
-        "on_channel_data_received",
+        "on_message_event",
+        "on_channel_message_event",
+        "on_channel_data_event",
         "on_send_confirmed",
         "on_advert_received",
         "on_node_discovered",
@@ -1983,12 +1990,14 @@ async def test_message_push_preserves_path_len_for_persistence(path_len):
     server._persist_companion_message = persist
     server._enqueue_frame = Mock()
 
-    await server._on_message_received(
-        b"\x01" * 32,
-        "direct",
-        1234,
-        0,
-        path_len=path_len,
+    await server._on_message_event(
+        MessageEvent(
+            sender_key=b"\x01" * 32,
+            text="direct",
+            timestamp=1234,
+            txt_type=0,
+            path_len=path_len,
+        )
     )
 
     assert persisted == [
@@ -2016,12 +2025,14 @@ async def test_rejected_message_push_skips_persistence_but_notifies_client():
     server._persist_companion_message = persist
     server._enqueue_frame = Mock()
 
-    await server._on_message_received(
-        b"\x01" * 32,
-        "rejected",
-        1234,
-        0,
-        queued=False,
+    await server._on_message_event(
+        MessageEvent(
+            sender_key=b"\x01" * 32,
+            text="rejected",
+            timestamp=1234,
+            txt_type=0,
+            queued=False,
+        )
     )
 
     persist.assert_not_awaited()

@@ -91,9 +91,9 @@ async def main():
     )
 
     # --- Register callbacks before starting ---
-    companion.on_message_received(on_msg)
+    companion.on_message_event(on_msg)
     companion.on_advert_received(on_advert)
-    companion.on_channel_message_received(on_chan_msg)
+    companion.on_channel_message_event(on_chan_msg)
     companion.on_send_confirmed(on_ack)
 
     await companion.start()
@@ -115,14 +115,14 @@ async def main():
 
 
 # --- Callbacks ---
-def on_msg(sender_key, text, timestamp, txt_type, *args):
-    print(f"DM from {sender_key[:8].hex()}: {text}")
+def on_msg(event):
+    print(f"DM from {event.sender_key[:8].hex()}: {event.text}")
 
 def on_advert(contact):
     print(f"Discovered: {contact.name} (type={contact.adv_type})")
 
-def on_chan_msg(channel_name, sender_name, text, timestamp, path_len, channel_idx, *args):
-    print(f"[{channel_name}] {sender_name}: {text}")
+def on_chan_msg(event):
+    print(f"[{event.channel_name}] {event.sender_name}: {event.text}")
 
 def on_ack(ack_crc):
     print(f"ACK confirmed: {ack_crc:#x}")
@@ -434,9 +434,7 @@ async def main():
         authenticate_callback=authenticate,
     )
 
-    bridge.on_message_received(
-        lambda key, text, ts, tt, *args: print(f"Bridge msg: {text}")
-    )
+    bridge.on_message_event(lambda event: print(f"Bridge msg: {event.text}"))
 
     await bridge.start()
 
@@ -778,7 +776,7 @@ Build a terminal or GUI chat client that discovers peers and exchanges messages.
 ```python
 companion = CompanionRadio(radio, identity, node_name="ChatApp")
 
-companion.on_message_received(display_message)
+companion.on_message_event(display_message)
 companion.on_advert_received(add_to_contact_list)
 
 await companion.start()
@@ -825,7 +823,7 @@ bridge = CompanionBridge(
     authenticate_callback=auth_check,
 )
 
-bridge.on_message_received(handle_bot_command)
+bridge.on_message_event(handle_bot_command)
 await bridge.start()
 
 # In the repeater's RX loop:
@@ -881,9 +879,8 @@ await companion.send_path_discovery_req(target_key)
 companion.set_channel(0, name="Emergency", secret=b"shared_channel_secret___________")
 companion.set_channel(1, name="General",   secret=b"another_shared_secret___________")
 
-companion.on_channel_message_received(
-    lambda ch_name, sender, text, ts, path_len, idx, *args:
-        print(f"[{ch_name}] {sender}: {text}")
+companion.on_channel_message_event(
+    lambda event: print(f"[{event.channel_name}] {event.sender_name}: {event.text}")
 )
 
 await companion.send_channel_message(0, "Emergency broadcast")
@@ -894,15 +891,26 @@ await companion.send_channel_message(0, "Emergency broadcast")
 ## Push Callbacks Reference
 
 Register callbacks to receive asynchronous events. Both sync and async functions are supported.
-Callbacks for `on_message_received` and `on_channel_message_received` receive optional trailing args
-when available; use `*args` to ignore them. For direct messages, `path_len` is the
-companion-format route byte: the encoded flood path length, or `0xFF` for a direct route.
-The final `queued` flag indicates whether the protected offline queue retained the message.
+
+Message callbacks receive a single frozen event object (`MessageEvent`,
+`ChannelMessageEvent`, or `ChannelDataEvent` from `openhop_core.companion`),
+so new metadata fields never change the callback signature. For direct
+messages, `event.path_len` is the companion-format route byte: the encoded
+flood path length, or `0xFF` for a direct route. `event.queued` is false when
+the protected offline queue could not retain the message.
+
+The older `on_message_received`, `on_channel_message_received`, and
+`on_channel_data_received` registrations remain supported but are deprecated;
+they explode the event into the legacy positional form shown below.
 
 | Registration Method | Callback Signature |
 |---|---|
-| `on_message_received` | `(sender_key: bytes, text: str, timestamp: int, txt_type: int [, packet_hash, snr, rssi, sender_prefix, path_len, queued])` |
-| `on_channel_message_received` | `(channel_name: str, sender_name: str, text: str, timestamp: int, path_len: int, channel_idx: int [, packet_hash, snr, rssi, queued])` |
+| `on_message_event` | `(event: MessageEvent)` |
+| `on_channel_message_event` | `(event: ChannelMessageEvent)` |
+| `on_channel_data_event` | `(event: ChannelDataEvent)` |
+| `on_message_received` (deprecated) | `(sender_key: bytes, text: str, timestamp: int, txt_type: int, packet_hash, snr, rssi, sender_prefix, path_len, queued)` |
+| `on_channel_message_received` (deprecated) | `(channel_name: str, sender_name: str, text: str, timestamp: int, path_len: int, channel_idx: int, packet_hash, snr, rssi, queued)` |
+| `on_channel_data_received` (deprecated) | `(channel_idx: int, path_len: int, data_type: int, payload: bytes, packet_hash, snr, rssi, queued)` |
 | `on_advert_received` | `(contact: Contact)` |
 | `on_contact_path_updated` | `(contact: Contact)` |
 | `on_send_confirmed` | `(ack_crc: int)` |
