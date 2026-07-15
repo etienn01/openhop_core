@@ -11,6 +11,7 @@ from ..protocol import Packet
 from ..protocol.constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
 from ..protocol.transport_keys import calc_transport_code, get_auto_key_for
 from .constants import (
+    DEFAULT_MAX_TX_POWER_DBM,
     MAX_SIGN_DATA_SIZE,
     STATS_TYPE_CORE,
     STATS_TYPE_PACKETS,
@@ -73,6 +74,28 @@ class _DeviceConfigMixin:
         self.prefs.tx_power_dbm = power_dbm
         self._save_prefs()
         return True
+
+    def supports_radio_params_mutation(self) -> bool:
+        """Return whether this companion can apply radio-parameter changes."""
+        return True
+
+    def supports_tx_power_mutation(self) -> bool:
+        """Return whether this companion can apply TX-power changes."""
+        return True
+
+    def get_max_tx_power_dbm(self) -> int:
+        """Return the maximum supported TX power for companion SELF_INFO.
+
+        A concrete radio or host integration can override this capability.
+        ``max_tx_power_dbm`` is intentionally separate from the current
+        ``tx_power`` preference: lowering the active power must not lower the
+        radio's advertised capability.
+        """
+        value = self._radio_config.get("max_tx_power_dbm", DEFAULT_MAX_TX_POWER_DBM)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_TX_POWER_DBM
 
     def set_tuning_params(self, rx_delay: float, airtime_factor: float) -> None:
         """Set RX delay and airtime factor tuning parameters."""

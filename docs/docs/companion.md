@@ -393,8 +393,8 @@ stats = companion.get_stats(STATS_TYPE_PACKETS)
 
 | Method | Base Behavior | Radio Override |
 |---|---|---|
-| `set_radio_params()` | Updates `prefs` fields | Also calls `radio.configure_radio()` |
-| `set_tx_power()` | Updates `prefs.tx_power_dbm` | Also calls `radio.set_tx_power()` |
+| `set_radio_params()` | Updates `prefs` fields | Calls `radio.configure_radio()` first, then persists only on success |
+| `set_tx_power()` | Updates `prefs.tx_power_dbm` | Calls `radio.set_tx_power()` first, then persists only on success |
 | `set_advert_name()` | Updates `prefs.node_name` | Also syncs `node.node_name` |
 | `set_flood_scope()` | Stores transport key | Also syncs to `node.dispatcher` |
 | `set_flood_region()` | Derives key from name | Also syncs to `node.dispatcher` |
@@ -463,6 +463,8 @@ CompanionBridge(
     radio_config: dict | None = None,
     authenticate_callback: Callable | None = None,  # (hash, pw) -> (bool, int)
     initial_contacts: iterable of Contact | None = None,  # optional bulk load on boot
+    radio_settings_getter: Callable[[], Mapping[str, Any]] | None = None,
+    max_tx_power_getter: Callable[[], int | None] | None = None,
 )
 ```
 
@@ -487,9 +489,9 @@ The bridge registers internal handlers for these payload types:
 
 ### All Other APIs
 
-`CompanionBridge` exposes the same messaging, contact, channel, path, signing, stats, and configuration APIs as `CompanionRadio` (inherited from `CompanionBase`). The only behavioral difference is that all TX goes through the `packet_injector` instead of an owned radio.
+`CompanionBridge` exposes the same messaging, contact, channel, path, signing, and stats APIs as `CompanionRadio`. All TX goes through the `packet_injector` instead of an owned radio.
 
-Note that **CompanionBridge does not own the radio**. `set_radio_params()` and `set_tx_power()` update in-memory prefs only; there is no physical radio to configure. `get_radio_params()` and `get_self_info()` return those in-memory prefs, not the repeater's actual hardware configuration.
+Radio settings are read-only for a bridge: `set_radio_params()` and `set_tx_power()` return `False` and do not change or persist bridge prefs. `get_radio_params()` and `get_self_info()` report the supplied host radio settings instead. To keep companion clients' combined profile-save action working, the frame server acknowledges syntactically valid radio writes to a bridge as no-ops; invalid values still receive an error. Pass `radio_settings_getter` when the host can provide live values; otherwise the bridge reads the `radio_config` mapping passed at construction (including later in-place updates). Pass `max_tx_power_getter` for the host's validated hardware limit; `max_tx_power_dbm` in those settings is the fallback capability field.
 
 ### Avoiding doubled messages
 

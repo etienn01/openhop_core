@@ -78,6 +78,44 @@ class TestCompanionRadioInit:
         assert comp.get_contact_by_name("Alice") is not None
         assert comp.get_contact_by_name("Bob") is not None
 
+    def test_failed_radio_configuration_does_not_change_prefs(self):
+        class RejectingRadio(MockRadio):
+            def configure_radio(self, **kwargs):
+                return False
+
+            def set_tx_power(self, power):
+                return False
+
+        comp = CompanionRadio(RejectingRadio(), LocalIdentity())
+        before = comp.get_self_info()
+
+        assert comp.set_radio_params(868_000_000, 125_000, 7, 8) is False
+        assert comp.set_tx_power(14) is False
+        assert comp.get_self_info() == before
+
+    def test_applied_radio_configuration_persists_after_backend_success(self):
+        class ConfigurableRadio(MockRadio):
+            def configure_radio(self, **kwargs):
+                self.radio_params = kwargs
+                return True
+
+            def set_tx_power(self, power):
+                self.tx_power = power
+                return True
+
+        radio = ConfigurableRadio()
+        comp = CompanionRadio(radio, LocalIdentity())
+
+        assert comp.set_radio_params(868_000_000, 125_000, 7, 8) is True
+        assert comp.set_tx_power(14) is True
+        assert radio.radio_params == {
+            "frequency": 868_000_000,
+            "bandwidth": 125_000,
+            "spreading_factor": 7,
+            "coding_rate": 8,
+        }
+        assert comp.get_radio_params()["tx_power_dbm"] == 14
+
 
 @pytest.mark.asyncio
 class TestCompanionRadioLifecycle:

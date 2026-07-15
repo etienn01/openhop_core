@@ -9,6 +9,7 @@ import struct
 from ...protocol import SIGNATURE_SIZE, CryptoUtils
 from ..constants import (
     ADV_TYPE_CHAT,
+    DEFAULT_MAX_TX_POWER_DBM,
     ERR_CODE_BAD_STATE,
     ERR_CODE_ILLEGAL_ARG,
     ERR_CODE_TABLE_FULL,
@@ -38,6 +39,26 @@ logger = logging.getLogger("CompanionFrameServer")
 class _DeviceCommandsMixin:
     """Device and configuration _cmd_* handlers of :class:`CompanionFrameServer`."""
 
+    def _max_tx_power_byte(self) -> int:
+        """Return the signed, one-byte SELF_INFO maximum TX-power field."""
+        getter = getattr(self.bridge, "get_max_tx_power_dbm", None)
+        try:
+            value = getter() if callable(getter) else DEFAULT_MAX_TX_POWER_DBM
+            value = int(value)
+        except (TypeError, ValueError):
+            value = DEFAULT_MAX_TX_POWER_DBM
+        except Exception:
+            logger.warning(
+                "Could not get maximum TX power from companion integration", exc_info=True
+            )
+            value = DEFAULT_MAX_TX_POWER_DBM
+        return max(-9, min(127, value)) & 0xFF
+
+    def _radio_mutation_supported(self, capability: str) -> bool:
+        """Check an optional integration capability while retaining old adapters."""
+        checker = getattr(self.bridge, capability, None)
+        return True if not callable(checker) else bool(checker())
+
     async def _cmd_app_start(self, data: bytes) -> None:
         # MeshCore CMD_APP_START requires the full 7-byte reserved prefix (total
         # frame len >= 8). Those bytes are reserved for future use, not a version:
@@ -52,7 +73,14 @@ class _DeviceCommandsMixin:
         lat = int(getattr(prefs, "latitude", 0) * 1e6)
         lon = int(getattr(prefs, "longitude", 0) * 1e6)
         frame = (
-            bytes([RESP_CODE_SELF_INFO, ADV_TYPE_CHAT, prefs.tx_power_dbm, 22])
+            bytes(
+                [
+                    RESP_CODE_SELF_INFO,
+                    ADV_TYPE_CHAT,
+                    prefs.tx_power_dbm & 0xFF,
+                    self._max_tx_power_byte(),
+                ]
+            )
             + pubkey
             + struct.pack("<ii", lat, lon)
             + bytes(
@@ -303,8 +331,18 @@ class _DeviceCommandsMixin:
         if not (5 <= sf <= 12) or not (5 <= cr <= 8):
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
-        self.bridge.set_radio_params(freq_khz * 1000, bw, sf, cr)
-        self._write_ok()
+        if not self._radio_mutation_supported("supports_radio_params_mutation"):
+            # Companion apps submit radio and identity settings as one save
+            # transaction and abandon subsequent updates after an error. A
+            # virtual companion cannot alter its host's shared radio, but a
+            # valid radio update must be acknowledged as a no-op so settings
+            # such as the name and position can still be saved.
+            self._write_ok()
+            return
+        if self.bridge.set_radio_params(freq_khz * 1000, bw, sf, cr):
+            self._write_ok()
+        else:
+            self._write_err(ERR_CODE_BAD_STATE)
 
     async def _cmd_set_tx_power(self, data: bytes) -> None:
         if len(data) < 1:
@@ -314,8 +352,16 @@ class _DeviceCommandsMixin:
         if power < -9 or power >= 30:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
-        self.bridge.set_tx_power(power)
-        self._write_ok()
+        if not self._radio_mutation_supported("supports_tx_power_mutation"):
+            # See _cmd_set_radio_params: acknowledge valid shared-radio
+            # writes without persisting or applying them for client
+            # transaction compatibility.
+            self._write_ok()
+            return
+        if self.bridge.set_tx_power(power):
+            self._write_ok()
+        else:
+            self._write_err(ERR_CODE_BAD_STATE)
 
     async def _cmd_export_private_key(self, data: bytes) -> None:
         """Export private/signing key as 64-byte MeshCore format (RESP_CODE_PRIVATE_KEY + 64 bytes).

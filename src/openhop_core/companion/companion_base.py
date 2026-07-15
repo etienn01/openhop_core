@@ -80,7 +80,10 @@ class CompanionBase(
     ) -> None:
         """Initialize shared stores, prefs, event service, and push callbacks."""
         self._identity = identity
-        self._radio_config = radio_config or {}
+        # Preserve a host-provided mapping by reference. A repeater can update
+        # it after an administrative change, and bridges must not report a
+        # stale startup snapshot.
+        self._radio_config = radio_config if radio_config is not None else {}
         self._running = False
 
         self.contacts = ContactStore(max_contacts)

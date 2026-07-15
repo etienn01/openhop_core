@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from typing import Any, Callable, Iterable, Optional
 
 from ..node.handlers import create_core_handlers
@@ -183,8 +184,12 @@ class CompanionBridge(CompanionBase):
         radio_config: Optional[dict] = None,
         authenticate_callback: Optional[Callable[..., tuple[bool, int]]] = None,
         initial_contacts: Optional[Iterable[Any]] = None,
+        radio_settings_getter: Optional[Callable[[], Mapping[str, Any]]] = None,
+        max_tx_power_getter: Optional[Callable[[], Optional[int]]] = None,
     ) -> None:
         """Initialise the companion bridge."""
+        self._radio_settings_getter = radio_settings_getter
+        self._max_tx_power_getter = max_tx_power_getter
         self._init_companion_stores(
             identity=identity,
             node_name=node_name,
@@ -282,6 +287,103 @@ class CompanionBridge(CompanionBase):
         """Set other params and sync the multi_acks pref to the text handler."""
         super().set_other_params(manual_add, telemetry_modes, advert_loc_policy, multi_acks)
         self._apply_multi_acks_pref()
+
+    # -------------------------------------------------------------------------
+    # Repeater-owned radio state
+    # -------------------------------------------------------------------------
+
+    def _get_host_radio_settings(self) -> Mapping[str, Any]:
+        """Return the host's current radio settings without granting mutation."""
+        if self._radio_settings_getter is None:
+            return self._radio_config
+        try:
+            settings = self._radio_settings_getter()
+        except Exception as e:
+            logger.warning("Could not read host radio settings: %s", e)
+            return self._radio_config
+        if not isinstance(settings, Mapping):
+            logger.warning(
+                "Host radio settings getter returned %s, not a mapping", type(settings).__name__
+            )
+            return self._radio_config
+        return settings
+
+    @staticmethod
+    def _set_pref_from_host(prefs: Any, field: str, value: Any) -> None:
+        """Set one integer radio preference when the host returned a valid value."""
+        try:
+            setattr(prefs, field, int(value))
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid host radio value for %s: %r", field, value)
+
+    def get_self_info(self):
+        """Return identity prefs with radio fields sourced from the host.
+
+        A bridge does not own RF state. Its persisted identity preferences
+        therefore cannot override the repeater's current radio settings.
+        """
+        prefs = super().get_self_info()
+        settings = self._get_host_radio_settings()
+        for field, keys in (
+            ("frequency_hz", ("frequency",)),
+            ("bandwidth_hz", ("bandwidth",)),
+            ("spreading_factor", ("spreading_factor",)),
+            ("coding_rate", ("coding_rate",)),
+            ("tx_power_dbm", ("power", "tx_power")),
+        ):
+            for key in keys:
+                if key in settings:
+                    self._set_pref_from_host(prefs, field, settings[key])
+                    break
+        return prefs
+
+    def get_radio_params(self) -> dict:
+        """Return the host's current radio configuration, not bridge prefs."""
+        prefs = self.get_self_info()
+        return {
+            "frequency_hz": prefs.frequency_hz,
+            "bandwidth_hz": prefs.bandwidth_hz,
+            "spreading_factor": prefs.spreading_factor,
+            "coding_rate": prefs.coding_rate,
+            "tx_power_dbm": prefs.tx_power_dbm,
+            "rx_delay_base": prefs.rx_delay_base,
+            "airtime_factor": prefs.airtime_factor,
+        }
+
+    def get_max_tx_power_dbm(self) -> int:
+        """Return the host-provided TX capability for companion SELF_INFO."""
+        value = None
+        if self._max_tx_power_getter is not None:
+            try:
+                value = self._max_tx_power_getter()
+            except Exception as e:
+                logger.warning("Could not get host maximum TX power: %s", e)
+        if value is None:
+            settings = self._get_host_radio_settings()
+            value = settings.get("max_tx_power_dbm", settings.get("max_tx_power"))
+        if value is None:
+            return super().get_max_tx_power_dbm()
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            logger.warning("Host returned invalid maximum TX power: %r", value)
+            return super().get_max_tx_power_dbm()
+
+    def supports_radio_params_mutation(self) -> bool:
+        """A virtual companion must not reconfigure the shared repeater radio."""
+        return False
+
+    def supports_tx_power_mutation(self) -> bool:
+        """A virtual companion must not change shared repeater TX power."""
+        return False
+
+    def set_radio_params(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
+        """Reject shared-radio changes without mutating companion preferences."""
+        return False
+
+    def set_tx_power(self, power_dbm: int) -> bool:
+        """Reject shared-radio TX-power changes without mutating preferences."""
+        return False
 
     def _get_group_text_handler(self):
         """Return the group text handler for name sync."""

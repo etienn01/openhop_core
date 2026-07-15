@@ -8,18 +8,16 @@ from enum import IntEnum
 # Wire-level values shared with the node/protocol layers live in
 # protocol.constants; they are re-exported here so existing
 # ``openhop_core.companion.constants`` imports keep working.
-from ..protocol.constants import (
-    ANON_REQ_TYPE_BASIC,  # noqa: F401
-    ANON_REQ_TYPE_OWNER,  # noqa: F401
-    ANON_REQ_TYPE_REGIONS,  # noqa: F401
-    CIPHER_BLOCK_SIZE,  # noqa: F401
-    MAX_PACKET_PAYLOAD,  # noqa: F401
-    MAX_PATH_SIZE,  # noqa: F401
-    PUB_KEY_SIZE,  # noqa: F401
-    TXT_TYPE_CLI_DATA,  # noqa: F401
-    TXT_TYPE_PLAIN,  # noqa: F401
-    TXT_TYPE_SIGNED_PLAIN,  # noqa: F401
-)
+from ..protocol.constants import ANON_REQ_TYPE_BASIC  # noqa: F401
+from ..protocol.constants import ANON_REQ_TYPE_OWNER  # noqa: F401
+from ..protocol.constants import ANON_REQ_TYPE_REGIONS  # noqa: F401
+from ..protocol.constants import CIPHER_BLOCK_SIZE  # noqa: F401
+from ..protocol.constants import MAX_PACKET_PAYLOAD  # noqa: F401
+from ..protocol.constants import MAX_PATH_SIZE  # noqa: F401
+from ..protocol.constants import PUB_KEY_SIZE  # noqa: F401
+from ..protocol.constants import TXT_TYPE_CLI_DATA  # noqa: F401
+from ..protocol.constants import TXT_TYPE_PLAIN  # noqa: F401
+from ..protocol.constants import TXT_TYPE_SIGNED_PLAIN  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # ADV Types (contact/node classification)
@@ -123,13 +121,14 @@ DEFAULT_RESPONSE_TIMEOUT_MS = 10000
 DEFAULT_MAX_CONTACTS = 1000
 DEFAULT_OFFLINE_QUEUE_SIZE = 512
 DEFAULT_MAX_CHANNELS = 40
+# SELF_INFO always carries a maximum TX-power byte. Backends which own or
+# represent a concrete radio should override this generic capability.
+DEFAULT_MAX_TX_POWER_DBM = 22
 CONTACT_NAME_SIZE = 32
 CHANNEL_NAME_SIZE = 32  # channel name field width (CHANNEL_INFO / SET_CHANNEL)
 MAX_SIGN_DATA_SIZE = 8192  # 8KB signing buffer (matches firmware)
 MAX_PENDING_ACK_CRCS = 64
-ZERO_FLOOD_SCOPE_KEY = (
-    b"\x00" * 16
-)  # firmware's null scope override (send_scope.isNull())
+ZERO_FLOOD_SCOPE_KEY = b"\x00" * 16  # firmware's null scope override (send_scope.isNull())
 
 # ---------------------------------------------------------------------------
 # Response-timeout hints (ms) returned in RESP_CODE_SENT frames. The firmware

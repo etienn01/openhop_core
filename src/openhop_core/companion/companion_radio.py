@@ -221,32 +221,69 @@ class CompanionRadio(CompanionBase):
         """Return the group text handler for name sync."""
         return self.node.dispatcher.group_text_handler
 
-    def set_radio_params(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
-        super().set_radio_params(freq_hz, bw_hz, sf, cr)
-        if hasattr(self._radio, "configure_radio"):
+    def supports_radio_params_mutation(self) -> bool:
+        """Whether the owned backend can reconfigure radio parameters."""
+        return callable(getattr(self._radio, "configure_radio", None))
+
+    def supports_tx_power_mutation(self) -> bool:
+        """Whether the owned backend can set its TX power."""
+        return callable(getattr(self._radio, "set_tx_power", None))
+
+    def get_max_tx_power_dbm(self) -> int:
+        """Return a backend-declared TX limit when one is available."""
+        getter = getattr(self._radio, "get_max_tx_power_dbm", None)
+        if callable(getter):
             try:
-                self._radio.configure_radio(
-                    frequency=freq_hz,
-                    bandwidth=bw_hz,
-                    spreading_factor=sf,
-                    coding_rate=cr,
-                )
-                return True
+                value = getter()
+                if value is not None:
+                    return int(value)
             except Exception as e:
-                logger.error("Error configuring radio: %s", e)
-                return False
-        return True
+                logger.warning("Could not get radio maximum TX power: %s", e)
+
+        value = getattr(self._radio, "max_tx_power_dbm", None)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                logger.warning("Radio reported an invalid maximum TX power: %r", value)
+        return super().get_max_tx_power_dbm()
+
+    def set_radio_params(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
+        """Apply parameters to owned hardware before persisting the change."""
+        if not (5 <= sf <= 12):
+            raise ValueError(f"Spreading factor out of range: {sf}")
+        if not (5 <= cr <= 8):
+            raise ValueError(f"Coding rate out of range: {cr}")
+        configure = getattr(self._radio, "configure_radio", None)
+        if not callable(configure):
+            return False
+        try:
+            applied = configure(
+                frequency=freq_hz,
+                bandwidth=bw_hz,
+                spreading_factor=sf,
+                coding_rate=cr,
+            )
+        except Exception as e:
+            logger.error("Error configuring radio: %s", e)
+            return False
+        if applied is False:
+            return False
+        return super().set_radio_params(freq_hz, bw_hz, sf, cr)
 
     def set_tx_power(self, power_dbm: int) -> bool:
-        super().set_tx_power(power_dbm)
-        if hasattr(self._radio, "set_tx_power"):
-            try:
-                self._radio.set_tx_power(power_dbm)
-                return True
-            except Exception as e:
-                logger.error("Error setting TX power: %s", e)
-                return False
-        return True
+        """Apply TX power to owned hardware before persisting the change."""
+        set_power = getattr(self._radio, "set_tx_power", None)
+        if not callable(set_power):
+            return False
+        try:
+            applied = set_power(power_dbm)
+        except Exception as e:
+            logger.error("Error setting TX power: %s", e)
+            return False
+        if applied is False:
+            return False
+        return super().set_tx_power(power_dbm)
 
     # -------------------------------------------------------------------------
     # Key Management

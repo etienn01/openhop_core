@@ -1617,11 +1617,12 @@ async def test_handle_cmd_dispatches_to_registered_handler():
 
 @pytest.mark.asyncio
 async def test_cmd_app_start_self_info_layout():
-    prefs = NodePrefs(node_name="TestNode", latitude=12.5, longitude=-3.25)
+    prefs = NodePrefs(node_name="TestNode", latitude=12.5, longitude=-3.25, tx_power_dbm=14)
     pubkey = bytes(range(32))
     bridge = Mock()
     bridge.get_self_info = Mock(return_value=prefs)
     bridge.get_public_key = Mock(return_value=pubkey)
+    bridge.get_max_tx_power_dbm = Mock(return_value=19)
     server, frames = _make_capture_server(bridge)
     # Version is negotiated only via DEVICE_QUERY; APP_START must not change it.
     server._app_target_ver = 5
@@ -1630,6 +1631,7 @@ async def test_cmd_app_start_self_info_layout():
 
     (frame,) = frames
     assert frame[0] == RESP_CODE_SELF_INFO
+    assert frame[2:4] == bytes([14, 19])
     assert frame[4:36] == pubkey
     lat, lon = struct.unpack_from("<ii", frame, 36)
     assert lat == int(12.5 * 1e6)
@@ -2263,6 +2265,84 @@ async def test_cmd_set_radio_params_validates_ranges():
     await server._cmd_set_radio_params(good)
     assert frames == [bytes([RESP_CODE_OK])]
     bridge.set_radio_params.assert_called_once_with(915_000_000, 250_000, 10, 5)
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_radio_params_acknowledges_virtual_companion_without_mutation():
+    from openhop_core.companion import CompanionBridge
+    from openhop_core.protocol import LocalIdentity
+
+    bridge = CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+    server, frames = _make_capture_server(bridge)
+    before = bridge.get_self_info()
+
+    await server._cmd_set_radio_params(struct.pack("<II", 915_000, 250_000) + bytes([10, 5]))
+
+    assert frames == [bytes([RESP_CODE_OK])]
+    assert bridge.get_self_info() == before
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_tx_power_acknowledges_virtual_companion_without_mutation():
+    from openhop_core.companion import CompanionBridge
+    from openhop_core.protocol import LocalIdentity
+
+    bridge = CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+    server, frames = _make_capture_server(bridge)
+    before = bridge.get_self_info()
+
+    await server._cmd_set_tx_power(bytes([14]))
+
+    assert frames == [bytes([RESP_CODE_OK])]
+    assert bridge.get_self_info() == before
+
+
+@pytest.mark.asyncio
+async def test_virtual_radio_noops_do_not_block_identity_updates():
+    """A combined client save can update identity fields after radio no-ops."""
+    from openhop_core.companion import CompanionBridge
+    from openhop_core.protocol import LocalIdentity
+
+    bridge = CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+    server, frames = _make_capture_server(bridge)
+    radio_before = bridge.get_radio_params()
+
+    await server._cmd_set_radio_params(struct.pack("<II", 915_000, 250_000) + bytes([10, 5]))
+    await server._cmd_set_tx_power(bytes([14]))
+    await server._cmd_set_advert_name(b"NewName")
+    await server._cmd_set_advert_latlon(struct.pack("<ii", 12_500_000, -3_250_000))
+
+    assert frames == [bytes([RESP_CODE_OK])] * 4
+    prefs = bridge.get_self_info()
+    assert prefs.node_name == "NewName"
+    assert (prefs.latitude, prefs.longitude) == (12.5, -3.25)
+    assert bridge.get_radio_params() == radio_before
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_radio_params_reports_backend_failure():
+    bridge = Mock()
+    bridge.supports_radio_params_mutation.return_value = True
+    bridge.set_radio_params.return_value = False
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_set_radio_params(struct.pack("<II", 915_000, 250_000) + bytes([10, 5]))
+
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_BAD_STATE])]
+    bridge.set_radio_params.assert_called_once_with(915_000_000, 250_000, 10, 5)
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_tx_power_reports_backend_failure():
+    bridge = Mock()
+    bridge.supports_tx_power_mutation.return_value = True
+    bridge.set_tx_power.return_value = False
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_set_tx_power(bytes([14]))
+
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_BAD_STATE])]
+    bridge.set_tx_power.assert_called_once_with(14)
 
 
 # ---------------------------------------------------------------------------

@@ -89,6 +89,63 @@ class TestCompanionBridgeInit:
         bridge.set_other_params(manual_add=0, telemetry_modes=0, advert_loc_policy=0, multi_acks=0)
         assert text_handler.multi_acks == 0
 
+    def test_host_radio_settings_are_reported_but_not_mutable(self):
+        host_settings = {
+            "frequency": 915_000_000,
+            "bandwidth": 250_000,
+            "spreading_factor": 10,
+            "coding_rate": 5,
+            "tx_power": 14,
+            "max_tx_power_dbm": 17,
+        }
+        bridge = CompanionBridge(LocalIdentity(), MockPacketInjector(), radio_config=host_settings)
+
+        assert bridge.get_radio_params() == {
+            "frequency_hz": 915_000_000,
+            "bandwidth_hz": 250_000,
+            "spreading_factor": 10,
+            "coding_rate": 5,
+            "tx_power_dbm": 14,
+            "rx_delay_base": 0.0,
+            "airtime_factor": 0.0,
+        }
+        assert bridge.get_max_tx_power_dbm() == 17
+
+        before = bridge.get_self_info()
+        assert bridge.set_radio_params(868_000_000, 125_000, 7, 8) is False
+        assert bridge.set_tx_power(20) is False
+        assert bridge.get_self_info() == before
+
+        # Administrative host updates remain visible without granting the
+        # virtual companion permission to make the update itself.
+        host_settings.update({"frequency": 868_000_000, "tx_power": 20})
+        current = bridge.get_self_info()
+        assert current.frequency_hz == 868_000_000
+        assert current.tx_power_dbm == 20
+
+    def test_radio_capability_getters_override_host_mapping(self):
+        host_settings = {
+            "frequency": 915_000_000,
+            "bandwidth": 250_000,
+            "spreading_factor": 10,
+            "coding_rate": 5,
+            "tx_power": 14,
+        }
+        bridge = CompanionBridge(
+            LocalIdentity(),
+            MockPacketInjector(),
+            radio_settings_getter=lambda: host_settings,
+            max_tx_power_getter=lambda: 19,
+        )
+
+        assert bridge.get_self_info().tx_power_dbm == 14
+        assert bridge.get_max_tx_power_dbm() == 19
+
+    def test_radio_capability_uses_generic_fallback_when_host_has_none(self):
+        bridge = CompanionBridge(LocalIdentity(), MockPacketInjector(), radio_config={})
+
+        assert bridge.get_max_tx_power_dbm() == 22
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle
