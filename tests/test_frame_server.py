@@ -9,6 +9,7 @@ import pytest
 
 from openhop_core.companion.constants import (
     CMD_GET_DEVICE_TIME,
+    CMD_IMPORT_PRIVATE_KEY,
     ERR_CODE_ILLEGAL_ARG,
     ERR_CODE_NOT_FOUND,
     ERR_CODE_TABLE_FULL,
@@ -32,6 +33,7 @@ from openhop_core.companion.constants import (
     RESP_CODE_CONTACTS_START,
     RESP_CODE_CURR_TIME,
     RESP_CODE_DEFAULT_FLOOD_SCOPE,
+    RESP_CODE_DISABLED,
     RESP_CODE_END_OF_CONTACTS,
     RESP_CODE_ERR,
     RESP_CODE_NO_MORE_MESSAGES,
@@ -1437,6 +1439,32 @@ async def test_handle_cmd_empty_payload_is_illegal_arg():
 async def test_handle_cmd_unknown_cmd_is_unsupported():
     server, frames = _make_capture_server(Mock())
     await server._handle_cmd(bytes([0xEE]))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+
+
+@pytest.mark.asyncio
+async def test_import_private_key_reports_disabled_without_changing_identity():
+    """Virtual-companion rekeying remains disabled, as in MeshCore's build."""
+    from openhop_core.companion import CompanionBridge
+    from openhop_core.protocol import LocalIdentity
+
+    identity = LocalIdentity()
+    bridge = CompanionBridge(identity, AsyncMock(return_value=True))
+    server, frames = _make_capture_server(bridge)
+    original_public_key = bridge.get_public_key()
+
+    await server._handle_cmd(bytes([CMD_IMPORT_PRIVATE_KEY]) + b"\xA5" * 64)
+
+    assert frames == [bytes([RESP_CODE_DISABLED])]
+    assert bridge.get_public_key() == original_public_key
+
+
+@pytest.mark.asyncio
+async def test_short_private_key_import_is_unsupported():
+    server, frames = _make_capture_server(Mock())
+
+    await server._handle_cmd(bytes([CMD_IMPORT_PRIVATE_KEY]) + b"\xA5" * 63)
+
     assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
 
 

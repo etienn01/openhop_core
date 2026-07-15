@@ -20,6 +20,7 @@ from ..constants import (
     RESP_CODE_CUSTOM_VARS,
     RESP_CODE_DEFAULT_FLOOD_SCOPE,
     RESP_CODE_DEVICE_INFO,
+    RESP_CODE_DISABLED,
     RESP_CODE_PRIVATE_KEY,
     RESP_CODE_SELF_INFO,
     RESP_CODE_STATS,
@@ -330,8 +331,13 @@ class _DeviceCommandsMixin:
         self._write_frame(bytes([RESP_CODE_PRIVATE_KEY]) + key_bytes)
 
     async def _cmd_import_private_key(self, data: bytes) -> None:
-        """Stub/no-op: private key is set from config; dynamic import may be supported later."""
-        self._write_ok()
+        """Report private-key import as unavailable without changing identity."""
+        # MeshCore only reaches the disabled-import branch for a complete
+        # 64-byte key payload. Short frames fall through to UNSUPPORTED_CMD.
+        if len(data) < 64:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
+        self._write_frame(bytes([RESP_CODE_DISABLED]))
 
     async def _cmd_set_tuning_params(self, data: bytes) -> None:
         if len(data) < 8:
