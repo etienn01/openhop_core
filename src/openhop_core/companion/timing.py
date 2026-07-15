@@ -14,7 +14,7 @@ reproduces the firmware math so login/stats/discovery use the same cadence.
 
 import math
 
-from ..protocol.packet_utils import PathUtils
+from ..protocol.packet_utils import PathUtils, coding_rate_denominator
 
 # Firmware constants (examples/companion_radio/MyMesh.cpp).
 SEND_TIMEOUT_BASE_MILLIS = 500
@@ -45,19 +45,13 @@ def estimate_airtime_ms(
 
 
     Mirrors ``SX1262Wrapper`` airtime math: explicit header, CRC on.
-    ``cr`` accepts either representation:
-    - companion/public denominator (5->4/5 .. 8->4/8), or
-    - legacy index (1->4/5 .. 4->4/8).
-    ``packet_length`` is the full on-air byte length (use
-    ``Packet.get_raw_length()``).
+    ``cr`` accepts either coding-rate representation; see
+    ``coding_rate_denominator``. ``packet_length`` is the full on-air byte
+    length (use ``Packet.get_raw_length()``).
     """
     sf = max(6, min(12, int(sf)))
     bw_hz = int(bw_hz) or 250000
-    cr_val = int(cr)
-    if 1 <= cr_val <= 4:
-        cr_denom = cr_val + 4
-    else:
-        cr_denom = max(5, min(8, cr_val))
+    cr_denom = coding_rate_denominator(cr)
     if low_dr_opt is None:
         low_dr_opt = sf >= 11 and bw_hz <= 125000
     ldro = 1 if low_dr_opt else 0
@@ -84,8 +78,7 @@ def calc_direct_timeout_ms(airtime_ms: float, out_path_len: int) -> int:
     hops = PathUtils.get_path_hash_count(out_path_len) if out_path_len > 0 else 0
     return int(
         SEND_TIMEOUT_BASE_MILLIS
-        + (DIRECT_SEND_PERHOP_FACTOR * airtime_ms + DIRECT_SEND_PERHOP_EXTRA_MILLIS)
-        * (hops + 1)
+        + (DIRECT_SEND_PERHOP_FACTOR * airtime_ms + DIRECT_SEND_PERHOP_EXTRA_MILLIS) * (hops + 1)
     )
 
 

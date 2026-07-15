@@ -27,6 +27,21 @@ from .constants import (
 )
 
 
+def coding_rate_denominator(cr: Union[int, float]) -> int:
+    """Return the LoRa coding-rate denominator (5..8) for rates 4/5..4/8.
+
+    Accepts either representation in use across configs and radio drivers:
+    the public denominator form (5..8) or the legacy index form (1..4,
+    meaning 4/5..4/8). Values outside both ranges are clamped to 5..8.
+    A value of 4 is unambiguous: it is not a valid denominator, so it
+    always means the legacy index for 4/8.
+    """
+    cr_val = int(cr)
+    if 1 <= cr_val <= 4:
+        return cr_val + 4
+    return max(5, min(8, cr_val))
+
+
 class PacketValidationUtils:
     """Centralized validation utilities for packet operations."""
 
@@ -48,9 +63,7 @@ class PacketValidationUtils:
             raise ValueError(f"routing_path must be a list, got {type(routing_path)}")
 
         if len(routing_path) > MAX_PATH_SIZE:
-            raise ValueError(
-                f"Path length {len(routing_path)} exceeds maximum {MAX_PATH_SIZE}"
-            )
+            raise ValueError(f"Path length {len(routing_path)} exceeds maximum {MAX_PATH_SIZE}")
 
         validated_path = []
         for i, item in enumerate(routing_path):
@@ -61,17 +74,13 @@ class PacketValidationUtils:
                     )
                 hex_part = item[:2]
                 if not all(c in "0123456789abcdefABCDEF" for c in hex_part):
-                    raise ValueError(
-                        f"Path[{i}]: '{hex_part}' contains invalid hex characters"
-                    )
+                    raise ValueError(f"Path[{i}]: '{hex_part}' contains invalid hex characters")
                 byte_val = int(hex_part, 16)
                 validated_path.append(byte_val)
             elif isinstance(item, (int, float)):
                 byte_val = int(item)
                 if not (0 <= byte_val <= 255):
-                    raise ValueError(
-                        f"Path[{i}]: value {byte_val} out of range (0-255)"
-                    )
+                    raise ValueError(f"Path[{i}]: value {byte_val} out of range (0-255)")
                 validated_path.append(byte_val)
             else:
                 raise ValueError(
@@ -80,9 +89,7 @@ class PacketValidationUtils:
         return validated_path
 
     @staticmethod
-    def validate_packet_bounds(
-        idx: int, required: int, data_len: int, error_msg: str
-    ) -> None:
+    def validate_packet_bounds(idx: int, required: int, data_len: int, error_msg: str) -> None:
         """Check if we have enough data remaining."""
         if idx + required > data_len:
             raise ValueError(error_msg)
@@ -147,12 +154,8 @@ class PathUtils:
         Hop count is stored in 6 bits (0-63). Values above 63 are invalid and raise.
         """
         if not 0 <= hash_count <= 63:
-            raise ValueError(
-                f"hop count must be 0-63 for path_len encoding, got {hash_count}"
-            )
-        return ((hash_size - 1) << PATH_HASH_SIZE_SHIFT) | (
-            hash_count & PATH_HASH_COUNT_MASK
-        )
+            raise ValueError(f"hop count must be 0-63 for path_len encoding, got {hash_count}")
+        return ((hash_size - 1) << PATH_HASH_SIZE_SHIFT) | (hash_count & PATH_HASH_COUNT_MASK)
 
     @staticmethod
     def is_valid_path_len(path_len_byte: int) -> bool:
@@ -297,9 +300,7 @@ class PacketHashingUtils:
     """Centralized hashing utilities for packets."""
 
     @staticmethod
-    def calculate_packet_hash(
-        payload_type: int, path_len: int, payload: bytes
-    ) -> bytes:
+    def calculate_packet_hash(payload_type: int, path_len: int, payload: bytes) -> bytes:
         """
         Calculate packet hash compatible with C++ implementation.
 
@@ -339,18 +340,14 @@ class PacketHashingUtils:
         Returns:
             str: Upper-case hex string of the packet hash, optionally truncated.
         """
-        raw_hash = PacketHashingUtils.calculate_packet_hash(
-            payload_type, path_len, payload
-        )
+        raw_hash = PacketHashingUtils.calculate_packet_hash(payload_type, path_len, payload)
         hex_str = raw_hash.hex().upper()
         return hex_str if length is None else hex_str[:length]
 
     @staticmethod
     def calculate_crc(payload_type: int, path_len: int, payload: bytes) -> int:
         """Calculate 4-byte CRC from packet hash."""
-        hash_bytes = PacketHashingUtils.calculate_packet_hash(
-            payload_type, path_len, payload
-        )
+        hash_bytes = PacketHashingUtils.calculate_packet_hash(payload_type, path_len, payload)
         return int.from_bytes(hash_bytes[:4], "little")
 
 
@@ -379,9 +376,7 @@ class PacketTimingUtils:
     """Utilities for packet transmission timing calculations."""
 
     @staticmethod
-    def estimate_airtime_ms(
-        packet_length_bytes: int, radio_config: dict = None
-    ) -> float:
+    def estimate_airtime_ms(packet_length_bytes: int, radio_config: dict = None) -> float:
         """
         Estimate LoRa packet airtime in milliseconds based on packet size and radio parameters.
 
@@ -405,19 +400,11 @@ class PacketTimingUtils:
             return radio_config["measured_airtime_ms"]
 
         sf = radio_config.get("spreading_factor", 10)
-        bw = radio_config.get(
-            "bandwidth", 250000
-        )  # Hz or kHz - convert to Hz if needed
+        bw = radio_config.get("bandwidth", 250000)  # Hz or kHz - convert to Hz if needed
         cr = radio_config.get("coding_rate", 5)
         preamble = radio_config.get("preamble_length", 8)
 
-        # coding_rate is public denominator (5..8) in companion/radio prefs; accept
-        # legacy index values (1..4) for compatibility with older callers.
-        cr_val = int(cr)
-        if 1 <= cr_val <= 4:
-            cr_denom = cr_val + 4
-        else:
-            cr_denom = max(5, min(8, cr_val))
+        cr_denom = coding_rate_denominator(cr)
 
         # Convert bandwidth to Hz if it's in kHz (values < 1000 are assumed to be kHz)
         if bw < 1000:
@@ -429,9 +416,9 @@ class PacketTimingUtils:
         preamble_time = preamble * symbol_time
 
         # Payload symbols (simplified)
-        payload_symbols = 8 + max(
-            0, (packet_length_bytes * 8 - 4 * sf + 28) // (4 * (sf - 2))
-        ) * (cr_denom)
+        payload_symbols = 8 + max(0, (packet_length_bytes * 8 - 4 * sf + 28) // (4 * (sf - 2))) * (
+            cr_denom
+        )
         payload_time = payload_symbols * symbol_time
 
         total_time_ms = (preamble_time + payload_time) * 1000
@@ -454,9 +441,7 @@ class PacketTimingUtils:
         """
         SEND_TIMEOUT_BASE_MILLIS = 500
         FLOOD_SEND_TIMEOUT_FACTOR = 16.0
-        return SEND_TIMEOUT_BASE_MILLIS + (
-            FLOOD_SEND_TIMEOUT_FACTOR * packet_airtime_ms
-        )
+        return SEND_TIMEOUT_BASE_MILLIS + (FLOOD_SEND_TIMEOUT_FACTOR * packet_airtime_ms)
 
     @staticmethod
     def calc_direct_timeout_ms(packet_airtime_ms: float, path_hash_count: int) -> float:
@@ -478,9 +463,6 @@ class PacketTimingUtils:
         DIRECT_SEND_PERHOP_FACTOR = 6.0
         DIRECT_SEND_PERHOP_EXTRA_MILLIS = 250
         return SEND_TIMEOUT_BASE_MILLIS + (
-            (
-                packet_airtime_ms * DIRECT_SEND_PERHOP_FACTOR
-                + DIRECT_SEND_PERHOP_EXTRA_MILLIS
-            )
+            (packet_airtime_ms * DIRECT_SEND_PERHOP_FACTOR + DIRECT_SEND_PERHOP_EXTRA_MILLIS)
             * (path_hash_count + 1)
         )
