@@ -126,7 +126,7 @@ class _DeviceCommandsMixin:
     async def _cmd_send_self_advert(self, data: bytes) -> None:
         flood = len(data) >= 1 and data[0] == 1
         ok = await self.bridge.advertise(flood=flood)
-        self._write_ok() if ok else self._write_err(ERR_CODE_BAD_STATE)
+        self._write_ok() if ok else self._write_err(ERR_CODE_TABLE_FULL)
 
     async def _cmd_set_advert_name(self, data: bytes) -> None:
         name = data.decode("utf-8", errors="replace").rstrip("\x00")

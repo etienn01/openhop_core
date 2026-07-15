@@ -2,6 +2,7 @@
 
 import asyncio
 from typing import Optional
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -332,6 +333,18 @@ class TestCompanionBridgePathAndControl:
         bridge = CompanionBridge(LocalIdentity(), injector)
         result = await bridge.send_path_discovery_req(b"\x00" * 32)
         assert result.success is False
+        assert result.error == "not_found"
+
+    async def test_send_path_discovery_req_send_failure(self):
+        injector = AsyncMock(return_value=False)
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        contact = _make_peer_contact("Target")
+        bridge.contacts.add(contact)
+
+        result = await bridge.send_path_discovery_req(contact.public_key)
+
+        assert result.success is False
+        assert result.error == "send_failed"
 
     async def test_send_path_discovery_req_success(self):
         injector = MockPacketInjector()
@@ -420,6 +433,18 @@ class TestCompanionBridgeBinaryReq:
         bridge = CompanionBridge(LocalIdentity(), injector)
         result = await bridge.send_binary_req(b"\x00" * 32, bytes([0x01]))
         assert result.success is False
+        assert result.error == "not_found"
+
+    async def test_send_binary_req_send_failure(self):
+        injector = AsyncMock(return_value=False)
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        contact = _make_peer_contact("Rpt")
+        bridge.contacts.add(contact)
+
+        result = await bridge.send_binary_req(contact.public_key, bytes([0x01]))
+
+        assert result.success is False
+        assert result.error == "send_failed"
 
     async def test_send_binary_req_with_contact(self):
         injector = MockPacketInjector()

@@ -168,6 +168,7 @@ class SentResult:
     is_flood: bool = False
     expected_ack: Optional[int] = None
     timeout_ms: Optional[int] = None
+    error: Optional[str] = None
 
 
 @dataclass

@@ -1865,6 +1865,41 @@ async def test_cmd_send_binary_req_success_and_unsupported():
     assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
 
 
+@pytest.mark.asyncio
+async def test_cmd_send_binary_req_maps_missing_and_send_failures_like_firmware():
+    bridge = Mock()
+    bridge.send_binary_req = AsyncMock(return_value=SentResult(success=False, error="not_found"))
+    server, frames = _make_capture_server(bridge)
+
+    await server._handle_cmd(bytes.fromhex("32") + bytes(32) + b"\x01")
+    assert frames == [bytes.fromhex("0102")]
+
+    bridge.send_binary_req = AsyncMock(return_value=SentResult(success=False, error="send_failed"))
+    frames.clear()
+    await server._handle_cmd(bytes.fromhex("32") + bytes(32) + b"\x01")
+    assert frames == [bytes.fromhex("0103")]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_path_discovery_maps_missing_and_send_failures_like_firmware():
+    bridge = Mock()
+    bridge.send_path_discovery_req = AsyncMock(
+        return_value=SentResult(success=False, error="not_found")
+    )
+    server, frames = _make_capture_server(bridge)
+    command = b"\x00" + bytes(32)
+
+    await server._handle_cmd(bytes.fromhex("34") + command)
+    assert frames == [bytes.fromhex("0102")]
+
+    bridge.send_path_discovery_req = AsyncMock(
+        return_value=SentResult(success=False, error="send_failed")
+    )
+    frames.clear()
+    await server._handle_cmd(bytes.fromhex("34") + command)
+    assert frames == [bytes.fromhex("0103")]
+
+
 # ---------------------------------------------------------------------------
 # CMD_SYNC_NEXT_MESSAGE and _build_message_frame variants
 # ---------------------------------------------------------------------------
@@ -2206,6 +2241,11 @@ async def test_cmd_send_self_advert_flood_flag():
     frames.clear()
     await server._cmd_send_self_advert(b"")
     bridge.advertise.assert_awaited_once_with(flood=False)
+
+    bridge.advertise = AsyncMock(return_value=False)
+    frames.clear()
+    await server._handle_cmd(bytes.fromhex("07"))
+    assert frames == [bytes.fromhex("0103")]
 
 
 @pytest.mark.asyncio

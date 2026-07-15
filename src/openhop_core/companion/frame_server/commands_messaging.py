@@ -180,7 +180,9 @@ class _MessagingCommandsMixin:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         if not result.success:
-            self._write_err(ERR_CODE_NOT_FOUND)
+            self._write_err(
+                ERR_CODE_NOT_FOUND if result.error == "not_found" else ERR_CODE_TABLE_FULL
+            )
             return
         self._write_sent_result(result, own_binary_tag=True)
 
@@ -254,7 +256,9 @@ class _MessagingCommandsMixin:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         if not result.success:
-            self._write_err(ERR_CODE_NOT_FOUND)
+            self._write_err(
+                ERR_CODE_NOT_FOUND if result.error == "not_found" else ERR_CODE_TABLE_FULL
+            )
             return
         self._write_sent_result(result)
 

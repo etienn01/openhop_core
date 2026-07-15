@@ -151,13 +151,13 @@ class _SendOpsMixin:
         """
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
-            return SentResult(success=False)
+            return SentResult(success=False, error="not_found")
         # Resolve by exact public key, not name: two contacts can share a name
         # (e.g. a re-keyed node) and get_by_name returns the first match, which
         # would encrypt/route to the wrong key.
         proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
-            return SentResult(success=False)
+            return SentResult(success=False, error="not_found")
         request_type = data[0] if len(data) >= 1 else 0
         # C++ companion pattern (BaseChatMesh::sendRequest):
         #   tag = getRTCClock()->getCurrentTimeUnique()
@@ -192,10 +192,10 @@ class _SendOpsMixin:
             logger.error("Binary request send error: %s", e)
             if "tag_hex" in locals():
                 self._pending_binary_requests.pop(tag_hex, None)
-            return SentResult(success=False)
+            return SentResult(success=False, error="send_failed")
         if not success:
             self._pending_binary_requests.pop(tag_hex, None)
-            return SentResult(success=False)
+            return SentResult(success=False, error="send_failed")
         return SentResult(
             # Only OUT_PATH_UNKNOWN (-1) floods; out_path_len == 0 is a known
             # zero-hop direct route, matching the builder's route selection and
@@ -297,13 +297,13 @@ class _SendOpsMixin:
         """
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
-            return SentResult(success=False)
+            return SentResult(success=False, error="not_found")
         # Resolve by exact public key, not name: two contacts can share a name
         # (e.g. a re-keyed node) and get_by_name returns the first match, which
         # would encrypt/route to the wrong key.
         proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
-            return SentResult(success=False)
+            return SentResult(success=False, error="not_found")
         inv_perm = 0xFF & ~TELEM_PERM_BASE
         req_data = bytes([REQ_TYPE_GET_TELEMETRY_DATA, inv_perm, 0, 0, 0]) + random.getrandbits(
             32
@@ -326,10 +326,11 @@ class _SendOpsMixin:
                 is_flood=True,
                 expected_ack=tag_int,
                 timeout_ms=DEFAULT_RESPONSE_TIMEOUT_MS,
+                error=None if success else "send_failed",
             )
         except Exception as e:
             logger.error("Error in path discovery: %s", e)
-            return SentResult(success=False)
+            return SentResult(success=False, error="send_failed")
 
     async def send_text_message(
         self,
