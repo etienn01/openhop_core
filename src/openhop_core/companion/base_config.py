@@ -151,6 +151,10 @@ class _DeviceConfigMixin:
         self._sign_buffer = bytearray()
         return MAX_SIGN_DATA_SIZE
 
+    def is_signing(self) -> bool:
+        """Return whether a companion signing session is active."""
+        return self._sign_buffer is not None
+
     def sign_data(self, data: bytes) -> bool:
         """Append data to the signing buffer."""
         if self._sign_buffer is None:

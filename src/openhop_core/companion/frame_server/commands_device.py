@@ -6,11 +6,12 @@ import inspect
 import logging
 import struct
 
-from ...protocol import CryptoUtils
+from ...protocol import SIGNATURE_SIZE, CryptoUtils
 from ..constants import (
     ADV_TYPE_CHAT,
     ERR_CODE_BAD_STATE,
     ERR_CODE_ILLEGAL_ARG,
+    ERR_CODE_TABLE_FULL,
     ERR_CODE_UNSUPPORTED_CMD,
     FIRMWARE_VER_CODE,
     RESP_CODE_ALLOWED_REPEAT_FREQ,
@@ -23,6 +24,8 @@ from ..constants import (
     RESP_CODE_DISABLED,
     RESP_CODE_PRIVATE_KEY,
     RESP_CODE_SELF_INFO,
+    RESP_CODE_SIGN_START,
+    RESP_CODE_SIGNATURE,
     RESP_CODE_STATS,
     STATS_TYPE_CORE,
     STATS_TYPE_PACKETS,
@@ -338,6 +341,47 @@ class _DeviceCommandsMixin:
             self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         self._write_frame(bytes([RESP_CODE_DISABLED]))
+
+    async def _cmd_sign_start(self, data: bytes) -> None:
+        """Start or replace the current 8 KiB companion signing session."""
+        sign_start = getattr(self.bridge, "sign_start", None)
+        if not callable(sign_start):
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
+        max_size = sign_start()
+        self._write_frame(bytes([RESP_CODE_SIGN_START, 0]) + struct.pack("<I", max_size))
+
+    async def _cmd_sign_data(self, data: bytes) -> None:
+        """Append a non-empty chunk to the current companion signing session."""
+        # Firmware does not match CMD_SIGN_DATA with an empty payload, so it
+        # falls through to the generic unsupported-command response.
+        if not data:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
+        sign_data = getattr(self.bridge, "sign_data", None)
+        if not callable(sign_data):
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
+        is_signing = getattr(self.bridge, "is_signing", None)
+        if callable(is_signing) and not is_signing():
+            self._write_err(ERR_CODE_BAD_STATE)
+            return
+        if not sign_data(data):
+            self._write_err(ERR_CODE_TABLE_FULL)
+            return
+        self._write_ok()
+
+    async def _cmd_sign_finish(self, data: bytes) -> None:
+        """Finish the active signing session and return its Ed25519 signature."""
+        sign_finish = getattr(self.bridge, "sign_finish", None)
+        if not callable(sign_finish):
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
+        signature = sign_finish()
+        if signature is None or len(signature) != SIGNATURE_SIZE:
+            self._write_err(ERR_CODE_BAD_STATE)
+            return
+        self._write_frame(bytes([RESP_CODE_SIGNATURE]) + signature)
 
     async def _cmd_set_tuning_params(self, data: bytes) -> None:
         if len(data) < 8:

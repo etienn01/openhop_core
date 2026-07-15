@@ -66,6 +66,9 @@ from ..constants import (
     CMD_SET_RADIO_TX_POWER,
     CMD_SET_TUNING_PARAMS,
     CMD_SHARE_CONTACT,
+    CMD_SIGN_DATA,
+    CMD_SIGN_FINISH,
+    CMD_SIGN_START,
     CMD_SYNC_NEXT_MESSAGE,
     ERR_CODE_ILLEGAL_ARG,
     ERR_CODE_UNSUPPORTED_CMD,
@@ -145,15 +148,9 @@ class CompanionFrameServer(
         if device_version is None:
             # At least 2 chars so client substring(0, 2) etc. doesn't RangeError
             device_version = f"{FIRMWARE_VER_CODE}.0"
-        self._build_date_bytes = (build_date.encode("utf-8") + b"\x00")[:12].ljust(
-            12, b"\x00"
-        )
-        self._model_bytes = (device_model.encode("utf-8") + b"\x00")[:40].ljust(
-            40, b"\x00"
-        )
-        self._version_bytes = (device_version.encode("utf-8") + b"\x00")[:20].ljust(
-            20, b"\x00"
-        )
+        self._build_date_bytes = (build_date.encode("utf-8") + b"\x00")[:12].ljust(12, b"\x00")
+        self._model_bytes = (device_model.encode("utf-8") + b"\x00")[:40].ljust(40, b"\x00")
+        self._version_bytes = (device_version.encode("utf-8") + b"\x00")[:20].ljust(20, b"\x00")
 
         # Command dispatch registry: cmd byte -> async handler(data)
         self._cmd_handlers = {
@@ -196,6 +193,9 @@ class CompanionFrameServer(
             CMD_EXPORT_CONTACT: self._cmd_export_contact,
             CMD_EXPORT_PRIVATE_KEY: self._cmd_export_private_key,
             CMD_IMPORT_PRIVATE_KEY: self._cmd_import_private_key,
+            CMD_SIGN_START: self._cmd_sign_start,
+            CMD_SIGN_DATA: self._cmd_sign_data,
+            CMD_SIGN_FINISH: self._cmd_sign_finish,
             CMD_SET_TUNING_PARAMS: self._cmd_set_tuning_params,
             CMD_LOGOUT: self._cmd_logout,
             CMD_GET_CUSTOM_VARS: self._cmd_get_custom_vars,
