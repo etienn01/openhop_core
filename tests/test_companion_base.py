@@ -218,6 +218,55 @@ class TestApplyPathHashMode:
 
 
 # ---------------------------------------------------------------------------
+# set_advert_name — 31-byte firmware field (char node_name[32], NodePrefs.h),
+# truncation is on UTF-8 bytes, not Python characters.
+# ---------------------------------------------------------------------------
+
+
+class TestSetAdvertName:
+    def test_ascii_name_longer_than_limit_truncates_to_31_bytes(self):
+        bridge = _make_bridge()
+        bridge.set_advert_name("a" * 40)
+        assert bridge.prefs.node_name == "a" * 31
+        assert len(bridge.prefs.node_name.encode("utf-8")) == 31
+
+    def test_ascii_name_exactly_at_limit_is_unchanged(self):
+        bridge = _make_bridge()
+        name = "a" * 31
+        bridge.set_advert_name(name)
+        assert bridge.prefs.node_name == name
+        assert len(bridge.prefs.node_name.encode("utf-8")) == 31
+
+    def test_multibyte_utf8_name_straddling_boundary_cuts_at_codepoint(self):
+        """30 ASCII bytes + one 3-byte codepoint (e.g. 'ééé' would be
+
+        2 bytes each; use a 3-byte char, e.g. '☃' SNOWMAN, so it can only
+        fit whole or not at all across the 31-byte boundary.
+        """
+        bridge = _make_bridge()
+        # 30 'a' bytes + a 3-byte snowman = 33 raw bytes; the snowman straddles
+        # byte 31 and must be dropped whole, never split into invalid UTF-8.
+        name = ("a" * 30) + "☃" + "b"
+        bridge.set_advert_name(name)
+        stored = bridge.prefs.node_name
+        encoded = stored.encode("utf-8")
+        assert len(encoded) <= 31
+        # Round-trips cleanly (no partial multi-byte sequence survived).
+        assert encoded.decode("utf-8") == stored
+        # The snowman didn't fit in the remaining 1 byte, so it (and the
+        # trailing 'b') were dropped; only the 30 leading ASCII bytes remain.
+        assert stored == "a" * 30
+
+    def test_multibyte_utf8_name_that_fits_is_preserved_whole(self):
+        """A multi-byte codepoint that fits cleanly within 31 bytes is kept intact."""
+        bridge = _make_bridge()
+        name = ("a" * 28) + "☃"  # 28 + 3 = 31 bytes exactly
+        bridge.set_advert_name(name)
+        assert bridge.prefs.node_name == name
+        assert len(bridge.prefs.node_name.encode("utf-8")) == 31
+
+
+# ---------------------------------------------------------------------------
 # share_contact — replay cached ADVERT blob (firmware shareContactZeroHop)
 # ---------------------------------------------------------------------------
 

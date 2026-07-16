@@ -13,6 +13,7 @@ from ..protocol.transport_keys import calc_transport_code, get_auto_key_for
 from .constants import (
     DEFAULT_MAX_TX_POWER_DBM,
     MAX_SIGN_DATA_SIZE,
+    NODE_NAME_MAX_BYTES,
     STATS_TYPE_CORE,
     STATS_TYPE_PACKETS,
     STATS_TYPE_RADIO,
@@ -31,8 +32,16 @@ class _DeviceConfigMixin:
     # -------------------------------------------------------------------------
 
     def set_advert_name(self, name: str) -> None:
-        """Set the node's advertised name (max 31 chars)."""
-        self.prefs.node_name = name[:31]
+        """Set the node's advertised name.
+
+        Firmware stores this in a fixed ``char node_name[32]`` (NodePrefs.h),
+        so the limit is 31 *bytes* of UTF-8, not 31 characters. Truncate on
+        the encoded bytes and decode leniently so a multi-byte codepoint
+        straddling the cut is dropped whole rather than split.
+        """
+        self.prefs.node_name = name.encode("utf-8")[:NODE_NAME_MAX_BYTES].decode(
+            "utf-8", errors="ignore"
+        )
         self._save_prefs()
 
     def set_advert_latlon(self, lat: float, lon: float) -> None:

@@ -126,6 +126,9 @@ DEFAULT_MAX_CHANNELS = 40
 DEFAULT_MAX_TX_POWER_DBM = 22
 CONTACT_NAME_SIZE = 32
 CHANNEL_NAME_SIZE = 32  # channel name field width (CHANNEL_INFO / SET_CHANNEL)
+# Firmware `char node_name[32]` (NodePrefs.h); usable bytes exclude the NUL terminator
+# (see MyMesh.cpp CMD_SET_ADVERT_NAME: `nlen > sizeof(_prefs.node_name) - 1`).
+NODE_NAME_MAX_BYTES = 31
 MAX_SIGN_DATA_SIZE = 8192  # 8KB signing buffer (matches firmware)
 MAX_PENDING_ACK_CRCS = 64
 ZERO_FLOOD_SCOPE_KEY = b"\x00" * 16  # firmware's null scope override (send_scope.isNull())
