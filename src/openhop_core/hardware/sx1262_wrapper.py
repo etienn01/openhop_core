@@ -30,6 +30,10 @@ class SX1262Radio(LoRaRadio):
     # Class variable to track the active instance (singleton-like behavior)
     _active_instance = None
 
+    # SX1262 PA hard limit in dBm; set_tx_power clamps any higher request down
+    # to this value (via SX126x.setTxPower) before writing it to the chip.
+    max_tx_power_dbm = 22
+
     # Common timing constants to avoid magic numbers
     RADIO_TIMING_DELAY = 0.01  # 10ms delay for standard radio operations
 

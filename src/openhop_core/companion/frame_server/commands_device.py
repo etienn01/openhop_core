@@ -41,10 +41,8 @@ class _DeviceCommandsMixin:
 
     def _max_tx_power_byte(self) -> int:
         """Return the signed, one-byte SELF_INFO maximum TX-power field."""
-        getter = getattr(self.bridge, "get_max_tx_power_dbm", None)
         try:
-            value = getter() if callable(getter) else DEFAULT_MAX_TX_POWER_DBM
-            value = int(value)
+            value = int(self.bridge.get_max_tx_power_dbm())
         except (TypeError, ValueError):
             value = DEFAULT_MAX_TX_POWER_DBM
         except Exception:

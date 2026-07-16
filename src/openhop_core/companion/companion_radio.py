@@ -28,6 +28,7 @@ from .constants import (
     DEFAULT_MAX_CONTACTS,
     DEFAULT_OFFLINE_QUEUE_SIZE,
 )
+from .radio_capabilities import resolve_max_tx_power_dbm
 
 logger = logging.getLogger("CompanionRadio")
 
@@ -236,21 +237,9 @@ class CompanionRadio(CompanionBase):
 
     def get_max_tx_power_dbm(self) -> int:
         """Return a backend-declared TX limit when one is available."""
-        getter = getattr(self._radio, "get_max_tx_power_dbm", None)
-        if callable(getter):
-            try:
-                value = getter()
-                if value is not None:
-                    return int(value)
-            except Exception as e:
-                logger.warning("Could not get radio maximum TX power: %s", e)
-
-        value = getattr(self._radio, "max_tx_power_dbm", None)
+        value = resolve_max_tx_power_dbm(self._radio)
         if value is not None:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                logger.warning("Radio reported an invalid maximum TX power: %r", value)
+            return value
         return super().get_max_tx_power_dbm()
 
     def set_radio_params(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:

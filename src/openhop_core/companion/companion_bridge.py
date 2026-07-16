@@ -39,6 +39,7 @@ from .constants import (
     DEFAULT_MAX_CONTACTS,
     DEFAULT_OFFLINE_QUEUE_SIZE,
 )
+from .radio_capabilities import resolve_max_tx_power_dbm
 
 logger = logging.getLogger("CompanionBridge")
 
@@ -353,22 +354,22 @@ class CompanionBridge(CompanionBase):
 
     def get_max_tx_power_dbm(self) -> int:
         """Return the host-provided TX capability for companion SELF_INFO."""
-        value = None
         if self._max_tx_power_getter is not None:
             try:
                 value = self._max_tx_power_getter()
             except Exception as e:
                 logger.warning("Could not get host maximum TX power: %s", e)
-        if value is None:
-            settings = self._get_host_radio_settings()
-            value = settings.get("max_tx_power_dbm", settings.get("max_tx_power"))
-        if value is None:
-            return super().get_max_tx_power_dbm()
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            logger.warning("Host returned invalid maximum TX power: %r", value)
-            return super().get_max_tx_power_dbm()
+            else:
+                if value is not None:
+                    try:
+                        return int(value)
+                    except (TypeError, ValueError):
+                        logger.warning("Host returned invalid maximum TX power: %r", value)
+                        return super().get_max_tx_power_dbm()
+        value = resolve_max_tx_power_dbm(None, self._get_host_radio_settings())
+        if value is not None:
+            return value
+        return super().get_max_tx_power_dbm()
 
     def supports_radio_params_mutation(self) -> bool:
         """A virtual companion must not reconfigure the shared repeater radio."""
