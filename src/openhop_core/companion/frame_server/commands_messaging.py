@@ -218,11 +218,14 @@ class _MessagingCommandsMixin:
         self._write_sent_result(result, own_binary_tag=True)
 
     async def _cmd_send_control_data(self, data: bytes) -> None:
-        if len(data) < 2:
-            self._write_err(ERR_CODE_ILLEGAL_ARG)
-            return
-        if (data[0] & 0x80) == 0:
-            self._write_err(ERR_CODE_ILLEGAL_ARG)
+        # Firmware: `len >= 2 && (cmd_frame[1] & 0x80) != 0`, where `len` includes
+        # the command byte. `data` here has the command byte already stripped, so
+        # the minimum is 1 byte, and `data[0]` is the firmware's `cmd_frame[1]`.
+        # A failure of either condition falls through the else-if chain to the
+        # catch-all `else { writeErrFrame(ERR_CODE_UNSUPPORTED_CMD); }`, not
+        # ILLEGAL_ARG.
+        if len(data) < 1 or (data[0] & 0x80) == 0:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         # Discovery request: register a no-op response callback
         if self._control_handler and len(data) >= 6 and (data[0] & 0xF0) == 0x80:

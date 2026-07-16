@@ -1855,6 +1855,62 @@ async def test_cmd_send_txt_msg_accepts_one_text_byte():
 
 
 # ---------------------------------------------------------------------------
+# CMD_SEND_CONTROL_DATA
+# ---------------------------------------------------------------------------
+
+
+def _control_bridge(result=True):
+    bridge = Mock()
+    bridge.send_control_data = AsyncMock(return_value=result)
+    return bridge
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_control_data_rejects_empty_payload():
+    """Firmware requires `len >= 2` (cmd byte + >=1 control byte). `data` here has
+    the command byte already stripped, so an empty payload is one byte short of
+    the firmware's minimum. A length-check failure falls through the else-if
+    chain to the catch-all `else { writeErrFrame(ERR_CODE_UNSUPPORTED_CMD); }`,
+    not ILLEGAL_ARG."""
+    bridge = _control_bridge()
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_send_control_data(b"")
+
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+    bridge.send_control_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_control_data_accepts_one_byte_high_bit_set():
+    """A one-byte payload with the high bit set (e.g. 0x80) is the firmware's
+    minimum valid control body and must pass the length gate and reach the
+    send path."""
+    bridge = _control_bridge(result=True)
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_send_control_data(bytes([0x80]))
+
+    bridge.send_control_data.assert_awaited_once_with(bytes([0x80]))
+    assert frames == [bytes([RESP_CODE_OK])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_control_data_rejects_high_bit_clear():
+    """Firmware still requires `(cmd_frame[1] & 0x80) != 0`; a first byte with
+    the high bit clear must be rejected as ERR_CODE_UNSUPPORTED_CMD (the same
+    else-if fall-through as a too-short frame), and must not reach the send
+    path."""
+    bridge = _control_bridge()
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_send_control_data(bytes([0x7F]))
+
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+    bridge.send_control_data.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # CMD_SEND_CHANNEL_TXT_MSG
 # ---------------------------------------------------------------------------
 
