@@ -16,6 +16,7 @@ from ..protocol.constants import (  # Payload types
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
+from ..protocol.packet_utils import calculate_lora_airtime_ms, packet_score
 from ..protocol.transport_keys import calc_transport_code
 from ..protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES, format_packet_info
 
@@ -30,6 +31,11 @@ from .handlers import (
 )
 
 ACK_TIMEOUT = 5.0  # seconds to wait for an ACK
+
+# Flood reception-quality delay bounds (MeshCore Dispatcher::checkRecv):
+# delays under the threshold process immediately, longer ones are capped.
+MIN_RX_DELAY_MS = 50.0
+MAX_RX_DELAY_MS = 32000.0
 
 
 class DispatcherState(str, enum.Enum):
@@ -112,6 +118,11 @@ class Dispatcher:
         # had path hash mode set by the companion. 0=1-byte, 1=2-byte, 2=3-byte.
         # When None, no default is applied.
         self.path_hash_mode: Optional[int] = None
+
+        # Base for the flood reception-quality delay (MeshCore rx_delay_base,
+        # the "set rxdelay" tuning param). 0 disables the delay, which is the
+        # firmware default. Synced from prefs/config by the owning layer.
+        self.rx_delay_base: float = 0.0
 
         self._logger = logging.getLogger("Dispatcher")
         self._current_expected_crc: Optional[int] = None
@@ -376,6 +387,44 @@ class Dispatcher:
         except RuntimeError:
             self._log("No event loop running, cannot process received packet")
 
+    def calc_rx_delay(self, score: float, air_time_ms: float) -> float:
+        """Reception-quality delay in ms before a flood packet is processed.
+
+        Matches the MeshCore node firmwares' calcRxDelay override: disabled
+        (0) when rx_delay_base <= 0, otherwise scaled so poorly received
+        packets wait longer, in units of the packet's airtime.
+        """
+        if self.rx_delay_base <= 0.0:
+            return 0.0
+        return (self.rx_delay_base ** (0.85 - score) - 1.0) * air_time_ms
+
+    def _flood_rx_delay_ms(self, frame_len: int, snr: float) -> float:
+        """Effective hold time for a flood packet, 0 when it should process now.
+
+        Scores the reception against the live radio settings and applies the
+        firmware thresholds: below 50 ms processes immediately, above 32 s is
+        capped. Radios that don't expose their LoRa settings fall back to the
+        same assumptions as the firmware base wrapper (SF10) and the default
+        MeshCore preset.
+        """
+        sf = getattr(self.radio, "spreading_factor", 10)
+        score = packet_score(snr, sf, frame_len)
+        air_time_ms = calculate_lora_airtime_ms(
+            frame_len,
+            sf,
+            getattr(self.radio, "bandwidth", 250000),
+            getattr(self.radio, "coding_rate", 5),
+            getattr(self.radio, "preamble_length", 8),
+        )
+        delay_ms = self.calc_rx_delay(score, air_time_ms)
+        if delay_ms < MIN_RX_DELAY_MS:
+            return 0.0
+        return min(delay_ms, MAX_RX_DELAY_MS)
+
+    async def _hold_flood_packet(self, delay_ms: float) -> None:
+        """Wait out a flood reception delay (overridable by tests/subclasses)."""
+        await asyncio.sleep(delay_ms / 1000.0)
+
     async def _process_received_packet(
         self,
         data: bytes,
@@ -445,6 +494,18 @@ class Dispatcher:
             await self._invoke_enhanced_raw_callback(self.raw_packet_callback, pkt, data, {})
         if self._raw_packet_subscribers or self.raw_packet_callback:
             self._log("[RX DEBUG] Raw packet callback completed")
+
+        # MeshCore holds flood packets for a reception-quality delay before
+        # processing: a better-received copy (shorter delay, here or at
+        # another node) processes first, and the dedupe check below — which
+        # must run after the hold, like firmware's hasSeen — then drops this
+        # copy when it wakes. Direct routes are never delayed, and the
+        # firmware-default rx_delay_base of 0 keeps processing immediate.
+        if pkt.is_route_flood():
+            delay_ms = self._flood_rx_delay_ms(len(data), snr_val)
+            if delay_ms > 0.0:
+                self._log(f"Holding flood packet {delay_ms:.0f}ms (reception-quality delay)")
+                await self._hold_flood_packet(delay_ms)
 
         # When disabled, packet_filter still tracks hashes for stats/visibility.
         packet_hash = pkt.calculate_packet_hash().hex()[:16]

@@ -92,6 +92,30 @@ def calculate_lora_airtime_ms(
     return total_symbols * symbol_time_s * 1000.0
 
 
+# Approximate SNR threshold per SF for successful reception (SF7..SF12),
+# from MeshCore's RadioLibWrappers (based on Semtech datasheets).
+_PACKET_SCORE_SNR_THRESHOLDS = (-7.5, -10.0, -12.5, -15.0, -17.5, -20.0)
+
+
+def packet_score(snr: float, sf: int, packet_len: int) -> float:
+    """Reception-quality score in [0, 1], matching MeshCore ``packetScoreInt``.
+
+    Grades how comfortably a packet was received: 0 when the SNR is at or
+    below the per-SF decode threshold, scaling up with SNR margin and down
+    with packet length (longer packets are likelier to collide). MeshCore
+    feeds this into the flood reception delay (``calcRxDelay``) and returns
+    0 for SF below 7. ``packet_len`` is the full on-air byte length.
+    """
+    if sf < 7:
+        return 0.0
+    threshold = _PACKET_SCORE_SNR_THRESHOLDS[min(sf, 12) - 7]
+    if snr < threshold:
+        return 0.0
+    snr_margin_rate = (snr - threshold) / 10.0
+    collision_penalty = 1.0 - (packet_len / 256.0)
+    return max(0.0, min(1.0, snr_margin_rate * collision_penalty))
+
+
 class PacketValidationUtils:
     """Centralized validation utilities for packet operations."""
 

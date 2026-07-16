@@ -144,6 +144,7 @@ class CompanionRadio(CompanionBase):
             return
         self._running = True
         self.node.dispatcher.set_default_path_hash_mode(self.prefs.path_hash_mode)
+        self.node.dispatcher.rx_delay_base = self.prefs.rx_delay_base
         self._apply_multi_acks_pref()
         self._dispatcher_task = asyncio.create_task(self.node.start())
         logger.info(
@@ -200,6 +201,11 @@ class CompanionRadio(CompanionBase):
         """Set path hash mode and sync to dispatcher default."""
         super().set_path_hash_mode(mode)
         self.node.dispatcher.set_default_path_hash_mode(self.prefs.path_hash_mode)
+
+    def set_tuning_params(self, rx_delay: float, airtime_factor: float) -> None:
+        """Set tuning params and sync the RX delay base to the dispatcher."""
+        super().set_tuning_params(rx_delay, airtime_factor)
+        self.node.dispatcher.rx_delay_base = self.prefs.rx_delay_base
 
     def set_other_params(
         self,
