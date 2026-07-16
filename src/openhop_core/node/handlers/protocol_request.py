@@ -66,10 +66,6 @@ class ProtocolRequestHandler:
         self.get_clients_fn = get_clients_fn
         self.request_handlers = request_handlers or {}
         self.log = log_fn if log_fn else lambda msg: None
-        # Replay watermark for clients that do not expose ``last_timestamp``
-        # (the ACL ClientInfo does, and is preferred so REQ shares the login
-        # watermark). Keyed by full client public key.
-        self._fallback_last_ts: dict[bytes, int] = {}
 
     async def __call__(self, packet) -> HandlerResult:
         """
@@ -234,52 +230,26 @@ class ProtocolRequestHandler:
 
         return None
 
-    def _client_pubkey(self, client) -> Optional[bytes]:
-        """Best-effort full public key for a client, used to key the fallback map."""
-        if hasattr(client, "id") and hasattr(client.id, "get_public_key"):
-            try:
-                return client.id.get_public_key()
-            except Exception:
-                pass
-        pk = getattr(client, "public_key", None)
-        if isinstance(pk, str):
-            try:
-                return bytes.fromhex(pk)
-            except ValueError:
-                return None
-        if isinstance(pk, (bytes, bytearray)):
-            return bytes(pk)
-        return None
-
     def _get_last_req_ts(self, client) -> int:
         """Last accepted REQ timestamp for this client (0 if none).
 
-        Prefers the client's own ``last_timestamp`` so REQ shares the login/ACL
-        watermark (firmware ``client->last_timestamp``); falls back to a
-        handler-local map for client objects that do not expose it.
+        Reads the client's own ``last_timestamp`` (firmware
+        ``client->last_timestamp``) so REQ shares the login/ACL replay watermark.
         """
-        ts = getattr(client, "last_timestamp", None)
-        if ts is not None:
-            try:
-                return int(ts)
-            except (TypeError, ValueError):
-                return 0
-        key = self._client_pubkey(client)
-        return self._fallback_last_ts.get(key, 0) if key is not None else 0
+        ts = getattr(client, "last_timestamp", 0)
+        try:
+            return int(ts) if ts is not None else 0
+        except (TypeError, ValueError):
+            return 0
 
     def _advance_client_watermark(self, client, timestamp: int) -> None:
         """Advance the replay watermark (and last_activity) after a valid REQ."""
-        if getattr(client, "last_timestamp", None) is not None:
-            try:
-                client.last_timestamp = timestamp
-                if hasattr(client, "last_activity"):
-                    client.last_activity = int(time.time())
-                return
-            except Exception:
-                pass
-        key = self._client_pubkey(client)
-        if key is not None:
-            self._fallback_last_ts[key] = timestamp
+        try:
+            client.last_timestamp = timestamp
+            if hasattr(client, "last_activity"):
+                client.last_activity = int(time.time())
+        except Exception:
+            pass
 
     async def _handle_request(self, client, timestamp: int, req_type: int, req_data: bytes):
         """
