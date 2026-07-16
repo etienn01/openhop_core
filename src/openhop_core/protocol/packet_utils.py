@@ -380,7 +380,9 @@ class PacketHashingUtils:
 
         Args:
             payload_type: Packet payload type
-            path_len: Path length (only used for TRACE packets)
+            path_len: Hashed ONLY for TRACE packets (which may revisit a node on
+                the return path); excluded for all other types so a rebroadcast
+                with a longer path dedups against the original.
             payload: Packet payload bytes
 
         Returns:

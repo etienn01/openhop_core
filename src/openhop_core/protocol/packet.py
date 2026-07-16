@@ -479,12 +479,19 @@ class Packet:
         - Message integrity validation
 
         Returns:
-            bytes: First MAX_HASH_SIZE bytes of SHA256 digest computed over
-                the payload type, path length, and payload data.
+            bytes: First MAX_HASH_SIZE bytes of a SHA256 digest computed over
+                the payload type and payload data. The path length (path_len) is
+                included ONLY for TRACE packets; it is excluded for every other
+                type.
 
         Note:
-            The hash includes payload type and path_len to ensure packets with
-            different routing or content types produce different hashes.
+            path_len is deliberately NOT hashed for non-TRACE packets: echo and
+            duplicate suppression depend on it, so a rebroadcast that arrives with
+            a longer accumulated path must hash identically to the original. Only
+            TRACE packets fold in path_len — per firmware's CAVEAT (Packet.cpp),
+            a TRACE can revisit the same node on its return path, so its hash must
+            differ by route. Matches PacketHashingUtils.calculate_packet_hash and
+            MeshCore Packet::calculatePacketHash.
         """
         return PacketHashingUtils.calculate_packet_hash(
             self.get_payload_type(), self.path_len, self.payload[: self.payload_len]
