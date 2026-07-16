@@ -1403,6 +1403,30 @@ async def test_cmd_set_flood_scope_dispatches_mode_byte():
     server._write_err.assert_called_once_with(ERR_CODE_UNSUPPORTED_CMD)
 
 
+@pytest.mark.asyncio
+async def test_cmd_set_flood_scope_empty_frame_is_unsupported():
+    """Empty CMD_SET_FLOOD_SCOPE_KEY frame (firmware len < 2) is UNSUPPORTED_CMD, not a scope reset.
+
+    Firmware requires len >= 2 (MyMesh.cpp CMD_SET_FLOOD_SCOPE_KEY); a bare
+    cmd byte with no mode byte falls through the else-if chain to the
+    catch-all writeErrFrame(ERR_CODE_UNSUPPORTED_CMD). This is distinct from
+    a frame with just the mode byte (mode 0, no key), which firmware DOES
+    accept and treats as a scope-override reset -- see
+    test_cmd_set_flood_scope_dispatches_mode_byte above, which must keep
+    passing unchanged.
+    """
+    bridge = Mock()
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+    server._write_err = Mock()
+
+    await server._cmd_set_flood_scope(b"")
+    bridge.set_flood_scope.assert_not_called()
+    bridge.set_flood_unscoped.assert_not_called()
+    server._write_ok.assert_not_called()
+    server._write_err.assert_called_once_with(ERR_CODE_UNSUPPORTED_CMD)
+
+
 def test_max_frame_size_is_176():
     """Companion frame size tracks firmware PR #2022 (172 -> 176)."""
     from openhop_core.companion.constants import (
@@ -2495,6 +2519,21 @@ async def test_cmd_get_stats_packets_layout_and_invalid_type():
 
 
 @pytest.mark.asyncio
+async def test_cmd_get_stats_empty_frame_is_unsupported():
+    """Empty CMD_GET_STATS frame (firmware len < 2) is UNSUPPORTED_CMD, not a default stats dump.
+
+    Firmware requires len >= 2 (MyMesh.cpp CMD_GET_STATS); a bare cmd byte
+    with no stats-type subtype byte falls through the else-if chain to the
+    catch-all writeErrFrame(ERR_CODE_UNSUPPORTED_CMD).
+    """
+    bridge = Mock()
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_get_stats(b"")
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+    bridge.get_stats.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_cmd_get_stats_uses_stats_getter():
     async def getter(stats_type):
         return {"recv": 5, "sent": 6}
@@ -2586,6 +2625,21 @@ async def test_cmd_set_advert_name_strips_nulls():
     await server._cmd_set_advert_name(b"NewName\x00")
     assert frames == [bytes([RESP_CODE_OK])]
     bridge.set_advert_name.assert_called_once_with("NewName")
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_advert_name_empty_frame_is_unsupported():
+    """Empty CMD_SET_ADVERT_NAME frame (firmware len < 2) is UNSUPPORTED_CMD, not a name clear.
+
+    Firmware requires len >= 2 (MyMesh.cpp CMD_SET_ADVERT_NAME); a bare cmd
+    byte with no name bytes falls through the else-if chain to the catch-all
+    writeErrFrame(ERR_CODE_UNSUPPORTED_CMD).
+    """
+    bridge = Mock()
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_set_advert_name(b"")
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+    bridge.set_advert_name.assert_not_called()
 
 
 @pytest.mark.asyncio

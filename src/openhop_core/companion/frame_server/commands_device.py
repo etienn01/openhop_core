@@ -165,6 +165,12 @@ class _DeviceCommandsMixin:
         self._write_ok() if ok else self._write_err(ERR_CODE_TABLE_FULL)
 
     async def _cmd_set_advert_name(self, data: bytes) -> None:
+        # Firmware (MyMesh.cpp: CMD_SET_ADVERT_NAME) requires len >= 2 (frame len
+        # including cmd byte), i.e. at least one name byte after the cmd byte.
+        # Shorter frames fall through to the catch-all UNSUPPORTED_CMD.
+        if len(data) < 1:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
         name = data.decode("utf-8", errors="replace").rstrip("\x00")
         self.bridge.set_advert_name(name)
         self._write_ok()
@@ -187,7 +193,13 @@ class _DeviceCommandsMixin:
         self._write_frame(frame)
 
     async def _cmd_get_stats(self, data: bytes) -> None:
-        stats_type = data[0] if len(data) >= 1 else STATS_TYPE_PACKETS
+        # Firmware (MyMesh.cpp: CMD_GET_STATS) requires len >= 2 (frame len
+        # including cmd byte), i.e. the stats-type subtype byte must be present.
+        # Shorter frames fall through to the catch-all UNSUPPORTED_CMD.
+        if len(data) < 1:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
+        stats_type = data[0]
         if stats_type not in (
             STATS_TYPE_CORE,
             STATS_TYPE_RADIO,
@@ -260,8 +272,17 @@ class _DeviceCommandsMixin:
           * mode 1 (FIRMWARE_VER_CODE 12+, PR #2492): force following floods to
             be unscoped, ignoring the configured default scope until mode 0.
         Older apps always sent mode 0, so this is backward compatible.
+
+        Firmware (MyMesh.cpp: CMD_SET_FLOOD_SCOPE_KEY) requires len >= 2 (frame
+        len including cmd byte), i.e. the mode byte must be present. A frame
+        with no bytes at all falls through to the catch-all UNSUPPORTED_CMD;
+        a frame with just the mode byte (mode 0) is valid and resets the
+        scope override, matching firmware's `len >= 2 + 16` else-branch.
         """
-        mode = data[0] if len(data) >= 1 else 0
+        if len(data) < 1:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
+        mode = data[0]
         if mode == 1:
             self.bridge.set_flood_unscoped()
             self._write_ok()
