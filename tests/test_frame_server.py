@@ -11,6 +11,7 @@ from openhop_core.companion.constants import (
     CMD_GET_CUSTOM_VARS,
     CMD_GET_DEVICE_TIME,
     CMD_IMPORT_PRIVATE_KEY,
+    CMD_SET_ADVERT_NAME,
     CMD_SIGN_DATA,
     CMD_SIGN_FINISH,
     CMD_SIGN_START,
@@ -1736,6 +1737,13 @@ async def test_get_custom_vars_multibyte_values_respect_encoded_byte_budget():
     # entry's worth of bytes.
     assert len(body) > 140
     assert 1 + len(body) <= 176  # RESP code byte + payload stays inside the frame cap
+    # Exact expected bytes: each entry "kNN:éééé" is 12 encoded bytes plus a
+    # 1-byte comma separator, so the written length before entry i is 13i-1;
+    # the check-before-append (>= 140) first blocks entry 11, leaving entries
+    # 0..10 written in full (13*11 - 1 = 142 bytes, an overshoot of 2).
+    expected = ",".join(f"k{i:02d}:" + "é" * 4 for i in range(11)).encode("utf-8")
+    assert len(expected) == 142
+    assert body == expected
 
 
 @pytest.mark.asyncio
@@ -1865,6 +1873,28 @@ async def test_cmd_app_start_self_info_env_zero_matches_old_single_nibble_byte()
     (frame,) = frames
     assert frame[46] == (1 | (2 << 2))
     assert frame[46] == 0x09
+
+
+@pytest.mark.asyncio
+async def test_cmd_app_start_self_info_packs_all_three_telemetry_nibbles():
+    # All three fields non-zero at once: base=1, loc=2, env=3 ->
+    # (3 << 4) | (2 << 2) | 1 == 0x39.
+    prefs = NodePrefs(
+        node_name="TestNode",
+        telemetry_mode_base=1,
+        telemetry_mode_location=2,
+        telemetry_mode_environment=3,
+    )
+    bridge = Mock()
+    bridge.get_self_info = Mock(return_value=prefs)
+    bridge.get_public_key = Mock(return_value=bytes(32))
+    bridge.get_max_tx_power_dbm = Mock(return_value=19)
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_app_start(bytes(7) + b"TestApp")
+
+    (frame,) = frames
+    assert frame[46] == 0x39
 
 
 @pytest.mark.asyncio
@@ -2643,6 +2673,41 @@ async def test_cmd_set_advert_name_empty_frame_is_unsupported():
 
 
 @pytest.mark.asyncio
+async def test_handle_cmd_routes_empty_set_advert_name_to_unsupported():
+    """Same empty-frame rejection, but through the _handle_cmd dispatch path:
+    a full inbound payload of just the CMD_SET_ADVERT_NAME byte must route to
+    the handler and come back as UNSUPPORTED_CMD, proving the wiring end to
+    end rather than only the handler in isolation."""
+    bridge = Mock()
+    server, frames = _make_capture_server(bridge)
+    await server._handle_cmd(bytes([CMD_SET_ADVERT_NAME]))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+    bridge.set_advert_name.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_cmd_set_advert_name_truncates_multibyte_end_to_end():
+    """CMD_SET_ADVERT_NAME through _handle_cmd with a real CompanionBridge:
+    the stored node name is capped at 31 UTF-8 bytes with a straddling
+    codepoint dropped whole (firmware caps the memcpy at
+    sizeof(node_name) - 1; the codepoint-clean cut is our deliberate
+    UTF-8-safe divergence)."""
+    from openhop_core.companion import CompanionBridge
+    from openhop_core.protocol import LocalIdentity
+
+    bridge = CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+    server, frames = _make_capture_server(bridge)
+
+    name = "a" * 30 + "☃"  # 30 ASCII bytes + 3-byte snowman = 33 bytes
+    await server._handle_cmd(bytes([CMD_SET_ADVERT_NAME]) + name.encode("utf-8"))
+
+    assert frames == [bytes([RESP_CODE_OK])]
+    stored = bridge.get_self_info().node_name
+    assert stored == "a" * 30  # snowman straddles the 31-byte cut -> dropped whole
+    assert len(stored.encode("utf-8")) <= 31
+
+
+@pytest.mark.asyncio
 async def test_cmd_send_self_advert_flood_flag():
     bridge = Mock()
     bridge.advertise = AsyncMock(return_value=True)
@@ -2788,6 +2853,26 @@ async def test_cmd_set_tx_power_accepts_value_exactly_at_advertised_max():
 
     assert frames == [bytes([RESP_CODE_OK])]
     bridge.set_tx_power.assert_called_once_with(19)
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_tx_power_floor_boundary():
+    """Firmware's lower bound is `power < -9` -> ILLEGAL_ARG, so -9 itself is
+    the lowest accepted value and -10 is rejected."""
+    bridge = Mock()
+    bridge.supports_tx_power_mutation.return_value = True
+    bridge.get_max_tx_power_dbm = Mock(return_value=19)
+    bridge.set_tx_power.return_value = True
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_set_tx_power(struct.pack("<b", -10))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+    bridge.set_tx_power.assert_not_called()
+
+    frames.clear()
+    await server._cmd_set_tx_power(struct.pack("<b", -9))
+    assert frames == [bytes([RESP_CODE_OK])]
+    bridge.set_tx_power.assert_called_once_with(-9)
 
 
 @pytest.mark.asyncio
