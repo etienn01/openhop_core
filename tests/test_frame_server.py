@@ -1904,6 +1904,60 @@ async def test_cmd_send_txt_msg_accepts_one_text_byte():
     assert frames and frames[0][0] == RESP_CODE_SENT
 
 
+@pytest.mark.asyncio
+async def test_cmd_send_txt_msg_rejects_reserved_txt_type_known_contact():
+    """Firmware (MyMesh.cpp CMD_SEND_TXT_MSG, ~L1087) only sends for
+    txt_type == TXT_TYPE_PLAIN or TXT_TYPE_CLI_DATA; anything else -- including
+    TXT_TYPE_SIGNED_PLAIN (not supported by this command) and fully
+    reserved/unknown byte values -- falls into the `else` branch. With a known
+    recipient, that branch's ternary (~L1119-1121) picks ERR_CODE_UNSUPPORTED_CMD,
+    and the send pipeline must not be touched."""
+    from openhop_core.companion.constants import TXT_TYPE_SIGNED_PLAIN
+
+    contact = _contact()
+    for reserved_type in (TXT_TYPE_SIGNED_PLAIN, 3, 255):
+        bridge = _txt_bridge(contact, SentResult(True))
+        server, frames = _make_capture_server(bridge)
+        data = bytes([reserved_type, 0]) + struct.pack("<I", 1) + contact.public_key[:6] + b"hi"
+        await server._cmd_send_txt_msg(data)
+        assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+        bridge.send_text_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_txt_msg_reserved_txt_type_unknown_contact_is_not_found():
+    """Firmware's else-branch ternary is `recipient == NULL ? ERR_CODE_NOT_FOUND
+    : ERR_CODE_UNSUPPORTED_CMD` (MyMesh.cpp ~L1119-1121) -- an unknown recipient
+    takes priority over an invalid txt_type, so this must report NOT_FOUND, not
+    UNSUPPORTED_CMD, preserving the firmware's error precedence."""
+    from openhop_core.companion.constants import TXT_TYPE_SIGNED_PLAIN
+
+    bridge = _txt_bridge(None, SentResult(True))
+    server, frames = _make_capture_server(bridge)
+    data = bytes([TXT_TYPE_SIGNED_PLAIN, 0]) + struct.pack("<I", 1) + bytes(6) + b"hi"
+    await server._cmd_send_txt_msg(data)
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_NOT_FOUND])]
+    bridge.send_text_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_txt_msg_supported_txt_types_still_sent():
+    """TXT_TYPE_PLAIN and TXT_TYPE_CLI_DATA -- the two types firmware supports
+    for CMD_SEND_TXT_MSG -- must still reach the send pipeline; the new
+    txt_type gate must not regress them."""
+    from openhop_core.companion.constants import TXT_TYPE_CLI_DATA, TXT_TYPE_PLAIN
+
+    contact = _contact()
+    for supported_type in (TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA):
+        result = SentResult(success=True, is_flood=False, expected_ack=0, timeout_ms=1000)
+        bridge = _txt_bridge(contact, result)
+        server, frames = _make_capture_server(bridge)
+        data = bytes([supported_type, 0]) + struct.pack("<I", 1) + contact.public_key[:6] + b"hi"
+        await server._cmd_send_txt_msg(data)
+        bridge.send_text_message.assert_awaited_once()
+        assert frames and frames[0][0] == RESP_CODE_SENT
+
+
 # ---------------------------------------------------------------------------
 # CMD_SEND_CONTROL_DATA
 # ---------------------------------------------------------------------------

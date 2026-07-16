@@ -36,6 +36,7 @@ from ..constants import (
     TRACE_PER_PATH_BYTE_TIMEOUT_MS,
     TXT_MSG_TIMEOUT_HINT_MS,
     TXT_TYPE_CLI_DATA,
+    TXT_TYPE_PLAIN,
     TXT_TYPE_SIGNED_PLAIN,
 )
 from ..models import QueuedMessage
@@ -90,6 +91,16 @@ class _MessagingCommandsMixin:
         contact = self.bridge.contacts.get_by_key_prefix(pubkey_prefix)
         if not contact:
             self._write_err(ERR_CODE_NOT_FOUND)
+            return
+        # Firmware (MyMesh.cpp CMD_SEND_TXT_MSG) only sends for TXT_TYPE_PLAIN
+        # and TXT_TYPE_CLI_DATA; any other txt_type (e.g. reserved/unknown
+        # values, or TXT_TYPE_SIGNED_PLAIN which this command doesn't support)
+        # falls into the `else` branch. That branch picks
+        # ERR_CODE_NOT_FOUND if the recipient lookup failed, else
+        # ERR_CODE_UNSUPPORTED_CMD for the unsupported txt_type — so the
+        # not-found check above must run first, and this check second.
+        if txt_type not in (TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA):
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         result = await self.bridge.send_text_message(
             contact.public_key_bytes,
