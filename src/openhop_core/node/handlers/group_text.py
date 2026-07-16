@@ -32,7 +32,10 @@ class GroupTextHandler(BaseHandler):
         self.channel_db = channel_db  # Live database instead of static config
         self.event_service = event_service
         self._packet_seen_callback = packet_seen_callback
-        self._seen_group_packets = PacketHashCache(ttl_seconds=60.0, max_entries=4096)
+        # MeshCore's seen table never expires (cyclic displacement only), so
+        # keep the window generous: echoes arriving via slow multi-hop paths
+        # or store-and-forward must still match the send-time mark.
+        self._seen_group_packets = PacketHashCache(ttl_seconds=600.0, max_entries=4096)
 
     @staticmethod
     def _packet_hash(packet: Packet) -> str:
@@ -49,6 +52,9 @@ class GroupTextHandler(BaseHandler):
         Group text has no authenticated sender identity. MeshCore marks the
         packet in its seen table before transmission, so an echoed packet is
         identified by its packet hash rather than its display-name prefix.
+        Suppression lasts the cache TTL from the last sighting (hits refresh
+        the entry); an echo arriving after a full quiet TTL is delivered as
+        incoming, unlike firmware's never-expiring (but smaller) seen table.
         """
         if packet.get_payload_type() != PAYLOAD_TYPE_GRP_TXT:
             return

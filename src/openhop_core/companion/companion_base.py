@@ -132,10 +132,12 @@ class CompanionBase(
         # Event-level de-dup caches keep reconnects from re-queuing text.
         self._seen_grp_txt = _SeenCache(ttl=60.0, max_size=4096)
         self._seen_txt = _SeenCache()
-        # Group packets have no sender identity.  Keep full packet hashes for
-        # the short period in which a local transmission can loop back or be
-        # repeated by the mesh; the capacity is a safety limit for untrusted RX.
-        self._seen_group_packets = PacketHashCache(ttl_seconds=60.0, max_entries=4096)
+        # Group packets have no sender identity, so local echoes are matched
+        # by full packet hash marked at send time. MeshCore's seen table never
+        # expires (cyclic displacement only); keep the window generous so
+        # echoes via slow multi-hop or store-and-forward paths still match.
+        # The capacity is a safety limit for untrusted RX.
+        self._seen_group_packets = PacketHashCache(ttl_seconds=600.0, max_entries=4096)
 
         # Allow subclasses to restore persisted preferences on startup.
         self._load_prefs()

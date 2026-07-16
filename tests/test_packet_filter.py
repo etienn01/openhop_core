@@ -178,3 +178,33 @@ class TestPacketHashCache:
 
         assert cache.check_and_add("fresh") is False
         assert list(cache._entries) == ["fresh"]
+
+    def test_hit_refreshes_entry_lifetime(self):
+        """Suppression extends while duplicates keep arriving: an entry near
+        expiry that gets a hit survives past its original TTL."""
+        cache = PacketHashCache(ttl_seconds=60, max_entries=4)
+        cache._entries["echoing"] = time.monotonic() - 50  # 10 s of TTL left
+
+        assert cache.check_and_add("echoing") is True
+        # The hit reset the clock: backdating by the original remainder no
+        # longer expires it.
+        cache._entries["echoing"] -= 50
+        assert cache.check_and_add("echoing") is True
+
+    def test_entry_expires_after_quiet_ttl(self):
+        cache = PacketHashCache(ttl_seconds=60, max_entries=4)
+        assert cache.check_and_add("once") is False
+        cache._entries["once"] = time.monotonic() - 61
+
+        assert cache.check_and_add("once") is False  # expired -> fresh again
+
+    def test_hit_refreshes_lru_position(self):
+        """A refreshed entry moves to the back of the eviction order."""
+        cache = PacketHashCache(ttl_seconds=60, max_entries=2)
+        assert cache.check_and_add("first") is False
+        assert cache.check_and_add("second") is False
+        assert cache.check_and_add("first") is True  # refresh: now newest
+
+        assert cache.check_and_add("third") is False  # evicts "second"
+        assert cache.check_and_add("first") is True
+        assert cache.check_and_add("second") is False

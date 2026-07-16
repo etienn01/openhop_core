@@ -93,12 +93,19 @@ class PacketHashCache:
             self._entries.popitem(last=False)
 
     def check_and_add(self, packet_hash: str) -> bool:
-        """Return whether *packet_hash* is still cached, otherwise store it."""
+        """Return whether *packet_hash* is still cached, otherwise store it.
+
+        A hit refreshes the entry, so suppression of a key extends while
+        duplicates keep arriving; an entry only expires after a full quiet
+        TTL. MeshCore's seen table has no expiry at all (a cyclic buffer of
+        160 hashes displaced by newer traffic), so refreshing keeps this
+        bounded cache closer to firmware behavior than a fixed window.
+        """
         now = time.monotonic()
         self._evict_expired(now)
-        if packet_hash in self._entries:
-            return True
+        hit = packet_hash in self._entries
         self._entries[packet_hash] = now
+        self._entries.move_to_end(packet_hash)
         if len(self._entries) > self.max_entries:
             self._entries.popitem(last=False)
-        return False
+        return hit
