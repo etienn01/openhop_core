@@ -688,6 +688,14 @@ class Dispatcher:
         except asyncio.TimeoutError:
             self._log(f"wait_for_ack() timeout for CRC {crc:08X}")
             return False
+        finally:
+            # Clean up our registration on every exit path (normal return,
+            # timeout, or cancellation) so `_waiting_acks` never leaks.
+            # Identity-guarded: if the receive path already popped our entry
+            # (the normal-ACK case) this is a no-op; if a *different* waiter
+            # has since registered under the same CRC, don't delete theirs.
+            if self._waiting_acks.get(crc) is event:
+                del self._waiting_acks[crc]
 
     # ------------------------------------------------------------------#
     # ACK tracking and management

@@ -367,6 +367,91 @@ class TestDispatcherACKSystem:
         assert crc not in dispatcher._recent_acks
 
 
+class TestDispatcherWaitForAckCleanup:
+    """wait_for_ack() must never leak entries in `_waiting_acks`, on any exit path."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_path_removes_waiting_ack(self, dispatcher):
+        """A wait_for_ack() call that times out must clean up its own registration."""
+        crc = 0xAABBCCDD
+
+        result = await dispatcher.wait_for_ack(crc, timeout=0.01)
+
+        assert result is False
+        assert crc not in dispatcher._waiting_acks
+
+    @pytest.mark.asyncio
+    async def test_cancellation_removes_waiting_ack(self, dispatcher):
+        """A wait_for_ack() task that is cancelled mid-wait must clean up its
+        own registration rather than leaking it forever."""
+        crc = 0xAABBCCDD
+
+        task = asyncio.create_task(dispatcher.wait_for_ack(crc, timeout=10))
+        await asyncio.sleep(0)  # let the task register and start waiting
+        assert crc in dispatcher._waiting_acks
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert crc not in dispatcher._waiting_acks
+
+    @pytest.mark.asyncio
+    async def test_stale_waiter_does_not_remove_newer_registration(self, dispatcher):
+        """If a stale waiter's cleanup runs after a *different* Event has been
+        registered under the same CRC (e.g. a fresh wait_for_ack() call took
+        over that slot), the stale cleanup must be a no-op rather than
+        deleting the newer registration out from under it."""
+        crc = 0xAABBCCDD
+
+        task = asyncio.create_task(dispatcher.wait_for_ack(crc, timeout=10))
+        await asyncio.sleep(0)  # let the task register
+        stale_event = dispatcher._waiting_acks[crc]
+
+        # Simulate a newer waiter taking over the same CRC slot.
+        newer_event = asyncio.Event()
+        dispatcher._waiting_acks[crc] = newer_event
+        assert stale_event is not newer_event
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The stale task's finally-block cleanup must not have clobbered
+        # the newer registration.
+        assert dispatcher._waiting_acks.get(crc) is newer_event
+
+    @pytest.mark.asyncio
+    async def test_normal_ack_receipt_still_works_and_cleans_up_once(self, dispatcher):
+        """The happy path (ACK arrives while waiting) must still return True
+        and leave `_waiting_acks` clean, with no double-delete errors."""
+        crc = 0xAABBCCDD
+
+        task = asyncio.create_task(dispatcher.wait_for_ack(crc, timeout=5))
+        await asyncio.sleep(0)  # let the task register
+        assert crc in dispatcher._waiting_acks
+
+        await dispatcher._register_ack_received(crc)
+
+        result = await task
+        assert result is True
+        assert crc not in dispatcher._waiting_acks
+
+    @pytest.mark.asyncio
+    async def test_cached_ack_early_fire_does_not_leak(self, dispatcher):
+        """expect_ack() fires its Event immediately when the CRC is already in
+        the recent-ACK cache (e.g. the ACK arrived just before we started
+        waiting). wait_for_ack() must still clean up its registration in that
+        case instead of leaving a permanently orphaned entry."""
+        crc = 0xAABBCCDD
+        dispatcher._recent_acks[crc] = asyncio.get_event_loop().time()
+
+        result = await dispatcher.wait_for_ack(crc, timeout=5)
+
+        assert result is True
+        assert crc not in dispatcher._waiting_acks
+
+
 class TestDispatcherStateManagement:
     """Test dispatcher state management."""
 
