@@ -4,6 +4,7 @@ Consolidates common operations between Packet and PacketBuilder classes.
 """
 
 import hashlib
+import math
 import struct
 from typing import Any, List, Optional, Union
 
@@ -40,6 +41,55 @@ def coding_rate_denominator(cr: Union[int, float]) -> int:
     if 1 <= cr_val <= 4:
         return cr_val + 4
     return max(5, min(8, cr_val))
+
+
+def calculate_lora_airtime_ms(
+    payload_len: int,
+    sf: int,
+    bw_hz: Union[int, float],
+    cr: Union[int, float],
+    preamble_symbols: int = 8,
+    crc_enabled: bool = True,
+    explicit_header: bool = True,
+    low_dr_opt: Optional[bool] = None,
+) -> float:
+    """LoRa time-on-air (ms), matching RadioLib's chip drivers.
+
+    MeshCore firmware airtime is RadioLib ``getTimeOnAir`` (the Semtech
+    AN1200.13 formula, with 6.25 sync symbols and a different numerator
+    constant for SF5/SF6). ``cr`` accepts either coding-rate representation;
+    see ``coding_rate_denominator``. ``payload_len`` is the full on-air byte
+    length (use ``Packet.get_raw_length()``).
+
+    When ``low_dr_opt`` is None it follows RadioLib's auto rule — enabled when
+    the symbol time is at least 16 ms — which is what firmware nodes use
+    (MeshCore never overrides the driver's LDRO auto-configuration). Note this
+    differs from the common "SF >= 11 and BW <= 125 kHz" shorthand at some
+    settings, e.g. SF12 @ 250 kHz and SF10 @ 62.5 kHz both have 16.384 ms
+    symbols and therefore use LDRO on real hardware.
+    """
+    sf = max(5, min(12, int(sf)))
+    bw_hz = float(bw_hz) or 250000.0
+    cr_denom = coding_rate_denominator(cr)
+
+    symbol_time_s = (1 << sf) / bw_hz
+    if low_dr_opt is None:
+        low_dr_opt = symbol_time_s * 1000.0 >= 16.0
+
+    sync_symbols = 6.25 if sf <= 6 else 4.25
+    sf_coeff2 = 0 if sf <= 6 else 8
+    bit_count = (
+        8 * payload_len
+        + (16 if crc_enabled else 0)
+        - 4 * sf
+        + sf_coeff2
+        + (20 if explicit_header else 0)
+    )
+    denom = 4 * (sf - 2) if low_dr_opt else 4 * sf
+    payload_symbols = 8 + math.ceil(max(bit_count, 0) / denom) * cr_denom
+
+    total_symbols = preamble_symbols + sync_symbols + payload_symbols
+    return total_symbols * symbol_time_s * 1000.0
 
 
 class PacketValidationUtils:
@@ -404,65 +454,12 @@ class PacketTimingUtils:
         cr = radio_config.get("coding_rate", 5)
         preamble = radio_config.get("preamble_length", 8)
 
-        cr_denom = coding_rate_denominator(cr)
-
         # Convert bandwidth to Hz if it's in kHz (values < 1000 are assumed to be kHz)
         if bw < 1000:
             bw = bw * 1000  # Convert kHz to Hz
 
-        symbol_time = (2**sf) / bw  # seconds per symbol
+        airtime_ms = calculate_lora_airtime_ms(packet_length_bytes, sf, bw, cr, preamble)
 
-        # Preamble time
-        preamble_time = preamble * symbol_time
-
-        # Payload symbols (simplified)
-        payload_symbols = 8 + max(0, (packet_length_bytes * 8 - 4 * sf + 28) // (4 * (sf - 2))) * (
-            cr_denom
-        )
-        payload_time = payload_symbols * symbol_time
-
-        total_time_ms = (preamble_time + payload_time) * 1000
-
-        # Add some overhead for processing and turnaround
-        return max(total_time_ms, 50.0)  # Minimum 50ms
-
-    @staticmethod
-    def calc_flood_timeout_ms(packet_airtime_ms: float) -> float:
-        """
-        Calculate timeout for flood packets.
-
-        Formula: 500ms + (16.0 × airtime)
-
-        Args:
-            packet_airtime_ms: Estimated packet airtime in milliseconds
-
-        Returns:
-            Timeout in milliseconds
-        """
-        SEND_TIMEOUT_BASE_MILLIS = 500
-        FLOOD_SEND_TIMEOUT_FACTOR = 16.0
-        return SEND_TIMEOUT_BASE_MILLIS + (FLOOD_SEND_TIMEOUT_FACTOR * packet_airtime_ms)
-
-    @staticmethod
-    def calc_direct_timeout_ms(packet_airtime_ms: float, path_hash_count: int) -> float:
-        """
-        Calculate timeout for direct packets.
-
-        Formula: 500ms + ((airtime × 6 + 250ms) × (path_hash_count + 1))
-
-        Args:
-            packet_airtime_ms: Estimated packet airtime in milliseconds
-            path_hash_count: Number of hops in the path (0 for direct).
-                Use ``PathUtils.get_path_hash_count(path_len)`` to extract
-                from an encoded path_len byte.
-
-        Returns:
-            Timeout in milliseconds
-        """
-        SEND_TIMEOUT_BASE_MILLIS = 500
-        DIRECT_SEND_PERHOP_FACTOR = 6.0
-        DIRECT_SEND_PERHOP_EXTRA_MILLIS = 250
-        return SEND_TIMEOUT_BASE_MILLIS + (
-            (packet_airtime_ms * DIRECT_SEND_PERHOP_FACTOR + DIRECT_SEND_PERHOP_EXTRA_MILLIS)
-            * (path_hash_count + 1)
-        )
+        # TODO: drop this legacy floor. Firmware reports true sub-50 ms
+        # airtimes; callers that need a wait margin already add their own.
+        return max(airtime_ms, 50.0)

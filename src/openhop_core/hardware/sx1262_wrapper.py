@@ -10,7 +10,7 @@ import random
 import time
 from typing import Optional, Union
 
-from ..protocol.packet_utils import coding_rate_denominator
+from ..protocol.packet_utils import calculate_lora_airtime_ms, coding_rate_denominator
 from .base import LoRaRadio
 from .gpio_manager import GPIOPinManager
 from .lora.LoRaRF.SX126x import SX126x, set_gpio_manager
@@ -941,20 +941,12 @@ class SX1262Radio(LoRaRadio):
 
     def _calculate_tx_timeout(self, packet_length: int) -> tuple[int, int]:
         """
-        Calculate the LoRa packet airtime and transmission timeout using the standard
-        Semtech formula.
+        Calculate the LoRa packet airtime and transmission timeout.
 
-        This method implements the LoRa airtime calculation as described in the Semtech
-        LoRa Modem Designer's Guide (AN1200.13, section 4.1), taking into account the
-        following parameters:
-            - Spreading Factor (SF)
-            - Bandwidth (BW)
-            - Coding Rate (CR)
-            - Preamble length
-            - Explicit/implicit header mode (always explicit here)
-            - CRC enabled (always enabled here)
-            - Low Data Rate Optimization (enabled if SF >= 11 and BW <= 125 kHz)
-            - Payload length (packet_length)
+        Airtime comes from the shared ``calculate_lora_airtime_ms`` (the
+        RadioLib-matching Semtech formula; explicit header, CRC on, LDRO by
+        the driver's symbol-time auto rule) using this radio's configured SF,
+        bandwidth, coding rate, and preamble length.
 
         Returns:
             timeout_ms (int): Calculated packet transmission timeout in milliseconds
@@ -965,37 +957,16 @@ class SX1262Radio(LoRaRadio):
         sf = self.spreading_factor
         bw_hz = int(self.bandwidth)  # your class already stores Hz
         cr_denom = coding_rate_denominator(self.coding_rate)
-        preamble = self.preamble_length
-        crc_on = True  # you always enable CRC
-        explicit_header = True  # you always use explicit header
-        low_dr_opt = 1 if (sf >= 11 and bw_hz <= 125000) else 0
-        symbol_time = (1 << sf) / float(bw_hz)
-        preamble_time = (preamble + 4.25) * symbol_time
-        ih = 0 if explicit_header else 1
-        crc = 1 if crc_on else 0
 
-        tmp = 8 * packet_length - 4 * sf + 28 + 16 * crc - 20 * ih
-
-        denom = 4 * (sf - 2 * low_dr_opt)
-
-        if tmp > 0:
-            payload_symbols = 8 + max(math.ceil(tmp / denom) * cr_denom, 0)
-        else:
-            payload_symbols = 8
-
-        payload_time = payload_symbols * symbol_time
-        air_time_ms = (preamble_time + payload_time) * 1000.0
+        air_time_ms = calculate_lora_airtime_ms(
+            packet_length, sf, bw_hz, cr_denom, self.preamble_length
+        )
         timeout_ms = math.ceil(air_time_ms) + 1000
         driver_timeout = timeout_ms * 64
 
         _trace(
             f"TX timing SF{sf}/{bw_hz / 1000:.1f}kHz "
             f"CR4/{cr_denom} {packet_length}B: "
-            f"symbol={symbol_time * 1000:.3f}ms, "
-            f"preamble={preamble_time * 1000:.1f}ms, "
-            f"tmp={tmp}, "
-            f"payload_syms={payload_symbols:.1f}, "
-            f"payload={payload_time * 1000:.1f}ms, "
             f"air_time={air_time_ms:.1f}ms, "
             f"timeout={timeout_ms}ms, "
             f"driver_timeout={driver_timeout}"
