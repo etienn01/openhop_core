@@ -1811,7 +1811,47 @@ async def test_cmd_send_txt_msg_unknown_contact_and_failure():
 
     server, frames = _make_capture_server(_txt_bridge(contact, SentResult(True)))
     await server._cmd_send_txt_msg(b"\x00\x00")  # too short
-    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+    # Firmware: a length-check failure falls through the else-if chain to the
+    # catch-all `else { writeErrFrame(ERR_CODE_UNSUPPORTED_CMD); }`, not ILLEGAL_ARG.
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_txt_msg_rejects_zero_text_bytes():
+    """Firmware requires `len >= 14` (cmd byte + 12 header bytes + >=1 text byte).
+    `data` here has the command byte already stripped, so the minimum is 13: a
+    12-byte header (txt_type, attempt, timestamp, pubkey_prefix) with zero text
+    bytes must be rejected with ERR_CODE_UNSUPPORTED_CMD, matching the firmware's
+    else-if fall-through, and must not reach the send pipeline."""
+    contact = _contact()
+    bridge = _txt_bridge(contact, SentResult(True))
+    server, frames = _make_capture_server(bridge)
+
+    data = bytes([0, 0]) + struct.pack("<I", 1) + contact.public_key[:6]
+    assert len(data) == 12
+    await server._cmd_send_txt_msg(data)
+
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+    bridge.send_text_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_txt_msg_accepts_one_text_byte():
+    """A 13-byte frame (12-byte header + exactly 1 text byte) passes the length
+    gate and proceeds to normal handling -- it must not be rejected as
+    ERR_CODE_UNSUPPORTED_CMD."""
+    contact = _contact()
+    result = SentResult(success=True, is_flood=False, expected_ack=0, timeout_ms=1000)
+    bridge = _txt_bridge(contact, result)
+    server, frames = _make_capture_server(bridge)
+
+    data = bytes([0, 0]) + struct.pack("<I", 1) + contact.public_key[:6] + b"h"
+    assert len(data) == 13
+    await server._cmd_send_txt_msg(data)
+
+    bridge.send_text_message.assert_awaited_once()
+    assert bridge.send_text_message.call_args.args[1] == "h"
+    assert frames and frames[0][0] == RESP_CODE_SENT
 
 
 # ---------------------------------------------------------------------------

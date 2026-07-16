@@ -64,8 +64,16 @@ class _MessagingCommandsMixin:
         self._write_err(code)
 
     async def _cmd_send_txt_msg(self, data: bytes) -> None:
-        if len(data) < 12:
-            self._write_err(ERR_CODE_ILLEGAL_ARG)
+        # Firmware: `cmd_frame[0] == CMD_SEND_TXT_MSG && len >= 14` (MyMesh.cpp
+        # handleCmdFrame), where len includes the command byte. `data` here has
+        # already had the command byte stripped, so the equivalent minimum is
+        # 13: 12 header bytes (txt_type, attempt, timestamp, pubkey_prefix)
+        # plus at least 1 text byte. Frames that fail this length check don't
+        # match any `else if` branch and fall through to the catch-all
+        # `else { writeErrFrame(ERR_CODE_UNSUPPORTED_CMD); }` at the end of
+        # handleCmdFrame, so that's the code we mirror here (not ILLEGAL_ARG).
+        if len(data) < 13:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         txt_type = data[0]
         attempt = data[1]
