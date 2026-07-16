@@ -12,7 +12,6 @@ mechanism entirely.
 import asyncio
 
 import pytest
-
 from openhop_core.node.dispatcher import MAX_RX_DELAY_MS, Dispatcher
 from openhop_core.protocol import Packet
 from openhop_core.protocol.constants import (
@@ -22,7 +21,7 @@ from openhop_core.protocol.constants import (
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
 from openhop_core.protocol.packet_filter import PacketFilter
-from openhop_core.protocol.packet_utils import packet_score
+from openhop_core.protocol.packet_utils import flood_rx_metrics, packet_score
 
 
 class StubRadio:
@@ -114,13 +113,17 @@ class TestCalcRxDelay:
         dispatcher = make_dispatcher()
         dispatcher.rx_delay_base = 10.0
         # (rx_delay_base ** (0.85 - score) - 1) * air_time
-        assert dispatcher.calc_rx_delay(0.0, 100.0) == pytest.approx(607.945784, rel=1e-6)
+        assert dispatcher.calc_rx_delay(0.0, 100.0) == pytest.approx(
+            607.945784, rel=1e-6
+        )
         assert dispatcher.calc_rx_delay(0.85, 100.0) == 0.0
 
     def test_worse_reception_waits_longer(self):
         dispatcher = make_dispatcher()
         dispatcher.rx_delay_base = 10.0
-        assert dispatcher.calc_rx_delay(0.2, 100.0) > dispatcher.calc_rx_delay(0.6, 100.0)
+        assert dispatcher.calc_rx_delay(0.2, 100.0) > dispatcher.calc_rx_delay(
+            0.6, 100.0
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +139,9 @@ class TestFloodRxDelayMs:
         # (RadioLib vector); SNR at the SF10 threshold scores 0.
         dispatcher = make_dispatcher()
         dispatcher.rx_delay_base = 10.0
-        assert dispatcher._flood_rx_delay_ms(24, -15.0) == pytest.approx(1126.791035, rel=1e-6)
+        assert dispatcher._flood_rx_delay_ms(24, -15.0) == pytest.approx(
+            1126.791035, rel=1e-6
+        )
 
     def test_strong_reception_is_immediate(self):
         # Score clamps to 1.0, making the exponent negative -> delay below 0.
@@ -157,6 +162,35 @@ class TestFloodRxDelayMs:
         dispatcher = make_dispatcher(StubRadio(sf=12, bandwidth=125000, coding_rate=8))
         dispatcher.rx_delay_base = 10.0
         assert dispatcher._flood_rx_delay_ms(255, -25.0) == MAX_RX_DELAY_MS
+
+
+class TestFloodRxMetricsShared:
+    def test_matches_dispatcher_delay_logic(self):
+        dispatcher = make_dispatcher()
+        dispatcher.rx_delay_base = 10.0
+        frame_len = 24
+        snr = -15.0
+
+        metrics = flood_rx_metrics(
+            frame_len,
+            snr,
+            dispatcher.radio.spreading_factor,
+            dispatcher.radio.bandwidth,
+            dispatcher.radio.coding_rate,
+            dispatcher.radio.preamble_length,
+            rx_delay_base=dispatcher.rx_delay_base,
+            min_delay_ms=50.0,
+            max_delay_ms=32000.0,
+        )
+        assert metrics.delay_ms == pytest.approx(
+            dispatcher._flood_rx_delay_ms(frame_len, snr)
+        )
+
+    def test_disabled_delay_still_reports_score_and_airtime(self):
+        metrics = flood_rx_metrics(24, -5.0, 10, 250000, 5, 8, rx_delay_base=0.0)
+        assert metrics.delay_ms == 0.0
+        assert 0.0 <= metrics.score <= 1.0
+        assert metrics.air_time_ms > 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +256,9 @@ class TestReceivePath:
         )
         assert len(hold.delays) == 1
         assert hold.delays[0] == pytest.approx(
-            dispatcher._flood_rx_delay_ms(len(make_frame(ROUTE_TYPE_FLOOD, PAYLOAD)), -15.0)
+            dispatcher._flood_rx_delay_ms(
+                len(make_frame(ROUTE_TYPE_FLOOD, PAYLOAD)), -15.0
+            )
         )
         assert len(handler.packets) == 1
 

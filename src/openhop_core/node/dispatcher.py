@@ -16,7 +16,7 @@ from ..protocol.constants import (  # Payload types
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
-from ..protocol.packet_utils import calculate_lora_airtime_ms, packet_score
+from ..protocol.packet_utils import flood_rx_metrics
 from ..protocol.transport_keys import calc_transport_code
 from ..protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES, format_packet_info
 
@@ -74,17 +74,27 @@ class Dispatcher:
         self.tx_delay = tx_delay
         self.state: DispatcherState = DispatcherState.IDLE
 
-        self.packet_received_callback: Optional[Callable[[Packet], Awaitable[None] | None]] = None
-        self.packet_sent_callback: Optional[Callable[[Packet], Awaitable[None] | None]] = None
+        self.packet_received_callback: Optional[
+            Callable[[Packet], Awaitable[None] | None]
+        ] = None
+        self.packet_sent_callback: Optional[
+            Callable[[Packet], Awaitable[None] | None]
+        ] = None
 
         # Optional listener for ACK received (e.g. companion send_confirmed)
-        self._ack_received_listener: Optional[Callable[[int], Awaitable[None] | None]] = None
+        self._ack_received_listener: Optional[
+            Callable[[int], Awaitable[None] | None]
+        ] = None
 
         # Optional callback for PAYLOAD_TYPE_RAW_CUSTOM (companion raw_data_received)
-        self.raw_data_received_callback: Optional[Callable[[Packet], Awaitable[None]]] = None
+        self.raw_data_received_callback: Optional[
+            Callable[[Packet], Awaitable[None]]
+        ] = None
 
         # Raw packet callbacks: single callback (legacy) and list of subscribers (after parse)
-        self.raw_packet_callback: Optional[Callable[[Packet, bytes], Awaitable[None] | None]] = None
+        self.raw_packet_callback: Optional[
+            Callable[[Packet, bytes], Awaitable[None] | None]
+        ] = None
         self._raw_packet_subscribers: List[Callable[..., Any]] = []
         # Raw RX subscribers: notified for every reception (data, rssi, snr) before duplicate/parse
         self._raw_rx_subscribers: List[Callable[..., Any]] = []
@@ -407,19 +417,18 @@ class Dispatcher:
         same assumptions as the firmware base wrapper (SF10) and the default
         MeshCore preset.
         """
-        sf = getattr(self.radio, "spreading_factor", 10)
-        score = packet_score(snr, sf, frame_len)
-        air_time_ms = calculate_lora_airtime_ms(
+        metrics = flood_rx_metrics(
             frame_len,
-            sf,
+            snr,
+            getattr(self.radio, "spreading_factor", 10),
             getattr(self.radio, "bandwidth", 250000),
             getattr(self.radio, "coding_rate", 5),
             getattr(self.radio, "preamble_length", 8),
+            rx_delay_base=self.rx_delay_base,
+            min_delay_ms=MIN_RX_DELAY_MS,
+            max_delay_ms=MAX_RX_DELAY_MS,
         )
-        delay_ms = self.calc_rx_delay(score, air_time_ms)
-        if delay_ms < MIN_RX_DELAY_MS:
-            return 0.0
-        return min(delay_ms, MAX_RX_DELAY_MS)
+        return metrics.delay_ms
 
     async def _hold_flood_packet(self, delay_ms: float) -> None:
         """Wait out a flood reception delay (overridable by tests/subclasses)."""
@@ -491,7 +500,9 @@ class Dispatcher:
         for callback in self._raw_packet_subscribers:
             await self._invoke_enhanced_raw_callback(callback, pkt, data, analysis)
         if self.raw_packet_callback:
-            await self._invoke_enhanced_raw_callback(self.raw_packet_callback, pkt, data, {})
+            await self._invoke_enhanced_raw_callback(
+                self.raw_packet_callback, pkt, data, {}
+            )
         if self._raw_packet_subscribers or self.raw_packet_callback:
             self._log("[RX DEBUG] Raw packet callback completed")
 
@@ -504,7 +515,9 @@ class Dispatcher:
         if pkt.is_route_flood():
             delay_ms = self._flood_rx_delay_ms(len(data), snr_val)
             if delay_ms > 0.0:
-                self._log(f"Holding flood packet {delay_ms:.0f}ms (reception-quality delay)")
+                self._log(
+                    f"Holding flood packet {delay_ms:.0f}ms (reception-quality delay)"
+                )
                 await self._hold_flood_packet(delay_ms)
 
         # When disabled, packet_filter still tracks hashes for stats/visibility.
@@ -522,7 +535,9 @@ class Dispatcher:
             self._log(
                 "   This suggests your packet was repeated by another node and came back to you!"
             )
-            self._log(f"Ignoring own packet (type={pkt.get_payload_type():02X}) to prevent loops")
+            self._log(
+                f"Ignoring own packet (type={pkt.get_payload_type():02X}) to prevent loops"
+            )
             return
 
         # Handle ACK matching for waiting senders
@@ -636,8 +651,12 @@ class Dispatcher:
             return False
         # Log what we sent
         type_name = PAYLOAD_TYPES.get(payload_type, f"UNKNOWN_{payload_type}")
-        route_name = ROUTE_TYPES.get(packet.get_route_type(), f"UNKNOWN_{packet.get_route_type()}")
-        self._log(f"TX {packet.get_raw_length()} bytes (type={type_name}, route={route_name})")
+        route_name = ROUTE_TYPES.get(
+            packet.get_route_type(), f"UNKNOWN_{packet.get_route_type()}"
+        )
+        self._log(
+            f"TX {packet.get_raw_length()} bytes (type={type_name}, route={route_name})"
+        )
 
         # Store metadata on packet for access by handlers
         if tx_metadata:
@@ -669,7 +688,9 @@ class Dispatcher:
 
         try:
             # Wait for the ACK using the event-based system
-            ack_received = await self.wait_for_ack(self._current_expected_crc, ACK_TIMEOUT)
+            ack_received = await self.wait_for_ack(
+                self._current_expected_crc, ACK_TIMEOUT
+            )
             if ack_received:
                 self._log(f"[>>acK] received for CRC {self._current_expected_crc:08X}")
                 return True
@@ -722,9 +743,13 @@ class Dispatcher:
         else:
             self._log(f"RX {type_name} ({payload_type}) len={pkt.payload_len}")
 
-        self._logger.debug(f"Received packet type {type_name}, payload length: {pkt.payload_len}")
+        self._logger.debug(
+            f"Received packet type {type_name}, payload length: {pkt.payload_len}"
+        )
         if pkt.payload_len > 0:
-            self._logger.debug(f"Payload preview: {pkt.payload[: min(10, pkt.payload_len)].hex()}")
+            self._logger.debug(
+                f"Payload preview: {pkt.payload[: min(10, pkt.payload_len)].hex()}"
+            )
 
         handler = self._get_handler(payload_type)
         if not handler:
@@ -764,7 +789,9 @@ class Dispatcher:
         while True:
             # Clean out old ACK CRCs (older than 5 seconds)
             now = asyncio.get_running_loop().time()
-            self._recent_acks = {crc: ts for crc, ts in self._recent_acks.items() if now - ts < 5}
+            self._recent_acks = {
+                crc: ts for crc, ts in self._recent_acks.items() if now - ts < 5
+            }
 
             # Clean old packet hashes for deduplication
             self.packet_filter.cleanup_old_hashes()

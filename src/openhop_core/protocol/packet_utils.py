@@ -6,7 +6,7 @@ Consolidates common operations between Packet and PacketBuilder classes.
 import hashlib
 import math
 import struct
-from typing import Any, List, Optional, Union
+from typing import Any, List, NamedTuple, Optional, Union
 
 from .constants import (
     MAX_HASH_SIZE,
@@ -116,6 +116,51 @@ def packet_score(snr: float, sf: int, packet_len: int) -> float:
     return max(0.0, min(1.0, snr_margin_rate * collision_penalty))
 
 
+class FloodRxMetrics(NamedTuple):
+    score: float
+    air_time_ms: float
+    delay_ms: float
+
+
+def flood_rx_metrics(
+    frame_len: int,
+    snr: float,
+    sf: int,
+    bw_hz: Union[int, float],
+    cr: Union[int, float],
+    preamble_symbols: int = 8,
+    *,
+    rx_delay_base: float = 0.0,
+    min_delay_ms: float = 50.0,
+    max_delay_ms: float = 32000.0,
+) -> FloodRxMetrics:
+    """Shared flood RX scoring/airtime/delay metrics used by core and repeater.
+
+    Uses the MeshCore packet score and airtime formulas. Delay follows the
+    Dispatcher calcRxDelay behavior: disabled when rx_delay_base <= 0,
+    immediate below min_delay_ms, capped at max_delay_ms.
+    """
+    score = packet_score(snr, sf, frame_len)
+    air_time_ms = calculate_lora_airtime_ms(
+        frame_len,
+        sf,
+        bw_hz,
+        cr,
+        preamble_symbols,
+    )
+
+    if rx_delay_base <= 0.0:
+        return FloodRxMetrics(score=score, air_time_ms=air_time_ms, delay_ms=0.0)
+
+    delay_ms = (float(rx_delay_base) ** (0.85 - score) - 1.0) * air_time_ms
+    if delay_ms < min_delay_ms:
+        delay_ms = 0.0
+    else:
+        delay_ms = min(delay_ms, max_delay_ms)
+
+    return FloodRxMetrics(score=score, air_time_ms=air_time_ms, delay_ms=delay_ms)
+
+
 class PacketValidationUtils:
     """Centralized validation utilities for packet operations."""
 
@@ -137,7 +182,9 @@ class PacketValidationUtils:
             raise ValueError(f"routing_path must be a list, got {type(routing_path)}")
 
         if len(routing_path) > MAX_PATH_SIZE:
-            raise ValueError(f"Path length {len(routing_path)} exceeds maximum {MAX_PATH_SIZE}")
+            raise ValueError(
+                f"Path length {len(routing_path)} exceeds maximum {MAX_PATH_SIZE}"
+            )
 
         validated_path = []
         for i, item in enumerate(routing_path):
@@ -148,13 +195,17 @@ class PacketValidationUtils:
                     )
                 hex_part = item[:2]
                 if not all(c in "0123456789abcdefABCDEF" for c in hex_part):
-                    raise ValueError(f"Path[{i}]: '{hex_part}' contains invalid hex characters")
+                    raise ValueError(
+                        f"Path[{i}]: '{hex_part}' contains invalid hex characters"
+                    )
                 byte_val = int(hex_part, 16)
                 validated_path.append(byte_val)
             elif isinstance(item, (int, float)):
                 byte_val = int(item)
                 if not (0 <= byte_val <= 255):
-                    raise ValueError(f"Path[{i}]: value {byte_val} out of range (0-255)")
+                    raise ValueError(
+                        f"Path[{i}]: value {byte_val} out of range (0-255)"
+                    )
                 validated_path.append(byte_val)
             else:
                 raise ValueError(
@@ -163,7 +214,9 @@ class PacketValidationUtils:
         return validated_path
 
     @staticmethod
-    def validate_packet_bounds(idx: int, required: int, data_len: int, error_msg: str) -> None:
+    def validate_packet_bounds(
+        idx: int, required: int, data_len: int, error_msg: str
+    ) -> None:
         """Check if we have enough data remaining."""
         if idx + required > data_len:
             raise ValueError(error_msg)
@@ -228,8 +281,12 @@ class PathUtils:
         Hop count is stored in 6 bits (0-63). Values above 63 are invalid and raise.
         """
         if not 0 <= hash_count <= 63:
-            raise ValueError(f"hop count must be 0-63 for path_len encoding, got {hash_count}")
-        return ((hash_size - 1) << PATH_HASH_SIZE_SHIFT) | (hash_count & PATH_HASH_COUNT_MASK)
+            raise ValueError(
+                f"hop count must be 0-63 for path_len encoding, got {hash_count}"
+            )
+        return ((hash_size - 1) << PATH_HASH_SIZE_SHIFT) | (
+            hash_count & PATH_HASH_COUNT_MASK
+        )
 
     @staticmethod
     def is_valid_path_len(path_len_byte: int) -> bool:
@@ -374,7 +431,9 @@ class PacketHashingUtils:
     """Centralized hashing utilities for packets."""
 
     @staticmethod
-    def calculate_packet_hash(payload_type: int, path_len: int, payload: bytes) -> bytes:
+    def calculate_packet_hash(
+        payload_type: int, path_len: int, payload: bytes
+    ) -> bytes:
         """
         Calculate packet hash compatible with C++ implementation.
 
@@ -416,14 +475,18 @@ class PacketHashingUtils:
         Returns:
             str: Upper-case hex string of the packet hash, optionally truncated.
         """
-        raw_hash = PacketHashingUtils.calculate_packet_hash(payload_type, path_len, payload)
+        raw_hash = PacketHashingUtils.calculate_packet_hash(
+            payload_type, path_len, payload
+        )
         hex_str = raw_hash.hex().upper()
         return hex_str if length is None else hex_str[:length]
 
     @staticmethod
     def calculate_crc(payload_type: int, path_len: int, payload: bytes) -> int:
         """Calculate 4-byte CRC from packet hash."""
-        hash_bytes = PacketHashingUtils.calculate_packet_hash(payload_type, path_len, payload)
+        hash_bytes = PacketHashingUtils.calculate_packet_hash(
+            payload_type, path_len, payload
+        )
         return int.from_bytes(hash_bytes[:4], "little")
 
 
@@ -452,7 +515,9 @@ class PacketTimingUtils:
     """Utilities for packet transmission timing calculations."""
 
     @staticmethod
-    def estimate_airtime_ms(packet_length_bytes: int, radio_config: dict = None) -> float:
+    def estimate_airtime_ms(
+        packet_length_bytes: int, radio_config: dict = None
+    ) -> float:
         """
         Estimate LoRa packet airtime in milliseconds based on packet size and radio parameters.
 
@@ -476,7 +541,9 @@ class PacketTimingUtils:
             return radio_config["measured_airtime_ms"]
 
         sf = radio_config.get("spreading_factor", 10)
-        bw = radio_config.get("bandwidth", 250000)  # Hz or kHz - convert to Hz if needed
+        bw = radio_config.get(
+            "bandwidth", 250000
+        )  # Hz or kHz - convert to Hz if needed
         cr = radio_config.get("coding_rate", 5)
         preamble = radio_config.get("preamble_length", 8)
 
@@ -484,7 +551,9 @@ class PacketTimingUtils:
         if bw < 1000:
             bw = bw * 1000  # Convert kHz to Hz
 
-        airtime_ms = calculate_lora_airtime_ms(packet_length_bytes, sf, bw, cr, preamble)
+        airtime_ms = calculate_lora_airtime_ms(
+            packet_length_bytes, sf, bw, cr, preamble
+        )
 
         # TODO: drop this legacy floor. Firmware reports true sub-50 ms
         # airtimes; callers that need a wait margin already add their own.
