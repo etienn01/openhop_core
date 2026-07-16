@@ -18,10 +18,20 @@ from .lora.LoRaRF.SX126x import SX126x, set_gpio_manager
 logger = logging.getLogger("SX1262_wrapper")
 TRACE_LEVEL = 5
 logging.addLevelName(TRACE_LEVEL, "TRACE")
+setattr(logging, "TRACE", TRACE_LEVEL)
+
+
+def _logger_trace(self, message, *args, **kwargs):
+    if self.isEnabledFor(TRACE_LEVEL):
+        self._log(TRACE_LEVEL, message, args, **kwargs)
+
+
+if not hasattr(logging.Logger, "trace"):
+    logging.Logger.trace = _logger_trace
 
 
 def _trace(message: str) -> None:
-    logger.log(TRACE_LEVEL, message)
+    logger.trace(message)
 
 
 class SX1262Radio(LoRaRadio):
