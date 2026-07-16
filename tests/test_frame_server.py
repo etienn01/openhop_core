@@ -1698,6 +1698,54 @@ async def test_cmd_app_start_self_info_layout():
 
 
 @pytest.mark.asyncio
+async def test_cmd_app_start_self_info_packs_telemetry_env_nibble():
+    # Firmware MyMesh.cpp CMD_APP_START handler packs the telemetry byte as
+    # (telemetry_mode_env << 4) | (telemetry_mode_loc << 2) | telemetry_mode_base.
+    # base=1, env=2 -> 0b00100001 == 0x21.
+    prefs = NodePrefs(
+        node_name="TestNode",
+        telemetry_mode_base=1,
+        telemetry_mode_location=0,
+        telemetry_mode_environment=2,
+    )
+    bridge = Mock()
+    bridge.get_self_info = Mock(return_value=prefs)
+    bridge.get_public_key = Mock(return_value=bytes(32))
+    bridge.get_max_tx_power_dbm = Mock(return_value=19)
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_app_start(bytes(7) + b"TestApp")
+
+    (frame,) = frames
+    # telemetry byte offset: RESP_CODE(1)+ADV_TYPE(1)+tx_power(1)+max_tx(1)
+    # + pubkey(32) + lat(4)+lon(4) + multi_acks(1)+advert_loc_policy(1) = 46
+    assert frame[46] == 0x21
+
+
+@pytest.mark.asyncio
+async def test_cmd_app_start_self_info_env_zero_matches_old_single_nibble_byte():
+    # With telemetry_mode_environment left at its default (0), the packed byte
+    # is unchanged from the pre-fix base|location-only packing.
+    prefs = NodePrefs(
+        node_name="TestNode",
+        telemetry_mode_base=1,
+        telemetry_mode_location=2,
+        telemetry_mode_environment=0,
+    )
+    bridge = Mock()
+    bridge.get_self_info = Mock(return_value=prefs)
+    bridge.get_public_key = Mock(return_value=bytes(32))
+    bridge.get_max_tx_power_dbm = Mock(return_value=19)
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_app_start(bytes(7) + b"TestApp")
+
+    (frame,) = frames
+    assert frame[46] == (1 | (2 << 2))
+    assert frame[46] == 0x09
+
+
+@pytest.mark.asyncio
 async def test_cmd_app_start_rejects_short_frame():
     bridge = Mock()
     server, frames = _make_capture_server(bridge)

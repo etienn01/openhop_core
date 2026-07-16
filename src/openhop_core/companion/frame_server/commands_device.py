@@ -89,8 +89,9 @@ class _DeviceCommandsMixin:
             )
             + bytes(
                 [
-                    getattr(prefs, "telemetry_mode_base", 0)
-                    | (getattr(prefs, "telemetry_mode_location", 0) << 2)
+                    (getattr(prefs, "telemetry_mode_base", 0) & 0x03)
+                    | ((getattr(prefs, "telemetry_mode_location", 0) & 0x03) << 2)
+                    | ((getattr(prefs, "telemetry_mode_environment", 0) & 0x03) << 4)
                 ]
             )
             + bytes([getattr(prefs, "manual_add_contacts", 0)])
