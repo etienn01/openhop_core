@@ -76,6 +76,7 @@ class PacketBuilder:
     @staticmethod
     def _create_packet(header: int, payload: bytes) -> Packet:
         """Create a packet with the given header and payload."""
+        PacketValidationUtils.validate_payload_size(len(payload))
         pkt = Packet()
         pkt.header = header
         pkt.payload = bytearray(payload)

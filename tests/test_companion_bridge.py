@@ -526,6 +526,16 @@ class TestCompanionBridgePathAndControl:
         assert result is False
         assert len(injector.calls) == 0
 
+    async def test_send_control_data_rejects_oversized_payload(self):
+        from openhop_core.protocol.constants import MAX_PACKET_PAYLOAD
+
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        oversized = bytes([0x80]) + bytes(MAX_PACKET_PAYLOAD)  # 1 + 184 = 185
+        result = await bridge.send_control_data(oversized)
+        assert result is False
+        assert len(injector.calls) == 0
+
 
 # ---------------------------------------------------------------------------
 # Binary request

@@ -617,15 +617,15 @@ class _SendOpsMixin:
     async def send_control_data(self, data: Any = None) -> bool:
         """Send a CONTROL packet (e.g. discovery request).
 
-        If *data* is provided it must be 1-254 bytes with the first byte having
-        the 0x80 bit set (e.g. ``DISCOVER_REQ``).  Returns ``False`` for
-        invalid payloads.
+        If *data* is provided it must be 1-MAX_PACKET_PAYLOAD bytes with the first
+        byte having the 0x80 bit set (e.g. ``DISCOVER_REQ``).  Returns ``False``
+        for invalid payloads.
 
         When called with no *data* (or ``None``), a default discovery request
         is sent for backward compatibility.
         """
         try:
-            if data and len(data) <= 254 and (data[0] & 0x80) != 0:
+            if data and len(data) <= MAX_PACKET_PAYLOAD and (data[0] & 0x80) != 0:
                 pkt = Packet()
                 pkt.header = PacketBuilder._create_header(PAYLOAD_TYPE_CONTROL, route_type="direct")
                 pkt.path_len = 0

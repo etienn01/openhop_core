@@ -16,12 +16,7 @@ from .constants import (
     SIGNATURE_SIZE,
     TIMESTAMP_SIZE,
 )
-from .packet_utils import (
-    PacketDataUtils,
-    PacketHashingUtils,
-    PacketValidationUtils,
-    PathUtils,
-)
+from .packet_utils import PacketDataUtils, PacketHashingUtils, PacketValidationUtils, PathUtils
 
 """
 ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -148,9 +143,7 @@ class Packet:
         # Set once the companion layer has decided this flood packet's scoping
         # (scoped or deliberately plain); the dispatcher must not re-scope it.
         self._flood_scope_applied = False
-        self._injected_for_tx = (
-            False  # Set by repeater inject path; skip engine on route
-        )
+        self._injected_for_tx = False  # Set by repeater inject path; skip engine on route
 
     def get_route_type(self) -> int:
         """
@@ -200,10 +193,7 @@ class Packet:
                 routing, which includes 4 bytes of transport codes after the header.
         """
         route_type = self.get_route_type()
-        return (
-            route_type == ROUTE_TYPE_TRANSPORT_FLOOD
-            or route_type == ROUTE_TYPE_TRANSPORT_DIRECT
-        )
+        return route_type == ROUTE_TYPE_TRANSPORT_FLOOD or route_type == ROUTE_TYPE_TRANSPORT_DIRECT
 
     def is_route_flood(self) -> bool:
         """
@@ -213,9 +203,7 @@ class Packet:
             bool: True if the packet uses any form of flood routing.
         """
         route_type = self.get_route_type()
-        return (
-            route_type == ROUTE_TYPE_TRANSPORT_FLOOD or route_type == ROUTE_TYPE_FLOOD
-        )
+        return route_type == ROUTE_TYPE_TRANSPORT_FLOOD or route_type == ROUTE_TYPE_FLOOD
 
     def is_route_direct(self) -> bool:
         """
@@ -225,9 +213,7 @@ class Packet:
             bool: True if the packet uses any form of direct routing.
         """
         route_type = self.get_route_type()
-        return (
-            route_type == ROUTE_TYPE_TRANSPORT_DIRECT or route_type == ROUTE_TYPE_DIRECT
-        )
+        return route_type == ROUTE_TYPE_TRANSPORT_DIRECT or route_type == ROUTE_TYPE_DIRECT
 
     def get_path_hash_size(self) -> int:
         """Extract per-hop hash size (1, 2, or 3) from the encoded path_len byte."""
@@ -375,9 +361,11 @@ class Packet:
             len(self.payload),
         )
 
-    def _check_bounds(
-        self, idx: int, required: int, data_len: int, error_msg: str
-    ) -> None:
+    def _validate_payload_size(self) -> None:
+        """Validate that payload_len does not exceed MAX_PACKET_PAYLOAD."""
+        PacketValidationUtils.validate_payload_size(self.payload_len)
+
+    def _check_bounds(self, idx: int, required: int, data_len: int, error_msg: str) -> None:
         """
         Check if we have enough data remaining for the requested operation.
 
@@ -406,9 +394,11 @@ class Packet:
 
         Raises:
             ValueError: If internal length values don't match actual buffer lengths,
-                indicating data corruption or incorrect packet construction.
+                indicating data corruption or incorrect packet construction, or if
+                the payload exceeds MAX_PACKET_PAYLOAD.
         """
         self._validate_lengths()
+        self._validate_payload_size()
 
         out = bytearray([self.header])
 

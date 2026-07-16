@@ -22,6 +22,7 @@ from openhop_core.node.handlers.anon_request import (
 from openhop_core.node.handlers.login_server import LoginServerHandler
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet
 from openhop_core.protocol.constants import (
+    MAX_PACKET_PAYLOAD,
     PAYLOAD_TYPE_ANON_REQ,
     PAYLOAD_TYPE_RESPONSE,
     ROUTE_TYPE_DIRECT,
@@ -245,7 +246,7 @@ class TestAnonRequestHandler:
         assert names.startswith("REGION000,")
         assert not names.endswith(",")
         assert all(part.startswith("REGION") for part in names.split(","))
-        assert self.sent[0][0].payload_len <= 256
+        assert self.sent[0][0].payload_len <= MAX_PACKET_PAYLOAD
 
     @pytest.mark.asyncio
     async def test_owner_reply(self):
