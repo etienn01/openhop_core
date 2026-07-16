@@ -185,6 +185,25 @@ class TestContactStore:
         since_150 = store.get_all(since=150)
         assert len(since_150) == 2
 
+    def test_count_is_full_size_regardless_of_since_filter(self):
+        # count() reports the full real-contact total for CONTACTS_START, even
+        # when a 'since' filter narrows the synced list to fewer entries.
+        store = ContactStore(max_contacts=10)
+        store.add(Contact(public_key=b"\x01" * 32, name="A", adv_type=1, lastmod=100))
+        store.add(Contact(public_key=b"\x02" * 32, name="B", adv_type=1, lastmod=200))
+        store.add(Contact(public_key=b"\x03" * 32, name="C", adv_type=1, lastmod=300))
+        assert store.count() == 3
+        assert len(store.get_all(since=250)) == 1
+
+    def test_count_excludes_transient_anon(self):
+        # Transient/anon (ADV_TYPE_NONE) entries are never synced, so they must
+        # not inflate the CONTACTS_START total.
+        store = ContactStore(max_contacts=10)
+        store.add(Contact(public_key=b"\x01" * 32, name="A", adv_type=1))
+        store.add_transient(Contact(public_key=b"\x02" * 32, name="", adv_type=0))
+        assert store.get_count() == 2
+        assert store.count() == 1
+
     def test_clear(self):
         store = ContactStore(max_contacts=5)
         store.add(Contact(public_key=b"\x01" * 32, name="A"))

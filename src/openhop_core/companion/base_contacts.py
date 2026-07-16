@@ -49,6 +49,14 @@ class _ContactChannelMixin:
         """
         return [c for c in self.contacts.get_all(since=since) if c.adv_type != ADV_TYPE_NONE]
 
+    def get_contact_count(self) -> int:
+        """Return the total real-contact count (firmware getNumContacts()).
+
+        Independent of any ``since`` filter; used for the CONTACTS_START total.
+        Excludes transient/anon entries, mirroring get_contacts.
+        """
+        return self.contacts.count()
+
     def get_contact_by_key(self, pub_key: bytes) -> Optional[Contact]:
         """Look up a contact by its full 32-byte public key."""
         return self.contacts.get_by_key(pub_key)

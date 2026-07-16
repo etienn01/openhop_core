@@ -1691,6 +1691,7 @@ async def test_cmd_get_contacts_start_body_end_sequence():
     # of the filtered result.
     bridge = Mock()
     bridge.get_contacts = Mock(side_effect=lambda since=0: [c2, c3] if since else [c1, c2, c3])
+    bridge.get_contact_count = Mock(return_value=3)
     server, frames = _make_capture_server(bridge)
 
     await server._cmd_get_contacts(struct.pack("<I", 50))

@@ -34,7 +34,7 @@ class _ContactCommandsMixin:
         # Firmware reports the total contact-table count here (MyMesh
         # CMD_GET_CONTACTS uses getNumContacts()), independent of the 'since'
         # filter; only the emitted frames and the end watermark are filtered.
-        total = len(contacts) if since == 0 else len(self.bridge.get_contacts(since=0))
+        total = self.bridge.get_contact_count()
         self._write_frame(bytes([RESP_CODE_CONTACTS_START]) + struct.pack("<I", total))
         for i, c in enumerate(contacts):
             self._write_contact_frame(c)
