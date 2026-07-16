@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from openhop_core.companion.constants import (
+    CMD_GET_CUSTOM_VARS,
     CMD_GET_DEVICE_TIME,
     CMD_IMPORT_PRIVATE_KEY,
     CMD_SIGN_DATA,
@@ -37,6 +38,7 @@ from openhop_core.companion.constants import (
     RESP_CODE_CONTACT_MSG_RECV_V3,
     RESP_CODE_CONTACTS_START,
     RESP_CODE_CURR_TIME,
+    RESP_CODE_CUSTOM_VARS,
     RESP_CODE_DEFAULT_FLOOD_SCOPE,
     RESP_CODE_DISABLED,
     RESP_CODE_END_OF_CONTACTS,
@@ -1644,6 +1646,102 @@ async def test_companion_sign_start_replaces_unfinished_session():
     assert frames[-1][0] == RESP_CODE_SIGNATURE
     assert identity.verify(b"new", frames[-1][1:])
     assert not identity.verify(b"old", frames[-1][1:])
+
+
+class _MockBridgeCustomVars:
+    """Minimal bridge exposing an ordered custom-vars dict for CMD_GET_CUSTOM_VARS."""
+
+    def __init__(self, custom_vars: dict[str, str]):
+        self._custom_vars = custom_vars
+
+    def get_custom_vars(self) -> dict[str, str]:
+        return dict(self._custom_vars)
+
+
+@pytest.mark.asyncio
+async def test_get_custom_vars_ascii_exact_fit_returns_everything():
+    """An ASCII payload landing exactly on the 140-byte budget is returned whole."""
+    custom_vars = {"k1": "v" * 66, "k2": "v" * 67}
+    bridge = _MockBridgeCustomVars(custom_vars)
+    server, frames = _make_capture_server(bridge)
+
+    await server._handle_cmd(bytes([CMD_GET_CUSTOM_VARS]))
+
+    expected = ",".join(f"{k}:{v}" for k, v in custom_vars.items())
+    assert len(expected) == 140  # sanity check on the fixture itself
+    assert frames == [bytes([RESP_CODE_CUSTOM_VARS]) + expected.encode("utf-8")]
+
+
+@pytest.mark.asyncio
+async def test_get_custom_vars_multibyte_values_respect_encoded_byte_budget():
+    """Regression for BUG-090: the 140 budget applies to encoded UTF-8 bytes, not
+    Python characters.
+
+    MyMesh.cpp's CMD_GET_CUSTOM_VARS handler (examples/companion_radio/MyMesh.cpp
+    lines 1784-1797) tracks `dp - (char*)&out_frame[1]`, i.e. bytes already written,
+    against the 140 threshold. The old OpenHop code instead joined all entries into
+    one string and sliced it with Python's `[:140]`, which counts *characters* -- with
+    multi-byte values that character-based cut can retain far more than 140 encoded
+    bytes. This fixture's 30 four-byte-each "é" x4 values produce a 269-character
+    joined string; the old `csv[:140]` slice alone would encode to 201 bytes -- past
+    even MAX_FRAME_SIZE (176, see constants.py), so firmware/clients would have
+    silently dropped the oversized frame. The fixed incremental encoder must keep the
+    payload well clear of that.
+    """
+    custom_vars = {f"k{i:02d}": "é" * 4 for i in range(30)}
+    bridge = _MockBridgeCustomVars(custom_vars)
+    server, frames = _make_capture_server(bridge)
+
+    await server._handle_cmd(bytes([CMD_GET_CUSTOM_VARS]))
+
+    # Sanity-check the bug this fixture reproduces: the old character-based slice
+    # would have exceeded the 140-byte budget (and the 176-byte transport frame max).
+    old_buggy_csv = ",".join(f"{k}:{v}" for k, v in custom_vars.items())[:140]
+    assert len(old_buggy_csv.encode("utf-8")) > 140
+    assert 1 + len(old_buggy_csv.encode("utf-8")) > 176  # RESP code byte + payload
+
+    assert len(frames) == 1
+    payload = frames[0]
+    assert payload[0] == RESP_CODE_CUSTOM_VARS
+    body = payload[1:]
+    # Fully decodable UTF-8 -- no mid-character truncation.
+    body.decode("utf-8")
+    # Overshoot-by-one-entry parity with firmware (see docstring): the budget check
+    # happens before appending an entry, using the length already written, so the
+    # final included entry may push the total past 140 but not by more than one
+    # entry's worth of bytes.
+    assert len(body) > 140
+    assert 1 + len(body) <= 176  # RESP code byte + payload stays inside the frame cap
+
+
+@pytest.mark.asyncio
+async def test_get_custom_vars_overshoots_budget_by_one_entry_like_firmware():
+    """The budget check happens BEFORE appending an entry and compares against bytes
+    already written (MyMesh.cpp examples/companion_radio/MyMesh.cpp lines 1786-1787:
+    `dp - (char*)&out_frame[1] < 140` is checked at the top of the for loop, before
+    that iteration's comma/name/value are written). So an entry that starts under
+    budget is written in full even if it crosses 140 -- and the loop then stops,
+    dropping any later entries entirely rather than skipping just the oversized one.
+    """
+    custom_vars = {
+        "a": "x" * 58,  # entry "a:xxx...x" -> 60 bytes
+        "b": "y" * 58,  # entry -> 60 bytes; running total after b = 121 (< 140)
+        "c": "z" * 22,  # entry -> 24 bytes + comma = 25; running total = 146 (> 140)
+        "d": "w",  # never reached: loop already stopped after c
+    }
+    bridge = _MockBridgeCustomVars(custom_vars)
+    server, frames = _make_capture_server(bridge)
+
+    await server._handle_cmd(bytes([CMD_GET_CUSTOM_VARS]))
+
+    assert len(frames) == 1
+    body = frames[0][1:]
+    assert len(body) == 146
+    text = body.decode("utf-8")
+    assert text == ",".join(
+        [f"a:{custom_vars['a']}", f"b:{custom_vars['b']}", f"c:{custom_vars['c']}"]
+    )
+    assert "d:" not in text
 
 
 @pytest.mark.asyncio

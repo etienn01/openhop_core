@@ -451,10 +451,21 @@ class _DeviceCommandsMixin:
         self._write_ok()
 
     async def _cmd_get_custom_vars(self, data: bytes) -> None:
+        # Mirrors MyMesh.cpp's CMD_GET_CUSTOM_VARS handler (examples/companion_radio/
+        # MyMesh.cpp lines ~1784-1797): it writes directly into the byte buffer and
+        # checks the *already-written* byte length against the 140 budget before
+        # appending each entry, so an entry that starts under budget is written in
+        # full even if it pushes the total past 140 (overshoot-by-one-entry).
         custom_vars = self.bridge.get_custom_vars()
-        parts = [f"{k}:{v}" for k, v in custom_vars.items()]
-        csv = ",".join(parts)[:140]
-        self._write_frame(bytes([RESP_CODE_CUSTOM_VARS]) + csv.encode("utf-8", errors="replace"))
+        out = bytearray()
+        for i, (name, value) in enumerate(custom_vars.items()):
+            if len(out) >= 140:
+                break
+            entry = f"{name}:{value}"
+            if i > 0:
+                out += b","
+            out += entry.encode("utf-8", errors="replace")
+        self._write_frame(bytes([RESP_CODE_CUSTOM_VARS]) + bytes(out))
 
     async def _cmd_set_custom_var(self, data: bytes) -> None:
         if len(data) < 3:
