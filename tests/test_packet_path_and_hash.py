@@ -654,6 +654,26 @@ class TestBadPacketDeserialization:
         with pytest.raises(ValueError, match="Unsupported packet version"):
             pkt.read_from(wire)
 
+    def test_only_payload_version_zero_accepted(self):
+        """Firmware Dispatcher rejects payload version > PAYLOAD_VER_1 (0), so
+        version 0 must parse and every reserved version (1-3) must be rejected."""
+        # Version 0 parses.
+        header0 = ROUTE_TYPE_FLOOD | (PAYLOAD_TYPE_TXT_MSG << PH_TYPE_SHIFT) | (0 << PH_VER_SHIFT)
+        pkt = Packet()
+        pkt.read_from(bytes([header0, 0]))
+        assert pkt.get_payload_ver() == 0
+
+        # Reserved versions 1, 2, 3 are all rejected (1 is the regression:
+        # it used to be accepted while MAX_SUPPORTED_PAYLOAD_VERSION was 1).
+        for bad_version in (1, 2, 3):
+            header = (
+                ROUTE_TYPE_FLOOD
+                | (PAYLOAD_TYPE_TXT_MSG << PH_TYPE_SHIFT)
+                | (bad_version << PH_VER_SHIFT)
+            )
+            with pytest.raises(ValueError, match="Unsupported packet version"):
+                Packet().read_from(bytes([header, 0]))
+
     def test_path_len_exceeds_max(self):
         """Encoded path_len that decodes to > MAX_PATH_SIZE (64) bytes must be rejected."""
         from openhop_core.protocol.packet_utils import PathUtils

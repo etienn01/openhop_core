@@ -65,11 +65,14 @@ FIRMWARE_MAX_DIRECT_PATH_VECTORS = (
 def create_test_packet(payload_type: int, payload: bytes) -> bytes:
     """Create a simple test packet bytes for testing."""
     packet = Packet()
-    # Set header with payload type (route type = direct = 1)
     # Ensure payload_type is valid (0-15)
     if payload_type > 15:
         payload_type = 15  # Max valid payload type
-    packet.header = (1 << 6) | (payload_type << 2)  # Version 0, route type 1, payload type
+    # Bits: version (6-7) = 0, payload type (2-5), route type (0-1) = 0.
+    # (The old value OR'd in (1 << 6), which sets the *version* field to 1, not
+    # the route type; version 1 is a reserved/unsupported wire format and is now
+    # rejected on parse, so the header must leave the version bits clear.)
+    packet.header = payload_type << 2
     packet.payload = bytearray(payload)
     packet.payload_len = len(payload)
     packet.path_len = 0  # No path
@@ -678,7 +681,7 @@ class TestDispatcherSendPacket:
         # Second pubkey byte matches our_hash but first byte does not — must not drop.
         other_pubkey = bytes([our_hash ^ 0xFF]) + bytes([our_hash]) + bytes(30)
         packet = Packet()
-        packet.header = (1 << 6) | (PAYLOAD_TYPE_ADVERT << 2)
+        packet.header = PAYLOAD_TYPE_ADVERT << 2  # version 0
         packet.payload = bytearray(other_pubkey + b"\x00" * 40)
         packet.payload_len = len(packet.payload)
         packet.path_len = 0
@@ -691,7 +694,7 @@ class TestDispatcherSendPacket:
         """Own advert: payload[0] equals our pubkey hash."""
         our_pubkey = dispatcher.local_identity.get_public_key()
         packet = Packet()
-        packet.header = (1 << 6) | (PAYLOAD_TYPE_ADVERT << 2)
+        packet.header = PAYLOAD_TYPE_ADVERT << 2  # version 0
         packet.payload = bytearray(our_pubkey + b"\x00" * 40)
         packet.payload_len = len(packet.payload)
         packet.path_len = 0
@@ -859,7 +862,7 @@ class TestDispatcherErrorHandling:
         """Test handling radio transmit errors."""
         # Create a proper Packet object
         packet = Packet()
-        packet.header = (1 << 6) | (PAYLOAD_TYPE_ADVERT << 2)  # ADVERT packets don't wait for ACK
+        packet.header = PAYLOAD_TYPE_ADVERT << 2  # version 0; ADVERT packets don't wait for ACK
         packet.payload = bytearray(b"test_data")
         packet.payload_len = len(packet.payload)
         packet.path_len = 0
@@ -967,7 +970,7 @@ class TestDispatcherPayloadBasedDedup:
 
         # Packet 1: 1-byte hash mode, 0 hops
         pkt1 = Packet()
-        pkt1.header = (1 << 6) | (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD
+        pkt1.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
         pkt1.path_len = PathUtils.encode_path_len(1, 0)
         pkt1.path = bytearray()
         pkt1.payload = bytearray(b"Hello mesh!")
@@ -976,7 +979,7 @@ class TestDispatcherPayloadBasedDedup:
 
         # Packet 2: same payload, 2 hops in path
         pkt2 = Packet()
-        pkt2.header = (1 << 6) | (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD
+        pkt2.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
         pkt2.path_len = PathUtils.encode_path_len(1, 2)
         pkt2.path = bytearray(b"\xAA\xBB")
         pkt2.payload = bytearray(b"Hello mesh!")

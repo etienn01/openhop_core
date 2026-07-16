@@ -151,7 +151,7 @@ class TestCompanionRadioLifecycle:
 
         # Build minimal valid packet (ACK) so dispatcher parses and notifies raw subscribers
         pkt = Packet()
-        pkt.header = (1 << 6) | (PAYLOAD_TYPE_ACK << 2)
+        pkt.header = PAYLOAD_TYPE_ACK << 2  # version 0
         pkt.payload = bytearray(b"\x01\x02\x03\x04")
         pkt.payload_len = 4
         pkt.path_len = 0
