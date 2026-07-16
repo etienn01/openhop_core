@@ -2605,6 +2605,73 @@ async def test_cmd_set_tx_power_reports_backend_failure():
     bridge.set_tx_power.assert_called_once_with(14)
 
 
+@pytest.mark.asyncio
+async def test_cmd_set_tx_power_rejects_above_advertised_hardware_max():
+    """Firmware (MyMesh.cpp CMD_SET_RADIO_TX_POWER) rejects power >
+    MAX_LORA_TX_POWER, the same target-specific limit SELF_INFO advertises.
+    A backend that only advertises 19 dBm must reject a 20 dBm request even
+    though it is below the generic 30 dBm ceiling."""
+    bridge = Mock()
+    bridge.supports_tx_power_mutation.return_value = True
+    bridge.get_max_tx_power_dbm = Mock(return_value=19)
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_set_tx_power(bytes([20]))
+
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+    bridge.set_tx_power.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_tx_power_accepts_value_exactly_at_advertised_max():
+    """Firmware's comparison is `power > MAX_LORA_TX_POWER`, so the max value
+    itself is inclusive and must be accepted."""
+    bridge = Mock()
+    bridge.supports_tx_power_mutation.return_value = True
+    bridge.get_max_tx_power_dbm = Mock(return_value=19)
+    bridge.set_tx_power.return_value = True
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_set_tx_power(bytes([19]))
+
+    assert frames == [bytes([RESP_CODE_OK])]
+    bridge.set_tx_power.assert_called_once_with(19)
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_tx_power_accepts_normal_value_below_max():
+    """No regression: a normal in-range request below the advertised max is
+    still accepted and applied."""
+    bridge = Mock()
+    bridge.supports_tx_power_mutation.return_value = True
+    bridge.get_max_tx_power_dbm = Mock(return_value=22)
+    bridge.set_tx_power.return_value = True
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_set_tx_power(bytes([14]))
+
+    assert frames == [bytes([RESP_CODE_OK])]
+    bridge.set_tx_power.assert_called_once_with(14)
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_tx_power_above_max_leaves_real_bridge_radio_unchanged():
+    """End-to-end with a real CompanionBridge (default advertised max 22 dBm):
+    a request above the hardware limit is rejected and the active tx power
+    is left untouched."""
+    from openhop_core.companion import CompanionBridge
+    from openhop_core.protocol import LocalIdentity
+
+    bridge = CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+    server, frames = _make_capture_server(bridge)
+    before = bridge.get_self_info().tx_power_dbm
+
+    await server._cmd_set_tx_power(bytes([23]))
+
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+    assert bridge.get_self_info().tx_power_dbm == before
+
+
 # ---------------------------------------------------------------------------
 # TXT_TYPE_SIGNED_PLAIN (room server posts): author prefix in the frame
 # ---------------------------------------------------------------------------

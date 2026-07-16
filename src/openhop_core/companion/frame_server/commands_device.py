@@ -39,8 +39,13 @@ logger = logging.getLogger("CompanionFrameServer")
 class _DeviceCommandsMixin:
     """Device and configuration _cmd_* handlers of :class:`CompanionFrameServer`."""
 
-    def _max_tx_power_byte(self) -> int:
-        """Return the signed, one-byte SELF_INFO maximum TX-power field."""
+    def _max_tx_power_dbm_value(self) -> int:
+        """Return the advertised maximum TX-power capability, in raw dBm.
+
+        Shared source of truth for the SELF_INFO maximum TX-power byte and the
+        CMD_SET_RADIO_TX_POWER upper-bound validation, matching firmware's
+        target-specific ``MAX_LORA_TX_POWER`` (MyMesh.cpp).
+        """
         try:
             value = int(self.bridge.get_max_tx_power_dbm())
         except (TypeError, ValueError):
@@ -50,7 +55,11 @@ class _DeviceCommandsMixin:
                 "Could not get maximum TX power from companion integration", exc_info=True
             )
             value = DEFAULT_MAX_TX_POWER_DBM
-        return max(-9, min(127, value)) & 0xFF
+        return value
+
+    def _max_tx_power_byte(self) -> int:
+        """Return the signed, one-byte SELF_INFO maximum TX-power field."""
+        return max(-9, min(127, self._max_tx_power_dbm_value())) & 0xFF
 
     def _radio_mutation_supported(self, capability: str) -> bool:
         """Check an optional integration capability while retaining old adapters."""
@@ -348,7 +357,11 @@ class _DeviceCommandsMixin:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         power = struct.unpack_from("<b", data, 0)[0]
-        if power < -9 or power >= 30:
+        # Firmware (MyMesh.cpp CMD_SET_RADIO_TX_POWER, ~L1409): reject below the
+        # -9 dBm floor or above the target-specific MAX_LORA_TX_POWER ceiling,
+        # the same capability advertised in SELF_INFO. Upper bound is inclusive.
+        max_power = self._max_tx_power_dbm_value()
+        if power < -9 or power > max_power:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         if not self._radio_mutation_supported("supports_tx_power_mutation"):
