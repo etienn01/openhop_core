@@ -532,8 +532,16 @@ class _MessagingCommandsMixin:
 
     async def _cmd_send_raw_data(self, data: bytes) -> None:
         """Handle CMD_SEND_RAW_DATA (25).
-        Format: [path_len_encoded][path][payload] (min 4-byte payload)."""
-        if len(data) < 6:
+        Format: [path_len_encoded][path][payload] (min 4-byte payload).
+
+        Firmware (MyMesh.cpp handleCmdFrame): `len >= 6` (len includes the
+        command byte, so the stripped `data` here only needs the path_len
+        byte to be present) then `path_len >= 0 && i + path_len + 4 <= len`,
+        which is exactly `1 + path_byte_len + 4 <= len(data)` below. A
+        zero-hop frame (path_len=0, 4-byte payload -> len(data) == 5) is the
+        firmware minimum and must not be rejected here.
+        """
+        if len(data) < 1:
             self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         path_len_byte = data[0]

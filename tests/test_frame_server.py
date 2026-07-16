@@ -415,13 +415,63 @@ async def test_cmd_add_update_contact_preserves_exact_encoded_path_bytes(encoded
 
 
 @pytest.mark.asyncio
-async def test_cmd_send_raw_data_invalid_len_writes_unsupported():
-    """Invalid CMD_SEND_RAW_DATA len < 6 -> ERR_CODE_UNSUPPORTED_CMD."""
+async def test_cmd_send_raw_data_short_of_min_payload_writes_unsupported():
+    """path_len=0 but fewer than 4 payload bytes -> ERR_CODE_UNSUPPORTED_CMD.
+
+    Previously this was rejected by a blanket `len(data) < 6` guard; now it
+    falls through to the path-aware bounds check (1 + path_byte_len + 4 >
+    len(data)), which rejects it for the same reason firmware does
+    (MyMesh.cpp: `i + path_len + 4 <= len` fails) with the same error code.
+    """
     bridge = _MockBridgeSendRawDirect()
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_ok = Mock()
     server._write_err = Mock()
     await server._cmd_send_raw_data(b"\x00\x00\x00")
+    assert len(bridge.calls) == 0
+    server._write_err.assert_called_once_with(ERR_CODE_UNSUPPORTED_CMD)
+    server._write_ok.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_raw_data_zero_hop_minimum_frame_is_accepted():
+    """Firmware minimum: path_len=0 (zero-hop, empty path) + 4-byte payload.
+
+    MyMesh.cpp: `len >= 6` (len includes the command byte) with path_len=0
+    reduces to `i + 0 + 4 <= len` i.e. exactly 6 bytes total, which is
+    len(data) == 5 once the command byte is stripped. This must reach the
+    send path, not be rejected as unsupported.
+    """
+    bridge = _MockBridgeSendRawDirect(success=True)
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+    server._write_err = Mock()
+    data = bytes([0]) + b"\x01\x02\x03\x04"  # path_len=0, 4-byte payload
+    await server._cmd_send_raw_data(data)
+    assert len(bridge.calls) == 1
+    path, payload, path_len_enc = bridge.calls[0]
+    assert path == b""
+    assert payload == b"\x01\x02\x03\x04"
+    assert path_len_enc == 0
+    server._write_ok.assert_called_once()
+    server._write_err.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_raw_data_empty_payload_writes_unsupported():
+    """0-byte data (no path_len byte at all) -> ERR_CODE_UNSUPPORTED_CMD, no send.
+
+    Firmware: `len >= 6` requires at least the command byte, path_len byte,
+    and 4-byte payload; a frame with nothing after the command byte fails
+    that condition and falls through the else-if chain to the catch-all
+    `writeErrFrame(ERR_CODE_UNSUPPORTED_CMD)` (MyMesh.cpp ~L1996). Here we
+    must guard against indexing data[0] on empty data and reject the same way.
+    """
+    bridge = _MockBridgeSendRawDirect()
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+    server._write_err = Mock()
+    await server._cmd_send_raw_data(b"")
     assert len(bridge.calls) == 0
     server._write_err.assert_called_once_with(ERR_CODE_UNSUPPORTED_CMD)
     server._write_ok.assert_not_called()
