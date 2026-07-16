@@ -10,16 +10,23 @@ This handles only the essential routing concerns:
 import hashlib
 import time
 from collections import OrderedDict
-from typing import Dict, Set
+from typing import Dict
 
 
 class PacketFilter:
     """Lightweight packet filter for dispatcher routing decisions."""
 
+    # Bounds for the malformed-frame blacklist: a peer that keeps varying
+    # invalid bytes must not be able to grow this structure without limit.
+    BLACKLIST_MAX_ENTRIES = 4096
+    BLACKLIST_TTL_SECONDS = 300.0
+
     def __init__(self, window_seconds: int = 30):
         self.window_seconds = window_seconds
         self._packet_hashes: Dict[str, float] = {}  # packet_hash -> timestamp
-        self._blacklist: Set[str] = set()  # blacklisted packet hashes
+        # packet_hash -> insert timestamp; OrderedDict gives FIFO eviction at
+        # capacity and lets re-blacklisting move an entry to the end.
+        self._blacklist: "OrderedDict[str, float]" = OrderedDict()
 
     def generate_hash(self, data: bytes) -> str:
         """Generate a hash for packet data."""
@@ -39,21 +46,46 @@ class PacketFilter:
         self._packet_hashes[packet_hash] = time.time()
 
     def blacklist(self, packet_hash: str) -> None:
-        """Add a packet hash to the blacklist."""
-        self._blacklist.add(packet_hash)
+        """Add a packet hash to the blacklist.
+
+        Re-blacklisting an already-present hash refreshes its timestamp and
+        moves it to the most-recently-inserted end. Once the structure is at
+        capacity (`BLACKLIST_MAX_ENTRIES`), the oldest entry is evicted (FIFO)
+        to make room, bounding memory even under sustained varied malformed
+        traffic.
+        """
+        self._blacklist[packet_hash] = time.time()
+        self._blacklist.move_to_end(packet_hash)
+        if len(self._blacklist) > self.BLACKLIST_MAX_ENTRIES:
+            self._blacklist.popitem(last=False)
 
     def is_blacklisted(self, packet_hash: str) -> bool:
-        """Check if a packet hash is blacklisted."""
-        return packet_hash in self._blacklist
+        """Check if a packet hash is blacklisted.
+
+        Pure read: does not mutate the blacklist (no timestamp refresh, no
+        deletion of expired entries). Expired entries are pruned separately
+        by `cleanup_old_hashes`.
+        """
+        inserted_at = self._blacklist.get(packet_hash)
+        if inserted_at is None:
+            return False
+        return (time.time() - inserted_at) < self.BLACKLIST_TTL_SECONDS
 
     def cleanup_old_hashes(self) -> None:
-        """Clean up old packet hashes beyond the deduplication window."""
+        """Clean up old packet hashes beyond the deduplication window, and
+        prune blacklist entries older than `BLACKLIST_TTL_SECONDS`."""
         current_time = time.time()
         old_hashes = [
             h for h, ts in self._packet_hashes.items() if current_time - ts > self.window_seconds
         ]
         for h in old_hashes:
             del self._packet_hashes[h]
+
+        expired_blacklist = [
+            h for h, ts in self._blacklist.items() if current_time - ts > self.BLACKLIST_TTL_SECONDS
+        ]
+        for h in expired_blacklist:
+            del self._blacklist[h]
 
     def get_stats(self) -> dict:
         """Get basic filter statistics."""
