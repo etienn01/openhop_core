@@ -61,13 +61,25 @@ def calc_flood_timeout_ms(airtime_ms: float) -> int:
     return int(SEND_TIMEOUT_BASE_MILLIS + FLOOD_SEND_TIMEOUT_FACTOR * airtime_ms)
 
 
-def calc_direct_timeout_ms(airtime_ms: float, out_path_len: int) -> int:
-    """Firmware ``calcDirectTimeoutMillisFor`` (out_path_len is the encoded byte)."""
-    hops = PathUtils.get_path_hash_count(out_path_len) if out_path_len > 0 else 0
+def calc_direct_timeout_ms_for_hops(airtime_ms: float, hop_count: int) -> int:
+    """Firmware ``calcDirectTimeoutMillisFor`` taking an explicit hop count.
+
+    Firmware masks the hop count to 6 bits (``path_hash_count = path_len & 63``,
+    MyMesh.cpp:851). Use this when the hop count is known directly (e.g. a TRACE
+    packet's ``path_len // hash_width``) rather than encoded in a contact's
+    path_len byte.
+    """
+    hops = max(0, int(hop_count)) & 63
     return int(
         SEND_TIMEOUT_BASE_MILLIS
         + (DIRECT_SEND_PERHOP_FACTOR * airtime_ms + DIRECT_SEND_PERHOP_EXTRA_MILLIS) * (hops + 1)
     )
+
+
+def calc_direct_timeout_ms(airtime_ms: float, out_path_len: int) -> int:
+    """Firmware ``calcDirectTimeoutMillisFor`` (out_path_len is the encoded byte)."""
+    hops = PathUtils.get_path_hash_count(out_path_len) if out_path_len > 0 else 0
+    return calc_direct_timeout_ms_for_hops(airtime_ms, hops)
 
 
 def response_timeout_ms(

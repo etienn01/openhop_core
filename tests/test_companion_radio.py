@@ -7,6 +7,7 @@ import pytest
 from openhop_core.companion import CompanionRadio
 from openhop_core.companion.constants import ADV_TYPE_CHAT
 from openhop_core.companion.models import Contact
+from openhop_core.companion.timing import estimate_airtime_ms
 from openhop_core.protocol import LocalIdentity, Packet, PacketBuilder
 from openhop_core.protocol.constants import PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_ADVERT, ROUTE_TYPE_FLOOD
 
@@ -370,8 +371,15 @@ class TestCompanionRadioPathAndControl:
         radio = MockRadio()
         comp = CompanionRadio(radio, LocalIdentity())
         result = await comp.send_trace_path_raw(0x12345678, 0xABCD, 0, bytes([0x01, 0x02]))
-        assert result is True
+        assert result.success is True
         assert len(radio.sent) == 1
+        assert result.is_flood is False
+        assert result.expected_ack == 0x12345678
+        # est_timeout is the firmware direct formula over the sent packet's airtime.
+        sent = Packet()
+        assert sent.read_from(radio.sent[0]) is True
+        airtime = estimate_airtime_ms(sent.get_raw_length(), 10, 250000, 5)
+        assert result.timeout_ms == int(500 + (6.0 * airtime + 250) * (2 + 1))
 
     async def test_send_control_data_default_discovery(self):
         radio = MockRadio()

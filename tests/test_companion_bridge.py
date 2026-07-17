@@ -2,13 +2,14 @@
 
 import asyncio
 from typing import Optional
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from openhop_core.companion import CompanionBridge
 from openhop_core.companion.constants import ADV_TYPE_CHAT, AUTOADD_CHAT
 from openhop_core.companion.models import Contact, MessageEvent
+from openhop_core.companion.timing import estimate_airtime_ms
 from openhop_core.node.events import MeshEvents
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
 from openhop_core.protocol.constants import (
@@ -512,8 +513,46 @@ class TestCompanionBridgePathAndControl:
         injector = MockPacketInjector()
         bridge = CompanionBridge(LocalIdentity(), injector)
         result = await bridge.send_trace_path_raw(0x12345678, 0xABCD, 0, bytes([0x01, 0x02]))
-        assert result is True
+        assert result.success is True
         assert len(injector.calls) == 1
+        # Firmware reports the trace SENT frame as direct, tagged with the trace tag.
+        assert result.is_flood is False
+        assert result.expected_ack == 0x12345678
+
+    async def test_send_trace_path_raw_est_timeout_matches_firmware(self):
+        """est_timeout = calcDirectTimeoutMillisFor(airtime(raw_len), path_len >> path_sz).
+
+        Firmware appends the trace path to the payload and zeroes path_len
+        (Mesh.cpp sendDirect), so its ``payload_len + path_len + 2`` is exactly
+        this packet's raw on-air length.
+        """
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        # flags=0 -> 1-byte hashes, so a 2-byte path is 2 hops.
+        result = await bridge.send_trace_path_raw(0x12345678, 0xABCD, 0, bytes([0x01, 0x02]))
+        pkt, _ = injector.calls[0]
+        raw_len = pkt.get_raw_length()
+        assert raw_len == 2 + 9 + 2  # header + path_len byte, tag/auth/flags, trace path
+        airtime = estimate_airtime_ms(raw_len, 10, 250000, 5)
+        assert result.timeout_ms == int(500 + (6.0 * airtime + 250) * (2 + 1))
+
+    async def test_send_trace_path_raw_est_timeout_scales_with_hash_width(self):
+        """Hop count is path bytes // (1 << (flags & 3)), not the raw byte count."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        # flags=1 -> 2-byte hashes, so a 4-byte path is 2 hops (not 4).
+        result = await bridge.send_trace_path_raw(0x11, 0x22, 1, bytes([1, 2, 3, 4]))
+        pkt, _ = injector.calls[0]
+        airtime = estimate_airtime_ms(pkt.get_raw_length(), 10, 250000, 5)
+        assert result.timeout_ms == int(500 + (6.0 * airtime + 250) * (2 + 1))
+
+    async def test_send_trace_path_raw_send_failure(self):
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        with patch.object(bridge, "_send_packet", AsyncMock(return_value=False)):
+            result = await bridge.send_trace_path_raw(0x12345678, 0xABCD, 0, bytes([0x01]))
+        assert result.success is False
+        assert result.error == "send_failed"
 
     async def test_send_control_data_valid_payload(self):
         injector = MockPacketInjector()

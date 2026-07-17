@@ -32,8 +32,6 @@ from ..constants import (
     RESP_CODE_NO_MORE_MESSAGES,
     STATUS_TIMEOUT_HINT_MS,
     TELEMETRY_TIMEOUT_HINT_MS,
-    TRACE_BASE_TIMEOUT_MS,
-    TRACE_PER_PATH_BYTE_TIMEOUT_MS,
     TXT_MSG_TIMEOUT_HINT_MS,
     TXT_TYPE_CLI_DATA,
     TXT_TYPE_PLAIN,
@@ -329,30 +327,20 @@ class _MessagingCommandsMixin:
             self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         try:
-            ok = await send_raw(tag, auth_code, flags, path_bytes)
+            result = await send_raw(tag, auth_code, flags, path_bytes)
         except Exception as e:
             logger.error("send_trace_path error: %s", e, exc_info=True)
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
-        if not ok:
+        if not result.success:
             self._write_err(ERR_CODE_TABLE_FULL)
             return
-        est_timeout_ms = TRACE_BASE_TIMEOUT_MS + (path_len * TRACE_PER_PATH_BYTE_TIMEOUT_MS)
-        self._write_sent_response(False, tag, est_timeout_ms)
-        # If we are the final hop, push trace data immediately
-        if path_bytes and self.local_hash is not None and path_bytes[-1] == self.local_hash:
-            snr_len = path_len // hash_width
-            path_snrs = bytes(snr_len)
-            final_snr_byte = 0
-            self.push_trace_data(
-                path_len,
-                flags,
-                tag,
-                auth_code,
-                path_bytes,
-                path_snrs,
-                final_snr_byte,
-            )
+        # Firmware CMD_SEND_TRACE_PATH only sends and returns SENT with the
+        # est_timeout hint (MyMesh.cpp:1750-1775); trace completion (the
+        # PUSH_CODE_TRACE_DATA frame) is produced by the receive pipeline when the
+        # echoed trace reaches the end of its path (Mesh.cpp:41-64 -> onTraceRecv),
+        # never synthesised here at send time.
+        self._write_sent_response(result.is_flood, tag, result.timeout_ms)
 
     def _build_message_frame(self, msg: "QueuedMessage") -> bytes:
         """Encode a QueuedMessage into a response frame (shared by base and subclasses)."""

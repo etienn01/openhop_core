@@ -26,6 +26,7 @@ from ..protocol.constants import (
     ROUTE_TYPE_DIRECT,
     TELEM_PERM_BASE,
 )
+from ..protocol.packet_utils import PathUtils
 from .base_support import ResponseWaiter, _fmt_path, _fmt_path_len, adv_type_to_flags
 from .constants import (
     ADV_TYPE_NONE,
@@ -41,7 +42,12 @@ from .constants import (
     TXT_TYPE_PLAIN,
 )
 from .models import Contact, QueuedMessage, SentResult
-from .timing import DEFAULT_MAX_ATTEMPTS, response_timeout_ms
+from .timing import (
+    DEFAULT_MAX_ATTEMPTS,
+    calc_direct_timeout_ms_for_hops,
+    estimate_airtime_ms,
+    response_timeout_ms,
+)
 
 logger = logging.getLogger("CompanionBase")
 
@@ -129,17 +135,47 @@ class _SendOpsMixin:
         auth_code: int,
         flags: int,
         path_bytes: bytes,
-    ) -> bool:
-        """Send a trace packet with an explicit path."""
+    ) -> SentResult:
+        """Send a trace packet with an explicit path.
+
+        Returns a :class:`SentResult` whose ``timeout_ms`` is the firmware
+        est_timeout hint for the RESP_CODE_SENT frame. Firmware
+        (MyMesh.cpp:1764-1765) sizes it from the packet's airtime and route:
+        ``t = getEstAirtimeFor(payload_len + path_len + 2)`` fed through
+        ``calcDirectTimeoutMillisFor(t, path_len >> path_sz)`` — i.e. the direct
+        per-hop formula with a hop count of ``path_len // hash_width``. Here the
+        whole trace (tag/auth/flags + path) lives in the payload, so
+        ``pkt.get_raw_length()`` already equals firmware's
+        ``payload_len + path_len + 2``.
+        """
         try:
             path_list = list(path_bytes)
             pkt = PacketBuilder.create_trace(tag, auth_code, flags, path=path_list)
             self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
-            return await self._send_packet(pkt, wait_for_ack=False)
+            success = await self._send_packet(pkt, wait_for_ack=False)
+            if not success:
+                return SentResult(success=False, error="send_failed")
+            hash_width = PathUtils.trace_payload_hash_width(flags)
+            hop_count = len(path_bytes) // hash_width if hash_width else 0
+            airtime_ms = estimate_airtime_ms(
+                pkt.get_raw_length(),
+                int(getattr(self.prefs, "spreading_factor", 10)),
+                int(getattr(self.prefs, "bandwidth_hz", 250000)),
+                int(getattr(self.prefs, "coding_rate", 5)),
+            )
+            est_timeout_ms = calc_direct_timeout_ms_for_hops(airtime_ms, hop_count)
+            # Firmware sends the trace via sendDirect and reports the SENT frame
+            # with the flood byte cleared (MyMesh.cpp:1768).
+            return SentResult(
+                success=True,
+                is_flood=False,
+                expected_ack=tag,
+                timeout_ms=est_timeout_ms,
+            )
         except Exception as e:
             logger.error("Error sending trace (raw path): %s", e)
-            return False
+            return SentResult(success=False, error="send_failed")
 
     async def send_binary_req(
         self, pub_key: bytes, data: bytes, timeout_seconds: float = 15.0

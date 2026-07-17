@@ -3301,3 +3301,125 @@ async def test_cmd_has_connection_expires(monkeypatch):
     clock["now"] = 1000.0 + 161.0
     await server._handle_cmd(bytes([CMD_HAS_CONNECTION]) + pubkey)
     assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_NOT_FOUND])]
+
+
+# ---------------------------------------------------------------------------
+# CMD_SEND_TRACE_PATH
+# ---------------------------------------------------------------------------
+
+
+def _trace_bridge(result):
+    bridge = Mock()
+    bridge.send_trace_path_raw = AsyncMock(return_value=result)
+    return bridge
+
+
+def _trace_frame(tag=0x11223344, auth=0x55667788, flags=0, path=b"\x01\x02"):
+    """CMD_SEND_TRACE_PATH payload as the handler sees it (command byte stripped)."""
+    return struct.pack("<II", tag, auth) + bytes([flags]) + path
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_trace_path_reports_bridge_est_timeout():
+    """The SENT frame carries the trace tag and the bridge's est_timeout verbatim.
+
+    Firmware writes RESP_CODE_SENT with the flood byte hardcoded to 0 and
+    est_timeout = calcDirectTimeoutMillisFor(...) (MyMesh.cpp:1764-1772).
+    """
+    result = SentResult(success=True, is_flood=False, expected_ack=0x11223344, timeout_ms=3848)
+    server, frames = _make_capture_server(_trace_bridge(result))
+    await server._cmd_send_trace_path(_trace_frame())
+    assert frames == [bytes([RESP_CODE_SENT, 0]) + struct.pack("<II", 0x11223344, 3848)]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_trace_path_passes_frame_fields_to_bridge():
+    result = SentResult(success=True, expected_ack=0xAABBCCDD, timeout_ms=1234)
+    bridge = _trace_bridge(result)
+    server, _frames = _make_capture_server(bridge)
+    await server._cmd_send_trace_path(
+        _trace_frame(tag=0xAABBCCDD, auth=0x99, flags=1, path=b"\x01\x02\x03\x04")
+    )
+    bridge.send_trace_path_raw.assert_awaited_once_with(0xAABBCCDD, 0x99, 1, b"\x01\x02\x03\x04")
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_trace_path_no_synthetic_push_for_self_terminated_path():
+    """A path ending in our own hash must not fabricate a TRACE_DATA push.
+
+    Firmware never emits PUSH_CODE_TRACE_DATA from the send handler; completion
+    is delivered by the receive pipeline when the echoed trace reaches the end
+    of its path (Mesh.cpp:54 -> onTraceRecv). The old shortcut also compared a
+    single byte against multi-byte hash entries, so it fired on suffix
+    collisions.
+    """
+    result = SentResult(success=True, expected_ack=0x11223344, timeout_ms=3848)
+    server, frames = _make_capture_server(_trace_bridge(result), local_hash=0x02)
+    server.push_trace_data = Mock()
+    await server._cmd_send_trace_path(_trace_frame(path=b"\x01\x02"))
+    server.push_trace_data.assert_not_called()
+    assert [f[0] for f in frames] == [RESP_CODE_SENT]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_trace_path_no_synthetic_push_on_multibyte_suffix_collision():
+    """flags=1 -> 2-byte hashes; a final hash of 0x0102 must not match local 0x02."""
+    result = SentResult(success=True, expected_ack=0x11223344, timeout_ms=999)
+    server, frames = _make_capture_server(_trace_bridge(result), local_hash=0x02)
+    server.push_trace_data = Mock()
+    await server._cmd_send_trace_path(_trace_frame(flags=1, path=b"\xaa\xbb\x01\x02"))
+    server.push_trace_data.assert_not_called()
+    assert [f[0] for f in frames] == [RESP_CODE_SENT]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_trace_path_send_failure_is_table_full():
+    result = SentResult(success=False, error="send_failed")
+    server, frames = _make_capture_server(_trace_bridge(result))
+    await server._cmd_send_trace_path(_trace_frame())
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_TABLE_FULL])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_trace_path_short_frame_is_illegal_arg():
+    """Firmware requires len > 10 (cmd byte + tag/auth/flags + >= 1 path byte)."""
+    bridge = _trace_bridge(SentResult(success=True))
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_send_trace_path(_trace_frame(path=b""))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+    bridge.send_trace_path_raw.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_trace_path_validates_path_against_hash_width():
+    """Firmware: (path_len >> path_sz) > MAX_PATH_SIZE or path_len % (1 << path_sz)."""
+    bridge = _trace_bridge(SentResult(success=True))
+    server, frames = _make_capture_server(bridge)
+
+    # flags=1 -> 2-byte hashes; an odd path length is not a whole number of hops.
+    await server._cmd_send_trace_path(_trace_frame(flags=1, path=b"\x01\x02\x03"))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+
+    # 65 one-byte hops exceeds MAX_PATH_SIZE.
+    frames.clear()
+    await server._cmd_send_trace_path(_trace_frame(path=bytes(MAX_PATH_SIZE + 1)))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+
+    bridge.send_trace_path_raw.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_trace_path_missing_bridge_method_is_unsupported():
+    bridge = Mock(spec=[])
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_send_trace_path(_trace_frame())
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_trace_path_bridge_exception_is_illegal_arg():
+    bridge = Mock()
+    bridge.send_trace_path_raw = AsyncMock(side_effect=RuntimeError("boom"))
+    server, frames = _make_capture_server(bridge)
+    await server._cmd_send_trace_path(_trace_frame())
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]

@@ -143,9 +143,9 @@ BINARY_REQ_TIMEOUT_HINT_MS = 10000
 LOGIN_TIMEOUT_HINT_MS = 10000
 STATUS_TIMEOUT_HINT_MS = 15000
 TELEMETRY_TIMEOUT_HINT_MS = 15000
-# Trace estimate: base + per-path-byte increment (CMD_SEND_TRACE_PATH).
-TRACE_BASE_TIMEOUT_MS = 5000
-TRACE_PER_PATH_BYTE_TIMEOUT_MS = 200
+# CMD_SEND_TRACE_PATH returns a per-packet est_timeout computed from the trace
+# packet's airtime and hop count (firmware calcDirectTimeoutMillisFor); see
+# CompanionBase.send_trace_path_raw. No fixed hint constant is needed.
 
 # ===========================================================================
 # Frame Protocol Constants (MeshCore Companion Radio Protocol)
