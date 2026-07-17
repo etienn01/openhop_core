@@ -8,7 +8,6 @@ from openhop_core.protocol import Packet
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
-    PAYLOAD_TYPE_GRP_DATA,
     PAYLOAD_TYPE_GRP_TXT,
     PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_TRACE,
@@ -664,54 +663,74 @@ class TestDispatcherSendPacket:
 
         assert result is False
 
-    def test_own_packet_detection(self, dispatcher):
-        """Test detection of own packets (TXT uses payload[1] as src hash)."""
+    @pytest.mark.asyncio
+    async def test_advert_with_colliding_first_byte_reaches_handler(self, dispatcher):
+        """A genuine peer advert whose payload[0] happens to equal our pubkey hash
+        (1-byte hash collision) is no longer dropped by a payload-based "own
+        packet" heuristic — only the seen table suppresses loopback now."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_ADVERT)
+        dispatcher.register_handler(PAYLOAD_TYPE_ADVERT, mock_handler)
+
+        our_hash = dispatcher.local_identity.get_public_key()[0]
+        # Peer pubkey collides with ours in the first byte, but this packet
+        # was never sent by us, so it must not be in the seen table.
+        peer_pubkey = bytes([our_hash]) + bytes(31)
+        packet_data = create_test_packet(PAYLOAD_TYPE_ADVERT, peer_pubkey + b"\x00" * 8)
+
+        await dispatcher._process_received_packet(packet_data)
+
+        assert mock_handler.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_txt_msg_with_colliding_src_hash_reaches_handler(self, dispatcher):
+        """A genuine peer TXT_MSG whose payload[1] (src hash) collides with our
+        pubkey hash is no longer dropped as "own" — it was never sent by us."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_TXT_MSG)
+        dispatcher.register_handler(PAYLOAD_TYPE_TXT_MSG, mock_handler)
+
         our_hash = dispatcher.local_identity.get_public_key()[0]
         payload = bytes([0, our_hash]) + b"test"  # dest_hash=0, src_hash=our_hash
         packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, payload)
 
-        packet = Packet()
-        packet.read_from(packet_data)
+        await dispatcher._process_received_packet(packet_data)
 
-        assert dispatcher._is_own_packet(packet) is True
+        assert mock_handler.call_count == 1
 
-    def test_own_advert_uses_payload_first_byte(self, dispatcher):
-        """ADVERT packets carry pubkey at payload[0]; must not use payload[1]."""
+    @pytest.mark.asyncio
+    async def test_ack_with_colliding_crc_byte_reaches_handler(self, dispatcher):
+        """ACK payload byte 1 is CRC data, not a sender hash; a peer ACK whose
+        CRC byte happens to equal our pubkey hash must still be dispatched."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_ACK)
+        dispatcher.register_handler(PAYLOAD_TYPE_ACK, mock_handler)
+
         our_hash = dispatcher.local_identity.get_public_key()[0]
-        # Second pubkey byte matches our_hash but first byte does not — must not drop.
-        other_pubkey = bytes([our_hash ^ 0xFF]) + bytes([our_hash]) + bytes(30)
-        packet = Packet()
-        packet.header = PAYLOAD_TYPE_ADVERT << 2  # version 0
-        packet.payload = bytearray(other_pubkey + b"\x00" * 40)
-        packet.payload_len = len(packet.payload)
-        packet.path_len = 0
+        payload = bytes([0x11, our_hash, 0x22, 0x33])
+        packet_data = create_test_packet(PAYLOAD_TYPE_ACK, payload)
 
-        assert packet.payload[1] == our_hash
-        assert packet.payload[0] != our_hash
-        assert dispatcher._is_own_packet(packet) is False
+        await dispatcher._process_received_packet(packet_data)
 
-    def test_own_advert_detected_by_first_pubkey_byte(self, dispatcher):
-        """Own advert: payload[0] equals our pubkey hash."""
+        assert mock_handler.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_sent_advert_dropped_on_loopback(self, dispatcher):
+        """Guard: our own genuinely-sent advert fed back is still dropped, via
+        the seen-table mark applied at send time (not a payload heuristic)."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_ADVERT)
+        dispatcher.register_handler(PAYLOAD_TYPE_ADVERT, mock_handler)
+
         our_pubkey = dispatcher.local_identity.get_public_key()
-        packet = Packet()
-        packet.header = PAYLOAD_TYPE_ADVERT << 2  # version 0
-        packet.payload = bytearray(our_pubkey + b"\x00" * 40)
-        packet.payload_len = len(packet.payload)
-        packet.path_len = 0
+        pkt = Packet()
+        pkt.header = PAYLOAD_TYPE_ADVERT << 2  # version 0
+        pkt.payload = bytearray(our_pubkey + b"\x00" * 40)
+        pkt.payload_len = len(pkt.payload)
+        pkt.path_len = 0
+        pkt.path = bytearray()
 
-        assert dispatcher._is_own_packet(packet) is True
+        assert await dispatcher.send_packet(pkt, wait_for_ack=False) is True
 
-    @pytest.mark.parametrize("payload_type", [PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_GRP_DATA])
-    def test_group_packet_mac_is_not_treated_as_a_sender_hash(self, dispatcher, payload_type):
-        """Group payload byte 1 is MAC data, not an authenticated sender hash."""
-        our_hash = dispatcher.local_identity.get_public_key()[0]
-        packet = Packet()
-        packet.header = payload_type << 2
-        packet.payload = bytearray([0x42, our_hash, 0x00, 0x99])
-        packet.payload_len = len(packet.payload)
-        packet.path_len = 0
+        await dispatcher._process_received_packet(pkt.write_to())
 
-        assert dispatcher._is_own_packet(packet) is False
+        assert mock_handler.call_count == 0
 
 
 class TestDispatcherCallbacks:

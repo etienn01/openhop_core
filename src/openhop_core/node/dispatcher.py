@@ -10,15 +10,13 @@ from ..protocol import Packet
 from ..protocol.constants import (  # Payload types
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
-    PAYLOAD_TYPE_GRP_DATA,
-    PAYLOAD_TYPE_GRP_TXT,
     PAYLOAD_TYPE_TRACE,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
 from ..protocol.packet_utils import flood_rx_metrics
 from ..protocol.transport_keys import calc_transport_code
-from ..protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES, format_packet_info
+from ..protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES
 
 # Import handler classes
 from .handlers import (
@@ -293,34 +291,6 @@ class Dispatcher:
         """Get handler for payload type, or fallback if not found."""
         return self._handlers.get(ptype, self._fallback_handler)
 
-    def _is_own_packet(self, pkt: Packet) -> bool:
-        """Check if this packet came from us by comparing the source hash."""
-        if not self.local_identity or not pkt.payload:
-            return False
-
-        our_pubkey = self.local_identity.get_public_key()
-        our_hash = our_pubkey[0] if len(our_pubkey) > 0 else 0
-
-        ptype = pkt.get_payload_type()
-        if ptype in (PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_GRP_DATA):
-            # Group payloads begin with a channel hash and MAC; they do not
-            # carry a sender public-key hash. Companion group-packet caches
-            # suppress their local echoes by exact packet hash instead.
-            return False
-        if ptype == PAYLOAD_TYPE_ADVERT:
-            if len(pkt.payload) < 1:
-                return False
-            is_own = pkt.payload[0] == our_hash
-        else:
-            if len(pkt.payload) < 2:
-                return False
-            is_own = pkt.payload[1] == our_hash
-
-        if is_own:
-            self._log(f"Own packet detected: our_hash={our_hash:02X}")
-
-        return is_own
-
     def set_packet_received_callback(
         self, callback: Callable[[Packet], Awaitable[None] | None]
     ) -> None:
@@ -512,17 +482,6 @@ class Dispatcher:
             self._log(f"Duplicate packet ignored (hash: {packet_hash})")
             return
         self.packet_filter.track_packet(packet_hash)
-
-        # Check if this is our own packet before processing handlers
-        if self._is_own_packet(pkt):
-            packet_info = format_packet_info(pkt.header, len(pkt.payload))
-
-            self._log(f"OWN PACKET RECEIVED! {packet_info}")
-            self._log(
-                "   This suggests your packet was repeated by another node and came back to you!"
-            )
-            self._log(f"Ignoring own packet (type={pkt.get_payload_type():02X}) to prevent loops")
-            return
 
         # Handle ACK matching for waiting senders
         await self._dispatch(pkt)
