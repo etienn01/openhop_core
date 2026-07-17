@@ -104,6 +104,12 @@ class CompanionBase(
         )
 
         self._custom_vars: dict[str, str] = {}
+        # Login-session connection registry, mirroring firmware BaseChatMesh
+        # connections[] (src/helpers/BaseChatMesh.cpp:74). Maps a full 32-byte
+        # server public key to a monotonic expiry deadline. See the
+        # note_login_connection / has_login_connection / clear_login_connection
+        # methods in base_send.py for the lifecycle.
+        self._login_connections: dict[bytes, float] = {}
         self._sign_buffer: Optional[bytearray] = None
         self._flood_transport_key: Optional[bytes] = None
         # Sticky "force unscoped flood" flag (FW PR #2492 / FIRMWARE_VER_CODE 12+):

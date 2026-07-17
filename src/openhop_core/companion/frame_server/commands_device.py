@@ -28,6 +28,7 @@ from ..constants import (
     RESP_CODE_SIGN_START,
     RESP_CODE_SIGNATURE,
     RESP_CODE_STATS,
+    RESP_CODE_TUNING_PARAMS,
     STATS_TYPE_CORE,
     STATS_TYPE_PACKETS,
     STATS_TYPE_RADIO,
@@ -470,6 +471,17 @@ class _DeviceCommandsMixin:
         af_ms = struct.unpack_from("<I", data, 4)[0]
         self.bridge.set_tuning_params(rx_ms / 1000.0, af_ms / 1000.0)
         self._write_ok()
+
+    async def _cmd_get_tuning_params(self, data: bytes) -> None:
+        # Firmware MyMesh.cpp:1428-1434: no length guard; responds with
+        # RESP_CODE_TUNING_PARAMS followed by uint32le(rx_delay_base * 1000) and
+        # uint32le(airtime_factor * 1000). The C floats truncate toward zero on
+        # the cast to uint32, so use int() (truncation), not round().
+        rx_delay_base, airtime_factor = self.bridge.get_tuning_params()
+        self._write_frame(
+            bytes([RESP_CODE_TUNING_PARAMS])
+            + struct.pack("<II", int(rx_delay_base * 1000), int(airtime_factor * 1000))
+        )
 
     async def _cmd_get_custom_vars(self, data: bytes) -> None:
         # Mirrors MyMesh.cpp's CMD_GET_CUSTOM_VARS handler (examples/companion_radio/

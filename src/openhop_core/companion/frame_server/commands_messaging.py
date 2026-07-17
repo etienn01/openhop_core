@@ -533,11 +533,31 @@ class _MessagingCommandsMixin:
 
         self._spawn_request_task(_write_telemetry_result(), "companion telemetry response")
 
+    async def _cmd_has_connection(self, data: bytes) -> None:
+        # Firmware MyMesh.cpp:1678-1684 gates this branch on
+        # `len >= 1 + PUB_KEY_SIZE` (length includes the command byte). OpenHop's
+        # `data` is cmd-byte-stripped, so a full pub key is 32 bytes; a shorter
+        # frame fails the guard and falls through the else-if chain to
+        # writeErrFrame(ERR_CODE_UNSUPPORTED_CMD).
+        if len(data) < PUB_KEY_SIZE:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
+        pubkey = data[:PUB_KEY_SIZE]
+        # hasConnectionTo (BaseChatMesh.cpp:707-712): OK if a live login
+        # connection exists, else ERR_CODE_NOT_FOUND.
+        if self.bridge.has_login_connection(pubkey):
+            self._write_ok()
+        else:
+            self._write_err(ERR_CODE_NOT_FOUND)
+
     async def _cmd_logout(self, data: bytes) -> None:
         if len(data) < PUB_KEY_SIZE:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         pubkey = data[:PUB_KEY_SIZE]
+        # Firmware CMD_LOGOUT (MyMesh.cpp:1685-1688) calls stopConnection before
+        # writeOKFrame, unconditionally clearing the connection slot.
+        self.bridge.clear_login_connection(pubkey)
         await self.bridge.send_logout(pubkey)
         self._write_ok()
 

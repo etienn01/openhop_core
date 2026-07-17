@@ -643,3 +643,41 @@ async def test_send_text_to_old_key_still_addresses_old_key():
     assert b"for the old one" in _decrypt_dm(pkt, sender_pub, old)
     with pytest.raises(Exception):
         _decrypt_dm(pkt, sender_pub, new)
+
+
+# ---------------------------------------------------------------------------
+# Login-session connection registry (mirrors BaseChatMesh connections[])
+# ---------------------------------------------------------------------------
+
+
+def test_login_connection_registry_note_has_clear():
+    bridge = CompanionBridge(LocalIdentity(), lambda *a, **k: None)
+    pubkey = b"\x11" * 32
+    assert bridge.has_login_connection(pubkey) is False
+    bridge.note_login_connection(pubkey, 4)  # 4 * 16 = 64s window
+    assert bridge.has_login_connection(pubkey) is True
+    bridge.clear_login_connection(pubkey)
+    assert bridge.has_login_connection(pubkey) is False
+
+
+def test_login_connection_zero_interval_not_recorded():
+    """Firmware only startConnection() with keep_alive_secs > 0 (MyMesh.cpp:688)."""
+    bridge = CompanionBridge(LocalIdentity(), lambda *a, **k: None)
+    pubkey = b"\x12" * 32
+    bridge.note_login_connection(pubkey, 0)
+    assert bridge.has_login_connection(pubkey) is False
+
+
+def test_login_connection_expires(monkeypatch):
+    """Expiry window is 2.5x the keep-alive interval (BaseChatMesh.cpp:749)."""
+    import openhop_core.companion.base_send as base_send
+
+    clock = {"now": 500.0}
+    monkeypatch.setattr(base_send.time, "monotonic", lambda: clock["now"])
+    bridge = CompanionBridge(LocalIdentity(), lambda *a, **k: None)
+    pubkey = b"\x13" * 32
+    bridge.note_login_connection(pubkey, 4)  # 64s keep-alive -> 160s window
+    clock["now"] = 500.0 + 159.9
+    assert bridge.has_login_connection(pubkey) is True
+    clock["now"] = 500.0 + 160.1
+    assert bridge.has_login_connection(pubkey) is False

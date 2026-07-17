@@ -10,8 +10,12 @@ import pytest
 from openhop_core.companion.constants import (
     CMD_GET_CUSTOM_VARS,
     CMD_GET_DEVICE_TIME,
+    CMD_GET_TUNING_PARAMS,
+    CMD_HAS_CONNECTION,
     CMD_IMPORT_PRIVATE_KEY,
+    CMD_LOGOUT,
     CMD_SET_ADVERT_NAME,
+    CMD_SET_TUNING_PARAMS,
     CMD_SIGN_DATA,
     CMD_SIGN_FINISH,
     CMD_SIGN_START,
@@ -52,6 +56,7 @@ from openhop_core.companion.constants import (
     RESP_CODE_SIGN_START,
     RESP_CODE_SIGNATURE,
     RESP_CODE_STATS,
+    RESP_CODE_TUNING_PARAMS,
     STATS_TYPE_PACKETS,
 )
 from openhop_core.companion.frame_server import CompanionFrameServer, _build_advert_push_frames
@@ -3062,3 +3067,126 @@ def test_build_message_frame_signed_plain_pads_missing_prefix():
     frame = server._build_message_frame(plain)
     assert frame[9:13] == struct.pack("<I", 7)
     assert frame[13:] == b"hi"  # no extra field for plain
+
+
+# ---------------------------------------------------------------------------
+# CMD_GET_TUNING_PARAMS (43) and CMD_HAS_CONNECTION (28)
+# ---------------------------------------------------------------------------
+
+
+def _tuning_bridge():
+    from openhop_core.companion.companion_bridge import CompanionBridge
+    from openhop_core.protocol import LocalIdentity
+
+    return CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+
+
+@pytest.mark.asyncio
+async def test_cmd_get_tuning_params_roundtrip():
+    """SET then GET returns exactly the values that were set (ms units)."""
+    server, frames = _make_capture_server(_tuning_bridge())
+    await server._handle_cmd(bytes([CMD_SET_TUNING_PARAMS]) + struct.pack("<II", 250, 1500))
+    frames.clear()
+    await server._handle_cmd(bytes([CMD_GET_TUNING_PARAMS]))
+    assert frames == [bytes([RESP_CODE_TUNING_PARAMS]) + struct.pack("<II", 250, 1500)]
+
+
+@pytest.mark.asyncio
+async def test_cmd_get_tuning_params_defaults():
+    """A fresh bridge reports zeroed tuning params (rx/af default 0.0)."""
+    server, frames = _make_capture_server(_tuning_bridge())
+    await server._handle_cmd(bytes([CMD_GET_TUNING_PARAMS]))
+    assert frames == [bytes([RESP_CODE_TUNING_PARAMS]) + b"\x00" * 8]
+
+
+@pytest.mark.asyncio
+async def test_cmd_get_tuning_params_ignores_extra_bytes():
+    """Firmware (MyMesh.cpp:1428) has no length guard: trailing bytes are
+    ignored and the fixed 9-byte frame is still returned."""
+    server, frames = _make_capture_server(_tuning_bridge())
+    await server._handle_cmd(bytes([CMD_SET_TUNING_PARAMS]) + struct.pack("<II", 250, 1500))
+    frames.clear()
+    await server._handle_cmd(bytes([CMD_GET_TUNING_PARAMS]) + b"\xff\xff\xff")
+    assert frames == [bytes([RESP_CODE_TUNING_PARAMS]) + struct.pack("<II", 250, 1500)]
+
+
+@pytest.mark.asyncio
+async def test_cmd_has_connection_short_frame_unsupported():
+    """A pub key shorter than 32 bytes fails the firmware length guard
+    (MyMesh.cpp:1678) and falls through to ERR_CODE_UNSUPPORTED_CMD."""
+    server, frames = _make_capture_server(_tuning_bridge())
+    await server._handle_cmd(bytes([CMD_HAS_CONNECTION]) + b"\x01" * 31)
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_has_connection_not_found():
+    """A full pub key with no live login session returns ERR_CODE_NOT_FOUND."""
+    server, frames = _make_capture_server(_tuning_bridge())
+    await server._handle_cmd(bytes([CMD_HAS_CONNECTION]) + b"\x02" * PUB_KEY_SIZE)
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_NOT_FOUND])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_has_connection_ok_after_login():
+    """After the wired login-success path records a connection, HAS_CONNECTION
+    reports RESP_CODE_OK."""
+    bridge = _tuning_bridge()
+    server, frames = _make_capture_server(bridge)
+    pubkey = b"\x03" * PUB_KEY_SIZE
+    # note_login_connection is the method fired by the login-response path
+    # (_format_login_result). keep_alive_interval byte 4 -> 64s window.
+    bridge.note_login_connection(pubkey, 4)
+    await server._handle_cmd(bytes([CMD_HAS_CONNECTION]) + pubkey)
+    assert frames == [bytes([RESP_CODE_OK])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_has_connection_zero_keep_alive_not_recorded():
+    """Firmware only calls startConnection when keep_alive_secs > 0
+    (MyMesh.cpp:688), so a zero interval records nothing."""
+    bridge = _tuning_bridge()
+    server, frames = _make_capture_server(bridge)
+    pubkey = b"\x04" * PUB_KEY_SIZE
+    bridge.note_login_connection(pubkey, 0)
+    await server._handle_cmd(bytes([CMD_HAS_CONNECTION]) + pubkey)
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_NOT_FOUND])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_has_connection_cleared_on_logout():
+    """CMD_LOGOUT clears the connection (stopConnection, BaseChatMesh.cpp:695),
+    so a subsequent HAS_CONNECTION reports NOT_FOUND."""
+    bridge = _tuning_bridge()
+    server, frames = _make_capture_server(bridge)
+    pubkey = b"\x05" * PUB_KEY_SIZE
+    bridge.note_login_connection(pubkey, 4)
+    await server._handle_cmd(bytes([CMD_LOGOUT]) + pubkey)
+    frames.clear()
+    await server._handle_cmd(bytes([CMD_HAS_CONNECTION]) + pubkey)
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_NOT_FOUND])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_has_connection_expires(monkeypatch):
+    """A connection expires 2.5x the keep-alive window after login, mirroring
+    firmware checkConnections (BaseChatMesh.cpp:749)."""
+    import openhop_core.companion.base_send as base_send
+
+    bridge = _tuning_bridge()
+    server, frames = _make_capture_server(bridge)
+    pubkey = b"\x06" * PUB_KEY_SIZE
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(base_send.time, "monotonic", lambda: clock["now"])
+
+    # keep_alive_interval 4 -> 64s keep-alive -> 160s expiry window.
+    bridge.note_login_connection(pubkey, 4)
+    clock["now"] = 1000.0 + 159.0
+    await server._handle_cmd(bytes([CMD_HAS_CONNECTION]) + pubkey)
+    assert frames == [bytes([RESP_CODE_OK])]
+
+    frames.clear()
+    clock["now"] = 1000.0 + 161.0
+    await server._handle_cmd(bytes([CMD_HAS_CONNECTION]) + pubkey)
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_NOT_FOUND])]

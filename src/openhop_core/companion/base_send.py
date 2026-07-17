@@ -843,6 +843,12 @@ class _SendOpsMixin:
                     "reason": "Login response timeout",
                 }
             data = login_result["data"]
+            if login_result["success"]:
+                # Mirror firmware onContactResponse (MyMesh.cpp:686-690):
+                # open a connection on a successful login response. This is the
+                # single point every login response (frame server or direct API)
+                # flows through, matching the firmware's onContactResponse.
+                self.note_login_connection(pub_key, data.get("keep_alive_interval", 0))
             return {
                 "success": login_result["success"],
                 "repeater": contact.name,
@@ -881,6 +887,57 @@ class _SendOpsMixin:
         except Exception as e:
             logger.error("Logout error: %s", e)
             return False
+
+    # -------------------------------------------------------------------------
+    # Login-session connection registry
+    #
+    # Mirrors firmware BaseChatMesh connections[] (src/helpers/BaseChatMesh.cpp).
+    # A successful login response carrying a non-zero keep-alive interval opens a
+    # connection (startConnection, BaseChatMesh.cpp:674-693); hasConnectionTo
+    # (BaseChatMesh.cpp:707-712) reports it live until logout (stopConnection,
+    # BaseChatMesh.cpp:695-705) or expiry. Firmware expires a slot 2.5x the
+    # keep-alive interval after the last server activity (checkConnections,
+    # BaseChatMesh.cpp:743-755), refreshing that deadline on every keep-alive ack
+    # (checkConnectionsAck, :726-741). Core has no keep-alive traffic on this
+    # path, so the window simply runs from login time — the closest faithful
+    # equivalent without inventing keep-alive machinery.
+    # -------------------------------------------------------------------------
+
+    def note_login_connection(self, pub_key: bytes, keep_alive_interval: int) -> None:
+        """Record a live login connection after a successful login response.
+
+        ``keep_alive_interval`` is the raw keep-alive byte from the login
+        response (login_response.py). Firmware onContactResponse
+        (MyMesh.cpp:686-690) computes ``keep_alive_secs = data[5] * 16`` and only
+        calls startConnection when that is > 0, so a zero interval records
+        nothing.
+        """
+        keep_alive_secs = int(keep_alive_interval) * 16
+        if keep_alive_secs <= 0:
+            return
+        # checkConnections (BaseChatMesh.cpp:749): expire_secs = keep_alive_secs * 5 / 2.
+        self._login_connections[bytes(pub_key)] = time.monotonic() + keep_alive_secs * 2.5
+
+    def has_login_connection(self, pub_key: bytes) -> bool:
+        """Return whether a non-expired login connection exists for ``pub_key``.
+
+        Mirrors hasConnectionTo (BaseChatMesh.cpp:707-712). Expired entries are
+        pruned lazily on lookup, standing in for firmware's checkConnections
+        sweep.
+        """
+        key = bytes(pub_key)
+        expiry = self._login_connections.get(key)
+        if expiry is None:
+            return False
+        if time.monotonic() >= expiry:
+            del self._login_connections[key]
+            return False
+        return True
+
+    def clear_login_connection(self, pub_key: bytes) -> None:
+        """Drop any login connection for ``pub_key`` (mirrors stopConnection,
+        BaseChatMesh.cpp:695-705)."""
+        self._login_connections.pop(bytes(pub_key), None)
 
     def _response_timeout_s(self, pkt: Packet, proxy: Any) -> float:
         """Adaptive response timeout (seconds) for a request packet.
