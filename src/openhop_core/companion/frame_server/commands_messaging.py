@@ -5,6 +5,7 @@ import asyncio
 import logging
 import struct
 
+from ...protocol.cayenne_lpp import TELEM_CHANNEL_SELF, encode_voltage
 from ...protocol.constants import TELEM_PERM_BASE, TELEM_PERM_ENVIRONMENT, TELEM_PERM_LOCATION
 from ...protocol.packet_utils import PathUtils
 from ..constants import (
@@ -41,20 +42,6 @@ from ..models import QueuedMessage
 
 logger = logging.getLogger("CompanionFrameServer")
 
-# CayenneLPP voltage entry, matching MeshCore's vendored CayenneLPP:
-# LPP_VOLTAGE type = 116 (0x74), 2 bytes, 0.01 V/LSB, unsigned, MSB-first
-# (CayenneLPP.h: `#define LPP_VOLTAGE 116`, LPP_VOLTAGE_SIZE 2, LPP_VOLTAGE_MULT 100;
-# CayenneLPP.cpp addField() writes [channel][type][value*mult big-endian]).
-# TELEM_CHANNEL_SELF = 1 (SensorManager.h:10).
-LPP_VOLTAGE_TYPE = 0x74
-LPP_VOLTAGE_MULT = 100
-TELEM_CHANNEL_SELF = 1
-
-
-def _f32(value: float) -> float:
-    """Round a Python double to IEEE-754 single precision (C `float`)."""
-    return struct.unpack("<f", struct.pack("<f", value))[0]
-
 
 def _encode_lpp_voltage(channel: int, millivolts: int) -> bytes:
     """Encode a CayenneLPP voltage entry the way the firmware does.
@@ -65,8 +52,7 @@ def _encode_lpp_voltage(channel: int, millivolts: int) -> bytes:
     rounding is reproduced here (e.g. 4200 mV -> 4.2f*100 = 419.99998 -> 419)
     to stay byte-identical. Unknown battery (0 mV) still emits a 0 V entry.
     """
-    v = int(_f32(_f32(millivolts / 1000.0) * _f32(LPP_VOLTAGE_MULT))) & 0xFFFF
-    return bytes([channel & 0xFF, LPP_VOLTAGE_TYPE, (v >> 8) & 0xFF, v & 0xFF])
+    return encode_voltage(channel, millivolts / 1000.0)
 
 
 class _MessagingCommandsMixin:
