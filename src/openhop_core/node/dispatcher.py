@@ -5,6 +5,7 @@ import enum
 import inspect
 import logging
 import random
+import time
 from typing import Any, Awaitable, Callable, List, Optional
 
 from ..protocol import Packet
@@ -37,6 +38,18 @@ ACK_TIMEOUT = 5.0  # seconds to wait for an ACK
 # delays under the threshold process immediately, longer ones are capped.
 MIN_RX_DELAY_MS = 50.0
 MAX_RX_DELAY_MS = 32000.0
+
+# TX airtime duty-cycle budget (MeshCore Dispatcher.cpp / Dispatcher.h). The
+# leaky bucket refills at the duty cycle 1/(1+airtime_factor) over a rolling
+# window and is spent on each transmit's estimated airtime. These reproduce the
+# firmware constants; the bucket is active only while client-repeat is enabled.
+DUTY_CYCLE_WINDOW_MS = 3_600_000  # Dispatcher.h getDutyCycleWindowMs() (1 hour)
+MIN_TX_BUDGET_RESERVE_MS = 100  # Dispatcher.cpp MIN_TX_BUDGET_RESERVE_MS
+MIN_TX_BUDGET_AIRTIME_DIV = 2  # Dispatcher.cpp MIN_TX_BUDGET_AIRTIME_DIV
+MAX_TRANS_UNIT = 255  # MeshCore.h MAX_TRANS_UNIT (worst-case reserve packet size)
+# NodePrefs default airtime_factor for the companion (MyMesh.cpp: "one half"),
+# i.e. a 50% duty cycle. Live value comes from prefs.airtime_factor.
+DEFAULT_AIRTIME_BUDGET_FACTOR = 1.0
 
 
 class DispatcherState(str, enum.Enum):
@@ -129,6 +142,15 @@ class Dispatcher:
         # default; only CompanionRadio.set_client_repeat toggles it. Nodes that
         # do their own forwarding (e.g. the repeater) leave this False.
         self._client_repeat_enabled: bool = False
+
+        # TX airtime duty-cycle budget (MeshCore getAirtimeBudgetFactor =
+        # prefs.airtime_factor). The leaky bucket is consulted ONLY while
+        # client-repeat is enabled; when disabled the send path is untouched.
+        # Synced from prefs by the owning layer (CompanionRadio).
+        self.airtime_budget_factor: float = DEFAULT_AIRTIME_BUDGET_FACTOR
+        self._tx_budget_ms: float = 0.0
+        self._tx_budget_last_update: float = 0.0
+        self._tx_next_time: float = 0.0
 
         self._logger = logging.getLogger("Dispatcher")
         self._current_expected_crc: Optional[int] = None
@@ -572,8 +594,103 @@ class Dispatcher:
     # ------------------------------------------------------------------
 
     def set_client_repeat_enabled(self, enabled: bool) -> None:
-        """Enable/disable client-repeat forwarding of received packets."""
-        self._client_repeat_enabled = bool(enabled)
+        """Enable/disable client-repeat forwarding of received packets.
+
+        Enabling also arms the TX airtime budget (firmware Dispatcher::begin
+        starts the bucket full at ``window * duty_cycle``).
+        """
+        enabled = bool(enabled)
+        if enabled and not self._client_repeat_enabled:
+            self._reset_tx_budget()
+        self._client_repeat_enabled = enabled
+
+    # ------------------------------------------------------------------
+    # TX airtime duty-cycle budget (MeshCore Dispatcher budget mechanics)
+    # ------------------------------------------------------------------
+
+    def _duty_cycle(self) -> float:
+        """duty_cycle = 1/(1+airtime_factor) (Dispatcher.cpp updateTxBudget)."""
+        return 1.0 / (1.0 + max(0.0, float(self.airtime_budget_factor)))
+
+    def _reset_tx_budget(self) -> None:
+        """Start the bucket full, matching Dispatcher::begin()."""
+        now = time.monotonic()
+        self._tx_budget_ms = DUTY_CYCLE_WINDOW_MS * self._duty_cycle()
+        self._tx_budget_last_update = now
+        self._tx_next_time = now
+
+    def _refill_tx_budget(self, now: float) -> None:
+        """Accrue budget at the duty cycle, capped at the window max.
+
+        Mirrors Dispatcher::updateTxBudget: ``refill = elapsed * duty_cycle``
+        added to ``tx_budget_ms`` and clamped to ``window * duty_cycle``.
+        """
+        duty = self._duty_cycle()
+        max_budget = DUTY_CYCLE_WINDOW_MS * duty
+        elapsed_ms = (now - self._tx_budget_last_update) * 1000.0
+        refill = elapsed_ms * duty
+        if refill > 0.0:
+            self._tx_budget_ms = min(self._tx_budget_ms + refill, max_budget)
+            self._tx_budget_last_update = now
+
+    def _tx_est_airtime_ms(self, byte_len: int) -> float:
+        """Estimated LoRa airtime for ``byte_len`` on-air bytes (live radio settings)."""
+        return calculate_lora_airtime_ms(
+            byte_len,
+            getattr(self.radio, "spreading_factor", 10),
+            getattr(self.radio, "bandwidth", 250000),
+            getattr(self.radio, "coding_rate", 5),
+            getattr(self.radio, "preamble_length", 8),
+        )
+
+    async def _await_tx_budget(self, packet: Packet) -> None:
+        """Delay until the airtime budget allows this transmit; never drops.
+
+        Reproduces the Dispatcher::checkSend TX gate: require at least
+        ``est_airtime(MAX_TRANS_UNIT) / MIN_TX_BUDGET_AIRTIME_DIV`` of budget
+        before sending, and honour the ``next_tx_time`` pacing that
+        Dispatcher's send-complete path sets when the budget dips below
+        MIN_TX_BUDGET_RESERVE_MS. When short, sleep for the firmware-computed
+        ``needed / duty_cycle`` and re-check. Called before the TX lock is
+        taken, so a waiting forward never blocks other transmits (ACKs,
+        companion sends); asyncio.sleep is cancellation-safe and the budget is
+        only mutated synchronously, so a cancelled wait leaves it consistent.
+        """
+        reserve_ms = self._tx_est_airtime_ms(MAX_TRANS_UNIT) / MIN_TX_BUDGET_AIRTIME_DIV
+        while True:
+            now = time.monotonic()
+            self._refill_tx_budget(now)
+            duty = self._duty_cycle()
+            wait_ms = 0.0
+            if self._tx_budget_ms < reserve_ms:
+                wait_ms = (reserve_ms - self._tx_budget_ms) / duty
+            # next_tx_time pacing from the previous debit.
+            pace_s = self._tx_next_time - now
+            wait_s = max(wait_ms / 1000.0, pace_s)
+            if wait_s <= 0.0:
+                return
+            await asyncio.sleep(wait_s)
+
+    def _debit_tx_budget(self, packet: Packet) -> None:
+        """Spend this transmit's estimated airtime (Dispatcher send-complete path).
+
+        Mirrors the isSendComplete block: refill, subtract the airtime (clamped
+        at zero), then set ``next_tx_time`` so the next send waits when the
+        budget fell below MIN_TX_BUDGET_RESERVE_MS.
+        """
+        now = time.monotonic()
+        self._refill_tx_budget(now)
+        airtime_ms = self._tx_est_airtime_ms(packet.get_raw_length())
+        if airtime_ms > self._tx_budget_ms:
+            self._tx_budget_ms = 0.0
+        else:
+            self._tx_budget_ms -= airtime_ms
+        duty = self._duty_cycle()
+        if self._tx_budget_ms < MIN_TX_BUDGET_RESERVE_MS:
+            needed = MIN_TX_BUDGET_RESERVE_MS - self._tx_budget_ms
+            self._tx_next_time = now + (needed / duty) / 1000.0
+        else:
+            self._tx_next_time = now
 
     def _copy_packet_for_forward(self, pkt: Packet) -> Packet:
         """Copy a received packet for retransmission with an independent path buffer.
@@ -741,6 +858,11 @@ class Dispatcher:
                 return False
         self._apply_flood_scope(packet)
         self._apply_default_path_hash_mode(packet)
+        # Airtime duty-cycle budget: only while client-repeat is on. Waiting
+        # here (before the TX lock) keeps a throttled forward from blocking
+        # other transmits. When disabled, the send path is unchanged.
+        if self._client_repeat_enabled:
+            await self._await_tx_budget(packet)
         async with self._tx_lock:  # Wait our turn
             return await self._send_packet_immediate(packet, wait_for_ack, expected_crc)
 
@@ -778,6 +900,9 @@ class Dispatcher:
             self._log("Radio transmit returned no confirmation metadata")
             self.state = DispatcherState.IDLE
             return False
+        # Spend the airtime budget on the completed transmit (client-repeat only).
+        if self._client_repeat_enabled:
+            self._debit_tx_budget(packet)
         # Log what we sent
         type_name = PAYLOAD_TYPES.get(payload_type, f"UNKNOWN_{payload_type}")
         route_name = ROUTE_TYPES.get(packet.get_route_type(), f"UNKNOWN_{packet.get_route_type()}")

@@ -108,7 +108,7 @@ class TestCompanionBridgeInit:
             "coding_rate": 5,
             "tx_power_dbm": 14,
             "rx_delay_base": 0.0,
-            "airtime_factor": 0.0,
+            "airtime_factor": 1.0,
         }
         assert bridge.get_max_tx_power_dbm() == 17
 

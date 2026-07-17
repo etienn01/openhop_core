@@ -3337,10 +3337,10 @@ async def test_cmd_get_tuning_params_roundtrip():
 
 @pytest.mark.asyncio
 async def test_cmd_get_tuning_params_defaults():
-    """A fresh bridge reports zeroed tuning params (rx/af default 0.0)."""
+    """A fresh bridge reports the firmware defaults (rx 0.0, airtime factor 1.0)."""
     server, frames = _make_capture_server(_tuning_bridge())
     await server._handle_cmd(bytes([CMD_GET_TUNING_PARAMS]))
-    assert frames == [bytes([RESP_CODE_TUNING_PARAMS]) + b"\x00" * 8]
+    assert frames == [bytes([RESP_CODE_TUNING_PARAMS]) + struct.pack("<II", 0, 1000)]
 
 
 @pytest.mark.asyncio

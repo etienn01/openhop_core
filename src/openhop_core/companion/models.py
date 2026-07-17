@@ -152,7 +152,8 @@ class NodePrefs:
     # limit; N rejects adverts N or more hops away (firmware getAutoAddMaxHops).
     autoadd_max_hops: int = 0
     rx_delay_base: float = 0.0
-    airtime_factor: float = 0.0
+    # Firmware companion default (NodePrefs airtime_factor 1.0 = 50% TX duty).
+    airtime_factor: float = 1.0
     # Reported in CMD_DEVICE_QUERY device info frame (byte 80).
     client_repeat: int = 0
     path_hash_mode: int = 0  # 0=1-byte, 1=2-byte, 2=3-byte hashes

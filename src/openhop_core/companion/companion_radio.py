@@ -147,6 +147,9 @@ class CompanionRadio(CompanionBase):
         self._running = True
         self.node.dispatcher.set_default_path_hash_mode(self.prefs.path_hash_mode)
         self.node.dispatcher.rx_delay_base = self.prefs.rx_delay_base
+        # Sync the airtime budget factor before arming the bucket so the initial
+        # duty cycle is correct when client-repeat starts enabled.
+        self.node.dispatcher.airtime_budget_factor = self.prefs.airtime_factor
         self.node.dispatcher.set_client_repeat_enabled(bool(self.prefs.client_repeat))
         self._apply_multi_acks_pref()
         self._dispatcher_task = asyncio.create_task(self.node.start())
@@ -209,6 +212,9 @@ class CompanionRadio(CompanionBase):
         """Set tuning params and sync the RX delay base to the dispatcher."""
         super().set_tuning_params(rx_delay, airtime_factor)
         self.node.dispatcher.rx_delay_base = self.prefs.rx_delay_base
+        # Keep the live airtime duty-cycle factor in sync (firmware reads
+        # getAirtimeBudgetFactor = prefs.airtime_factor on every budget update).
+        self.node.dispatcher.airtime_budget_factor = self.prefs.airtime_factor
 
     def set_other_params(
         self,
