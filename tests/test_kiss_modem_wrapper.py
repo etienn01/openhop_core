@@ -5,6 +5,7 @@ Tests the KISS frame encoding/decoding, command/response handling,
 and LoRaRadio interface implementation.
 """
 
+import gc
 import struct
 import threading
 import time
@@ -56,6 +57,7 @@ from openhop_core.hardware.kiss_modem_wrapper import (
     RESP_TX_DONE,
     RESP_VERSION,
     RESPONSE_TIMEOUT,
+    RX_META_WAIT_SECONDS,
     KissModemWrapper,
 )
 
@@ -229,7 +231,7 @@ class TestKissFrameEncoding:
 
         assert len(received) == 0
         assert len(modem._pending_rx_queue) == 1
-        assert modem._pending_rx_queue[0] == b"\x01\x02\x03"
+        assert modem._pending_rx_queue[0][0] == b"\x01\x02\x03"
 
     def test_port_non_zero_discarded(self):
         """Frames with port != 0 are ignored (type byte 0x10 = port 1, cmd 0)"""
@@ -246,6 +248,172 @@ class TestKissFrameEncoding:
 
         assert len(received) == 0
         assert len(modem._pending_rx_queue) == 0
+
+
+class TestRxMetaBoundedWait:
+    """Data frames must be delivered even when RxMeta never arrives.
+
+    Firmware emits Data unconditionally and RxMeta only when signal reporting is
+    enabled, so reception must not be gated on RxMeta. A queued Data frame waits at
+    most RX_META_WAIT_SECONDS for its RxMeta, then is flushed with sentinel metrics.
+    """
+
+    @staticmethod
+    def _feed(modem, frame):
+        for byte in frame:
+            modem._decode_kiss_byte(byte)
+
+    @staticmethod
+    def _expire_pending(modem):
+        """Force every queued Data frame's deadline into the past."""
+        q = modem._pending_rx_queue
+        for i in range(len(q)):
+            q[i] = (q[i][0], time.monotonic() - 1.0)
+
+    def test_data_with_prompt_rx_meta_uses_real_metrics(self):
+        """Data followed promptly by RxMeta is dispatched with real metrics."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        received = []
+        modem.on_frame_received = lambda d, r, s: received.append((d, r, s))
+
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0x01, 0x02, KISS_FEND]))
+        # SNR=0x10 (4.0 dB), RSSI=0xB0 (-80)
+        self._feed(
+            modem,
+            bytes([KISS_FEND, KISS_CMD_SETHARDWARE, HW_RESP_RX_META, 0x10, 0xB0, KISS_FEND]),
+        )
+
+        assert received == [(b"\x01\x02", -80, 4.0)]
+        assert modem.stats["last_snr"] == pytest.approx(4.0)
+        assert modem.stats["last_rssi"] == -80
+        assert len(modem._pending_rx_queue) == 0
+
+    def test_flush_does_not_fire_before_deadline(self):
+        """A freshly queued Data frame is not flushed while its deadline is in future."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        received = []
+        modem.on_frame_received = lambda d, r, s: received.append((d, r, s))
+
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0x09, KISS_FEND]))
+        modem._flush_expired_rx_frames()
+
+        assert received == []
+        assert len(modem._pending_rx_queue) == 1
+
+    def test_data_without_rx_meta_flushed_with_sentinel(self):
+        """Data with no RxMeta is dispatched after the wait with sentinel metrics.
+
+        rx_packets is counted, but last_snr / last_rssi keep their real values.
+        """
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        received = []
+        modem.on_frame_received = lambda d, r, s: received.append((d, r, s))
+
+        # Seed known real metrics so we can prove sentinels don't overwrite them.
+        modem.stats["last_snr"] = 7.0
+        modem.stats["last_rssi"] = -50
+        rx_before = modem.stats["rx_packets"]
+
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0x01, 0x02, 0x03, KISS_FEND]))
+        self._expire_pending(modem)
+        modem._flush_expired_rx_frames()
+
+        assert received == [(b"\x01\x02\x03", -999, -999.0)]
+        assert modem.stats["rx_packets"] == rx_before + 1
+        assert modem.stats["last_snr"] == 7.0
+        assert modem.stats["last_rssi"] == -50
+        assert len(modem._pending_rx_queue) == 0
+
+    def test_flush_preserves_arrival_order(self):
+        """A timed-out head is delivered before a later Data whose RxMeta is prompt."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        received = []
+        modem.on_frame_received = lambda d, r, s: received.append((d, r, s))
+
+        # DATA1 arrives with no RxMeta and times out.
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0x01, KISS_FEND]))
+        self._expire_pending(modem)
+        modem._flush_expired_rx_frames()
+
+        # DATA2 arrives later with a prompt RxMeta (SNR=2.0 dB, RSSI=-100).
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0x02, KISS_FEND]))
+        self._feed(
+            modem,
+            bytes([KISS_FEND, KISS_CMD_SETHARDWARE, HW_RESP_RX_META, 0x08, 0x9C, KISS_FEND]),
+        )
+
+        assert [entry[0] for entry in received] == [b"\x01", b"\x02"]
+        assert received[0] == (b"\x01", -999, -999.0)
+        assert received[1] == (b"\x02", -100, 2.0)
+
+    def test_lost_rx_meta_costs_only_one_packets_metrics(self):
+        """One lost RxMeta must not permanently shift metric attribution.
+
+        DATA1's RxMeta is lost; after DATA1 times out, DATA2's RxMeta pairs with
+        DATA2 (the new head), so DATA2 gets its own metrics rather than inheriting
+        DATA1's leftover.
+        """
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        received = []
+        modem.on_frame_received = lambda d, r, s: received.append((d, r, s))
+
+        # DATA1 with its RxMeta lost -> flushed sentinel on timeout.
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0xAA, KISS_FEND]))
+        self._expire_pending(modem)
+        modem._flush_expired_rx_frames()
+
+        # DATA2 with its own RxMeta (SNR=4.0 dB, RSSI=-80).
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0xBB, KISS_FEND]))
+        self._feed(
+            modem,
+            bytes([KISS_FEND, KISS_CMD_SETHARDWARE, HW_RESP_RX_META, 0x10, 0xB0, KISS_FEND]),
+        )
+
+        assert received[0] == (b"\xaa", -999, -999.0)
+        assert received[1] == (b"\xbb", -80, 4.0)  # its own metrics, not leftover
+        assert len(modem._pending_rx_queue) == 0
+
+    def test_rx_meta_with_empty_queue_is_ignored(self):
+        """A leftover RxMeta with nothing pending updates stats but dispatches nothing."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        received = []
+        modem.on_frame_received = lambda d, r, s: received.append((d, r, s))
+
+        self._feed(
+            modem,
+            bytes([KISS_FEND, KISS_CMD_SETHARDWARE, HW_RESP_RX_META, 0x10, 0xB0, KISS_FEND]),
+        )
+
+        assert received == []
+        assert len(modem._pending_rx_queue) == 0
+
+    def test_disconnect_clears_pending_rx_queue(self):
+        """Reconnect/disconnect must drop stale Data frames so they cannot pair with
+        an RxMeta from a later link session."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0x01, 0x02, KISS_FEND]))
+        assert len(modem._pending_rx_queue) == 1
+
+        modem.disconnect()
+
+        assert len(modem._pending_rx_queue) == 0
+
+    def test_bounded_wait_constant_is_subsecond(self):
+        """Sanity guard: the RxMeta wait stays short so reception is not stalled."""
+        assert 0 < RX_META_WAIT_SECONDS <= 0.5
 
 
 class TestCommandResponses:
@@ -1507,20 +1675,41 @@ class TestKissTuningMethods:
         modem.set_kiss_full_duplex(False)
         assert written[0][2] == 0x00
 
-    def test_set_signal_report_returns_true_on_ok_response(self):
-        """Test set_signal_report returns True when modem responds OK or SignalReport"""
+    def test_set_signal_report_round_trip_via_real_send_command(self):
+        """Firmware answers SET_SIGNAL_REPORT (0x19) with HW_RESP_SIGNAL_REPORT (0x9A).
+
+        Drive the real _send_command so the acceptable-response set is exercised:
+        the 0x9A reply must complete the waiter (no 5s timeout), set_signal_report
+        must return True, and nothing may be left stranded in _response_queue.
+        """
         modem = KissModemWrapper(port="/dev/null", auto_configure=False)
-
-        def mock_send_command(cmd, data=b"", timeout=5.0):
-            if cmd == HW_CMD_SET_SIGNAL_REPORT:
-                return (HW_RESP_SIGNAL_REPORT, bytes([0x01]))
-            return None
-
-        modem._send_command = mock_send_command
         modem.is_connected = True
 
-        assert modem.set_signal_report(True) is True
-        assert modem.set_signal_report(False) is True
+        mock_serial = MagicMock()
+        mock_serial.is_open = True
+        mock_serial.write.side_effect = lambda b: len(b)
+        modem.serial_conn = mock_serial
+
+        result_holder: dict[str, object] = {}
+
+        def caller():
+            result_holder["resp"] = modem.set_signal_report(True)
+
+        t = threading.Thread(target=caller)
+        started = time.monotonic()
+        t.start()
+
+        # Synthetic 0x9A reply carrying the enabled flag, fed through real parsing.
+        reply = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, HW_RESP_SIGNAL_REPORT, 0x01, KISS_FEND])
+        for b in reply:
+            modem._decode_kiss_byte(b)
+
+        t.join(timeout=2.0)
+        elapsed = time.monotonic() - started
+
+        assert result_holder.get("resp") is True
+        assert elapsed < RESPONSE_TIMEOUT  # completed on the reply, not a timeout
+        assert len(modem._response_queue) == 0  # 0x9A consumed, nothing stray left
 
     def test_set_signal_report_returns_true_on_ok(self):
         """Test set_signal_report returns True when modem responds HW_RESP_OK"""
@@ -1594,6 +1783,10 @@ class TestContextManager:
 
     def test_context_manager_calls_connect_disconnect(self):
         """Test context manager calls connect and disconnect"""
+        # Drain finalizers from GC-collectable modems left by earlier tests so their
+        # __del__ -> cleanup -> disconnect does not land inside the patch window below
+        # and inflate the call count.
+        gc.collect()
         with patch.object(KissModemWrapper, "connect", return_value=True) as mock_connect:
             with patch.object(KissModemWrapper, "disconnect") as mock_disconnect:
                 with KissModemWrapper(port="/dev/null", auto_configure=False) as modem:

@@ -204,6 +204,10 @@ DEFAULT_TIMEOUT = 1.0
 # port timeout is min(this, self.timeout) so a caller-supplied lower timeout still wins.
 RX_READ_TIMEOUT_S = 0.1
 RESPONSE_TIMEOUT = 5.0  # Timeout for command responses
+# Max time a received Data frame waits for its trailing RxMeta before being
+# dispatched with sentinel metrics. RxMeta is only emitted when signal reporting
+# is enabled, so a modem that never sends it must not stall reception.
+RX_META_WAIT_SECONDS = 0.25
 # Extra margin added to estimated airtime when waiting for a DATA TX_DONE, so a long
 # transmit (e.g. a high-SF flood advert) is not cut short by the flat command timeout.
 TX_DONE_TIMEOUT_MARGIN_S = 1.0
@@ -246,6 +250,13 @@ class KissModemWrapper(LoRaRadio):
         HW_CMD_SET_TX_POWER,
         HW_CMD_SET_SIGNAL_REPORT,
         HW_CMD_REBOOT,
+    }
+
+    # Some SetHardware setters answer with the GET-form response code rather than
+    # the setter's own command|0x80. SET_SIGNAL_REPORT (0x19) replies with
+    # HW_RESP(HW_CMD_GET_SIGNAL_REPORT) = 0x9A.
+    _SETHW_EXTRA_ACCEPT_RESP: dict[int, int] = {
+        HW_CMD_SET_SIGNAL_REPORT: HW_RESP_SIGNAL_REPORT,
     }
 
     def __init__(
@@ -398,8 +409,11 @@ class KissModemWrapper(LoRaRadio):
         self._tx_done_event = threading.Event()
         self._tx_done_result: Optional[bool] = None
 
-        # Pending RX data payloads (Data frame) waiting for RxMeta frame
-        self._pending_rx_queue: deque = deque()
+        # Pending RX data payloads (Data frame) awaiting their RxMeta frame.
+        # Each entry is (payload, deadline_monotonic); a frame is dispatched with
+        # sentinel metrics once its deadline passes if no RxMeta has arrived.
+        self._pending_rx_queue: deque[tuple[bytes, float]] = deque()
+        self._pending_rx_lock = threading.Lock()
 
         self.stats = {
             "frames_sent": 0,
@@ -483,6 +497,7 @@ class KissModemWrapper(LoRaRadio):
 
         self._stop_io_threads(join_timeout=2.0)
         self._stop_reconnect_thread(join_timeout=2.0)
+        self._clear_pending_rx()
 
         if self._callback_executor is not None:
             self._callback_executor.shutdown(wait=False)
@@ -494,6 +509,9 @@ class KissModemWrapper(LoRaRadio):
         """Open serial device and start RX/TX workers."""
         try:
             self._shutting_down = False
+            # Drop any Data frames left over from a prior session so a stale payload
+            # cannot pair with an RxMeta from the freshly opened link.
+            self._clear_pending_rx()
             self.serial_conn = serial.Serial(
                 port=self.port,
                 baudrate=self.baudrate,
@@ -1095,6 +1113,9 @@ class KissModemWrapper(LoRaRadio):
             acceptable: set[int] = {expected, HW_RESP_ERROR}
             if sub_cmd in self._SETHW_ALLOW_OK_FOR:
                 acceptable.add(HW_RESP_OK)
+            extra_resp = self._SETHW_EXTRA_ACCEPT_RESP.get(sub_cmd)
+            if extra_resp is not None:
+                acceptable.add(extra_resp)
 
             # Check queued responses first (late/out-of-order arrivals).
             with self._response_lock:
@@ -1949,16 +1970,20 @@ class KissModemWrapper(LoRaRadio):
         self.stats["bytes_received"] += len(self.rx_frame_buffer) - 1
 
         if cmd == CMD_DATA:
-            # Data frame: raw packet only (≤255 bytes per spec); queue until RxMeta arrives
+            # Data frame: raw packet only (≤255 bytes per spec). Queue it with a
+            # deadline; RxMeta (only sent when signal reporting is on) pairs metrics,
+            # otherwise the frame is flushed with sentinel metrics once it times out.
             payload = bytes(self.rx_frame_buffer[1:])
-            if len(self._pending_rx_queue) >= MAX_PENDING_RX_FRAMES:
-                self.stats["frame_errors"] += 1
-                logger.warning(
-                    "Pending RX queue full (max %d), dropping Data frame",
-                    MAX_PENDING_RX_FRAMES,
-                )
-            else:
-                self._pending_rx_queue.append(payload)
+            with self._pending_rx_lock:
+                if len(self._pending_rx_queue) >= MAX_PENDING_RX_FRAMES:
+                    self.stats["frame_errors"] += 1
+                    logger.warning(
+                        "Pending RX queue full (max %d), dropping Data frame",
+                        MAX_PENDING_RX_FRAMES,
+                    )
+                else:
+                    deadline = time.monotonic() + RX_META_WAIT_SECONDS
+                    self._pending_rx_queue.append((payload, deadline))
 
         elif cmd == KISS_CMD_SETHARDWARE:
             # SetHardware: first byte is sub_cmd, rest is payload
@@ -1982,14 +2007,18 @@ class KissModemWrapper(LoRaRadio):
                     self.stats["last_snr"] = snr_db
                     self.stats["last_rssi"] = rssi_raw
                     self.stats["rx_packets"] += 1
-                if self._pending_rx_queue:
-                    packet_data = self._pending_rx_queue.popleft()
+                with self._pending_rx_lock:
+                    packet_data = (
+                        self._pending_rx_queue.popleft()[0] if self._pending_rx_queue else None
+                    )
+                if packet_data is not None:
                     if self.on_frame_received:
                         try:
                             self._dispatch_rx_callback(packet_data, rssi_raw, snr_db)
                         except Exception as e:
                             logger.error(f"Error in frame received callback: {e}")
                 else:
+                    # Leftover RxMeta from a desynced/flushed head: nothing to pair.
                     logger.warning("RxMeta received with no pending Data frame")
 
             elif sub_cmd == HW_RESP_TX_DONE:
@@ -2042,6 +2071,35 @@ class KissModemWrapper(LoRaRadio):
                         self._response_queue.append((sub_cmd, payload))
         # cmd 0xFF (Return) has port=15 so is already discarded above
 
+    def _flush_expired_rx_frames(self) -> None:
+        """
+        Dispatch Data frames whose RxMeta never arrived within RX_META_WAIT_SECONDS.
+
+        Only the head is inspected: deadlines are monotonically increasing, so once
+        the head has time remaining the rest do too. Flushing strictly from the head
+        preserves arrival order even when a later frame's RxMeta arrives promptly.
+        Sentinel metrics (-999) are used; rx_packets is still counted but last_snr /
+        last_rssi are left untouched so no fake signal reading is recorded.
+        """
+        now = time.monotonic()
+        while True:
+            with self._pending_rx_lock:
+                if not self._pending_rx_queue or self._pending_rx_queue[0][1] > now:
+                    break
+                payload = self._pending_rx_queue.popleft()[0]
+                self.stats["rx_packets"] += 1
+            if self.on_frame_received:
+                try:
+                    self._dispatch_rx_callback(payload, -999, -999.0)
+                except Exception as e:
+                    logger.error(f"Error in frame received callback: {e}")
+
+    def _clear_pending_rx(self) -> None:
+        """Drop any queued Data frames (e.g. on disconnect/reconnect) so a stale
+        payload never pairs with an RxMeta from a different link session."""
+        with self._pending_rx_lock:
+            self._pending_rx_queue.clear()
+
     def _rx_worker(self):
         """Background thread for receiving data"""
         while (
@@ -2053,6 +2111,10 @@ class KissModemWrapper(LoRaRadio):
                 conn = self.serial_conn
                 if conn is None:
                     break
+                # Flush Data frames whose RxMeta timed out. Runs every loop, including
+                # idle wakeups (the read below caps at RX_READ_TIMEOUT_S), so a stalled
+                # head is released within roughly RX_META_WAIT_SECONDS.
+                self._flush_expired_rx_frames()
                 # Blocking read of >=1 byte: sleeps in the kernel (releasing the GIL) until
                 # data or the port timeout, instead of busy-polling. On wake, drain whatever
                 # else has arrived and bulk-decode it in one pass.
