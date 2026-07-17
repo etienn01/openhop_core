@@ -617,6 +617,15 @@ class Dispatcher:
         """Send a packet immediately (assumes lock is held)."""
         payload_type = packet.get_payload_type()
 
+        # Mark this packet seen before transmitting, matching firmware's
+        # hasSeen() call right before sendPacket() in Mesh::sendFlood/
+        # sendDirect/sendZeroHop: if a neighbor rebroadcasts it back to us,
+        # the RX-path dedupe check (packet_filter.is_duplicate) must catch
+        # it. Uses the same hash the RX path tracks with, so a returned copy
+        # with a mutated path (path excluded from the hash) still matches.
+        packet_hash = packet.calculate_packet_hash().hex()[:16]
+        self.packet_filter.track_packet(packet_hash)
+
         # ------------------------------------------------------------------ #
         #  Send the packet (lock ensures only one transmission at a time)
         # ------------------------------------------------------------------ #

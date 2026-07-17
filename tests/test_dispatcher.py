@@ -1022,3 +1022,98 @@ class TestDispatcherPayloadBasedDedup:
 
         # Second attempt should be rejected at blacklist check (not re-parsed)
         await dispatcher._process_received_packet(bad_data)
+
+
+class TestDispatcherSendMarksSeen:
+    """Sending a packet marks it seen in the packet filter, matching firmware's
+    hasSeen() call right before sendPacket() in Mesh::sendFlood/sendDirect/
+    sendZeroHop: a neighbor rebroadcasting our own packet back to us must be
+    dropped as a duplicate rather than dispatched to handlers."""
+
+    @pytest.mark.asyncio
+    async def test_sent_flood_packet_dropped_on_loopback(self, dispatcher):
+        """Identical bytes fed back through the receive path are deduplicated."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_TXT_MSG)
+        dispatcher.register_handler(PAYLOAD_TYPE_TXT_MSG, mock_handler)
+
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(b"outbound message")
+        pkt.payload_len = len(pkt.payload)
+
+        assert await dispatcher.send_packet(pkt, wait_for_ack=False) is True
+
+        looped_data = pkt.write_to()
+        await dispatcher._process_received_packet(looped_data)
+
+        assert mock_handler.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_sent_flood_packet_dropped_on_loopback_with_mutated_path(self, dispatcher):
+        """A rebroadcast copy with a different path/path_len is still recognized as
+        our own send, since calculate_packet_hash() excludes path for non-TRACE."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_TXT_MSG)
+        dispatcher.register_handler(PAYLOAD_TYPE_TXT_MSG, mock_handler)
+
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(b"outbound message")
+        pkt.payload_len = len(pkt.payload)
+
+        assert await dispatcher.send_packet(pkt, wait_for_ack=False) is True
+
+        looped = Packet()
+        looped.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
+        looped.path_len = 2
+        looped.path = bytearray(b"\xAA\xBB")
+        looped.payload = bytearray(b"outbound message")
+        looped.payload_len = len(looped.payload)
+
+        await dispatcher._process_received_packet(looped.write_to())
+
+        assert mock_handler.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_distinct_inbound_packet_not_suppressed_after_send(self, dispatcher):
+        """A genuinely different inbound packet is not caught by the send-time mark."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_TXT_MSG)
+        dispatcher.register_handler(PAYLOAD_TYPE_TXT_MSG, mock_handler)
+
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(b"outbound message")
+        pkt.payload_len = len(pkt.payload)
+
+        assert await dispatcher.send_packet(pkt, wait_for_ack=False) is True
+
+        other_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"a completely different message")
+        await dispatcher._process_received_packet(other_data)
+
+        assert mock_handler.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_sent_group_packet_dropped_on_loopback(self, dispatcher):
+        """GRP_TXT: _is_own_packet always returns False for group payload types, so
+        this loopback would previously reach handlers — the send-time seen-table
+        mark is the only thing that catches it."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_GRP_TXT)
+        dispatcher.register_handler(PAYLOAD_TYPE_GRP_TXT, mock_handler)
+
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_GRP_TXT << 2) | ROUTE_TYPE_FLOOD  # version 0
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(b"\x11" * 4 + b"group message ciphertext")
+        pkt.payload_len = len(pkt.payload)
+
+        assert await dispatcher.send_packet(pkt, wait_for_ack=False) is True
+
+        await dispatcher._process_received_packet(pkt.write_to())
+
+        assert mock_handler.call_count == 0
