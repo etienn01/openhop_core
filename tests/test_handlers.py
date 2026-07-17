@@ -1349,6 +1349,19 @@ class TestProtocolRequestHandler:
         assert r.response is not None
         assert client.last_timestamp == 500
 
+    def test_advance_client_watermark_is_monotonic(self):
+        """The watermark never moves backwards: if another accepted request
+        advanced it between the replay check and the write, an older (but
+        already-validated) timestamp must not regress it."""
+        handler, client, _ = self._req_handler_with_client()
+
+        client.last_timestamp = 2000
+        handler._advance_client_watermark(client, 1500)
+        assert client.last_timestamp == 2000
+
+        handler._advance_client_watermark(client, 2500)
+        assert client.last_timestamp == 2500
+
     def test_flood_req_returns_path_packet(self):
         """REQ via flood → path-return PATH packet (firmware createPathReturn + sendFlood)."""
         peer_identity = LocalIdentity()

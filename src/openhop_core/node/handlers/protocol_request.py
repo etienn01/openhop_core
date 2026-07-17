@@ -245,7 +245,10 @@ class ProtocolRequestHandler:
     def _advance_client_watermark(self, client, timestamp: int) -> None:
         """Advance the replay watermark (and last_activity) after a valid REQ."""
         try:
-            client.last_timestamp = timestamp
+            # Monotonic: the watermark must never move backwards, even if
+            # another accepted request advanced it between our replay check
+            # and this write.
+            client.last_timestamp = max(self._get_last_req_ts(client), timestamp)
             if hasattr(client, "last_activity"):
                 client.last_activity = int(time.time())
         except Exception:
