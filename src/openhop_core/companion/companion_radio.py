@@ -21,6 +21,7 @@ from ..protocol.constants import (
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
+from ..protocol.packet_utils import PathUtils
 from .companion_base import CompanionBase
 from .constants import (
     ADV_TYPE_CHAT,
@@ -339,6 +340,10 @@ class CompanionRadio(CompanionBase):
             # (firmware onContactPathRecv behaviour). Without this the remote
             # repeater never learns its route back to us and floods every reply.
             dispatcher.protocol_response_handler.set_packet_injector(self._send_packet)
+        # When a direct trace reaches the end of its path, push completion data
+        # to connected clients (firmware onTraceRecv -> PUSH_CODE_TRACE_DATA).
+        if getattr(dispatcher, "trace_handler", None):
+            dispatcher.trace_handler.on_trace_complete = self._on_trace_complete
 
     async def _on_packet_received(self, pkt: Any) -> None:
         route_type = pkt.get_route_type()
@@ -366,3 +371,33 @@ class CompanionRadio(CompanionBase):
 
     async def _on_packet_sent(self, pkt: Any) -> None:
         pass
+
+    async def _on_trace_complete(self, pkt: Packet, parsed_data: dict) -> None:
+        """Trace reached the end of its path: fire trace_received with the
+        assembled PUSH_CODE_TRACE_DATA fields (firmware onTraceRecv layout)."""
+        path_hashes = parsed_data.get("trace_path_bytes") or b""
+        if not path_hashes:
+            return
+        flags = parsed_data.get("flags", 0)
+        hash_len = len(path_hashes)
+        expected_snr_len = hash_len // PathUtils.trace_payload_hash_width(flags)
+        if expected_snr_len <= 0:
+            return
+        snr_scaled = max(-128, min(127, int(round(pkt.get_snr() * 4))))
+        snr_byte = snr_scaled if snr_scaled >= 0 else (256 + snr_scaled)
+        # Firmware copies path_snrs from pkt->path (length hash_len >> path_sz).
+        path_snrs = bytes(pkt.path)[:expected_snr_len]
+        if len(path_snrs) < expected_snr_len:
+            path_snrs = path_snrs + b"\x00" * (expected_snr_len - len(path_snrs))
+        await self._fire_callbacks(
+            "trace_received",
+            {
+                "path_len": hash_len,
+                "flags": flags,
+                "tag": parsed_data.get("tag", 0),
+                "auth_code": parsed_data.get("auth_code", 0),
+                "path_hashes": path_hashes,
+                "path_snrs": path_snrs,
+                "final_snr_byte": snr_byte,
+            },
+        )

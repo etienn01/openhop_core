@@ -50,6 +50,7 @@ class _PushMixin:
         self.bridge.on_contact_deleted(self._on_contact_deleted)
         self.bridge.on_contacts_full(self._on_contacts_full)
         self.bridge.on_raw_data_received(self._on_raw_data_received)
+        self.bridge.on_trace_received(self._on_trace_received)
 
     # -------------------------------------------------------------------------
     # Bridge event callbacks (registered by _setup_push_callbacks)
@@ -262,6 +263,18 @@ class _PushMixin:
             + payload_bytes[:payload_len]
         )
         self._enqueue_frame(data)
+
+    def _on_trace_received(self, info: dict) -> None:
+        """Push PUSH_CODE_TRACE_DATA (0x89) when a trace completes at this node."""
+        self.push_trace_data(
+            path_len=info["path_len"],
+            flags=info["flags"],
+            tag=info["tag"],
+            auth_code=info["auth_code"],
+            path_hashes=info["path_hashes"],
+            path_snrs=info["path_snrs"],
+            final_snr_byte=info["final_snr_byte"],
+        )
 
     # -------------------------------------------------------------------------
     # Public push methods (called directly by host application)
