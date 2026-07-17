@@ -41,6 +41,12 @@ class AckHandler(BaseHandler):
         """Handle discrete ACK packets (payload type 1)."""
         ack_crc = await self.process_discrete_ack(packet)
         if ack_crc is not None:
+            # Firmware BaseChatMesh::onAckRecv marks the packet do-not-retransmit
+            # when the ACK matches a message this node sent (processAck != NULL),
+            # so a client repeater does not re-flood an ACK addressed to itself.
+            # _waiting_acks holds the CRCs we are awaiting — the Core equivalent.
+            if self.dispatcher is not None and ack_crc in self.dispatcher._waiting_acks:
+                packet.mark_do_not_retransmit()
             await self._notify_ack_received(ack_crc)
 
     async def process_discrete_ack(self, packet: Packet) -> Optional[int]:

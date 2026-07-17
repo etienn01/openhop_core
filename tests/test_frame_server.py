@@ -1290,13 +1290,19 @@ async def test_handle_client_connection_reset_disconnects_cleanly(caplog):
 
 
 @pytest.mark.asyncio
-async def test_cmd_get_allowed_repeat_freq_empty_list():
-    """CMD_GET_ALLOWED_REPEAT_FREQ replies with the response code and no ranges."""
-    server = CompanionFrameServer(Mock(), "hash", port=0)
+async def test_cmd_get_allowed_repeat_freq_returns_ranges():
+    """CMD_GET_ALLOWED_REPEAT_FREQ replies with (lower,upper) u32le kHz pairs."""
+    bridge = Mock()
+    bridge.get_allowed_repeat_freqs.return_value = ((433000, 433000), (918000, 918000))
+    server = CompanionFrameServer(bridge, "hash", port=0)
     frames: list[bytes] = []
     server._write_frame = lambda f: frames.append(f)
     await server._cmd_get_allowed_repeat_freq(b"")
-    assert frames == [bytes([RESP_CODE_ALLOWED_REPEAT_FREQ])]
+    assert frames == [
+        bytes([RESP_CODE_ALLOWED_REPEAT_FREQ])
+        + struct.pack("<II", 433000, 433000)
+        + struct.pack("<II", 918000, 918000)
+    ]
 
 
 @pytest.mark.asyncio
@@ -3014,6 +3020,133 @@ async def test_cmd_set_radio_params_reports_backend_failure():
 
     assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_BAD_STATE])]
     bridge.set_radio_params.assert_called_once_with(915_000_000, 250_000, 10, 5)
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_radio_params_frequency_lower_bound_is_150mhz():
+    """Firmware parity: 149,999 kHz is rejected, 150,000 kHz is accepted."""
+    bridge = Mock()
+    bridge.get_allowed_repeat_freqs.return_value = ()
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_set_radio_params(struct.pack("<II", 149_999, 250_000) + bytes([10, 5]))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+    bridge.set_radio_params.assert_not_called()
+
+    frames.clear()
+    await server._cmd_set_radio_params(struct.pack("<II", 150_000, 250_000) + bytes([10, 5]))
+    assert frames == [bytes([RESP_CODE_OK])]
+    bridge.set_radio_params.assert_called_once_with(150_000_000, 250_000, 10, 5)
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_radio_params_parses_optional_repeat_byte():
+    """The extended 11-byte frame's repeat byte is parsed and persisted."""
+    bridge = Mock()
+    bridge.get_allowed_repeat_freqs.return_value = ((433000, 433000),)
+    server, frames = _make_capture_server(bridge)
+
+    # No repeat byte -> persisted as 0 (firmware resets client_repeat).
+    await server._cmd_set_radio_params(struct.pack("<II", 433_000, 250_000) + bytes([10, 5]))
+    assert frames == [bytes([RESP_CODE_OK])]
+    bridge.set_client_repeat.assert_called_once_with(0)
+
+    bridge.set_client_repeat.reset_mock()
+    frames.clear()
+    # Repeat byte = 1 on an allowed frequency -> persisted as 1.
+    await server._cmd_set_radio_params(struct.pack("<II", 433_000, 250_000) + bytes([10, 5, 1]))
+    assert frames == [bytes([RESP_CODE_OK])]
+    bridge.set_client_repeat.assert_called_once_with(1)
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_radio_params_repeat_on_disallowed_freq_is_illegal_arg():
+    bridge = Mock()
+    bridge.get_allowed_repeat_freqs.return_value = ((433000, 433000), (918000, 918000))
+    server, frames = _make_capture_server(bridge)
+
+    # 868,000 kHz is a valid general frequency but not an allowed repeat freq.
+    await server._cmd_set_radio_params(struct.pack("<II", 868_000, 250_000) + bytes([10, 5, 1]))
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+    bridge.set_radio_params.assert_not_called()
+    bridge.set_client_repeat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_radio_params_repeat_persists_and_byte80_roundtrips():
+    """repeat=1 on an allowed freq persists and DEVICE_QUERY byte 80 reflects it."""
+    from openhop_core.companion import CompanionRadio
+    from openhop_core.protocol import LocalIdentity
+
+    class ConfigurableRadio:
+        def set_rx_callback(self, cb):
+            pass
+
+        def configure_radio(self, **kwargs):
+            return True
+
+        async def send(self, data):
+            return True
+
+        def get_last_rssi(self):
+            return -70
+
+        def get_last_snr(self):
+            return 5
+
+    comp = CompanionRadio(ConfigurableRadio(), LocalIdentity())
+    server, frames = _make_capture_server(comp)
+
+    await server._cmd_set_radio_params(struct.pack("<II", 433_000, 250_000) + bytes([10, 5, 1]))
+    assert frames == [bytes([RESP_CODE_OK])]
+    assert comp.prefs.client_repeat == 1
+    assert comp.node.dispatcher._client_repeat_enabled is True
+
+    frames.clear()
+    await server._cmd_device_query(bytes([3]))
+    assert frames[0][80] == 1
+
+
+@pytest.mark.asyncio
+async def test_cmd_set_radio_params_bridge_acks_but_ignores_repeat():
+    """A virtual companion acks the save but never enables client-repeat."""
+    from openhop_core.companion import CompanionBridge
+    from openhop_core.protocol import LocalIdentity
+
+    bridge = CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+    server, frames = _make_capture_server(bridge)
+
+    await server._cmd_set_radio_params(struct.pack("<II", 433_000, 250_000) + bytes([10, 5, 1]))
+    assert frames == [bytes([RESP_CODE_OK])]
+    assert bridge.get_self_info().client_repeat == 0
+
+    frames.clear()
+    await server._cmd_device_query(bytes([3]))
+    assert frames[0][80] == 0
+
+
+@pytest.mark.asyncio
+async def test_cmd_get_allowed_repeat_freq_default_table_bytes():
+    """The default table serialises to the three firmware repeat bands."""
+    from openhop_core.companion import CompanionRadio
+    from openhop_core.protocol import LocalIdentity
+
+    class _Radio:
+        def set_rx_callback(self, cb):
+            pass
+
+        async def send(self, data):
+            return True
+
+    comp = CompanionRadio(_Radio(), LocalIdentity())
+    server, frames = _make_capture_server(comp)
+    await server._cmd_get_allowed_repeat_freq(b"")
+    assert frames == [
+        bytes([RESP_CODE_ALLOWED_REPEAT_FREQ])
+        + struct.pack("<II", 433000, 433000)
+        + struct.pack("<II", 869495, 869495)
+        + struct.pack("<II", 918000, 918000)
+    ]
 
 
 @pytest.mark.asyncio

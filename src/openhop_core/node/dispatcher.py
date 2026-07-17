@@ -4,17 +4,19 @@ import asyncio
 import enum
 import inspect
 import logging
+import random
 from typing import Any, Awaitable, Callable, List, Optional
 
 from ..protocol import Packet
 from ..protocol.constants import (  # Payload types
+    MAX_PATH_SIZE,
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_TRACE,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
-from ..protocol.packet_utils import flood_rx_metrics
+from ..protocol.packet_utils import PathUtils, calculate_lora_airtime_ms, flood_rx_metrics
 from ..protocol.transport_keys import calc_transport_code
 from ..protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES
 
@@ -23,6 +25,7 @@ from .handlers import (
     AckHandler,
     AnonReqResponseHandler,
     ControlHandler,
+    HandlerResult,
     MultipartAckHandler,
     TraceHandler,
     create_core_handlers,
@@ -121,6 +124,11 @@ class Dispatcher:
         # the "set rxdelay" tuning param). 0 disables the delay, which is the
         # firmware default. Synced from prefs/config by the owning layer.
         self.rx_delay_base: float = 0.0
+
+        # Client-repeat forwarding (MeshCore _prefs.client_repeat). Off by
+        # default; only CompanionRadio.set_client_repeat toggles it. Nodes that
+        # do their own forwarding (e.g. the repeater) leave this False.
+        self._client_repeat_enabled: bool = False
 
         self._logger = logging.getLogger("Dispatcher")
         self._current_expected_crc: Optional[int] = None
@@ -483,8 +491,27 @@ class Dispatcher:
             return
         self.packet_filter.track_packet(packet_hash)
 
+        # Client-repeat: build the retransmit from the just-received packet
+        # BEFORE handlers run, so a copy is taken while path/payload are intact
+        # (no Core handler mutates the received packet's path/payload). The
+        # forward is only scheduled after _dispatch so a flood packet consumed
+        # by this node (a handler marked it do-not-retransmit, mirroring
+        # firmware Mesh::onRecvPacket) is not re-flooded. Direct/TRACE forwards
+        # keep their next-hop guards and are unaffected by the mark, matching
+        # firmware which forwards those before payload processing. Our own
+        # retransmit re-tracks the same hash in the send funnel, so a copy
+        # echoed back over RF is dropped by the dedupe check above.
+        forward_pkt = None
+        if self._client_repeat_enabled:
+            forward_pkt = self._build_client_repeat_forward(pkt)
+
         # Handle ACK matching for waiting senders
         await self._dispatch(pkt)
+
+        if forward_pkt is not None and not (
+            forward_pkt.is_route_flood() and pkt.is_marked_do_not_retransmit()
+        ):
+            asyncio.create_task(self._client_repeat_transmit(forward_pkt))
 
     # ------------------------------------------------------------------
     # Public interface - sending and receiving packets
@@ -539,6 +566,156 @@ class Dispatcher:
         if getattr(pkt, "_path_hash_mode_applied", False):
             return
         pkt.apply_path_hash_mode(self.path_hash_mode, mark_applied=False)
+
+    # ------------------------------------------------------------------
+    # Client-repeat forwarding (MeshCore Mesh::onRecvPacket forward paths)
+    # ------------------------------------------------------------------
+
+    def set_client_repeat_enabled(self, enabled: bool) -> None:
+        """Enable/disable client-repeat forwarding of received packets."""
+        self._client_repeat_enabled = bool(enabled)
+
+    def _copy_packet_for_forward(self, pkt: Packet) -> Packet:
+        """Copy a received packet for retransmission with an independent path buffer.
+
+        Marks the copy as already-scoped and already-hash-moded so the send
+        funnel retransmits it verbatim (never re-scoping a forwarded flood or
+        overwriting the path hash width we set here).
+        """
+        fwd = Packet()
+        fwd.header = pkt.header
+        fwd.path_len = pkt.path_len
+        fwd.path = bytearray(pkt.path)
+        fwd.payload = bytearray(pkt.payload[: pkt.payload_len])
+        fwd.payload_len = pkt.payload_len
+        fwd.transport_codes = list(pkt.transport_codes)
+        fwd._snr = pkt._snr
+        fwd._rssi = pkt._rssi
+        fwd._flood_scope_applied = True
+        fwd._path_hash_mode_applied = True
+        return fwd
+
+    def _build_client_repeat_forward(self, pkt: Packet) -> Optional[Packet]:
+        """Build the retransmit packet for a received packet, or None to drop.
+
+        Mirrors the forwarding branches of MeshCore ``Mesh::onRecvPacket``:
+        direct TRACE appends an SNR byte, routed-direct traffic strips self and
+        retransmits, and flood traffic appends our hash unless it was consumed
+        by this node. ``allowPacketForward`` (``_prefs.client_repeat != 0``) is
+        the ``_client_repeat_enabled`` gate checked by the caller.
+        """
+        if self.local_identity is None:
+            return None
+        self_key = self.local_identity.get_public_key()
+        ptype = pkt.get_payload_type()
+
+        if pkt.is_route_direct() and ptype == PAYLOAD_TYPE_TRACE:
+            return self._build_trace_forward(pkt, self_key)
+        if pkt.is_route_direct() and pkt.get_path_hash_count() > 0:
+            return self._build_direct_forward(pkt, self_key)
+        if pkt.is_route_flood():
+            return self._build_flood_forward(pkt, self_key)
+        return None
+
+    def _build_flood_forward(self, pkt: Packet, self_key: bytes) -> Optional[Packet]:
+        """Append this node's hash to a flood path (Mesh::routeRecvPacket).
+
+        Whether the forward is actually sent is decided after ``_dispatch``:
+        firmware's ``!isMarkedDoNotRetransmit()`` guard is honoured there via
+        the do-not-retransmit mark a handler sets when it genuinely consumes the
+        packet (a real decrypt, not a bare dest-hash collision). Own-advert
+        echoes and any other copy we hear back are dropped earlier by the RX
+        seen-table (the TX-side track_packet), matching firmware's hasSeen; a
+        self-advert is never re-received without this node first transmitting
+        (and thus tracking) it, so no self-advert special case is needed here.
+        """
+        hash_size = pkt.get_path_hash_size()
+        hop_count = pkt.get_path_hash_count()
+        # Firmware guards: (n+1)*hashSize <= MAX_PATH_SIZE and the 6-bit hop cap.
+        if hop_count >= 63:
+            return None
+        if (hop_count + 1) * hash_size > MAX_PATH_SIZE:
+            return None
+        fwd = self._copy_packet_for_forward(pkt)
+        fwd.path.extend(self_key[:hash_size])
+        fwd.path_len = PathUtils.encode_path_len(hash_size, hop_count + 1)
+        return fwd
+
+    def _build_direct_forward(self, pkt: Packet, self_key: bytes) -> Optional[Packet]:
+        """Strip self and retransmit a routed-direct packet when we are the next hop."""
+        hash_size = pkt.get_path_hash_size()
+        if len(pkt.path) < hash_size:
+            return None
+        if bytes(pkt.path[:hash_size]) != self_key[:hash_size]:
+            return None  # this node is not the next hop
+        hop_count = pkt.get_path_hash_count()
+        fwd = self._copy_packet_for_forward(pkt)
+        fwd.path = bytearray(fwd.path[hash_size:])
+        fwd.path_len = PathUtils.encode_path_len(hash_size, hop_count - 1)
+        return fwd
+
+    def _build_trace_forward(self, pkt: Packet, self_key: bytes) -> Optional[Packet]:
+        """Append this node's scaled SNR to a direct TRACE (Mesh::onRecvPacket TRACE)."""
+        if pkt.path_len >= MAX_PATH_SIZE:
+            return None
+        # payload: trace_tag(4) auth_code(4) flags(1), then the routing hashes.
+        if pkt.payload_len < 9:
+            return None
+        flags = pkt.payload[8]
+        path_sz = flags & 0x03
+        hash_width = 1 << path_sz
+        header_len = 9
+        length = pkt.payload_len - header_len
+        offset = pkt.path_len << path_sz
+        if offset >= length:
+            return None  # TRACE has reached the end of its path (consume, not forward)
+        start = header_len + offset
+        if bytes(pkt.payload[start : start + hash_width]) != self_key[:hash_width]:
+            return None  # not the next hop in the trace path
+        fwd = self._copy_packet_for_forward(pkt)
+        snr_byte = int(pkt.get_snr() * 4) & 0xFF
+        while len(fwd.path) <= fwd.path_len:
+            fwd.path.append(0)
+        fwd.path[fwd.path_len] = snr_byte
+        fwd.path_len += 1
+        return fwd
+
+    def _client_repeat_delay_ms(self, pkt: Packet) -> float:
+        """Random retransmit jitter for a forward (MyMesh getRetransmitDelay).
+
+        Flood uses t = estAirtime*0.5, direct uses t = estAirtime*0.2, and the
+        delay is uniform in [0, 5*t] ms. Airtime is estimated over the on-air
+        length (path bytes + payload + 2) against the live radio settings.
+        """
+        frame_len = pkt.get_path_byte_len() + pkt.payload_len + 2
+        airtime_ms = calculate_lora_airtime_ms(
+            frame_len,
+            getattr(self.radio, "spreading_factor", 10),
+            getattr(self.radio, "bandwidth", 250000),
+            getattr(self.radio, "coding_rate", 5),
+            getattr(self.radio, "preamble_length", 8),
+        )
+        factor = 0.5 if pkt.is_route_flood() else 0.2
+        t = airtime_ms * factor
+        if t <= 0:
+            return 0.0
+        return float(random.randint(0, int(5 * t)))
+
+    async def _client_repeat_transmit(self, pkt: Packet) -> None:
+        """Wait out the retransmit jitter then send the forward through the funnel.
+
+        Stage 2 airtime budgeting slots in here / in the send funnel: the
+        forward is a plain send_packet, so a budget gate can suppress it.
+        """
+        try:
+            delay_ms = self._client_repeat_delay_ms(pkt)
+            if delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000.0)
+            await self.send_packet(pkt, wait_for_ack=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            self._log(f"Client-repeat forward failed: {err}")
 
     async def send_packet(
         self,
@@ -707,7 +884,15 @@ class Dispatcher:
             return
 
         try:
-            await handler(pkt)
+            result = await handler(pkt)
+            # Mirror firmware Mesh::onRecvPacket markDoNotRetransmit: a data or
+            # anon packet genuinely decrypted for this identity is consumed and
+            # must not be re-flooded. HandlerResult.authenticated is that
+            # verdict (False on a bare dest-hash collision), so the client-repeat
+            # flood forward is suppressed only on real consumption. ACK marking
+            # is done inside AckHandler (it does not return a HandlerResult).
+            if isinstance(result, HandlerResult) and result.authenticated:
+                pkt.mark_do_not_retransmit()
             if self.packet_received_callback:
                 await self._invoke_callback(self.packet_received_callback, pkt)
         except Exception as err:

@@ -147,6 +147,7 @@ class CompanionRadio(CompanionBase):
         self._running = True
         self.node.dispatcher.set_default_path_hash_mode(self.prefs.path_hash_mode)
         self.node.dispatcher.rx_delay_base = self.prefs.rx_delay_base
+        self.node.dispatcher.set_client_repeat_enabled(bool(self.prefs.client_repeat))
         self._apply_multi_acks_pref()
         self._dispatcher_task = asyncio.create_task(self.node.start())
         logger.info(
@@ -235,6 +236,15 @@ class CompanionRadio(CompanionBase):
     def supports_tx_power_mutation(self) -> bool:
         """Whether the owned backend can set its TX power."""
         return callable(getattr(self._radio, "set_tx_power", None))
+
+    def supports_client_repeat(self) -> bool:
+        """A radio-owning companion can act as a client repeater."""
+        return True
+
+    def set_client_repeat(self, value: int) -> None:
+        """Persist the client-repeat preference and toggle forwarding live."""
+        super().set_client_repeat(value)
+        self.node.dispatcher.set_client_repeat_enabled(bool(self.prefs.client_repeat))
 
     def get_max_tx_power_dbm(self) -> int:
         """Return a backend-declared TX limit when one is available."""

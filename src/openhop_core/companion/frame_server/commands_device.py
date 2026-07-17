@@ -352,13 +352,21 @@ class _DeviceCommandsMixin:
         bw = struct.unpack_from("<I", data, 4)[0]
         sf = data[8]
         cr = data[9]
-        if not (100_000 <= freq_khz <= 2_500_000):
+        # Optional repeat byte (FIRMWARE_VER_CODE 9+): enables client-repeat.
+        repeat = data[10] if len(data) > 10 else 0
+        # Firmware lower bound is 150,000 kHz (MyMesh.cpp CMD_SET_RADIO_PARAMS).
+        if not (150_000 <= freq_khz <= 2_500_000):
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         if not (7000 <= bw <= 500000):
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         if not (5 <= sf <= 12) or not (5 <= cr <= 8):
+            self._write_err(ERR_CODE_ILLEGAL_ARG)
+            return
+        # Firmware rejects enabling repeat on a frequency outside the allowed
+        # repeat table, and does so before any device-specific gating.
+        if repeat and not self._repeat_freq_allowed(freq_khz):
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         if not self._radio_mutation_supported("supports_radio_params_mutation"):
@@ -369,10 +377,21 @@ class _DeviceCommandsMixin:
             # such as the name and position can still be saved.
             self._write_ok()
             return
-        if self.bridge.set_radio_params(freq_khz * 1000, bw, sf, cr):
-            self._write_ok()
-        else:
+        if not self.bridge.set_radio_params(freq_khz * 1000, bw, sf, cr):
             self._write_err(ERR_CODE_BAD_STATE)
+            return
+        # Firmware persists client_repeat alongside the radio params (0 when the
+        # byte is absent). A companion that cannot repeat acks the save but
+        # never stores a nonzero preference (ack-but-ignore).
+        if self._radio_mutation_supported("supports_client_repeat"):
+            self.bridge.set_client_repeat(repeat)
+        self._write_ok()
+
+    def _repeat_freq_allowed(self, freq_khz: int) -> bool:
+        """Whether ``freq_khz`` falls in the companion's allowed-repeat ranges."""
+        getter = getattr(self.bridge, "get_allowed_repeat_freqs", None)
+        ranges = getter() if callable(getter) else ()
+        return any(lower <= freq_khz <= upper for lower, upper in ranges)
 
     async def _cmd_set_tx_power(self, data: bytes) -> None:
         if len(data) < 1:
@@ -573,9 +592,12 @@ class _DeviceCommandsMixin:
     async def _cmd_get_allowed_repeat_freq(self, data: bytes) -> None:
         """Handle CMD_GET_ALLOWED_REPEAT_FREQ (60).
 
-        Firmware (MyMesh.cpp:1958) replies with RESP_ALLOWED_REPEAT_FREQ followed
-        by zero or more (lower_freq, upper_freq) little-endian u32 pairs. The
-        virtual companion does not model regional repeat-frequency restrictions,
-        so it advertises an empty range list (response code with no pairs).
+        Firmware (MyMesh.cpp:1973) replies with RESP_ALLOWED_REPEAT_FREQ followed
+        by zero or more (lower_freq, upper_freq) little-endian u32 pairs (in kHz).
         """
-        self._write_frame(bytes([RESP_CODE_ALLOWED_REPEAT_FREQ]))
+        getter = getattr(self.bridge, "get_allowed_repeat_freqs", None)
+        ranges = getter() if callable(getter) else ()
+        frame = bytearray([RESP_CODE_ALLOWED_REPEAT_FREQ])
+        for lower, upper in ranges:
+            frame += struct.pack("<II", lower, upper)
+        self._write_frame(bytes(frame))

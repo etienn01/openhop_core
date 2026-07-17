@@ -133,6 +133,13 @@ MAX_SIGN_DATA_SIZE = 8192  # 8KB signing buffer (matches firmware)
 MAX_PENDING_ACK_CRCS = 64
 ZERO_FLOOD_SCOPE_KEY = b"\x00" * 16  # firmware's null scope override (send_scope.isNull())
 
+# Frequencies (kHz) at which client-repeat may be enabled, as inclusive
+# (lower, upper) ranges. Mirrors firmware's default ``repeat_freq_ranges``
+# (MyMesh.cpp), single-frequency entries for the three default LoRa bands.
+# A concrete companion may override this via the ``allowed_repeat_freq_ranges``
+# key in its ``radio_config`` dict (list of (lower_khz, upper_khz) pairs).
+DEFAULT_ALLOWED_REPEAT_FREQ_RANGES = ((433000, 433000), (869495, 869495), (918000, 918000))
+
 # ---------------------------------------------------------------------------
 # Response-timeout hints (ms) returned in RESP_CODE_SENT frames. The firmware
 # computes est_timeout per packet (calcFlood/DirectTimeoutMillisFor); the

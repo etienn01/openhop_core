@@ -11,6 +11,7 @@ from ..protocol import Packet
 from ..protocol.constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
 from ..protocol.transport_keys import calc_transport_code, get_auto_key_for
 from .constants import (
+    DEFAULT_ALLOWED_REPEAT_FREQ_RANGES,
     DEFAULT_MAX_TX_POWER_DBM,
     MAX_SIGN_DATA_SIZE,
     NODE_NAME_MAX_BYTES,
@@ -80,6 +81,32 @@ class _DeviceConfigMixin:
     def supports_tx_power_mutation(self) -> bool:
         """Return whether this companion can apply TX-power changes."""
         return True
+
+    def supports_client_repeat(self) -> bool:
+        """Return whether this companion can act as a client repeater.
+
+        A concrete companion that owns a radio can forward mesh traffic
+        (MeshCore ``_prefs.client_repeat``). Host-shared virtual companions
+        must override this to False.
+        """
+        return True
+
+    def get_allowed_repeat_freqs(self) -> tuple:
+        """Return the (lower_khz, upper_khz) ranges where client-repeat is allowed.
+
+        Mirrors firmware's ``repeat_freq_ranges`` (MyMesh.cpp). Defaults to the
+        three single-frequency LoRa bands; a companion can override the set via
+        the ``allowed_repeat_freq_ranges`` key of its ``radio_config`` dict.
+        """
+        ranges = self._radio_config.get(
+            "allowed_repeat_freq_ranges", DEFAULT_ALLOWED_REPEAT_FREQ_RANGES
+        )
+        return tuple((int(lower), int(upper)) for lower, upper in ranges)
+
+    def set_client_repeat(self, value: int) -> None:
+        """Persist the client-repeat preference (advertised in DEVICE_QUERY byte 80)."""
+        self.prefs.client_repeat = int(value) & 0xFF
+        self._save_prefs()
 
     def get_max_tx_power_dbm(self) -> int:
         """Return the maximum supported TX power for companion SELF_INFO.

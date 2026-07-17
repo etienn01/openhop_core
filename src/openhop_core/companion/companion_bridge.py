@@ -379,6 +379,10 @@ class CompanionBridge(CompanionBase):
         """A virtual companion must not change shared repeater TX power."""
         return False
 
+    def supports_client_repeat(self) -> bool:
+        """A virtual companion must not enable client-repeat on the shared host."""
+        return False
+
     def set_radio_params(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
         """Reject shared-radio changes without mutating companion preferences."""
         return False
