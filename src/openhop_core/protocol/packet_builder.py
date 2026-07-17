@@ -434,7 +434,12 @@ class PacketBuilder:
             # Returns: 3
             ```
         """
-        timestamp = PacketBuilder._get_timestamp()
+        # Plain wall time, matching firmware Mesh::createAdvert's getCurrentTime().
+        # The strictly-increasing _get_timestamp() is reserved for request/login
+        # tags: sharing it here would let a burst of requests inflate the counter
+        # past real time, and peers would then drop this node's later wall-time
+        # adverts as replays until the clock caught up.
+        timestamp = int(time.time())
         pubkey = local_identity.get_public_key()
         ts_bytes = struct.pack("<I", timestamp)
         appdata = PacketBuilder._encode_advert_data(name, lat, lon, feature1, feature2, flags)

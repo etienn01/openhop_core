@@ -536,6 +536,45 @@ def test_create_telem_request_honors_explicit_route_type():
     assert bytes(pkt.path) == b""
 
 
+def test_advert_timestamp_uses_wall_time_not_the_unique_request_clock():
+    """Adverts carry plain wall time (firmware Mesh::createAdvert uses
+    getCurrentTime, not getCurrentTimeUnique). If the advert shared the
+    strictly-increasing request clock, a burst of requests would inflate the
+    advert timestamp into the future and peers would drop this node's later
+    wall-time adverts as replays until real time caught up."""
+    import struct
+    from unittest.mock import patch
+
+    with patch("time.time", return_value=1_700_000_000.0):
+        # Inflate the shared request clock well past the frozen wall time.
+        for _ in range(5):
+            PacketBuilder._get_timestamp()
+        assert PacketBuilder._last_unique_timestamp > 1_700_000_000
+
+        identity = LocalIdentity()
+        pkt = PacketBuilder.create_advert(identity, "TestNode", 1)
+
+        # Advert payload: pubkey(32) + timestamp(4 LE) + signature + appdata.
+        advert_ts = struct.unpack("<I", bytes(pkt.payload[32:36]))[0]
+        assert advert_ts == 1_700_000_000
+
+
+def test_advert_timestamps_follow_the_wall_clock():
+    """Two adverts in successive seconds carry those wall-clock seconds; two in
+    the same second may carry the same value (getCurrentTime semantics)."""
+    import struct
+    from unittest.mock import patch
+
+    identity = LocalIdentity()
+    stamps = []
+    for now in (2_000_000_000.0, 2_000_000_000.0, 2_000_000_001.0):
+        with patch("time.time", return_value=now):
+            pkt = PacketBuilder.create_advert(identity, "TestNode", 1)
+        stamps.append(struct.unpack("<I", bytes(pkt.payload[32:36]))[0])
+
+    assert stamps == [2_000_000_000, 2_000_000_000, 2_000_000_001]
+
+
 def test_get_timestamp_is_strictly_monotonic_within_same_second():
     """Back-to-back tags must strictly increase even within one wall-clock second.
 
