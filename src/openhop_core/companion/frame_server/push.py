@@ -211,18 +211,33 @@ class _PushMixin:
         )
         self._enqueue_frame(frame)
 
-    def _on_path_discovery_response(self, tag_bytes, contact_pubkey, out_path, in_path):
+    def _on_path_discovery_response(
+        self, tag_bytes, contact_pubkey, out_len_byte, out_path, in_len_byte, in_path
+    ):
         pub_key_prefix = (
             contact_pubkey if isinstance(contact_pubkey, bytes) else bytes.fromhex(contact_pubkey)
         )[:6]
         out_path = out_path if isinstance(out_path, bytes) else bytes(out_path)
         in_path = in_path if isinstance(in_path, bytes) else bytes(in_path)
+        # Re-announce the ENCODED path_len bytes verbatim, matching the firmware
+        # (MyMesh.cpp:757-765). Drop the whole frame if either encoded byte is
+        # invalid, mirroring the isValidPathLen guard at MyMesh.cpp:754-755.
+        if not (
+            PathUtils.is_valid_path_len(out_len_byte) and PathUtils.is_valid_path_len(in_len_byte)
+        ):
+            logger.debug(
+                "[PUSH] dropping path_discovery frame: invalid encoded path_len "
+                "(out=0x%02X, in=0x%02X)",
+                out_len_byte,
+                in_len_byte,
+            )
+            return
         frame = (
             bytes([PUSH_CODE_PATH_DISCOVERY_RESPONSE, 0])
             + pub_key_prefix
-            + bytes([len(out_path)])
+            + bytes([out_len_byte])
             + out_path
-            + bytes([len(in_path)])
+            + bytes([in_len_byte])
             + in_path
         )
         self._enqueue_frame(frame)

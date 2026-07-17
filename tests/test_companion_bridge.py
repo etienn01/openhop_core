@@ -496,11 +496,17 @@ class TestCompanionBridgePathAndControl:
 
         handled = await bridge._try_handle_path_discovery(
             result.expected_ack.to_bytes(4, "little"),
-            (b"\x01", b"\x02", contact.public_key),
+            (0x01, b"\x0a", 0x01, b"\x0b", contact.public_key),
         )
         assert handled is True
         assert len(callbacks) == 1
+        # (tag_bytes, contact_pubkey, out_len_byte, out_path, in_len_byte, in_path)
         assert callbacks[0][0] == result.expected_ack.to_bytes(4, "little")
+        assert callbacks[0][1] == contact.public_key
+        assert callbacks[0][2] == 0x01
+        assert callbacks[0][3] == b"\x0a"
+        assert callbacks[0][4] == 0x01
+        assert callbacks[0][5] == b"\x0b"
 
     async def test_send_trace_path_raw(self):
         injector = MockPacketInjector()

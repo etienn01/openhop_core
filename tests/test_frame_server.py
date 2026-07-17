@@ -29,6 +29,7 @@ from openhop_core.companion.constants import (
     PUSH_CODE_BINARY_RESPONSE,
     PUSH_CODE_MSG_WAITING,
     PUSH_CODE_NEW_ADVERT,
+    PUSH_CODE_PATH_DISCOVERY_RESPONSE,
     RESP_CODE_ALLOWED_REPEAT_FREQ,
     RESP_CODE_CHANNEL_DATA_RECV,
     RESP_CODE_CHANNEL_INFO,
@@ -1348,6 +1349,96 @@ def test_binary_response_push_only_for_owned_tag():
     assert payload[2:6] == tag_bytes
     assert payload[6:] == b"\xaa\xbb"
     assert tag not in server._companion_binary_tags
+
+
+def _path_discovery_server():
+    """Build a frame server with a queue for path-discovery push tests."""
+    bridge = Mock()
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=16)
+    return server
+
+
+def _path_push_payload(frame):
+    """Strip the outbound frame prefix (1 byte code + 2 byte len) from a queued frame."""
+    return frame[3:]
+
+
+def test_path_discovery_push_preserves_encoded_len_2byte():
+    """2-byte-hash paths re-announce the ENCODED path_len byte verbatim, not a raw
+    byte count. Firmware writes out_path_len / in_path_len directly
+    (MyMesh.cpp:757-765)."""
+    server = _path_discovery_server()
+    pubkey = bytes(range(32))
+    out_path = bytes([0x11, 0x22, 0x33, 0x44])  # encoded 0x42 = size 2, count 2
+    in_path = bytes([0xAA, 0xBB])  # encoded 0x41 = size 2, count 1
+    server._on_path_discovery_response(b"\x00\x00\x00\x00", pubkey, 0x42, out_path, 0x41, in_path)
+    assert server._write_queue.qsize() == 1
+    payload = _path_push_payload(server._write_queue.get_nowait())
+    assert payload == (
+        bytes([PUSH_CODE_PATH_DISCOVERY_RESPONSE, 0])
+        + pubkey[:6]
+        + bytes([0x42])
+        + out_path
+        + bytes([0x41])
+        + in_path
+    )
+
+
+def test_path_discovery_push_1byte_unchanged():
+    """1-byte-hash paths (encoded byte == raw hop count) are unchanged (backward-compat)."""
+    server = _path_discovery_server()
+    pubkey = bytes(range(32))
+    out_path = bytes([0x01, 0x02, 0x03])  # encoded 0x03 = size 1, count 3
+    in_path = bytes([0x04, 0x05, 0x06])
+    server._on_path_discovery_response(b"\x00\x00\x00\x00", pubkey, 0x03, out_path, 0x03, in_path)
+    payload = _path_push_payload(server._write_queue.get_nowait())
+    assert payload == (
+        bytes([PUSH_CODE_PATH_DISCOVERY_RESPONSE, 0])
+        + pubkey[:6]
+        + bytes([0x03])
+        + out_path
+        + bytes([0x03])
+        + in_path
+    )
+
+
+def test_path_discovery_push_3byte():
+    """3-byte-hash paths (encoded 0x83 = size 3, count 3 -> 9 path bytes) round-trip."""
+    server = _path_discovery_server()
+    pubkey = bytes(range(32))
+    out_path = bytes(range(0x10, 0x19))  # 9 bytes
+    in_path = bytes(range(0x20, 0x29))  # 9 bytes
+    server._on_path_discovery_response(b"\x00\x00\x00\x00", pubkey, 0x83, out_path, 0x83, in_path)
+    payload = _path_push_payload(server._write_queue.get_nowait())
+    assert payload == (
+        bytes([PUSH_CODE_PATH_DISCOVERY_RESPONSE, 0])
+        + pubkey[:6]
+        + bytes([0x83])
+        + out_path
+        + bytes([0x83])
+        + in_path
+    )
+
+
+def test_path_discovery_push_zero_hop():
+    """Zero-hop (encoded 0x00) paths carry no path bytes in either direction."""
+    server = _path_discovery_server()
+    pubkey = bytes(range(32))
+    server._on_path_discovery_response(b"\x00\x00\x00\x00", pubkey, 0x00, b"", 0x00, b"")
+    payload = _path_push_payload(server._write_queue.get_nowait())
+    assert payload == (
+        bytes([PUSH_CODE_PATH_DISCOVERY_RESPONSE, 0]) + pubkey[:6] + bytes([0x00]) + bytes([0x00])
+    )
+
+
+def test_path_discovery_push_invalid_len_suppressed():
+    """Invalid encoded path_len (0xC0 = reserved hash_size 4) suppresses the whole
+    frame, mirroring the isValidPathLen guard at MyMesh.cpp:754-755."""
+    server = _path_discovery_server()
+    pubkey = bytes(range(32))
+    server._on_path_discovery_response(b"\x00\x00\x00\x00", pubkey, 0xC0, b"", 0x00, b"")
+    assert server._write_queue.qsize() == 0
 
 
 @pytest.mark.asyncio

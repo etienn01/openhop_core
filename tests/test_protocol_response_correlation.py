@@ -197,9 +197,65 @@ async def test_path_response_binary_callback_uses_the_authenticated_colliding_co
     tag_bytes, response_data, path_info = binary_responses[0]
     assert tag_bytes == tag.to_bytes(4, "little")
     assert response_data.startswith(b"path-response")
-    assert path_info == (out_path, b"", SECOND_COLLIDING_PEER.get_public_key())
+    # path_info carries the ENCODED path_len bytes alongside the path bytes:
+    # (out_len_byte, out_path, in_len_byte, in_path, matched_pubkey). Here the
+    # packet arrived with an empty inbound path, so in_len_byte is 0.
+    assert path_info == (
+        PathUtils.encode_path_len(1, len(out_path)),
+        out_path,
+        0,
+        b"",
+        SECOND_COLLIDING_PEER.get_public_key(),
+    )
     assert contacts.get_by_key(SECOND_COLLIDING_PEER.get_public_key()).out_path == out_path
     assert contacts.get_by_key(FIRST_COLLIDING_PEER.get_public_key()).out_path == b""
+
+
+@pytest.mark.asyncio
+async def test_protocol_response_pathinfo_carries_encoded_lens():
+    """The PATH branch must preserve the ENCODED out path_len byte (raw_decrypted[0])
+    and the inbound encoded byte (pkt.path_len) verbatim, not a raw byte count."""
+    contacts = _contacts_with_colliding_peers()
+    handler = ProtocolResponseHandler(lambda _message: None, LOCAL_IDENTITY, contacts)
+    binary_responses = []
+    handler.set_binary_response_callback(
+        lambda tag, data, path_info: binary_responses.append((tag, data, path_info))
+    )
+    tag = 0x12345678
+    # Outbound: 2-byte hashes, 2 hops -> encoded 0x42, 4 path bytes on the wire.
+    out_path = b"\xA1\xB2\xC3\xD4"
+    out_len_byte = PathUtils.encode_path_len(2, 2)
+    assert out_len_byte == 0x42
+
+    shared_secret = Identity(SECOND_COLLIDING_PEER.get_public_key()).calc_shared_secret(
+        LOCAL_IDENTITY.get_private_key()
+    )
+    response = tag.to_bytes(4, "little") + b"path-response"
+    plaintext = bytes([out_len_byte]) + out_path + bytes([PAYLOAD_TYPE_RESPONSE]) + response
+    packet = Packet()
+    packet.header = (PAYLOAD_TYPE_PATH << 2) | ROUTE_TYPE_DIRECT
+    # Inbound path: 2-byte hashes, 1 hop -> encoded 0x41, 2 path bytes.
+    in_len_byte = PathUtils.encode_path_len(2, 1)
+    assert in_len_byte == 0x41
+    packet.path_len = in_len_byte
+    packet.path = bytearray(b"\xEE\xFF")
+    packet.payload = bytearray(
+        bytes([LOCAL_IDENTITY.get_public_key()[0], SECOND_COLLIDING_PEER.get_public_key()[0]])
+        + CryptoUtils.encrypt_then_mac(shared_secret[:16], shared_secret, plaintext)
+    )
+    packet.payload_len = len(packet.payload)
+
+    await handler(packet)
+
+    assert len(binary_responses) == 1
+    _tag_bytes, _response_data, path_info = binary_responses[0]
+    assert path_info == (
+        out_len_byte,
+        out_path,
+        in_len_byte,
+        b"\xEE\xFF",
+        SECOND_COLLIDING_PEER.get_public_key(),
+    )
 
 
 @pytest.mark.asyncio

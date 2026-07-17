@@ -280,7 +280,7 @@ class _CallbackMixin:
 
     async def _try_handle_path_discovery(self, tag_bytes: bytes, path_info: tuple) -> bool:
         """If tag is pending path discovery, fire path_discovery_response and return True."""
-        out_path, in_path, contact_pubkey = path_info
+        out_len_byte, out_path, in_len_byte, in_path, contact_pubkey = path_info
         tag_int = int.from_bytes(tag_bytes, "little")
         if tag_int not in self._pending_discovery_tags:
             return False
@@ -289,7 +289,9 @@ class _CallbackMixin:
             "path_discovery_response",
             tag_bytes,
             contact_pubkey,
+            out_len_byte,
             out_path,
+            in_len_byte,
             in_path,
         )
         return True

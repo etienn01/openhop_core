@@ -300,7 +300,20 @@ class ProtocolResponseHandler:
                     if PathUtils.is_valid_path_len(path_len_byte):
                         out_path = bytes(raw_decrypted[1 : 1 + path_byte_len])
                         in_path = bytes(pkt.path) if pkt.path else b""
-                        path_info = (out_path, in_path, matched_contact_pubkey)
+                        # Preserve the ENCODED path_len bytes (hash_count in
+                        # bits 0-5, hash_size-1 in bits 6-7) so the push frame
+                        # re-announces them verbatim like the firmware, which
+                        # writes out_path_len / in_path_len directly
+                        # (MyMesh.cpp:757-765). in_len_byte is pkt.path_len,
+                        # the encoded byte the packet arrived with.
+                        in_len_byte = pkt.path_len if pkt.path else 0
+                        path_info = (
+                            path_len_byte,
+                            out_path,
+                            in_len_byte,
+                            in_path,
+                            matched_contact_pubkey,
+                        )
 
                 # Do not deliver login responses to the binary callback; they are
                 # handled by LoginResponseHandler. Login response format is
