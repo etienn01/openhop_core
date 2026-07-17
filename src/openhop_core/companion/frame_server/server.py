@@ -255,6 +255,16 @@ class CompanionFrameServer(
         """Hook: return (millivolts, used_kb, total_kb).  Default: all zeros."""
         return (0, 0, 0)
 
+    def _get_self_telemetry_lpp(self) -> bytes:
+        """Hook: return local sensor telemetry as CayenneLPP bytes.
+
+        Mirrors the firmware self-telemetry `sensors.querySensors(0xFF, ...)`
+        (MyMesh.cpp:1646) with permission mask 0xFF. Concrete deployments with
+        a modem should override to return `KissModemWrapper.get_sensors(0xFF)`.
+        Default is no sensor data; the battery-voltage floor is still emitted.
+        """
+        return b""
+
     # -------------------------------------------------------------------------
     # Command dispatch
     # -------------------------------------------------------------------------

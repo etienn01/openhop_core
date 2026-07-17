@@ -1039,6 +1039,117 @@ async def test_cmd_send_telemetry_req_failure_no_empty_push():
     assert not any(f[0] == PUSH_CODE_TELEMETRY_RESPONSE for f in frames)
 
 
+@pytest.mark.asyncio
+async def test_cmd_send_telemetry_req_self_form_pushes_local_telemetry():
+    """Self form (data == 3) pushes voltage floor + sensor LPP synchronously.
+
+    Firmware MyMesh.cpp:1642-1656. 4200 mV -> CayenneLPP voltage entry
+    [channel=0x01][type=0x74][value big-endian]; value = int(4.2f * 100) = 419
+    (0x01A3) because firmware computes value*multiplier in single-precision
+    float and truncates.
+    """
+    from openhop_core.companion.constants import PUSH_CODE_TELEMETRY_RESPONSE
+
+    self_pubkey = bytes(range(100, 132))
+    sensor_lpp = b"\x02\x67\x01\x10"  # arbitrary known sensor LPP bytes
+    bridge = Mock()
+    bridge.get_public_key = Mock(return_value=self_pubkey)
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._get_batt_and_storage = lambda: (4200, 0, 0)
+    server._get_self_telemetry_lpp = lambda: sensor_lpp
+    frames: list[bytes] = []
+    server._write_frame = lambda f: frames.append(f)
+
+    await server._cmd_send_telemetry_req(b"\x00\x00\x00")
+
+    expected_voltage = bytes([0x01, 0x74, 0x01, 0xA3])
+    assert frames == [
+        bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0x00])
+        + self_pubkey[:6]
+        + expected_voltage
+        + sensor_lpp
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_telemetry_req_self_form_voltage_floor_when_no_sensors():
+    """Self form still pushes the voltage-only floor when there is no sensor data."""
+    from openhop_core.companion.constants import PUSH_CODE_TELEMETRY_RESPONSE
+
+    self_pubkey = bytes(range(32))
+    bridge = Mock()
+    bridge.get_public_key = Mock(return_value=self_pubkey)
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._get_batt_and_storage = lambda: (3700, 0, 0)
+    server._get_self_telemetry_lpp = lambda: b""
+    frames: list[bytes] = []
+    server._write_frame = lambda f: frames.append(f)
+
+    await server._cmd_send_telemetry_req(b"\x00\x00\x00")
+
+    # 3700 mV -> 3.7f * 100 = 370 (0x0172).
+    expected_voltage = bytes([0x01, 0x74, 0x01, 0x72])
+    assert frames == [
+        bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0x00]) + self_pubkey[:6] + expected_voltage
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_telemetry_req_mid_length_unsupported():
+    """A frame length that matches neither form -> UNSUPPORTED_CMD (else-if fall-through)."""
+    bridge = Mock()
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    frames: list[bytes] = []
+    server._write_frame = lambda f: frames.append(f)
+
+    await server._cmd_send_telemetry_req(b"\x00" * 10)
+
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_telemetry_req_empty_unsupported():
+    """An empty frame -> UNSUPPORTED_CMD (else-if fall-through)."""
+    bridge = Mock()
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    frames: list[bytes] = []
+    server._write_frame = lambda f: frames.append(f)
+
+    await server._cmd_send_telemetry_req(b"")
+
+    assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_telemetry_req_remote_form_unchanged():
+    """Remote/contact form (data >= 35) still sends a SENT result + deferred push."""
+    from openhop_core.companion.constants import PUSH_CODE_TELEMETRY_RESPONSE
+
+    pubkey = bytes(range(32))
+    raw = b"\x01" * 20
+    bridge = Mock()
+    bridge._start_telemetry_request = AsyncMock(
+        return_value={
+            "success": True,
+            "sent": SentResult(success=True, is_flood=False, expected_ack=0x5566, timeout_ms=8000),
+            "task": asyncio.create_task(
+                _return_result({"success": True, "telemetry_data": {"raw_bytes": raw}})
+            ),
+        }
+    )
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    frames: list[bytes] = []
+    server._write_frame = lambda f: frames.append(f)
+
+    await server._cmd_send_telemetry_req(bytes(3) + pubkey)
+    await asyncio.sleep(0)
+
+    assert frames[0] == bytes([RESP_CODE_SENT, 0]) + struct.pack("<II", 0x5566, 8000)
+    telem_frames = [f for f in frames if f[0] == PUSH_CODE_TELEMETRY_RESPONSE]
+    assert len(telem_frames) == 1
+    assert telem_frames[0] == bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + pubkey[:6] + raw
+
+
 class _BlockingReader:
     """Reader that blocks until released, then returns EOF."""
 
