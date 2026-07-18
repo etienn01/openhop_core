@@ -8,6 +8,7 @@ client-repeat is enabled; when disabled the send path is untouched.
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -233,3 +234,242 @@ async def test_cancellation_during_wait_leaves_bucket_consistent(clock):
     assert radio.send_count == 0
     assert d._tx_budget_ms == 0.0
     assert d._tx_budget_last_update == clock.t
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency: admission is re-decided under the TX lock (real time, no clock)
+# --------------------------------------------------------------------------- #
+
+
+class GatedRadio:
+    """Radio that records real send-start times and can block its first send.
+
+    ``gate`` (an asyncio.Event) parks the first ``send`` so a caller can hold the
+    TX lock in flight while another caller is examined. Non-first sends yield
+    once so concurrent callers get to evaluate the pre-gate before the first
+    debit lands.
+    """
+
+    def __init__(self):
+        self.rx_callback = None
+        self.send_count = 0
+        self.send_starts = []
+        self.gate = None
+        self._first = True
+
+    def set_rx_callback(self, cb):
+        self.rx_callback = cb
+
+    async def send(self, data):
+        self.send_starts.append(time.monotonic())
+        self.send_count += 1
+        if self.gate is not None and self._first:
+            self._first = False
+            await self.gate.wait()
+        else:
+            await asyncio.sleep(0)
+        return {"ok": 1}
+
+    def get_last_rssi(self):
+        return -70
+
+    def get_last_snr(self):
+        return 8.0
+
+
+def _make_gated(factor=0.0):
+    d = Dispatcher(GatedRadio(), dedupe_enabled=True)
+    d.local_identity = Identity()
+    d.airtime_budget_factor = factor
+    d.set_client_repeat_enabled(True)
+    return d, d.radio
+
+
+@pytest.mark.asyncio
+async def test_concurrent_second_send_waits_for_pacing():
+    # Budget seeded for exactly one send. Task A holds the lock in radio.send;
+    # task B passes the pre-gate against the undebited bucket and queues on the
+    # lock. B must not transmit until A's debit-derived pacing has elapsed.
+    d, radio = _make_gated(factor=0.0)  # duty 1.0
+    d._tx_est_airtime_ms = lambda n: 200.0  # reserve 100, spend 200 each
+    now = time.monotonic()
+    d._tx_budget_ms = 200.0
+    d._tx_budget_last_update = now
+    d._tx_next_time = now
+    radio.gate = asyncio.Event()
+
+    task_a = asyncio.create_task(d.send_packet(_flood_txt(), wait_for_ack=False))
+    await asyncio.sleep(0.02)  # A reaches radio.send and blocks holding the lock
+    assert radio.send_count == 1
+    assert d._tx_lock.locked()
+
+    task_b = asyncio.create_task(d.send_packet(_flood_txt(), wait_for_ack=False))
+    await asyncio.sleep(0.02)  # B passes the pre-gate snapshot, queues on the lock
+    assert radio.send_count == 1  # B has NOT transmitted yet
+
+    radio.gate.set()  # A finishes -> debits, sets next_tx_time pacing, frees lock
+    assert await task_a is True
+    pacing_deadline = d._tx_next_time  # A's debit put next_tx_time in the future
+    assert pacing_deadline > now  # a real pacing window exists
+
+    assert await task_b is True
+    assert radio.send_count == 2
+    # On pre-fix code B reuses the pre-lock snapshot and transmits immediately,
+    # i.e. before pacing_deadline. The under-lock recheck holds it back.
+    assert radio.send_starts[1] >= pacing_deadline
+
+
+@pytest.mark.asyncio
+async def test_burst_serialized_by_pacing():
+    # Four tasks against a one-send bucket. Every send yields once, so all four
+    # evaluate the pre-gate before the first debit; the under-lock recheck then
+    # serializes them one per next_tx_time pacing window.
+    d, radio = _make_gated(factor=0.0)  # duty 1.0
+    d._tx_est_airtime_ms = lambda n: 200.0  # reserve 100, spend 200 each
+    now = time.monotonic()
+    d._tx_budget_ms = 200.0  # only the first admits without waiting
+    d._tx_budget_last_update = now
+    d._tx_next_time = now
+
+    tasks = [asyncio.create_task(d.send_packet(_flood_txt(), wait_for_ack=False)) for _ in range(4)]
+    assert all(await asyncio.gather(*tasks))
+    assert radio.send_count == 4
+    # Each debit sets ~0.1 s (needed 100 / duty 1.0) of pacing every later
+    # admission honours. On pre-fix code all four share the pre-lock snapshot
+    # and fire back-to-back (gaps ~0).
+    starts = radio.send_starts
+    for i in range(1, 4):
+        assert starts[i] - starts[i - 1] >= 0.08
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_queued_on_lock_no_debit():
+    # Cancel B while it is queued on the TX lock behind A. B must leave the
+    # bucket untouched (no debit), and the lock must stay usable afterwards.
+    d, radio = _make_gated(factor=0.0)
+    d._tx_est_airtime_ms = lambda n: 200.0
+    now = time.monotonic()
+    d._tx_budget_ms = 200.0
+    d._tx_budget_last_update = now
+    d._tx_next_time = now
+    radio.gate = asyncio.Event()
+
+    task_a = asyncio.create_task(d.send_packet(_flood_txt(), wait_for_ack=False))
+    await asyncio.sleep(0.02)
+    assert radio.send_count == 1
+    assert d._tx_lock.locked()
+
+    task_b = asyncio.create_task(d.send_packet(_flood_txt(), wait_for_ack=False))
+    await asyncio.sleep(0.02)  # B passes the pre-gate, blocks acquiring the lock
+    budget_before = d._tx_budget_ms
+    task_b.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task_b
+    assert d._tx_budget_ms == budget_before  # B took no debit
+    assert radio.send_count == 1  # B never transmitted
+
+    radio.gate.set()
+    assert await task_a is True
+    assert not d._tx_lock.locked()  # lock released and usable
+
+    d._tx_budget_ms = 200.0
+    d._tx_next_time = time.monotonic()
+    assert await d.send_packet(_flood_txt(), wait_for_ack=False) is True
+    assert radio.send_count == 2  # a fresh send still goes through after B's cancel
+
+
+class _ResultRadio(Radio):
+    """Radio whose send fails deterministically: raises, or returns None."""
+
+    def __init__(self, mode):
+        super().__init__()
+        self.mode = mode
+
+    async def send(self, data):
+        self.send_count += 1
+        if self.mode == "raise":
+            raise RuntimeError("tx fail")
+        return None  # missing confirmation metadata
+
+
+@pytest.mark.asyncio
+async def test_failed_send_takes_no_debit(clock, monkeypatch):
+    # A raising or None-returning send returns False before the debit path, so
+    # neither the budget nor the pacing clock moves (pinned: true pre- and post-fix).
+    monkeypatch.setattr(disp_mod.asyncio, "sleep", clock.sleep)
+    for mode in ("raise", "none"):
+        radio = _ResultRadio(mode)
+        d = Dispatcher(radio, dedupe_enabled=True)
+        d.local_identity = Identity()
+        d.airtime_budget_factor = 1.0
+        d.set_client_repeat_enabled(True)
+        d._tx_est_airtime_ms = lambda n: 200.0  # reserve 100
+        d._tx_budget_ms = 200.0
+        d._tx_budget_last_update = clock.t
+        d._tx_next_time = clock.t
+
+        assert await d.send_packet(_flood_txt(), wait_for_ack=False) is False
+        assert radio.send_count == 1
+        assert d._tx_budget_ms == pytest.approx(200.0)  # no debit
+        assert d._tx_next_time == pytest.approx(clock.t)  # pacing untouched
+
+
+@pytest.mark.asyncio
+async def test_lock_free_while_throttled_waiting():
+    # A task throttled in its budget wait does not hold the TX lock (sleeps
+    # happen off the lock).
+    d, radio = _make_gated(factor=0.0)
+    d._tx_est_airtime_ms = lambda n: 200.0
+    now = time.monotonic()
+    d._tx_budget_ms = 0.0
+    d._tx_budget_last_update = now
+    d._tx_next_time = now + 3600.0  # long pacing -> stays parked in the wait
+
+    task = asyncio.create_task(d.send_packet(_flood_txt(), wait_for_ack=False))
+    await asyncio.sleep(0.02)  # let it reach the budget sleep
+    assert radio.send_count == 0
+    assert not d._tx_lock.locked()  # not holding the lock while sleeping
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_toggle_off_releases_waiter_ungated(monkeypatch):
+    # Disabling client-repeat while a task is parked in its budget wait releases
+    # it after the current sleep and lets it send ungated (no debit, no pacing).
+    d, radio = _make_gated(factor=0.0)
+    d._tx_est_airtime_ms = lambda n: 200.0
+    now = time.monotonic()
+    d._tx_budget_ms = 10_000.0  # budget is not the constraint
+    d._tx_budget_last_update = now
+    d._tx_next_time = now + 3600.0  # pacing far out -> never admits on its own
+
+    real_sleep = asyncio.sleep
+    release = asyncio.Event()
+
+    async def gated_sleep(secs):
+        if secs and secs > 0:
+            await release.wait()  # park the budget wait until the test releases it
+        # Always yield, so a pre-fix loop that ignores the flag cannot tight-spin
+        # (the wait_for timeout below can still fire) -- it fails cleanly instead.
+        await real_sleep(0)
+
+    monkeypatch.setattr(disp_mod.asyncio, "sleep", gated_sleep)
+
+    task = asyncio.create_task(d.send_packet(_flood_txt(), wait_for_ack=False))
+    for _ in range(5):
+        await real_sleep(0)
+    assert radio.send_count == 0  # parked in the budget wait
+    assert not d._tx_lock.locked()
+
+    d.set_client_repeat_enabled(False)  # disable does not reset the bucket
+    release.set()  # let the current sleep return; the loop re-reads the flag
+    # On pre-fix code the wait loop ignores the flag and never admits (huge
+    # pacing), so this times out; the flag check releases it post-fix.
+    assert await asyncio.wait_for(task, 2.0) is True
+    assert radio.send_count == 1  # proceeded on the next iteration, ungated
+    # No debit (a debit subtracts airtime); refill only ever adds to the bucket.
+    assert d._tx_budget_ms >= 10_000.0
+    assert d._tx_next_time == pytest.approx(now + 3600.0)  # pacing untouched

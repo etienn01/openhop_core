@@ -643,30 +643,43 @@ class Dispatcher:
             getattr(self.radio, "preamble_length", 8),
         )
 
-    async def _await_tx_budget(self, packet: Packet) -> None:
-        """Delay until the airtime budget allows this transmit; never drops.
+    def _tx_budget_wait_s(self) -> float:
+        """Seconds this transmit must wait for the airtime budget; <= 0 admits.
 
-        Reproduces the Dispatcher::checkSend TX gate: require at least
-        ``est_airtime(MAX_TRANS_UNIT) / MIN_TX_BUDGET_AIRTIME_DIV`` of budget
-        before sending, and honour the ``next_tx_time`` pacing that
-        Dispatcher's send-complete path sets when the budget dips below
-        MIN_TX_BUDGET_RESERVE_MS. When short, sleep for the firmware-computed
-        ``needed / duty_cycle`` and re-check. Called before the TX lock is
-        taken, so a waiting forward never blocks other transmits (ACKs,
-        companion sends); asyncio.sleep is cancellation-safe and the budget is
-        only mutated synchronously, so a cancelled wait leaves it consistent.
+        Reproduces the Dispatcher::checkSend TX gate synchronously: refill, then
+        require at least ``est_airtime(MAX_TRANS_UNIT) / MIN_TX_BUDGET_AIRTIME_DIV``
+        of budget and honour the ``next_tx_time`` pacing the send-complete path
+        set when the budget last dipped below MIN_TX_BUDGET_RESERVE_MS. The
+        shortfall is scaled by ``1/duty_cycle`` to the firmware-computed
+        ``needed / duty_cycle`` wait. Refill is the only budget mutation here and
+        is monotonically increasing, so this is safe to call both before and
+        again under ``_tx_lock`` as the admission recheck.
         """
+        now = time.monotonic()
+        self._refill_tx_budget(now)
         reserve_ms = self._tx_est_airtime_ms(MAX_TRANS_UNIT) / MIN_TX_BUDGET_AIRTIME_DIV
-        while True:
-            now = time.monotonic()
-            self._refill_tx_budget(now)
-            duty = self._duty_cycle()
-            wait_ms = 0.0
-            if self._tx_budget_ms < reserve_ms:
-                wait_ms = (reserve_ms - self._tx_budget_ms) / duty
-            # next_tx_time pacing from the previous debit.
-            pace_s = self._tx_next_time - now
-            wait_s = max(wait_ms / 1000.0, pace_s)
+        wait_ms = 0.0
+        if self._tx_budget_ms < reserve_ms:
+            wait_ms = (reserve_ms - self._tx_budget_ms) / self._duty_cycle()
+        # next_tx_time pacing from the previous debit.
+        pace_s = self._tx_next_time - now
+        return max(wait_ms / 1000.0, pace_s)
+
+    async def _await_tx_budget(self, packet: Packet) -> None:
+        """Sleep (never under ``_tx_lock``) until the airtime budget admits; never drops.
+
+        This is the pre-lock throttle only; admission is re-decided under
+        ``_tx_lock`` in ``send_packet`` (via ``_tx_budget_wait_s``) so a snapshot
+        taken here can never authorise a transmit past a debit another task
+        committed under the lock. Because only ``_tx_lock`` holders debit and the
+        sole out-of-lock mutation (``_refill_tx_budget``) is monotonically
+        increasing, an under-lock pass cannot be invalidated before ``radio.send``.
+        Sleeps happen only here, off the lock, so a throttled forward never
+        blocks other transmits and ``asyncio.sleep`` stays cancellation-safe. A
+        client-repeat toggle mid-wait releases the waiter after its current sleep.
+        """
+        while self._client_repeat_enabled:
+            wait_s = self._tx_budget_wait_s()
             if wait_s <= 0.0:
                 return
             await asyncio.sleep(wait_s)
@@ -858,13 +871,24 @@ class Dispatcher:
                 return False
         self._apply_flood_scope(packet)
         self._apply_default_path_hash_mode(packet)
-        # Airtime duty-cycle budget: only while client-repeat is on. Waiting
-        # here (before the TX lock) keeps a throttled forward from blocking
-        # other transmits. When disabled, the send path is unchanged.
-        if self._client_repeat_enabled:
+        # Airtime duty-cycle budget: only while client-repeat is on. When
+        # disabled the send path is unchanged (a recorded deliberate deferral).
+        if not self._client_repeat_enabled:
+            async with self._tx_lock:  # Wait our turn
+                return await self._send_packet_immediate(packet, wait_for_ack, expected_crc)
+        # Throttle off-lock, then re-decide admission under the lock so a
+        # snapshot taken before queueing cannot transmit past a debit another
+        # task committed under _tx_lock. _debit_tx_budget runs only under the
+        # lock and the sole out-of-lock mutation (_refill_tx_budget) only
+        # increases the budget, so an under-lock pass holds until radio.send.
+        # Livelock is bounded: every debit sets _tx_next_time pacing that all
+        # later admissions honour (firmware's next_tx_time property). Never
+        # sleep under the lock -- fall out of the async with to wait again.
+        while True:
             await self._await_tx_budget(packet)
-        async with self._tx_lock:  # Wait our turn
-            return await self._send_packet_immediate(packet, wait_for_ack, expected_crc)
+            async with self._tx_lock:  # Wait our turn
+                if not self._client_repeat_enabled or self._tx_budget_wait_s() <= 0.0:
+                    return await self._send_packet_immediate(packet, wait_for_ack, expected_crc)
 
     async def _send_packet_immediate(
         self,
