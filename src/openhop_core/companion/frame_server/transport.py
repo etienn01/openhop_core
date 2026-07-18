@@ -237,7 +237,9 @@ class _FrameTransportMixin:
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
                 except (AttributeError, OSError):
                     pass  # older macOS may lack KEEPINTVL/KEEPCNT
-        except OSError as e:
+        except (AttributeError, OSError) as e:
+            # AttributeError: some Python builds (observed: 3.9.6 on macOS)
+            # don't expose socket.TCP_KEEPALIVE at all.
             logger.debug("Could not set TCP keepalive: %s", e)
 
     async def _evict_existing_client(self) -> None:

@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
+import socket
 import struct
+import sys
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -1287,6 +1289,48 @@ async def test_handle_client_connection_reset_disconnects_cleanly(caplog):
     assert server._client_reader is None
     assert server._writer_task is None
     assert any("ConnectionResetError" in rec.message for rec in caplog.records)
+
+
+class _FakeSocket:
+    """Records setsockopt calls; raises AttributeError for a missing constant."""
+
+    def __init__(self):
+        self.calls = []
+
+    def setsockopt(self, level, optname, value):
+        self.calls.append((level, optname, value))
+
+
+class _SocketWriter:
+    """Minimal writer exposing a fake underlying socket via get_extra_info."""
+
+    def __init__(self, sock):
+        self._sock = sock
+
+    def get_extra_info(self, name):
+        return self._sock if name == "socket" else None
+
+
+def test_configure_socket_survives_missing_tcp_keepalive_constant(monkeypatch, caplog):
+    """A Python build lacking socket.TCP_KEEPALIVE must not crash client setup.
+
+    Some Python builds (observed: Python 3.9.6 on macOS) do not expose
+    socket.TCP_KEEPALIVE at all, so referencing it raises AttributeError rather
+    than the OSError the platform branch already guards against.
+    """
+    caplog.set_level(logging.DEBUG, logger="CompanionFrameServer")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.delattr(socket, "TCP_KEEPALIVE", raising=False)
+
+    sock = _FakeSocket()
+    writer = _SocketWriter(sock)
+
+    CompanionFrameServer._configure_socket(writer)  # must not raise
+
+    # TCP_NODELAY and SO_KEEPALIVE are independent of TCP_KEEPALIVE and must
+    # still be applied.
+    assert (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) in sock.calls
+    assert (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1) in sock.calls
 
 
 @pytest.mark.asyncio
