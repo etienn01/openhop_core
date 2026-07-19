@@ -617,14 +617,23 @@ class KissSerialWrapper(LoRaRadio):
             elif byte == KISS_TFESC:
                 self.rx_frame_buffer.append(KISS_FESC)
             else:
-                # Invalid escape sequence
+                # Invalid escape sequence; reset so we resync at next FEND
                 self.stats["frame_errors"] += 1
                 logger.warning(f"Invalid KISS escape sequence: 0x{byte:02X}")
+                self.rx_frame_buffer.clear()
+                self.in_frame = False
             self.escaped = False
 
         else:
             if self.in_frame:
-                self.rx_frame_buffer.append(byte)
+                if len(self.rx_frame_buffer) >= MAX_FRAME_SIZE:
+                    # Frame too long (e.g. lost FEND); reset and resync at next FEND
+                    self.stats["frame_errors"] += 1
+                    logger.warning("KISS frame exceeded max size (%d), resyncing", MAX_FRAME_SIZE)
+                    self.rx_frame_buffer.clear()
+                    self.in_frame = False
+                else:
+                    self.rx_frame_buffer.append(byte)
 
     def _decode_kiss(self, data: bytes) -> None:
         """Bulk KISS decoder used by the RX worker.
@@ -649,14 +658,16 @@ class KissSerialWrapper(LoRaRadio):
                 b = data[i]
                 i += 1
                 escaped = False
+                # Mirrors _decode_kiss_byte: escaped bytes are appended without a size check
                 if b == KISS_TFEND:
                     buf.append(KISS_FEND)
                 elif b == KISS_TFESC:
                     buf.append(KISS_FESC)
                 else:
-                    # Mirrors _decode_kiss_byte: count + log, but do NOT clear/resync
                     self.stats["frame_errors"] += 1
                     logger.warning(f"Invalid KISS escape sequence: 0x{b:02X}")
+                    buf.clear()
+                    in_frame = False
                 continue
 
             fend = data.find(_KISS_FEND_B, i)
@@ -670,7 +681,19 @@ class KissSerialWrapper(LoRaRadio):
 
             run_end = n if nxt == -1 else nxt
             if run_end > i and in_frame:
-                buf += data[i:run_end]  # this decoder applies no MAX_FRAME_SIZE cap
+                run = data[i:run_end]
+                # Honor the MAX_FRAME_SIZE resync rule from _decode_kiss_byte: fill to the
+                # cap, then the next plain byte triggers a resync (lost-FEND protection).
+                space = MAX_FRAME_SIZE - len(buf)
+                if len(run) <= space:
+                    buf += run
+                else:
+                    if space > 0:
+                        buf += run[:space]
+                    self.stats["frame_errors"] += 1
+                    logger.warning("KISS frame exceeded max size (%d), resyncing", MAX_FRAME_SIZE)
+                    buf.clear()
+                    in_frame = False
 
             if nxt == -1:
                 break
