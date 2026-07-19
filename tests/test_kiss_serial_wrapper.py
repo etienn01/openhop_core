@@ -184,3 +184,61 @@ class TestWaitForRxThreadSafety:
         assert seen == [b"\x55"]
         # Callback restored after wait completes
         assert wrapper.on_frame_received == seen.append
+
+
+class TestConnectionHealth:
+    """connect()/workers/__enter__ must not leave a false-healthy transport."""
+
+    def test_autoconfig_failure_disconnects(self):
+        wrapper = _make_wrapper(auto_configure=True)
+        mock_serial = MagicMock()
+        mock_serial.is_open = True
+        mock_serial.read.return_value = b""
+        mock_serial.in_waiting = 0
+
+        with (
+            patch(
+                "openhop_core.hardware.kiss_serial_wrapper.serial.Serial",
+                return_value=mock_serial,
+            ),
+            patch.object(wrapper, "configure_radio_and_enter_kiss", return_value=False),
+        ):
+            assert wrapper.connect() is False
+
+        assert wrapper.is_connected is False
+        assert wrapper.stop_event.is_set()
+        mock_serial.close.assert_called()
+
+    def test_tx_worker_fatal_clears_connected(self):
+        wrapper = _make_wrapper()
+        wrapper.is_connected = True
+        wrapper.stop_event.clear()
+        wrapper.serial_conn = MagicMock()
+        wrapper.serial_conn.is_open = True
+        wrapper.serial_conn.write.side_effect = OSError("broken pipe")
+        wrapper.tx_buffer.append(b"\xc0\x00\xc0")
+
+        wrapper._tx_worker()
+
+        assert wrapper.is_connected is False
+        assert wrapper.stop_event.is_set()
+        # Further queueing must be rejected once unhealthy
+        assert wrapper.send_frame(b"\x01") is False
+
+    def test_rx_worker_fatal_clears_connected(self):
+        wrapper = _make_wrapper()
+        wrapper.is_connected = True
+        wrapper.stop_event.clear()
+        wrapper.serial_conn = MagicMock()
+        wrapper.serial_conn.read.side_effect = OSError("device gone")
+
+        wrapper._rx_worker()
+
+        assert wrapper.is_connected is False
+        assert wrapper.stop_event.is_set()
+
+    def test_enter_raises_when_connect_fails(self):
+        wrapper = _make_wrapper()
+        with patch.object(wrapper, "connect", return_value=False):
+            with pytest.raises(RuntimeError, match="Failed to connect"):
+                wrapper.__enter__()

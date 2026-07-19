@@ -166,13 +166,14 @@ class KissSerialWrapper(LoRaRadio):
             if self.auto_configure:
                 if not self.configure_radio_and_enter_kiss():
                     logger.warning("Auto-configuration failed, KISS mode not active")
+                    self.disconnect()
                     return False
 
             return True
 
         except Exception as e:
             logger.error(f"Failed to connect to {self.port}: {e}")
-            self.is_connected = False
+            self.disconnect()
             return False
 
     def disconnect(self):
@@ -771,6 +772,9 @@ class KissSerialWrapper(LoRaRadio):
             except Exception as e:
                 if self.is_connected:  # Only log if we expect to be connected
                     logger.error(f"RX worker error: {e}")
+                # Mark unhealthy so callers stop accepting work; peer worker exits via stop_event.
+                self.is_connected = False
+                self.stop_event.set()
                 break
 
     def _tx_worker(self):
@@ -797,11 +801,15 @@ class KissSerialWrapper(LoRaRadio):
             except Exception as e:
                 if self.is_connected:  # Only log if we expect to be connected
                     logger.error(f"TX worker error: {e}")
+                # Mark unhealthy so callers stop accepting work; peer worker exits via stop_event.
+                self.is_connected = False
+                self.stop_event.set()
                 break
 
     def __enter__(self):
         """Context manager entry"""
-        self.connect()
+        if not self.connect():
+            raise RuntimeError(f"Failed to connect to KISS serial port {self.port}")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
