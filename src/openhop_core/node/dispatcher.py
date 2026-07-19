@@ -97,8 +97,9 @@ class Dispatcher:
         # Optional callback for PAYLOAD_TYPE_RAW_CUSTOM (companion raw_data_received)
         self.raw_data_received_callback: Optional[Callable[[Packet], Awaitable[None]]] = None
 
-        # Raw packet callbacks: single callback (legacy) and list of subscribers (after parse)
-        self.raw_packet_callback: Optional[Callable[[Packet, bytes], Awaitable[None] | None]] = None
+        # Raw packet callbacks: single callback (legacy) and list of subscribers (after parse).
+        # Callbacks accept (pkt, data) or (pkt, data, analysis).
+        self.raw_packet_callback: Optional[Callable[..., Awaitable[None] | None]] = None
         self._raw_packet_subscribers: List[Callable[..., Any]] = []
         # Raw RX subscribers: notified for every reception (data, rssi, snr) before duplicate/parse
         self._raw_rx_subscribers: List[Callable[..., Any]] = []
@@ -338,10 +339,11 @@ class Dispatcher:
         """Set optional listener for ACK CRCs (e.g. companion send_confirmed)."""
         self._ack_received_listener = callback
 
-    def set_raw_packet_callback(
-        self, callback: Callable[[Packet, bytes], Awaitable[None] | None]
-    ) -> None:
-        """Set callback for raw packet data (includes both parsed packet and raw bytes)."""
+    def set_raw_packet_callback(self, callback: Callable[..., Awaitable[None] | None]) -> None:
+        """Set callback for raw packet data.
+
+        Callback receives ``(pkt, data)`` or ``(pkt, data, analysis)``.
+        """
         self.raw_packet_callback = callback
 
     def add_raw_packet_subscriber(self, callback: Callable[..., Any]) -> None:
@@ -1122,22 +1124,36 @@ class Dispatcher:
     async def _invoke_enhanced_raw_callback(
         self, callback, pkt: Packet, data: bytes, analysis: dict
     ) -> None:
-        """Call raw packet callback with extra analysis data."""
+        """Call raw packet callback with extra analysis data.
+
+        Arity is selected from the callable signature before invoke so a
+        handler exception is never misread as a 2-arg signature miss.
+        """
+        use_enhanced = True
         try:
-            if inspect.iscoroutinefunction(callback):
-                await callback(pkt, data, analysis)
-            else:
-                callback(pkt, data, analysis)
-        except Exception as e:
-            self._log(f"Raw callback error: {e}")
-            # Fallback to original callback format
+            sig = inspect.signature(callback)
             try:
+                sig.bind(pkt, data, analysis)
+            except TypeError:
+                sig.bind(pkt, data)
+                use_enhanced = False
+        except (ValueError, TypeError):
+            # Uninspectable callables, or neither arity binds: prefer enhanced.
+            use_enhanced = True
+
+        try:
+            if use_enhanced:
+                if inspect.iscoroutinefunction(callback):
+                    await callback(pkt, data, analysis)
+                else:
+                    callback(pkt, data, analysis)
+            else:
                 if inspect.iscoroutinefunction(callback):
                     await callback(pkt, data)
                 else:
                     callback(pkt, data)
-            except Exception as e2:
-                self._log(f"Fallback raw callback error: {e2}")
+        except Exception as e:
+            self._log(f"Raw callback error: {e}")
 
     # ------------------------------------------------------------------
     # Logging helper

@@ -921,6 +921,52 @@ class TestDispatcherErrorHandling:
 
         # Should not crash
 
+    @pytest.mark.asyncio
+    async def test_enhanced_raw_callback_raise_invoked_once(self, dispatcher):
+        """A 3-arg callback that raises must not be retried with 2 args."""
+        calls = []
+
+        def failing_callback(packet, data, analysis):
+            calls.append(len([packet, data, analysis]))
+            raise RuntimeError("handler failed")
+
+        dispatcher.set_raw_packet_callback(failing_callback)
+        packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"test_payload")
+        await dispatcher._process_received_packet(packet_data)
+
+        assert calls == [3]
+
+    @pytest.mark.asyncio
+    async def test_variadic_raw_callback_raise_invoked_once(self, dispatcher):
+        """Variadic callbacks must not double-fire when the enhanced call raises."""
+        calls = []
+
+        def failing_callback(*args):
+            calls.append(len(args))
+            if len(args) == 3:
+                raise RuntimeError("enhanced path failed")
+
+        dispatcher.set_raw_packet_callback(failing_callback)
+        packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"test_payload")
+        await dispatcher._process_received_packet(packet_data)
+
+        assert calls == [3]
+
+    @pytest.mark.asyncio
+    async def test_legacy_two_arg_raw_callback(self, dispatcher):
+        """Strict 2-arg callbacks still receive (pkt, data) once."""
+        calls = []
+
+        def legacy_callback(packet, data):
+            calls.append((packet, data))
+
+        dispatcher.set_raw_packet_callback(legacy_callback)
+        packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"test_payload")
+        await dispatcher._process_received_packet(packet_data)
+
+        assert len(calls) == 1
+        assert calls[0][1] == packet_data
+
 
 class TestDispatcherIntegration:
     """Integration tests for dispatcher."""
