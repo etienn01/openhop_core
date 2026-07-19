@@ -121,6 +121,48 @@ class TestOversizeFrameResync:
         assert received[0] == b"\x07"
         assert wrapper.stats["frame_errors"] >= 1
 
+    def test_bytewise_escaped_oversize_then_valid(self):
+        """FESC/TFEND floods must hit the same cap as plain-byte runaways."""
+        received = []
+        wrapper = _make_wrapper(on_frame_received=received.append)
+        runaway = bytearray([KISS_FEND, KISS_CMD_DATA])
+        for _ in range(MAX_FRAME_SIZE + 200):
+            runaway.extend([KISS_FESC, KISS_TFEND])
+        valid = _kiss_encode(KISS_CMD_DATA, b"\x11\x22")
+        _feed_bytewise(wrapper, bytes(runaway) + valid)
+
+        assert len(received) == 1
+        assert received[0] == b"\x11\x22"
+        assert wrapper.stats["frame_errors"] >= 1
+        assert len(wrapper.rx_frame_buffer) <= MAX_FRAME_SIZE
+        assert not wrapper.in_frame or len(wrapper.rx_frame_buffer) <= MAX_FRAME_SIZE
+
+    def test_bulk_escaped_oversize_then_valid(self):
+        received = []
+        wrapper = _make_wrapper(on_frame_received=received.append)
+        runaway = bytes([KISS_FEND, KISS_CMD_DATA]) + bytes([KISS_FESC, KISS_TFEND]) * (
+            MAX_FRAME_SIZE + 200
+        )
+        valid = _kiss_encode(KISS_CMD_DATA, b"\x33")
+        wrapper._decode_kiss(runaway + valid)
+
+        assert len(received) == 1
+        assert received[0] == b"\x33"
+        assert wrapper.stats["frame_errors"] >= 1
+        assert len(wrapper.rx_frame_buffer) <= MAX_FRAME_SIZE
+
+    def test_buffer_never_exceeds_max_during_escaped_runaway(self):
+        wrapper = _make_wrapper()
+        wrapper._decode_kiss_byte(KISS_FEND)
+        wrapper._decode_kiss_byte(KISS_CMD_DATA)
+        for _ in range(MAX_FRAME_SIZE + 200):
+            wrapper._decode_kiss_byte(KISS_FESC)
+            wrapper._decode_kiss_byte(KISS_TFEND)
+            assert len(wrapper.rx_frame_buffer) <= MAX_FRAME_SIZE
+
+        assert wrapper.stats["frame_errors"] >= 1
+        assert not wrapper.in_frame
+
 
 class TestWaitForRxThreadSafety:
     """wait_for_rx must complete its Future on the event loop, not the RX thread."""

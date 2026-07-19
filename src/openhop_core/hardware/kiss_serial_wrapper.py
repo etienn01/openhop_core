@@ -620,10 +620,16 @@ class KissSerialWrapper(LoRaRadio):
                 self.escaped = True
 
         elif self.escaped:
-            if byte == KISS_TFEND:
-                self.rx_frame_buffer.append(KISS_FEND)
-            elif byte == KISS_TFESC:
-                self.rx_frame_buffer.append(KISS_FESC)
+            if byte == KISS_TFEND or byte == KISS_TFESC:
+                decoded = KISS_FEND if byte == KISS_TFEND else KISS_FESC
+                # Same MAX_FRAME_SIZE cap as plain bytes — escape floods must not grow unbounded.
+                if len(self.rx_frame_buffer) >= MAX_FRAME_SIZE:
+                    self.stats["frame_errors"] += 1
+                    logger.warning("KISS frame exceeded max size (%d), resyncing", MAX_FRAME_SIZE)
+                    self.rx_frame_buffer.clear()
+                    self.in_frame = False
+                else:
+                    self.rx_frame_buffer.append(decoded)
             else:
                 # Invalid escape sequence; reset so we resync at next FEND
                 self.stats["frame_errors"] += 1
@@ -666,11 +672,18 @@ class KissSerialWrapper(LoRaRadio):
                 b = data[i]
                 i += 1
                 escaped = False
-                # Mirrors _decode_kiss_byte: escaped bytes are appended without a size check
-                if b == KISS_TFEND:
-                    buf.append(KISS_FEND)
-                elif b == KISS_TFESC:
-                    buf.append(KISS_FESC)
+                # Mirrors _decode_kiss_byte: escaped payload bytes honor MAX_FRAME_SIZE.
+                if b == KISS_TFEND or b == KISS_TFESC:
+                    decoded = KISS_FEND if b == KISS_TFEND else KISS_FESC
+                    if len(buf) >= MAX_FRAME_SIZE:
+                        self.stats["frame_errors"] += 1
+                        logger.warning(
+                            "KISS frame exceeded max size (%d), resyncing", MAX_FRAME_SIZE
+                        )
+                        buf.clear()
+                        in_frame = False
+                    else:
+                        buf.append(decoded)
                 else:
                     self.stats["frame_errors"] += 1
                     logger.warning(f"Invalid KISS escape sequence: 0x{b:02X}")
