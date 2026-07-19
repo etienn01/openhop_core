@@ -151,7 +151,7 @@ CompanionRadio(
 
 ```python
 await companion.start()      # start dispatcher task
-await companion.stop()       # cancel dispatcher
+await companion.stop()       # stop node / exit dispatcher loop
 companion.is_running         # bool property
 ```
 

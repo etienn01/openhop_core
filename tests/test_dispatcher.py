@@ -854,17 +854,25 @@ class TestDispatcherMaintenance:
         """Health checks should run via asyncio.to_thread to avoid loop blocking."""
         dispatcher.radio.check_radio_health = Mock(return_value=True)
 
-        sleep_calls = {"count": 0}
+        wait_calls = {"count": 0}
 
-        async def fake_sleep(_seconds):
-            sleep_calls["count"] += 1
-            if sleep_calls["count"] >= 60:
+        async def fake_wait_for(awaitable, timeout=None):
+            wait_calls["count"] += 1
+            if wait_calls["count"] >= 60:
+                # Close the awaitable to avoid "coroutine was never awaited"
+                # when we cancel out of the maintenance wait.
+                if hasattr(awaitable, "close"):
+                    awaitable.close()
                 raise asyncio.CancelledError()
+            # Maintenance tick: treat as timeout so the loop continues
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise asyncio.TimeoutError()
 
         to_thread_mock = AsyncMock(return_value=True)
 
         with (
-            patch("openhop_core.node.dispatcher.asyncio.sleep", side_effect=fake_sleep),
+            patch("openhop_core.node.dispatcher.asyncio.wait_for", side_effect=fake_wait_for),
             patch("openhop_core.node.dispatcher.asyncio.to_thread", to_thread_mock),
         ):
             with pytest.raises(asyncio.CancelledError):

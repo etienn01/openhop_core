@@ -153,6 +153,12 @@ class CompanionRadio(CompanionBase):
         self.node.dispatcher.set_client_repeat_enabled(bool(self.prefs.client_repeat))
         self._apply_multi_acks_pref()
         self._dispatcher_task = asyncio.create_task(self.node.start())
+        # Wait until the dispatcher loop is active so a following stop() cannot
+        # lose a race where run_forever clears the stop event before starting.
+        while not self.node.dispatcher._run_forever_active:
+            if self._dispatcher_task.done():
+                break
+            await asyncio.sleep(0)
         logger.info(
             "CompanionRadio started: name=%s, key=%s...",
             self.prefs.node_name,
@@ -165,14 +171,13 @@ class CompanionRadio(CompanionBase):
             self.node.dispatcher.remove_raw_packet_subscriber(self._on_raw_packet_rx_log)
         except Exception:
             logger.debug("Remove raw packet subscriber during stop failed", exc_info=True)
+        await self.node.stop()
         if self._dispatcher_task:
-            self._dispatcher_task.cancel()
             try:
                 await self._dispatcher_task
             except asyncio.CancelledError:
                 pass
             self._dispatcher_task = None
-        self.node.stop()
         logger.info("CompanionRadio stopped")
 
     @property

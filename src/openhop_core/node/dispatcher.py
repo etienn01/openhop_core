@@ -178,9 +178,40 @@ class Dispatcher:
         # Initialize fallback handler
         self._fallback_handler = None
 
+        # Cooperative shutdown for run_forever / MeshNode.stop. Events are
+        # created lazily on the running loop (Python 3.9 binds Event to a loop
+        # at construction; __init__ may run before the test/app loop exists).
+        self._stop_event: Optional[asyncio.Event] = None
+        self._stopped_event: Optional[asyncio.Event] = None
+        self._run_forever_active = False
+        self._rx_enabled = True
+
         # Hook up the radio's receive callback - all radios should support this
-        self.radio.set_rx_callback(self._on_packet_received)
-        self._logger.info("Registered RX callback with radio")
+        self._arm_rx()
+
+    def _ensure_lifecycle_events(self) -> tuple:
+        """Create stop/stopped events on the running loop if needed."""
+        if self._stop_event is None:
+            self._stop_event = asyncio.Event()
+            self._stopped_event = asyncio.Event()
+            self._stopped_event.set()
+        return self._stop_event, self._stopped_event
+
+    def _arm_rx(self) -> None:
+        """Register the RX callback and allow new packet tasks."""
+        self._rx_enabled = True
+        if self.radio is not None and hasattr(self.radio, "set_rx_callback"):
+            self.radio.set_rx_callback(self._on_packet_received)
+            self._logger.info("Registered RX callback with radio")
+
+    def _disarm_rx(self) -> None:
+        """Stop spawning new packet tasks; best-effort clear the radio callback."""
+        self._rx_enabled = False
+        if self.radio is not None and hasattr(self.radio, "set_rx_callback"):
+            try:
+                self.radio.set_rx_callback(None)
+            except Exception:
+                self._logger.debug("Clearing radio RX callback failed", exc_info=True)
 
     def set_contact_book(self, contact_book):
         """Set the contact book for decryption operations."""
@@ -384,6 +415,8 @@ class Dispatcher:
         snr: Optional[float] = None,
     ) -> None:
         """Called by the radio when a packet comes in. rssi/snr are per-packet when provided."""
+        if not self._rx_enabled:
+            return
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self._process_received_packet(data, rssi, snr))
@@ -1065,25 +1098,67 @@ class Dispatcher:
             await self._invoke_ack_listener(crc)
 
     async def run_forever(self) -> None:
-        """Run the dispatcher maintenance loop indefinitely (call this in an asyncio task)."""
+        """Run the dispatcher maintenance loop until :meth:`stop` is awaited.
+
+        Call this in an asyncio task. Re-arming RX on entry supports restart
+        after a previous stop. The loop exits cooperatively when the stop
+        event is set (checked at least once per second).
+        """
+        # Sync prelude runs until the first await below, so a concurrent
+        # stop() cannot interleave between these assignments.
+        stop_event, stopped_event = self._ensure_lifecycle_events()
+        stop_event.clear()
+        stopped_event.clear()
+        self._run_forever_active = True
+        self._arm_rx()
         health_check_counter = 0
-        while True:
-            # Clean out old ACK CRCs (older than 5 seconds)
-            now = asyncio.get_running_loop().time()
-            self._recent_acks = {crc: ts for crc, ts in self._recent_acks.items() if now - ts < 5}
+        try:
+            while not stop_event.is_set():
+                # Clean out old ACK CRCs (older than 5 seconds)
+                now = asyncio.get_running_loop().time()
+                self._recent_acks = {
+                    crc: ts for crc, ts in self._recent_acks.items() if now - ts < 5
+                }
 
-            # Clean old packet hashes for deduplication
-            self.packet_filter.cleanup_old_hashes()
+                # Clean old packet hashes for deduplication
+                self.packet_filter.cleanup_old_hashes()
 
-            # Simple health check every 60 seconds
-            health_check_counter += 1
-            if health_check_counter >= 60:
-                health_check_counter = 0
-                if hasattr(self.radio, "check_radio_health"):
-                    await asyncio.to_thread(self.radio.check_radio_health)
+                # Simple health check every 60 seconds
+                health_check_counter += 1
+                if health_check_counter >= 60:
+                    health_check_counter = 0
+                    if hasattr(self.radio, "check_radio_health"):
+                        await asyncio.to_thread(self.radio.check_radio_health)
 
-            # With callback-based RX, just do maintenance tasks
-            await asyncio.sleep(1.0)  # Check every second for cleanup
+                # Wait for stop or the next maintenance tick
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            self._run_forever_active = False
+            self._disarm_rx()
+            stopped_event.set()
+
+    async def stop(self) -> None:
+        """Disarm RX and exit :meth:`run_forever` cooperatively. Idempotent.
+
+        Does not cancel in-flight packet tasks or close the radio; callers
+        own hardware lifecycle. If the maintenance loop is not running,
+        returns after disarming without waiting.
+        """
+        stop_event, stopped_event = self._ensure_lifecycle_events()
+        self._disarm_rx()
+        stop_event.set()
+        if not self._run_forever_active:
+            # A just-scheduled run_forever may clear the stop event during its
+            # sync prelude; yield and re-assert so that race still exits.
+            await asyncio.sleep(0)
+            stop_event.set()
+            self._disarm_rx()
+            if not self._run_forever_active:
+                return
+        await stopped_event.wait()
 
     # ------------------------------------------------------------------
     # Internal helper methods
@@ -1195,5 +1270,12 @@ class Dispatcher:
         return None
 
     def cleanup(self):
-        """Clean up resources when shutting down."""
+        """Sync signal to stop the maintenance loop and disarm RX.
+
+        Does not await loop exit. Prefer ``await stop()`` for awaitable
+        shutdown from an async caller.
+        """
+        self._disarm_rx()
+        if self._stop_event is not None:
+            self._stop_event.set()
         self._log("Dispatcher cleanup completed")
