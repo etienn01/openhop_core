@@ -712,9 +712,19 @@ await server.push_control_data(
 
 ```python
 class MyFrameServer(CompanionFrameServer):
-    async def _persist_companion_message(self, msg_dict: dict) -> None:
-        """Called when a message is received. Save to database."""
-        await self.db.save_message(msg_dict)
+    async def _persist_companion_message(self, msg_dict: dict, queue_entry=None) -> None:
+        """Called when a message is received. Save to database.
+
+        ``queue_entry`` is the exact in-memory queue entry this message came
+        from. After a successful write, remove that entry by identity
+        (``self.bridge.message_queue.remove(queue_entry)``) so an interleaved
+        receive can never evict a newer, unpersisted message. When it is None
+        (older event producers), leave the message in memory — a duplicate is
+        preferable to a loss.
+        """
+        persisted = await self.db.save_message(msg_dict)
+        if persisted and queue_entry is not None:
+            self.bridge.message_queue.remove(queue_entry)
 
     def _sync_next_from_persistence(self) -> QueuedMessage | None:
         """Called when the in-memory queue is empty. Pop from database."""
@@ -758,7 +768,7 @@ Note: `set_time()` does **not** call `_save_prefs()` — the time offset is a tr
 
 ```python
 class CompanionFrameServer:
-    async def _persist_companion_message(self, msg_dict: dict) -> None: ...
+    async def _persist_companion_message(self, msg_dict: dict, queue_entry=None) -> None: ...
     def _sync_next_from_persistence(self) -> QueuedMessage | None: ...
     def _save_contacts(self) -> None: ...
     def _save_channels(self) -> None: ...
