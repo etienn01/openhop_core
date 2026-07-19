@@ -200,9 +200,17 @@ class Dispatcher:
     def _arm_rx(self) -> None:
         """Register the RX callback and allow new packet tasks."""
         self._rx_enabled = True
-        if self.radio is not None and hasattr(self.radio, "set_rx_callback"):
+        if self.radio is None:
+            return
+        if hasattr(self.radio, "set_rx_callback"):
             self.radio.set_rx_callback(self._on_packet_received)
             self._logger.info("Registered RX callback with radio")
+        else:
+            self._logger.warning(
+                "Radio %s has no set_rx_callback; the dispatcher will never "
+                "receive packets from this radio",
+                type(self.radio).__name__,
+            )
 
     def _disarm_rx(self) -> None:
         """Stop spawning new packet tasks; best-effort clear the radio callback."""

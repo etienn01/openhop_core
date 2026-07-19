@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -244,6 +245,30 @@ class TestDispatcherInitialization:
 
         assert evt.is_set()
         assert crc not in dispatcher._waiting_acks
+
+
+class TestDispatcherRxArming:
+    """RX arming behavior for radios without a push callback interface."""
+
+    def test_warns_when_radio_lacks_set_rx_callback(self, caplog):
+        """A radio with no set_rx_callback yields a silent no-RX dispatcher;
+        construction must say so loudly instead of quietly never receiving."""
+
+        class PullOnlyRadio:
+            async def send(self, data):
+                return {}
+
+            async def wait_for_rx(self):
+                return b""
+
+        with caplog.at_level(logging.WARNING, logger="Dispatcher"):
+            Dispatcher(radio=PullOnlyRadio(), packet_filter=PacketFilter())
+        assert any("set_rx_callback" in rec.message for rec in caplog.records)
+
+    def test_no_warning_when_radio_supports_set_rx_callback(self, mock_radio, caplog):
+        with caplog.at_level(logging.WARNING, logger="Dispatcher"):
+            Dispatcher(radio=mock_radio, packet_filter=PacketFilter())
+        assert not [rec for rec in caplog.records if "set_rx_callback" in rec.message]
 
 
 class TestDispatcherPacketProcessing:
