@@ -786,9 +786,8 @@ class KissSerialWrapper(LoRaRadio):
             except Exception as e:
                 if self.is_connected:  # Only log if we expect to be connected
                     logger.error(f"RX worker error: {e}")
-                # Mark unhealthy so callers stop accepting work; peer worker exits via stop_event.
-                self.is_connected = False
-                self.stop_event.set()
+                # Mark unhealthy and release the port so a later connect() can reopen it.
+                self._fail_transport()
                 break
 
     def _tx_worker(self):
@@ -815,10 +814,26 @@ class KissSerialWrapper(LoRaRadio):
             except Exception as e:
                 if self.is_connected:  # Only log if we expect to be connected
                     logger.error(f"TX worker error: {e}")
-                # Mark unhealthy so callers stop accepting work; peer worker exits via stop_event.
-                self.is_connected = False
-                self.stop_event.set()
+                # Mark unhealthy and release the port so a later connect() can reopen it.
+                self._fail_transport()
                 break
+
+    def _fail_transport(self) -> None:
+        """Mark the link unhealthy and close the serial port from a worker thread.
+
+        Does not join threads (the caller is one of them). Closing the port wakes
+        the peer worker out of a blocking read so both sides exit.
+        """
+        self.is_connected = False
+        self.stop_event.set()
+        conn = self.serial_conn
+        if conn is None:
+            return
+        try:
+            if conn.is_open:
+                conn.close()
+        except Exception as e:
+            logger.debug("Error closing serial after worker failure: %s", e)
 
     def __enter__(self):
         """Context manager entry"""

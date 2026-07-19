@@ -286,6 +286,7 @@ class TestConnectionHealth:
 
         assert wrapper.is_connected is False
         assert wrapper.stop_event.is_set()
+        wrapper.serial_conn.close.assert_called()
         # Further queueing must be rejected once unhealthy
         assert wrapper.send_frame(b"\x01") is False
 
@@ -294,12 +295,46 @@ class TestConnectionHealth:
         wrapper.is_connected = True
         wrapper.stop_event.clear()
         wrapper.serial_conn = MagicMock()
+        wrapper.serial_conn.is_open = True
         wrapper.serial_conn.read.side_effect = OSError("device gone")
 
         wrapper._rx_worker()
 
         assert wrapper.is_connected is False
         assert wrapper.stop_event.is_set()
+        wrapper.serial_conn.close.assert_called()
+
+    def test_tx_worker_fatal_closes_port_for_reconnect(self):
+        """Worker death must release the fd so a later connect() can reopen the port."""
+        wrapper = _make_wrapper()
+        wrapper.is_connected = True
+        wrapper.stop_event.clear()
+        old_serial = MagicMock()
+        old_serial.is_open = True
+        old_serial.write.side_effect = OSError("broken pipe")
+        wrapper.serial_conn = old_serial
+        wrapper.tx_buffer.append(b"\xc0\x00\xc0")
+
+        wrapper._tx_worker()
+
+        old_serial.close.assert_called_once()
+        # Simulate pyserial after close: is_open becomes False
+        old_serial.is_open = False
+
+        new_serial = MagicMock()
+        new_serial.is_open = True
+        new_serial.read.return_value = b""
+        new_serial.in_waiting = 0
+        with patch(
+            "openhop_core.hardware.kiss_serial_wrapper.serial.Serial",
+            return_value=new_serial,
+        ):
+            assert wrapper.connect() is True
+
+        assert wrapper.is_connected is True
+        assert wrapper.serial_conn is new_serial
+        assert not wrapper.stop_event.is_set()
+        wrapper.disconnect()
 
     def test_enter_raises_when_connect_fails(self):
         wrapper = _make_wrapper()
