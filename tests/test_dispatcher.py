@@ -967,6 +967,66 @@ class TestDispatcherErrorHandling:
         assert len(calls) == 1
         assert calls[0][1] == packet_data
 
+    @pytest.mark.asyncio
+    async def test_bare_decorator_two_arg_raw_callback_rescued(self, dispatcher):
+        """Bare *args wrappers around 2-arg handlers must still run (TypeError rescue)."""
+        calls = []
+
+        def wrap(fn):
+            def wrapper(*args, **kwargs):
+                return fn(*args, **kwargs)
+
+            return wrapper
+
+        @wrap
+        def legacy(packet, data):
+            calls.append((packet, data))
+
+        dispatcher.set_raw_packet_callback(legacy)
+        packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"test_payload")
+        await dispatcher._process_received_packet(packet_data)
+
+        assert len(calls) == 1
+        assert calls[0][1] == packet_data
+
+    @pytest.mark.asyncio
+    async def test_bare_decorator_three_arg_raise_invoked_once(self, dispatcher):
+        """Bare wrapper around 3-arg that raises RuntimeError must not 2-arg retry."""
+        calls = []
+
+        def wrap(fn):
+            def wrapper(*args, **kwargs):
+                return fn(*args, **kwargs)
+
+            return wrapper
+
+        @wrap
+        def enhanced(packet, data, analysis):
+            calls.append(len([packet, data, analysis]))
+            raise RuntimeError("handler failed")
+
+        dispatcher.set_raw_packet_callback(enhanced)
+        packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"test_payload")
+        await dispatcher._process_received_packet(packet_data)
+
+        assert calls == [3]
+
+    @pytest.mark.asyncio
+    async def test_variadic_typeerror_falls_back_to_two_arg(self, dispatcher):
+        """Variadic arity miss (TypeError on 3-arg) still rescues with 2-arg."""
+        calls = []
+
+        def callback(*args):
+            calls.append(len(args))
+            if len(args) == 3:
+                raise TypeError("takes 2 positional arguments but 3 were given")
+
+        dispatcher.set_raw_packet_callback(callback)
+        packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"test_payload")
+        await dispatcher._process_received_packet(packet_data)
+
+        assert calls == [3, 2]
+
 
 class TestDispatcherIntegration:
     """Integration tests for dispatcher."""

@@ -1115,26 +1115,50 @@ class Dispatcher:
     ) -> None:
         """Call raw packet callback with extra analysis data.
 
-        Arity is selected from the callable signature before invoke so a
-        handler exception is never misread as a 2-arg signature miss.
+        Concrete signatures (no *args/**kwargs) are bound once so a handler
+        exception is never retried as a 2-arg call. Variadic or uninspectable
+        callables try the enhanced form first and fall back to 2-arg only on
+        TypeError, so bare decorators around legacy 2-arg handlers still work.
         """
-        use_enhanced = True
         try:
+            # signature() follows __wrapped__ when present (functools.wraps).
             sig = inspect.signature(callback)
+            is_variadic = any(
+                p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+                for p in sig.parameters.values()
+            )
+        except (ValueError, TypeError):
+            sig = None
+            is_variadic = True
+
+        if not is_variadic:
+            use_enhanced = True
             try:
                 sig.bind(pkt, data, analysis)
             except TypeError:
-                sig.bind(pkt, data)
-                use_enhanced = False
-        except (ValueError, TypeError):
-            # Uninspectable callables, or neither arity binds: prefer enhanced.
-            use_enhanced = True
+                try:
+                    sig.bind(pkt, data)
+                    use_enhanced = False
+                except TypeError:
+                    use_enhanced = True
+            try:
+                if use_enhanced:
+                    await invoke_maybe_awaitable(callback, pkt, data, analysis)
+                else:
+                    await invoke_maybe_awaitable(callback, pkt, data)
+            except Exception as e:
+                self._log(f"Raw callback error: {e}")
+            return
 
+        # Variadic / uninspectable: try enhanced, TypeError-only 2-arg rescue.
         try:
-            if use_enhanced:
-                await invoke_maybe_awaitable(callback, pkt, data, analysis)
-            else:
+            await invoke_maybe_awaitable(callback, pkt, data, analysis)
+        except TypeError as e:
+            self._log(f"Raw callback error: {e}")
+            try:
                 await invoke_maybe_awaitable(callback, pkt, data)
+            except Exception as e2:
+                self._log(f"Fallback raw callback error: {e2}")
         except Exception as e:
             self._log(f"Raw callback error: {e}")
 
