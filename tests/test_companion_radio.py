@@ -140,6 +140,27 @@ class TestCompanionRadioLifecycle:
         await comp.stop()
         assert comp.is_running is False
 
+    async def test_start_raises_when_dispatcher_dies_immediately(self):
+        """[fails pre-fix] A dispatcher that fails before its loop becomes
+        active must fail start() instead of reporting a radio that will never
+        receive or transmit."""
+        radio = MockRadio()
+        comp = CompanionRadio(radio, LocalIdentity())
+
+        async def failing_start():
+            raise OSError("serial port vanished")
+
+        comp.node.start = failing_start
+        with pytest.raises(OSError, match="serial port vanished"):
+            await comp.start()
+        assert comp.is_running is False
+        assert comp._dispatcher_task is None
+        # A later start with a healthy dispatcher must still work.
+        del comp.node.start
+        await comp.start()
+        assert comp.is_running is True
+        await comp.stop()
+
     async def test_start_idempotent_warning(self, caplog):
         radio = MockRadio()
         comp = CompanionRadio(radio, LocalIdentity())

@@ -157,6 +157,19 @@ class CompanionRadio(CompanionBase):
         # lose a race where run_forever clears the stop event before starting.
         while not self.node.dispatcher._run_forever_active:
             if self._dispatcher_task.done():
+                # The dispatcher died before its loop became active (e.g. a
+                # radio failure). Surface that instead of reporting a started
+                # radio that will never receive or transmit.
+                task = self._dispatcher_task
+                self._dispatcher_task = None
+                self._running = False
+                try:
+                    exc = task.exception()
+                except asyncio.CancelledError:
+                    raise RuntimeError("Dispatcher task was cancelled during startup") from None
+                if exc is not None:
+                    logger.error("CompanionRadio start failed: %s", exc)
+                    raise exc
                 break
             await asyncio.sleep(0)
         logger.info(
