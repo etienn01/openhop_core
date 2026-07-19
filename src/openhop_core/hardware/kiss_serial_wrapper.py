@@ -242,7 +242,16 @@ class KissSerialWrapper(LoRaRadio):
             return False
 
         try:
-            # Update local config
+            # Create and queue the KISS command frame first; only commit local
+            # config after the TX buffer accepts it so get_config() matches the TNC.
+            kiss_frame = self._encode_kiss_frame(cmd, bytes([value]))
+
+            if len(self.tx_buffer) >= TX_BUFFER_SIZE:
+                self.stats["buffer_overruns"] += 1
+                return False
+
+            self.tx_buffer.append(kiss_frame)
+
             if cmd == KISS_CMD_TXDELAY:
                 self.config["txdelay"] = value
             elif cmd == KISS_CMD_PERSIST:
@@ -254,15 +263,7 @@ class KissSerialWrapper(LoRaRadio):
             elif cmd == KISS_CMD_FULLDUP:
                 self.config["fulldup"] = bool(value)
 
-            # Create and send KISS command frame
-            kiss_frame = self._encode_kiss_frame(cmd, bytes([value]))
-
-            if len(self.tx_buffer) < TX_BUFFER_SIZE:
-                self.tx_buffer.append(kiss_frame)
-                return True
-            else:
-                self.stats["buffer_overruns"] += 1
-                return False
+            return True
 
         except Exception as e:
             logger.error(f"Failed to send config command: {e}")

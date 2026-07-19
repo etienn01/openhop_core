@@ -12,11 +12,13 @@ import pytest
 
 from openhop_core.hardware.kiss_serial_wrapper import (
     KISS_CMD_DATA,
+    KISS_CMD_TXDELAY,
     KISS_FEND,
     KISS_FESC,
     KISS_TFEND,
     KISS_TFESC,
     MAX_FRAME_SIZE,
+    TX_BUFFER_SIZE,
     KissSerialWrapper,
 )
 
@@ -262,3 +264,30 @@ class TestConnectionHealth:
         with patch.object(wrapper, "connect", return_value=False):
             with pytest.raises(RuntimeError, match="Failed to connect"):
                 wrapper.__enter__()
+
+
+class TestConfigQueueOrdering:
+    """Local config must not change when the TX queue rejects a command."""
+
+    def test_full_queue_leaves_config_unchanged(self):
+        wrapper = _make_wrapper()
+        wrapper.is_connected = True
+        original = wrapper.get_config()["txdelay"]
+        # Fill the TX buffer to capacity
+        for _ in range(TX_BUFFER_SIZE):
+            wrapper.tx_buffer.append(b"\xc0\x00\xc0")
+
+        assert wrapper.send_config_command(KISS_CMD_TXDELAY, original + 10) is False
+        assert wrapper.get_config()["txdelay"] == original
+        assert wrapper.stats["buffer_overruns"] == 1
+        assert len(wrapper.tx_buffer) == TX_BUFFER_SIZE
+
+    def test_successful_queue_updates_config(self):
+        wrapper = _make_wrapper()
+        wrapper.is_connected = True
+        original = wrapper.get_config()["txdelay"]
+        new_value = original + 5
+
+        assert wrapper.send_config_command(KISS_CMD_TXDELAY, new_value) is True
+        assert wrapper.get_config()["txdelay"] == new_value
+        assert len(wrapper.tx_buffer) == 1
