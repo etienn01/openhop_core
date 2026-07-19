@@ -136,6 +136,7 @@ class _RxEventsMixin:
                 sender_prefix=sender_prefix,
                 path_len=path_len,
                 queued=was_queued,
+                queue_entry=msg if was_queued else None,
             ),
         )
 
@@ -193,6 +194,7 @@ class _RxEventsMixin:
                 snr=snr,
                 rssi=rssi,
                 queued=was_queued,
+                queue_entry=msg if was_queued else None,
             ),
         )
 
@@ -279,5 +281,6 @@ class _RxEventsMixin:
                 snr=snr,
                 rssi=rssi,
                 queued=was_queued,
+                queue_entry=queued_message if was_queued else None,
             ),
         )

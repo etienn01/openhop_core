@@ -8,7 +8,7 @@ import pytest
 
 from openhop_core.companion import CompanionBridge
 from openhop_core.companion.constants import ADV_TYPE_CHAT, AUTOADD_CHAT
-from openhop_core.companion.models import Contact, MessageEvent
+from openhop_core.companion.models import Contact, MessageEvent, QueuedMessage
 from openhop_core.companion.timing import estimate_airtime_ms
 from openhop_core.node.events import MeshEvents
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
@@ -1208,6 +1208,34 @@ class TestCompanionBridgeDeduplication:
         assert event.packet_hash == "C1D2E3F4"
         assert event.path_len == 0x42
         assert event.queued is True
+        # A queued push carries the exact in-memory queue entry by identity.
+        assert event.queue_entry is bridge.message_queue.peek()
+
+    async def test_message_event_queue_entry_none_when_push_rejected(self):
+        """A rejected protected-queue push carries queue_entry=None."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        # Fill the protected (all-direct) queue so the next direct push is rejected.
+        bridge.message_queue._max_size = 1
+        bridge.message_queue.push(QueuedMessage(sender_key=b"\x09" * 32, text="held"))
+        key_hex = LocalIdentity().get_public_key().hex()
+        events = []
+        bridge.on_message_event(events.append)
+
+        await bridge._handle_mesh_event(
+            MeshEvents.NEW_MESSAGE,
+            {
+                "contact_pubkey": key_hex,
+                "message_text": "rejected",
+                "timestamp": 2000,
+                "txt_type": 0,
+                "packet_hash": "DEADBEEF",
+            },
+        )
+
+        assert len(events) == 1
+        assert events[0].queued is False
+        assert events[0].queue_entry is None
 
     async def test_legacy_async_message_callback_receives_positional_form(self):
         """The deprecated on_message_received adapter preserves the positional

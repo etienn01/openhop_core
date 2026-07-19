@@ -414,6 +414,34 @@ class TestMessageQueue:
         assert q.count == 0
         assert q.pop() is None
 
+    def test_remove_by_identity_from_middle(self):
+        q = MessageQueue(max_size=5)
+        first = QueuedMessage(sender_key=b"\x01" * 32, text="first")
+        middle = QueuedMessage(sender_key=b"\x02" * 32, text="middle")
+        last = QueuedMessage(sender_key=b"\x03" * 32, text="last")
+        q.push(first)
+        q.push(middle)
+        q.push(last)
+
+        assert q.remove(middle) is True
+        assert q.count == 2
+        assert [q.pop().text for _ in range(2)] == ["first", "last"]
+
+    def test_remove_absent_returns_false(self):
+        q = MessageQueue(max_size=5)
+        held = QueuedMessage(sender_key=b"\x01" * 32, text="held")
+        q.push(held)
+
+        # An equal-but-distinct instance is not the same identity.
+        twin = QueuedMessage(sender_key=b"\x01" * 32, text="held")
+        assert q.remove(twin) is False
+        assert q.count == 1
+        assert q.peek() is held
+
+    def test_remove_from_empty_returns_false(self):
+        q = MessageQueue(max_size=5)
+        assert q.remove(QueuedMessage(sender_key=b"", text="x")) is False
+
 
 # ---------------------------------------------------------------------------
 # PathCache

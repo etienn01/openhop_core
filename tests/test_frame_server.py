@@ -2642,7 +2642,7 @@ async def test_message_push_preserves_path_len_for_persistence(path_len):
     server = CompanionFrameServer(bridge, "hash", port=0)
     persisted = []
 
-    async def persist(msg_dict):
+    async def persist(msg_dict, queue_entry=None):
         persisted.append(msg_dict)
 
     server._persist_companion_message = persist

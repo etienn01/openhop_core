@@ -60,6 +60,19 @@ class MessageQueue:
             return self._queue.pop()
         return None
 
+    def remove(self, msg: QueuedMessage) -> bool:
+        """Remove a specific entry from the queue by identity (``is``).
+
+        Used by persistence layers to remove exactly the entry they persisted,
+        immune to interleaved pushes that reorder the queue. Returns True if the
+        entry was found and removed, False otherwise.
+        """
+        for index, queued in enumerate(self._queue):
+            if queued is msg:
+                del self._queue[index]
+                return True
+        return False
+
     def peek(self) -> Optional[QueuedMessage]:
         """Return the oldest message without removing it, or None if empty."""
         if self._queue:

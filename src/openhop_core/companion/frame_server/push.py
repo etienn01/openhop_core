@@ -71,7 +71,7 @@ class _PushMixin:
             "sender_prefix": event.sender_prefix,
         }
         if event.queued:
-            await self._persist_companion_message(msg_dict)
+            await self._persist_companion_message(msg_dict, event.queue_entry)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))
 
     async def _on_channel_message_event(self, event: ChannelMessageEvent):
@@ -88,7 +88,7 @@ class _PushMixin:
             "rssi": event.rssi,
         }
         if event.queued:
-            await self._persist_companion_message(msg_dict)
+            await self._persist_companion_message(msg_dict, event.queue_entry)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))
 
     async def _on_channel_data_event(self, event: ChannelDataEvent):
@@ -107,7 +107,7 @@ class _PushMixin:
             "channel_data_payload": bytes(event.payload or b""),
         }
         if event.queued:
-            await self._persist_companion_message(msg_dict)
+            await self._persist_companion_message(msg_dict, event.queue_entry)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))
 
     def _on_send_confirmed(self, crc, trip_ms=0):

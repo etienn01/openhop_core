@@ -217,9 +217,12 @@ class CompanionFrameServer(
     # Persistence hooks (override in subclasses for SQLite, etc.)
     # -------------------------------------------------------------------------
 
-    async def _persist_companion_message(self, msg_dict: dict) -> None:
+    async def _persist_companion_message(self, msg_dict: dict, queue_entry=None) -> None:
         """Hook: persist a received message.  Default is a no-op — the message
-        stays in the bridge's in-memory queue for ``sync_next_message``."""
+        stays in the bridge's in-memory queue for ``sync_next_message``.
+
+        ``queue_entry`` is the exact in-memory queue entry this message came from,
+        so an overriding persistence layer can remove it by identity."""
 
     def _sync_next_from_persistence(self) -> Optional[QueuedMessage]:
         """Hook: pop a persisted message when the bridge queue is empty.

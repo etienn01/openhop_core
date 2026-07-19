@@ -235,6 +235,10 @@ class MessageEvent:
     # Companion-format route byte: encoded path_len for floods, 0xFF for direct.
     path_len: int = 0
     queued: bool = True
+    # The exact in-memory offline-queue entry this event describes, so a
+    # persistence layer can remove that entry by identity instead of guessing.
+    # None when the protected queue rejected the push.
+    queue_entry: Optional[QueuedMessage] = None
 
 
 @dataclass(frozen=True)
@@ -251,6 +255,10 @@ class ChannelMessageEvent:
     snr: Optional[float] = None
     rssi: Optional[int] = None
     queued: bool = True
+    # The exact in-memory offline-queue entry this event describes, so a
+    # persistence layer can remove that entry by identity instead of guessing.
+    # None when the protected queue rejected the push.
+    queue_entry: Optional[QueuedMessage] = None
 
 
 @dataclass(frozen=True)
@@ -265,3 +273,7 @@ class ChannelDataEvent:
     snr: Optional[float] = None
     rssi: Optional[int] = None
     queued: bool = True
+    # The exact in-memory offline-queue entry this event describes, so a
+    # persistence layer can remove that entry by identity instead of guessing.
+    # None when the protected queue rejected the push.
+    queue_entry: Optional[QueuedMessage] = None
