@@ -1,10 +1,10 @@
-import inspect
 import struct
 from typing import Callable, Optional
 
 from ...protocol import CryptoUtils, Identity, Packet
 from ...protocol.constants import PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_RESPONSE
 from ...protocol.packet_utils import PathUtils
+from ...util.callbacks import invoke_maybe_awaitable
 from .base import BaseHandler
 from .result import HandlerResult
 
@@ -261,10 +261,7 @@ class LoginResponseHandler(BaseHandler):
     async def _safe_callback(self, callback, success: bool, data: dict):
         """Safely invoke a login completion callback without blocking."""
         try:
-            if inspect.iscoroutinefunction(callback):
-                await callback(success, data)
-            else:
-                callback(success, data)
+            await invoke_maybe_awaitable(callback, success, data)
         except Exception as e:
             self.log(f"Error in login callback: {e}")
 

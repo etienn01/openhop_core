@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import time
 from typing import Any, Callable, Optional
 
+from ..util.callbacks import invoke_maybe_awaitable
 from .base_support import _fmt_path
 
 logger = logging.getLogger("CompanionBase")
@@ -44,9 +44,7 @@ class _CallbackMixin:
     @staticmethod
     async def _call_legacy(callback: Callable, *args: Any) -> None:
         """Invoke a legacy positional callback, awaiting it when async."""
-        result = callback(*args)
-        if inspect.isawaitable(result):
-            await result
+        await invoke_maybe_awaitable(callback, *args)
 
     def on_message_received(self, callback: Callable) -> None:
         """Deprecated: prefer :meth:`on_message_event`.
@@ -299,10 +297,7 @@ class _CallbackMixin:
     async def _fire_callbacks(self, event_name: str, *args: Any) -> None:
         for callback in self._push_callbacks.get(event_name, []):
             try:
-                if inspect.iscoroutinefunction(callback):
-                    await callback(*args)
-                else:
-                    callback(*args)
+                await invoke_maybe_awaitable(callback, *args)
             except Exception as e:
                 logger.error("Error in %s callback: %s", event_name, e)
 

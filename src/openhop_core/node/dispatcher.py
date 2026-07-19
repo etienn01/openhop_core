@@ -20,6 +20,7 @@ from ..protocol.constants import (  # Payload types
 from ..protocol.packet_utils import PathUtils, calculate_lora_airtime_ms, flood_rx_metrics
 from ..protocol.transport_keys import calc_transport_code
 from ..protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES
+from ..util.callbacks import invoke_maybe_awaitable
 
 # Import handler classes
 from .handlers import (
@@ -448,10 +449,7 @@ class Dispatcher:
             snr_val = 0.0
         for cb in self._raw_rx_subscribers:
             try:
-                if inspect.iscoroutinefunction(cb):
-                    await cb(data, rssi_val, snr_val)
-                else:
-                    cb(data, rssi_val, snr_val)
+                await invoke_maybe_awaitable(cb, data, rssi_val, snr_val)
             except Exception as e:
                 self._log(f"Raw RX subscriber error: {e}")
 
@@ -478,10 +476,7 @@ class Dispatcher:
         # Let the node know about this packet for analysis (statistics, caching, etc.)
         if self.packet_analysis_callback:
             try:
-                if inspect.iscoroutinefunction(self.packet_analysis_callback):
-                    await self.packet_analysis_callback(pkt, data)
-                else:
-                    self.packet_analysis_callback(pkt, data)
+                await invoke_maybe_awaitable(self.packet_analysis_callback, pkt, data)
                 self._log("[RX DEBUG] Packet analysis callback completed")
             except Exception as e:
                 self._log(f"Error in packet analysis callback: {e}")
@@ -1106,20 +1101,14 @@ class Dispatcher:
         await self._process_received_packet(data)
 
     async def _invoke_callback(self, cb, pkt: Packet) -> None:
-        if inspect.iscoroutinefunction(cb):
-            await cb(pkt)
-        else:
-            cb(pkt)
+        await invoke_maybe_awaitable(cb, pkt)
 
     async def _invoke_ack_listener(self, crc: int) -> None:
         """Invoke ack-received listener (sync or async)."""
         cb = self._ack_received_listener
         if cb is None:
             return
-        if inspect.iscoroutinefunction(cb):
-            await cb(crc)
-        else:
-            cb(crc)
+        await invoke_maybe_awaitable(cb, crc)
 
     async def _invoke_enhanced_raw_callback(
         self, callback, pkt: Packet, data: bytes, analysis: dict
@@ -1143,15 +1132,9 @@ class Dispatcher:
 
         try:
             if use_enhanced:
-                if inspect.iscoroutinefunction(callback):
-                    await callback(pkt, data, analysis)
-                else:
-                    callback(pkt, data, analysis)
+                await invoke_maybe_awaitable(callback, pkt, data, analysis)
             else:
-                if inspect.iscoroutinefunction(callback):
-                    await callback(pkt, data)
-                else:
-                    callback(pkt, data)
+                await invoke_maybe_awaitable(callback, pkt, data)
         except Exception as e:
             self._log(f"Raw callback error: {e}")
 

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import inspect
 from typing import Awaitable, Callable, Optional
 
 from ...protocol import Packet
 from ...protocol.constants import PAYLOAD_TYPE_ACK
 from ...protocol.packet_utils import PathUtils
+from ...util.callbacks import invoke_maybe_awaitable
 from .base import BaseHandler
 from .crypto_helpers import iter_decrypt_by_src_hash
 
@@ -147,8 +147,4 @@ class AckHandler(BaseHandler):
     async def _notify_ack_received(self, crc: int):
         """Notify the dispatcher that an ACK was received."""
         if self._ack_received_callback:
-            cb = self._ack_received_callback
-            if inspect.iscoroutinefunction(cb):
-                await cb(crc)
-            else:
-                cb(crc)
+            await invoke_maybe_awaitable(self._ack_received_callback, crc)
