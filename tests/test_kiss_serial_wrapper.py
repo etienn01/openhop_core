@@ -186,6 +186,26 @@ class TestWaitForRxThreadSafety:
         assert wrapper.on_frame_received == seen.append
 
 
+class TestSendMetadataContract:
+    """Successful queueing must return a metadata mapping (Dispatcher rejects None)."""
+
+    @pytest.mark.asyncio
+    async def test_send_returns_empty_dict_on_success(self):
+        wrapper = _make_wrapper()
+        wrapper.is_connected = True
+        result = await wrapper.send(b"\x01\x02\x03")
+        assert result == {}
+        assert isinstance(result, dict)
+        assert len(wrapper.tx_buffer) == 1
+
+    @pytest.mark.asyncio
+    async def test_send_raises_when_not_connected(self):
+        wrapper = _make_wrapper()
+        wrapper.is_connected = False
+        with pytest.raises(Exception, match="Failed to send frame"):
+            await wrapper.send(b"\x01")
+
+
 class TestConnectionHealth:
     """connect()/workers/__enter__ must not leave a false-healthy transport."""
 

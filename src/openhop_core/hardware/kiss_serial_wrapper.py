@@ -485,12 +485,12 @@ class KissSerialWrapper(LoRaRadio):
         if not success:
             raise Exception("Failed to initialize KISS radio")
 
-    async def send(self, data: bytes) -> None:
+    async def send(self, data: bytes) -> Optional[Dict[str, Any]]:
         """
-        Send data via KISS TNC. Returns None (no metadata available).
+        Send data via KISS TNC.
 
-        Args:
-            data: Data to send
+        Returns:
+            Empty metadata dict on successful queue (no hardware TX metadata).
 
         Raises:
             Exception: If send fails
@@ -498,7 +498,7 @@ class KissSerialWrapper(LoRaRadio):
         success = self.send_frame(data)
         if not success:
             raise Exception("Failed to send frame via KISS TNC")
-        return None
+        return {}
 
     async def wait_for_rx(self) -> bytes:
         """
