@@ -507,16 +507,22 @@ class KissSerialWrapper(LoRaRadio):
             Received packet data
         """
         # Create a future to wait for the next received frame
+        loop = asyncio.get_running_loop()
         future = asyncio.Future()
 
         # Store the original callback
         original_callback = self.on_frame_received
 
-        # Set a temporary callback that completes the future
+        # Set a temporary callback that completes the future on the event loop.
+        # RX delivery runs on the serial worker thread, so set_result must be
+        # scheduled with call_soon_threadsafe rather than called directly.
         def temp_callback(data: bytes):
             if not future.done():
-                future.set_result(data)
-            # Restore original callback if it exists
+                try:
+                    loop.call_soon_threadsafe(future.set_result, data)
+                except RuntimeError as e:
+                    logger.error(f"Failed to complete wait_for_rx future: {e}")
+            # Fan out to the original callback if it exists
             if original_callback:
                 try:
                     original_callback(data)

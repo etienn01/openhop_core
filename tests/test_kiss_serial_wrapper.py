@@ -4,6 +4,12 @@ Tests for KissSerialWrapper (generic KISS TNC over serial).
 Decoder and queue behavior is exercised without a real serial port.
 """
 
+import asyncio
+import threading
+from unittest.mock import MagicMock, patch
+
+import pytest
+
 from openhop_core.hardware.kiss_serial_wrapper import (
     KISS_CMD_DATA,
     KISS_FEND,
@@ -112,3 +118,69 @@ class TestOversizeFrameResync:
         assert len(received) == 1
         assert received[0] == b"\x07"
         assert wrapper.stats["frame_errors"] >= 1
+
+
+class TestWaitForRxThreadSafety:
+    """wait_for_rx must complete its Future on the event loop, not the RX thread."""
+
+    @pytest.mark.asyncio
+    async def test_wait_for_rx_schedules_set_result_on_loop(self):
+        wrapper = _make_wrapper()
+        payload = b"\x10\x20"
+
+        async def deliver_from_worker():
+            # Allow wait_for_rx to install its temp callback first.
+            await asyncio.sleep(0)
+            # Simulate RX worker thread invoking the callback.
+            thread = threading.Thread(
+                target=wrapper.on_frame_received,
+                args=(payload,),
+            )
+            thread.start()
+            thread.join(timeout=2.0)
+            assert not thread.is_alive()
+
+        deliver_task = asyncio.create_task(deliver_from_worker())
+        result = await asyncio.wait_for(wrapper.wait_for_rx(), timeout=2.0)
+        await deliver_task
+        assert result == payload
+
+    @pytest.mark.asyncio
+    async def test_wait_for_rx_uses_call_soon_threadsafe(self):
+        wrapper = _make_wrapper()
+        real_loop = asyncio.get_running_loop()
+        mock_loop = MagicMock(wraps=real_loop)
+        mock_loop.call_soon_threadsafe = MagicMock(side_effect=real_loop.call_soon_threadsafe)
+
+        with patch("asyncio.get_running_loop", return_value=mock_loop):
+
+            async def deliver():
+                await asyncio.sleep(0)
+                wrapper.on_frame_received(b"\x01")
+
+            deliver_task = asyncio.create_task(deliver())
+            result = await asyncio.wait_for(wrapper.wait_for_rx(), timeout=2.0)
+            await deliver_task
+
+        assert result == b"\x01"
+        mock_loop.call_soon_threadsafe.assert_called()
+        args, _kwargs = mock_loop.call_soon_threadsafe.call_args
+        assert args[1] == b"\x01"
+
+    @pytest.mark.asyncio
+    async def test_wait_for_rx_fans_out_to_original_callback(self):
+        seen = []
+        wrapper = _make_wrapper(on_frame_received=seen.append)
+
+        async def deliver():
+            await asyncio.sleep(0)
+            wrapper.on_frame_received(b"\x55")
+
+        deliver_task = asyncio.create_task(deliver())
+        result = await asyncio.wait_for(wrapper.wait_for_rx(), timeout=2.0)
+        await deliver_task
+
+        assert result == b"\x55"
+        assert seen == [b"\x55"]
+        # Callback restored after wait completes
+        assert wrapper.on_frame_received == seen.append
