@@ -950,3 +950,120 @@ class TestLoginResponseCorrelation:
         result = await task
         assert result["success"] is False
         assert result["reason"] == "Login failed"
+
+
+def _colliding_peer(name, first_byte, avoid_keys=()):
+    """Return (identity, Contact) whose pubkey FIRST byte equals ``first_byte``.
+
+    Hash-colliding contacts exercise the 1-byte dest/src hash ambiguity: the
+    handler must attribute responses by full-pubkey decryption, never by hash.
+    """
+    avoid = set(avoid_keys)
+    while True:
+        ident = LocalIdentity()
+        pk = ident.get_public_key()
+        if pk[0] == first_byte and pk not in avoid:
+            return ident, Contact(public_key=pk, name=name)
+
+
+def _build_non_login_response_packet(server_identity, comp_identity, *, tag=7):
+    """Build an authenticated RESPONSE whose contents are not a login reply
+    (telemetry-style: tag(4) + short data), as a colliding sensor would emit."""
+    shared_secret = Identity(server_identity.get_public_key()).calc_shared_secret(
+        comp_identity.get_private_key()
+    )
+    plaintext = struct.pack("<I", tag) + bytes([0x01, 0x74, 0x01, 0x72])
+    encrypted = CryptoUtils.encrypt_then_mac(shared_secret[:16], shared_secret, plaintext)
+    payload = (
+        bytes([comp_identity.get_public_key()[0], server_identity.get_public_key()[0]]) + encrypted
+    )
+    pkt = Packet()
+    pkt.header = ROUTE_TYPE_DIRECT | (PAYLOAD_TYPE_RESPONSE << 2)
+    pkt.path_len = 0
+    pkt.path = bytearray()
+    pkt.payload = bytearray(payload)
+    pkt.payload_len = len(payload)
+    return pkt
+
+
+@pytest.mark.asyncio
+class TestLoginResponseHashCollisions:
+    """Hash-colliding contacts must not strand or swallow each other's responses."""
+
+    def _setup_colliding_pair(self):
+        radio = MockRadio()
+        identity = LocalIdentity()
+        comp = CompanionRadio(radio, identity)
+        (a_identity, a_contact) = _distinct_peers(["RptA"], avoid={identity.get_public_key()[0]})[0]
+        b_identity, b_contact = _colliding_peer(
+            "RptB", a_contact.public_key[0], avoid_keys={a_contact.public_key}
+        )
+        comp.contacts.add(a_contact)
+        comp.contacts.add(b_contact)
+        return radio, identity, comp, (a_identity, a_contact), (b_identity, b_contact)
+
+    async def test_colliding_concurrent_logins_both_resolve(self, monkeypatch):
+        """[fails pre-fix] The first completed login must not close the response
+        gate on a concurrent login to a hash-colliding contact."""
+        (
+            radio,
+            identity,
+            comp,
+            (a_identity, a_contact),
+            (b_identity, b_contact),
+        ) = self._setup_colliding_pair()
+        monkeypatch.setattr(comp, "_response_timeout_s", lambda pkt, proxy: 0.5)
+        handler = comp._get_login_response_handler()
+
+        task_a = asyncio.create_task(comp.send_login(a_contact.public_key, "pw-a"))
+        await _wait_until(lambda: len(radio.sent) >= 1)
+        task_b = asyncio.create_task(comp.send_login(b_contact.public_key, "pw-b"))
+        await _wait_until(lambda: len(radio.sent) >= 2)
+
+        resp_a = _build_login_response_packet(a_identity, identity, timestamp=111)
+        await handler(resp_a)
+        result_a = await task_a
+        assert result_a["success"] is True
+        assert result_a["tag"] == 111
+
+        resp_b = _build_login_response_packet(b_identity, identity, timestamp=222)
+        await handler(resp_b)
+        result_b = await task_b
+        assert result_b["success"] is True
+        assert result_b["repeater"] == "RptB"
+        assert result_b["tag"] == 222
+
+    async def test_colliding_non_login_response_is_forwarded_not_swallowed(self, monkeypatch):
+        """[fails pre-fix] While a login is pending to A, an authenticated
+        non-login RESPONSE from hash-colliding B must reach the protocol
+        response handler, and A's real response must still resolve A."""
+        from unittest.mock import AsyncMock
+
+        from openhop_core.node.handlers import HandlerResult
+
+        (
+            radio,
+            identity,
+            comp,
+            (a_identity, a_contact),
+            (b_identity, b_contact),
+        ) = self._setup_colliding_pair()
+        monkeypatch.setattr(comp, "_response_timeout_s", lambda pkt, proxy: 0.5)
+        handler = comp._get_login_response_handler()
+        protocol_handler = AsyncMock(return_value=HandlerResult.consumed())
+        handler.set_protocol_response_handler(protocol_handler)
+
+        task_a = asyncio.create_task(comp.send_login(a_contact.public_key, "pw-a"))
+        await _wait_until(lambda: len(radio.sent) >= 1)
+
+        telemetry_resp = _build_non_login_response_packet(b_identity, identity, tag=7)
+        result = await handler(telemetry_resp)
+        assert result.authenticated
+        protocol_handler.assert_awaited_once_with(telemetry_resp)
+        assert not task_a.done()
+
+        resp_a = _build_login_response_packet(a_identity, identity, timestamp=111)
+        await handler(resp_a)
+        result_a = await task_a
+        assert result_a["success"] is True
+        assert result_a["tag"] == 111

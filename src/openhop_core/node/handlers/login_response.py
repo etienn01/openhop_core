@@ -75,6 +75,29 @@ class LoginResponseHandler(BaseHandler):
         pk = contact.public_key
         return pk if isinstance(pk, bytes) else bytes.fromhex(pk)
 
+    def _has_pending_login_for_hash(self, lookup_hash: int) -> bool:
+        """True when any pending login (or stored password) targets this hash."""
+        if lookup_hash in self._active_login_passwords:
+            return True
+        return any(key and key[0] == lookup_hash for key in self._pending_logins)
+
+    async def _forward_to_protocol_handler(self, packet) -> HandlerResult:
+        """Route a RESPONSE that is not a pending login onward.
+
+        Telemetry/status responses correlate in the protocol response handler.
+        PATH packets are skipped: PathHandler already invoked the protocol
+        response handler for them before we were called.
+        """
+        if self._protocol_response_handler:
+            if packet.get_payload_type() == PAYLOAD_TYPE_PATH:
+                return HandlerResult.not_for_us()
+            try:
+                result = await self._protocol_response_handler(packet)
+                return result if isinstance(result, HandlerResult) else HandlerResult.not_for_us()
+            except Exception as e:
+                self.log("Error forwarding RESPONSE packet to " f"protocol response handler: {e}")
+        return HandlerResult.not_for_us()
+
     def store_login_password(self, dest_hash: int, password: str):
         """Store password for response decryption by destination hash."""
         self._active_login_passwords[dest_hash] = password
@@ -109,26 +132,14 @@ class LoginResponseHandler(BaseHandler):
         if dest_hash != self.local_identity.get_public_key()[0]:
             return HandlerResult.not_for_us()
 
-        # Find stored password and matching contact(s)
-        if lookup_hash not in self._active_login_passwords:
-            # This might be a telemetry response, not a login response
-            # Forward to protocol response handler if available (only for RESPONSE packets;
-            # PATH packets are already handled by PathHandler before we are called).
-            if self._protocol_response_handler:
-                pkt_type = packet.get_payload_type()
-                if pkt_type == PAYLOAD_TYPE_PATH:
-                    # PathHandler already invoked protocol_response_handler for this packet.
-                    return HandlerResult.not_for_us()
-                try:
-                    result = await self._protocol_response_handler(packet)
-                    return (
-                        result if isinstance(result, HandlerResult) else HandlerResult.not_for_us()
-                    )
-                except Exception as e:
-                    self.log(
-                        "Error forwarding RESPONSE packet to " f"protocol response handler: {e}"
-                    )
-            return HandlerResult.not_for_us()
+        # Gate: only attempt login processing while a login is actually pending
+        # for this 1-byte hash. The full-pubkey pending map is authoritative so
+        # one login completing cannot close the gate on a concurrent login to a
+        # hash-colliding contact; the legacy per-hash password store is kept as
+        # a compatibility gate.
+        if not self._has_pending_login_for_hash(lookup_hash):
+            # Not a login response (e.g. telemetry/status); route onward.
+            return await self._forward_to_protocol_handler(packet)
 
         # Collect all contacts whose public_key first byte matches (hash collision / multiple peers)
         candidates = []
@@ -160,6 +171,12 @@ class LoginResponseHandler(BaseHandler):
                 break
 
         if authenticated and matched_contact:
+            if self._pubkey_bytes(matched_contact) not in self._pending_logins:
+                # Authenticated, but this contact has no login pending: not a
+                # login response. Mirrors firmware onContactResponse, where a
+                # pending_login pubkey mismatch falls through to the status/
+                # telemetry matchers instead of being treated as a login.
+                return await self._forward_to_protocol_handler(packet)
             if response_data is None:
                 self.log("Authenticated login response had invalid or incomplete contents")
                 return HandlerResult.consumed()
