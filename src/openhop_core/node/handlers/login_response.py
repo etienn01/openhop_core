@@ -32,11 +32,16 @@ class LoginResponseHandler(BaseHandler):
     def payload_type() -> int:
         return PAYLOAD_TYPE_RESPONSE
 
-    def __init__(self, local_identity, contacts, log_fn, login_callback=None):
+    def __init__(self, local_identity, contacts, log_fn):
         self.local_identity = local_identity
         self.contacts = contacts
         self.log = log_fn
-        self.login_callback = login_callback  # Callback to notify of login success/failure
+        # Pending login completions keyed by the target contact's full public key
+        # (32 bytes). A response is dispatched only to the waiter whose target
+        # matches the authenticated sender, mirroring the firmware sender gate
+        # (companion_radio MyMesh.cpp: pending_login compared against the
+        # responding contact's pubkey) generalized to concurrent logins.
+        self._pending_logins = {}  # pubkey bytes -> callback
         # Store login passwords persistently (not tied to contact objects)
         self._active_login_passwords = {}  # dest_hash -> password
         # Protocol response handler for forwarding telemetry responses
@@ -46,13 +51,29 @@ class LoginResponseHandler(BaseHandler):
         """Set protocol response handler for forwarding telemetry responses."""
         self._protocol_response_handler = protocol_response_handler
 
-    def set_login_callback(self, callback: Callable[[bool, dict], None]):
-        """Set callback to notify when login response is received.
+    def register_login_callback(self, pubkey: bytes, callback: Callable[[bool, dict], None]):
+        """Register a completion for a login to the contact with ``pubkey``.
 
-        Args:
-            callback: Function that accepts (success: bool, response_data: dict)
+        Keyed by the target's full public key (not the 1-byte dest hash, which
+        collides). The callback accepts (success: bool, response_data: dict).
         """
-        self.login_callback = callback
+        self._pending_logins[bytes(pubkey)] = callback
+
+    def remove_login_callback(self, pubkey: bytes, callback) -> None:
+        """Remove the pending login for ``pubkey`` only if it is ``callback``.
+
+        Identity-guarded so a timed-out login never clears a concurrent login's
+        pending completion.
+        """
+        key = bytes(pubkey)
+        if self._pending_logins.get(key) is callback:
+            del self._pending_logins[key]
+
+    @staticmethod
+    def _pubkey_bytes(contact) -> bytes:
+        """Return a contact's public key as 32 raw bytes (hex str or bytes)."""
+        pk = contact.public_key
+        return pk if isinstance(pk, bytes) else bytes.fromhex(pk)
 
     def store_login_password(self, dest_hash: int, password: str):
         """Store password for response decryption by destination hash."""
@@ -121,14 +142,9 @@ class LoginResponseHandler(BaseHandler):
                 continue
 
         if not candidates:
-            if self.login_callback:
-                await self._safe_callback(
-                    False,
-                    {
-                        "error": "No contact found for login response (src_hash=0x%02x)"
-                        % lookup_hash
-                    },
-                )
+            # No contact matches the responding key: nothing to correlate to a
+            # waiter (firmware ignores a response from a non-matching contact).
+            self.log("No contact found for login response (src_hash=0x%02x)" % lookup_hash)
             return HandlerResult.not_for_us()
 
         # Try each candidate until one decrypts successfully (same shared-secret as firmware)
@@ -150,8 +166,9 @@ class LoginResponseHandler(BaseHandler):
             await self._process_login_response(response_data, matched_contact)
             self.clear_login_password(lookup_hash)
             return HandlerResult.consumed()
-        elif self.login_callback:
-            await self._safe_callback(False, {"error": "Failed to decrypt login response"})
+        # Decryption failed for every candidate: the response is not authentically
+        # ours, so no waiter is resolved (firmware ignores it).
+        self.log("Failed to decrypt login response")
         return HandlerResult.not_for_us()
 
     async def _decrypt_response(
@@ -232,17 +249,22 @@ class LoginResponseHandler(BaseHandler):
         else:
             self.log(f"Login failed to '{contact.name}' " f"(code: 0x{response_code:02X})")
 
-        if self.login_callback:
-            await self._safe_callback(success, response_data)
+        # Dispatch ONLY to the waiter whose target matches this authenticated
+        # sender's full public key. No pending login for this contact → resolve
+        # nothing (firmware ignores a response from a non-pending contact).
+        callback = self._pending_logins.get(self._pubkey_bytes(contact))
+        if callback is not None:
+            await self._safe_callback(callback, success, response_data)
+        else:
+            self.log(f"No pending login for '{contact.name}' - login response ignored")
 
-    async def _safe_callback(self, success: bool, data: dict):
-        """Safely call the login callback without blocking."""
+    async def _safe_callback(self, callback, success: bool, data: dict):
+        """Safely invoke a login completion callback without blocking."""
         try:
-            if self.login_callback is not None:
-                if inspect.iscoroutinefunction(self.login_callback):
-                    await self.login_callback(success, data)
-                else:
-                    self.login_callback(success, data)
+            if inspect.iscoroutinefunction(callback):
+                await callback(success, data)
+            else:
+                callback(success, data)
         except Exception as e:
             self.log(f"Error in login callback: {e}")
 
@@ -260,8 +282,11 @@ class AnonReqResponseHandler(BaseHandler):
         self.log = log_fn
         self.login_response_handler = LoginResponseHandler(local_identity, contacts, log_fn)
 
-    def set_login_callback(self, callback):
-        self.login_response_handler.set_login_callback(callback)
+    def register_login_callback(self, pubkey: bytes, callback):
+        self.login_response_handler.register_login_callback(pubkey, callback)
+
+    def remove_login_callback(self, pubkey: bytes, callback):
+        self.login_response_handler.remove_login_callback(pubkey, callback)
 
     def store_login_password(self, dest_hash: int, password: str):
         self.login_response_handler.store_login_password(dest_hash, password)

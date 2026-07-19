@@ -4,6 +4,7 @@ from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder, PathUtils
 from ...protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_TXT_MSG,
+    TXT_TYPE_CLI_DATA,
     TXT_TYPE_PLAIN,
     TXT_TYPE_SIGNED_PLAIN,
 )
@@ -40,13 +41,33 @@ class TextMessageHandler(BaseHandler):
         self.log = log_fn
         self.send_packet = send_packet_fn
         self.event_service = event_service  # Event service for broadcasting
-        self.command_response_callback = None  # Callback for command responses
+        # Pending repeater-command responses keyed by the target contact's full
+        # public key (32 bytes). A CLI_DATA reply is delivered to the waiter for
+        # its authenticated sender only; every other message flows to normal
+        # delivery, mirroring firmware BaseChatMesh (only TXT_TYPE_CLI_DATA from a
+        # known contact is routed to onCommandDataRecv).
+        self._pending_command_responses = {}  # pubkey bytes -> callback
         self.radio_config = radio_config or {}  # Radio configuration for airtime calculations
         self.multi_acks = 0  # multi_acks pref (0=off); set via set_multi_acks()
 
-    def set_command_response_callback(self, callback):
-        """Set callback function for command responses."""
-        self.command_response_callback = callback
+    def register_command_response(self, pubkey: bytes, callback):
+        """Register a callback to receive the next CLI_DATA reply from ``pubkey``.
+
+        Keyed by the target's full public key (not the 1-byte dest hash, which
+        collides). One reply completes one command: the entry is removed when the
+        matching reply arrives.
+        """
+        self._pending_command_responses[bytes(pubkey)] = callback
+
+    def unregister_command_response(self, pubkey: bytes, callback) -> None:
+        """Remove the pending entry for ``pubkey`` only if it is ``callback``.
+
+        Identity-guarded so a timed-out command never clears a different command's
+        pending entry.
+        """
+        key = bytes(pubkey)
+        if self._pending_command_responses.get(key) is callback:
+            del self._pending_command_responses[key]
 
     def set_multi_acks(self, value: int) -> None:
         """Set the ``multi_acks`` preference (mirrors firmware getExtraAckTransmitCount)."""
@@ -332,16 +353,29 @@ class TextMessageHandler(BaseHandler):
         decoded_msg = message_body[:visible_len].decode("utf-8", "replace")
         self.log(f"Received TXT_MSG: {decoded_msg}")
 
-        # Check if this is a command response (if callback is set)
-        if self.command_response_callback:
-            try:
-                self.command_response_callback(decoded_msg, matched_contact)
-                self.log(f"Command response captured from {matched_contact.name}: {decoded_msg}")
-                # Don't save command responses to regular message database
-                return HandlerResult.consumed()
-            except Exception as e:
-                self.log(f"Error in command response callback: {e}")
-                # Continue with normal message processing if callback fails
+        # Intercept as a repeater-command response only for CLI_DATA replies whose
+        # authenticated sender has a pending command (firmware routes only
+        # TXT_TYPE_CLI_DATA from a known contact to onCommandDataRecv; everything
+        # else is delivered normally). Match on the full sender public key so a
+        # dest-hash collision cannot cross-resolve. Plain DMs and CLI_DATA with no
+        # pending command fall through to normal delivery.
+        if txt_type == TXT_TYPE_CLI_DATA:
+            callback = self._pending_command_responses.get(sender_pubkey)
+            if callback is not None:
+                # One reply completes one command: remove the entry before
+                # delivering so a second reply within the window is delivered
+                # normally rather than swallowed.
+                del self._pending_command_responses[sender_pubkey]
+                try:
+                    callback(decoded_msg, matched_contact)
+                    self.log(
+                        f"Command response captured from {matched_contact.name}: {decoded_msg}"
+                    )
+                    # Don't save command responses to regular message database
+                    return HandlerResult.consumed()
+                except Exception as e:
+                    self.log(f"Error in command response callback: {e}")
+                    # Continue with normal message processing if callback fails
 
         # Save the incoming message by publishing event for app to handle
         message_timestamp = timestamp_int

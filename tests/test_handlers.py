@@ -38,6 +38,8 @@ from openhop_core.protocol.constants import (
     ROUTE_TYPE_TRANSPORT_FLOOD,
     SIGNATURE_SIZE,
     TIMESTAMP_SIZE,
+    TXT_TYPE_CLI_DATA,
+    TXT_TYPE_PLAIN,
 )
 from openhop_core.protocol.packet_utils import PathUtils
 from openhop_core.protocol.utils import decode_appdata
@@ -73,6 +75,27 @@ class MockEventService:
     def __init__(self):
         self.publish = AsyncMock()
         self.publish_sync = MagicMock()
+
+
+def _build_direct_dm(sender_identity, receiver_identity, text, txt_type=TXT_TYPE_PLAIN):
+    """Build a real encrypted direct DM packet from sender to receiver."""
+
+    class _SendContact:
+        def __init__(self, pubkey_hex):
+            self.public_key = pubkey_hex
+            self.out_path = []
+            self.out_path_len = -1
+
+    receiver_contact = _SendContact(receiver_identity.get_public_key().hex())
+    packet, _ = PacketBuilder.create_text_message(
+        receiver_contact,
+        sender_identity,
+        text,
+        attempt=0,
+        message_type="direct",
+        txt_type=txt_type,
+    )
+    return packet
 
 
 # Base Handler Tests
@@ -222,11 +245,89 @@ class TestTextMessageHandler:
         assert self.handler.send_packet == self.send_packet_fn
         assert self.handler.event_service == self.event_service
 
-    def test_set_command_response_callback(self):
-        """Test setting command response callback."""
+    def test_register_command_response(self):
+        """Registering/unregistering a command response is keyed by full pubkey."""
         callback = MagicMock()
-        self.handler.set_command_response_callback(callback)
-        assert self.handler.command_response_callback == callback
+        pubkey = bytes(range(32))
+        self.handler.register_command_response(pubkey, callback)
+        assert self.handler._pending_command_responses[pubkey] is callback
+        # Identity-guarded removal: a different callback does not clear the entry.
+        self.handler.unregister_command_response(pubkey, MagicMock())
+        assert self.handler._pending_command_responses[pubkey] is callback
+        self.handler.unregister_command_response(pubkey, callback)
+        assert pubkey not in self.handler._pending_command_responses
+
+    @pytest.mark.asyncio
+    async def test_cli_data_reply_completes_pending_command_one_shot(self):
+        """A CLI_DATA reply from the pending sender is captured exactly once."""
+        sender = LocalIdentity()
+        self.contacts.contacts = [MockContact(public_key=sender.get_public_key().hex(), name="rpt")]
+        captured = []
+        self.handler.register_command_response(
+            sender.get_public_key(), lambda text, contact: captured.append(text)
+        )
+
+        pkt = _build_direct_dm(sender, self.local_identity, "reply one", TXT_TYPE_CLI_DATA)
+        result = await self.handler(pkt)
+        assert result.authenticated is True
+        assert captured == ["reply one"]
+        # One reply completes one command: the entry is gone and the next
+        # CLI_DATA from the same sender is delivered as a normal message.
+        assert sender.get_public_key() not in self.handler._pending_command_responses
+        self.event_service.publish_sync.assert_not_called()
+
+        pkt2 = _build_direct_dm(sender, self.local_identity, "reply two", TXT_TYPE_CLI_DATA)
+        await self.handler(pkt2)
+        assert captured == ["reply one"]
+        self.event_service.publish_sync.assert_called_once()
+        event_name, event_data = self.event_service.publish_sync.call_args.args
+        assert event_name == MeshEvents.NEW_MESSAGE
+        assert event_data["message_text"] == "reply two"
+
+    @pytest.mark.asyncio
+    async def test_plain_dm_from_pending_sender_not_intercepted(self):
+        """A plain DM is delivered normally even while its sender has a pending command."""
+        sender = LocalIdentity()
+        self.contacts.contacts = [MockContact(public_key=sender.get_public_key().hex(), name="rpt")]
+        captured = []
+        self.handler.register_command_response(
+            sender.get_public_key(), lambda text, contact: captured.append(text)
+        )
+
+        pkt = _build_direct_dm(sender, self.local_identity, "just a dm", TXT_TYPE_PLAIN)
+        await self.handler(pkt)
+
+        assert captured == []
+        assert sender.get_public_key() in self.handler._pending_command_responses
+        self.event_service.publish_sync.assert_called_once()
+        event_name, event_data = self.event_service.publish_sync.call_args.args
+        assert event_name == MeshEvents.NEW_MESSAGE
+        assert event_data["message_text"] == "just a dm"
+
+    @pytest.mark.asyncio
+    async def test_cli_data_from_other_contact_delivered_normally(self):
+        """CLI_DATA from a contact with no pending command flows to normal delivery."""
+        target = LocalIdentity()
+        other = LocalIdentity()
+        self.contacts.contacts = [
+            MockContact(public_key=target.get_public_key().hex(), name="rpt"),
+            MockContact(public_key=other.get_public_key().hex(), name="other"),
+        ]
+        captured = []
+        self.handler.register_command_response(
+            target.get_public_key(), lambda text, contact: captured.append(text)
+        )
+
+        pkt = _build_direct_dm(other, self.local_identity, "unrelated cli", TXT_TYPE_CLI_DATA)
+        await self.handler(pkt)
+
+        assert captured == []
+        # The target's pending entry is untouched.
+        assert target.get_public_key() in self.handler._pending_command_responses
+        self.event_service.publish_sync.assert_called_once()
+        event_name, event_data = self.event_service.publish_sync.call_args.args
+        assert event_name == MeshEvents.NEW_MESSAGE
+        assert event_data["message_text"] == "unrelated cli"
 
     @pytest.mark.asyncio
     async def test_call_with_short_payload(self):
@@ -894,6 +995,19 @@ class TestLoginResponseHandler:
         assert self.handler.log == self.log_fn
         assert self.handler.local_identity == self.local_identity
         assert self.handler.local_identity == self.local_identity
+
+    def test_register_login_callback_identity_guard(self):
+        """Pending logins are keyed by full pubkey; removal is identity-guarded."""
+        callback = MagicMock()
+        pubkey = bytes(range(32))
+        self.handler.register_login_callback(pubkey, callback)
+        assert self.handler._pending_logins[pubkey] is callback
+        # A different callback (e.g. a newer login's cleanup racing an older
+        # one) must not clear this entry.
+        self.handler.remove_login_callback(pubkey, MagicMock())
+        assert self.handler._pending_logins[pubkey] is callback
+        self.handler.remove_login_callback(pubkey, callback)
+        assert pubkey not in self.handler._pending_logins
 
 
 # Protocol Response Handler Tests

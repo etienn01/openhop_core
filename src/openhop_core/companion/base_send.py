@@ -830,7 +830,8 @@ class _SendOpsMixin:
             login_result["data"] = data
             login_event.set()
 
-        login_handler.set_login_callback(_login_cb)
+        login_target_key = proxy.public_key_bytes
+        login_handler.register_login_callback(login_target_key, _login_cb)
 
         async def _wait_login(timeout_s: float) -> dict:
             try:
@@ -850,7 +851,7 @@ class _SendOpsMixin:
         login_sent_tag = int.from_bytes(proxy.public_key_bytes[:4], "little")
 
         def _cleanup_login() -> None:
-            login_handler.set_login_callback(None)
+            login_handler.remove_login_callback(login_target_key, _login_cb)
             login_handler.clear_login_password(dest_hash)
 
         # MeshCore exposes the first four public-key bytes as the login SENT
@@ -1303,7 +1304,8 @@ class _SendOpsMixin:
             response_data["success"] = True
             response_event.set()
 
-        text_handler.set_command_response_callback(_response_cb)
+        target_key = proxy.public_key_bytes
+        text_handler.register_command_response(target_key, _response_cb)
         try:
             msg_type = "flood" if proxy.out_path_len < 0 else "direct"
             pkt, _ = PacketBuilder.create_text_message(
@@ -1331,7 +1333,7 @@ class _SendOpsMixin:
             logger.error("Repeater command error: %s", e)
             return {"success": False, "reason": str(e)}
         finally:
-            text_handler.set_command_response_callback(None)
+            text_handler.unregister_command_response(target_key, _response_cb)
 
     def _track_pending_ack(self, ack_crc: int) -> None:
         """Record a pending expected ACK with its send time (send_confirmed).

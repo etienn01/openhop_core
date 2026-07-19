@@ -1,6 +1,7 @@
 """Tests for CompanionRadio (stand-alone companion with radio)."""
 
 import asyncio
+import struct
 
 import pytest
 
@@ -8,8 +9,17 @@ from openhop_core.companion import CompanionRadio
 from openhop_core.companion.constants import ADV_TYPE_CHAT
 from openhop_core.companion.models import Contact
 from openhop_core.companion.timing import estimate_airtime_ms
-from openhop_core.protocol import LocalIdentity, Packet, PacketBuilder
-from openhop_core.protocol.constants import PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_ADVERT, ROUTE_TYPE_FLOOD
+from openhop_core.node.events import MeshEvents
+from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
+from openhop_core.protocol.constants import (
+    PAYLOAD_TYPE_ACK,
+    PAYLOAD_TYPE_ADVERT,
+    PAYLOAD_TYPE_RESPONSE,
+    ROUTE_TYPE_DIRECT,
+    ROUTE_TYPE_FLOOD,
+    TXT_TYPE_CLI_DATA,
+    TXT_TYPE_PLAIN,
+)
 
 
 def _make_peer_contact(name: str) -> Contact:
@@ -497,9 +507,11 @@ class TestCompanionLoginRetry:
 
         handler = comp._get_login_response_handler()
         captured = {}
-        orig_set = handler.set_login_callback
+        orig_set = handler.register_login_callback
         monkeypatch.setattr(
-            handler, "set_login_callback", lambda cb: (captured.__setitem__("cb", cb), orig_set(cb))
+            handler,
+            "register_login_callback",
+            lambda pubkey, cb: (captured.__setitem__("cb", cb), orig_set(pubkey, cb)),
         )
 
         calls = {"n": 0}
@@ -556,3 +568,385 @@ class TestCompanionLoginRetry:
         assert sent.timeout_ms == 10
         result = await started["task"]
         assert result["success"] is False
+
+
+# ---------------------------------------------------------------------------
+# Repeater-command response correlation (drives the real text handler)
+# ---------------------------------------------------------------------------
+
+
+def _distinct_peers(names, avoid=()):
+    """Return [(identity, Contact)] whose pubkey first bytes are all distinct.
+
+    Distinct first bytes keep the 1-byte src/dest hashes from colliding so each
+    test observation is attributable to exactly one peer.
+    """
+    peers = []
+    seen = set(avoid)
+    for name in names:
+        while True:
+            ident = LocalIdentity()
+            first = ident.get_public_key()[0]
+            if first not in seen:
+                seen.add(first)
+                peers.append((ident, Contact(public_key=ident.get_public_key(), name=name)))
+                break
+    return peers
+
+
+def _build_direct_dm(sender_identity, receiver_pubkey: bytes, text: str, txt_type: int):
+    """Build a real encrypted direct DM from ``sender_identity`` to ``receiver_pubkey``."""
+
+    class _Receiver:
+        public_key = receiver_pubkey.hex()
+        out_path = []
+        out_path_len = -1
+
+    pkt, _ = PacketBuilder.create_text_message(
+        _Receiver(),
+        sender_identity,
+        text,
+        attempt=0,
+        message_type="direct",
+        txt_type=txt_type,
+    )
+    return pkt
+
+
+class _EventRecorder:
+    """Minimal event-service stub recording publish_sync calls."""
+
+    def __init__(self):
+        self.events = []
+
+    def publish_sync(self, name, data):
+        self.events.append((name, data))
+
+
+def _shorten_command_timeout(monkeypatch, timeouts):
+    """Shrink send_repeater_command's fixed 15 s response window for tests.
+
+    ``timeouts`` is a list consumed once per command (in start order); other
+    ``asyncio.wait_for`` timeouts pass through untouched.
+    """
+    remaining = list(timeouts)
+    real_wait_for = asyncio.wait_for
+
+    async def fast_wait_for(awaitable, timeout):
+        if timeout == 15.0 and remaining:
+            timeout = remaining.pop(0)
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", fast_wait_for)
+
+
+async def _wait_until(predicate, timeout_s=2.0):
+    """Poll ``predicate`` until true (or fail the test after ``timeout_s``)."""
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while not predicate():
+        assert asyncio.get_event_loop().time() < deadline, "condition not reached in time"
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+class TestRepeaterCommandCorrelation:
+    """send_repeater_command must only consume CLI_DATA replies from its target."""
+
+    def _setup(self, names):
+        radio = MockRadio()
+        identity = LocalIdentity()
+        comp = CompanionRadio(radio, identity)
+        peers = _distinct_peers(names, avoid={identity.get_public_key()[0]})
+        for _, contact in peers:
+            comp.contacts.add(contact)
+        return radio, identity, comp, peers
+
+    async def test_plain_dm_during_pending_command_is_delivered_not_swallowed(self, monkeypatch):
+        """[fails pre-fix] An unrelated plain DM during a command window is delivered
+        as a normal message and the command times out instead of resolving with it."""
+        radio, identity, comp, peers = self._setup(["Rpt", "Friend"])
+        (_, rpt_contact), (friend_identity, _) = peers
+        handler = comp._get_text_handler()
+        recorder = _EventRecorder()
+        monkeypatch.setattr(handler, "event_service", recorder)
+        _shorten_command_timeout(monkeypatch, [0.5])
+
+        task = asyncio.create_task(comp.send_repeater_command(rpt_contact.public_key, "ver"))
+        await _wait_until(lambda: len(radio.sent) >= 1)
+
+        dm = _build_direct_dm(
+            friend_identity, identity.get_public_key(), "hello there", TXT_TYPE_PLAIN
+        )
+        await handler(dm)
+
+        new_messages = [d for n, d in recorder.events if n == MeshEvents.NEW_MESSAGE]
+        assert len(new_messages) == 1
+        assert new_messages[0]["message_text"] == "hello there"
+        assert new_messages[0]["contact_name"] == "Friend"
+
+        result = await task
+        assert result["success"] is False
+        assert result["response"] is None
+
+    @pytest.mark.parametrize("first_reply", ["a", "b"])
+    async def test_overlapping_commands_resolve_with_own_replies(self, monkeypatch, first_reply):
+        """[fails pre-fix] Two overlapping commands each resolve with the reply from
+        their own target, whichever reply arrives first."""
+        radio, identity, comp, peers = self._setup(["RptA", "RptB"])
+        (a_identity, a_contact), (b_identity, b_contact) = peers
+        handler = comp._get_text_handler()
+        _shorten_command_timeout(monkeypatch, [0.5, 0.5])
+
+        task_a = asyncio.create_task(comp.send_repeater_command(a_contact.public_key, "ver"))
+        await _wait_until(lambda: len(radio.sent) >= 1)
+        task_b = asyncio.create_task(comp.send_repeater_command(b_contact.public_key, "ver"))
+        await _wait_until(lambda: len(radio.sent) >= 2)
+
+        reply_a = _build_direct_dm(
+            a_identity, identity.get_public_key(), "reply-A", TXT_TYPE_CLI_DATA
+        )
+        reply_b = _build_direct_dm(
+            b_identity, identity.get_public_key(), "reply-B", TXT_TYPE_CLI_DATA
+        )
+        for reply in [reply_a, reply_b] if first_reply == "a" else [reply_b, reply_a]:
+            await handler(reply)
+
+        result_a = await task_a
+        result_b = await task_b
+        assert result_a["success"] is True
+        assert result_a["response"] == "reply-A"
+        assert result_b["success"] is True
+        assert result_b["response"] == "reply-B"
+
+    async def test_old_command_timeout_does_not_clear_newer_pending(self, monkeypatch):
+        """[fails pre-fix] A timed-out older command's cleanup leaves a newer
+        command's pending response registration intact."""
+        radio, identity, comp, peers = self._setup(["RptA", "RptB"])
+        (_, a_contact), (b_identity, b_contact) = peers
+        handler = comp._get_text_handler()
+        _shorten_command_timeout(monkeypatch, [0.2, 2.0])
+
+        task_a = asyncio.create_task(comp.send_repeater_command(a_contact.public_key, "ver"))
+        await _wait_until(lambda: len(radio.sent) >= 1)
+        task_b = asyncio.create_task(comp.send_repeater_command(b_contact.public_key, "ver"))
+        await _wait_until(lambda: len(radio.sent) >= 2)
+
+        result_a = await task_a  # times out; its cleanup runs
+        assert result_a["success"] is False
+
+        reply_b = _build_direct_dm(
+            b_identity, identity.get_public_key(), "reply-B", TXT_TYPE_CLI_DATA
+        )
+        await handler(reply_b)
+
+        result_b = await task_b
+        assert result_b["success"] is True
+        assert result_b["response"] == "reply-B"
+
+    async def test_cli_data_without_pending_command_is_delivered_normally(self, monkeypatch):
+        """CLI_DATA from a contact with no pending command is a normal message
+        (firmware queues it to the client rather than dropping it)."""
+        radio, identity, comp, peers = self._setup(["Rpt"])
+        (rpt_identity, _) = peers[0]
+        handler = comp._get_text_handler()
+        recorder = _EventRecorder()
+        monkeypatch.setattr(handler, "event_service", recorder)
+
+        pkt = _build_direct_dm(
+            rpt_identity, identity.get_public_key(), "unsolicited", TXT_TYPE_CLI_DATA
+        )
+        await handler(pkt)
+
+        new_messages = [d for n, d in recorder.events if n == MeshEvents.NEW_MESSAGE]
+        assert len(new_messages) == 1
+        assert new_messages[0]["message_text"] == "unsolicited"
+
+    async def test_single_command_happy_path(self, monkeypatch):
+        """A single command resolves with its target's CLI_DATA reply."""
+        radio, identity, comp, peers = self._setup(["Rpt"])
+        (rpt_identity, rpt_contact) = peers[0]
+        handler = comp._get_text_handler()
+        _shorten_command_timeout(monkeypatch, [1.0])
+
+        task = asyncio.create_task(comp.send_repeater_command(rpt_contact.public_key, "ver"))
+        await _wait_until(lambda: len(radio.sent) >= 1)
+
+        reply = _build_direct_dm(
+            rpt_identity, identity.get_public_key(), "fw v1.2.3", TXT_TYPE_CLI_DATA
+        )
+        await handler(reply)
+
+        result = await task
+        assert result["success"] is True
+        assert result["response"] == "fw v1.2.3"
+        assert result["repeater"] == "Rpt"
+
+
+# ---------------------------------------------------------------------------
+# Login response correlation (drives the real login_response handler)
+# ---------------------------------------------------------------------------
+
+
+def _build_login_response_packet(
+    server_identity,
+    comp_identity,
+    *,
+    response_code=0x80,
+    keep_alive=4,
+    is_admin=1,
+    permissions=3,
+    timestamp=1000,
+):
+    """Build a real encrypted RESPONSE packet as a firmware server would emit."""
+    shared_secret = Identity(server_identity.get_public_key()).calc_shared_secret(
+        comp_identity.get_private_key()
+    )
+    plaintext = (
+        struct.pack("<IBBBB", timestamp, response_code, keep_alive, is_admin, permissions)
+        + b"\x00\x00\x00\x00"  # random blob
+    )
+    encrypted = CryptoUtils.encrypt_then_mac(shared_secret[:16], shared_secret, plaintext)
+    payload = (
+        bytes([comp_identity.get_public_key()[0], server_identity.get_public_key()[0]]) + encrypted
+    )
+    pkt = Packet()
+    pkt.header = ROUTE_TYPE_DIRECT | (PAYLOAD_TYPE_RESPONSE << 2)
+    pkt.path_len = 0
+    pkt.path = bytearray()
+    pkt.payload = bytearray(payload)
+    pkt.payload_len = len(payload)
+    return pkt
+
+
+@pytest.mark.asyncio
+class TestLoginResponseCorrelation:
+    """send_login completions must be correlated to the responding contact."""
+
+    def _setup(self, names):
+        radio = MockRadio()
+        identity = LocalIdentity()
+        comp = CompanionRadio(radio, identity)
+        peers = _distinct_peers(names, avoid={identity.get_public_key()[0]})
+        for _, contact in peers:
+            comp.contacts.add(contact)
+        return radio, identity, comp, peers
+
+    @pytest.mark.parametrize("first_response", ["a", "b"])
+    async def test_concurrent_logins_resolve_with_own_responses(self, monkeypatch, first_response):
+        """[fails pre-fix] Concurrent logins to two servers each resolve only with
+        their own server's response data, whichever response arrives first."""
+        radio, identity, comp, peers = self._setup(["RptA", "RptB"])
+        (a_identity, a_contact), (b_identity, b_contact) = peers
+        monkeypatch.setattr(comp, "_response_timeout_s", lambda pkt, proxy: 0.5)
+        handler = comp._get_login_response_handler()
+
+        task_a = asyncio.create_task(comp.send_login(a_contact.public_key, "pw-a"))
+        await _wait_until(lambda: len(radio.sent) >= 1)
+        task_b = asyncio.create_task(comp.send_login(b_contact.public_key, "pw-b"))
+        await _wait_until(lambda: len(radio.sent) >= 2)
+
+        resp_a = _build_login_response_packet(
+            a_identity, identity, is_admin=1, keep_alive=4, timestamp=111
+        )
+        resp_b = _build_login_response_packet(
+            b_identity, identity, is_admin=0, keep_alive=8, timestamp=222
+        )
+        for resp in [resp_a, resp_b] if first_response == "a" else [resp_b, resp_a]:
+            await handler(resp)
+
+        result_a = await task_a
+        result_b = await task_b
+        assert result_a["success"] is True
+        assert result_a["repeater"] == "RptA"
+        assert result_a["is_admin"] is True
+        assert result_a["keep_alive_interval"] == 4
+        assert result_a["tag"] == 111
+        assert result_b["success"] is True
+        assert result_b["repeater"] == "RptB"
+        assert result_b["is_admin"] is False
+        assert result_b["keep_alive_interval"] == 8
+        assert result_b["tag"] == 222
+
+    async def test_login_timeout_does_not_cancel_other_pending_login(self, monkeypatch):
+        """[fails pre-fix] Login A timing out (and cleaning up) leaves login B's
+        pending completion intact; B still resolves from its own response."""
+        radio, identity, comp, peers = self._setup(["RptA", "RptB"])
+        (_, a_contact), (b_identity, b_contact) = peers
+        a_key_hex = a_contact.public_key.hex()
+        monkeypatch.setattr(
+            comp,
+            "_response_timeout_s",
+            lambda pkt, proxy: 0.05 if proxy.public_key == a_key_hex else 0.5,
+        )
+        handler = comp._get_login_response_handler()
+
+        task_a = asyncio.create_task(comp.send_login(a_contact.public_key, "pw-a"))
+        await _wait_until(lambda: len(radio.sent) >= 1)
+        task_b = asyncio.create_task(comp.send_login(b_contact.public_key, "pw-b"))
+        await _wait_until(lambda: len(radio.sent) >= 2)
+
+        result_a = await task_a  # exhausts its retry budget; cleanup runs
+        assert result_a["success"] is False
+
+        resp_b = _build_login_response_packet(b_identity, identity, is_admin=1, timestamp=222)
+        await handler(resp_b)
+
+        result_b = await task_b
+        assert result_b["success"] is True
+        assert result_b["repeater"] == "RptB"
+        assert result_b["is_admin"] is True
+
+    async def test_response_without_pending_login_resolves_nothing(self, monkeypatch):
+        """A login response from a contact with no pending login resolves no waiter
+        and leaves other pending logins intact."""
+        radio, identity, comp, peers = self._setup(["RptA", "Stale"])
+        (a_identity, a_contact), (stale_identity, stale_contact) = peers
+        monkeypatch.setattr(comp, "_response_timeout_s", lambda pkt, proxy: 0.5)
+        handler = comp._get_login_response_handler()
+        # Stale state: a stored password but no pending completion for this contact.
+        handler.store_login_password(stale_contact.public_key[0], "old-pw")
+
+        task_a = asyncio.create_task(comp.send_login(a_contact.public_key, "pw-a"))
+        await _wait_until(lambda: len(radio.sent) >= 1)
+
+        stale_resp = _build_login_response_packet(stale_identity, identity, timestamp=999)
+        await handler(stale_resp)
+        await asyncio.sleep(0.05)
+        assert not task_a.done()  # A's waiter was not resolved by the stale response
+
+        resp_a = _build_login_response_packet(a_identity, identity, timestamp=111)
+        await handler(resp_a)
+        result_a = await task_a
+        assert result_a["success"] is True
+        assert result_a["tag"] == 111
+
+    async def test_single_login_happy_and_failed_paths(self, monkeypatch):
+        """A single login resolves success from an OK response and failure from a
+        rejection response (both via the real handler)."""
+        radio, identity, comp, peers = self._setup(["Rpt"])
+        (rpt_identity, rpt_contact) = peers[0]
+        monkeypatch.setattr(comp, "_response_timeout_s", lambda pkt, proxy: 0.5)
+        handler = comp._get_login_response_handler()
+
+        task = asyncio.create_task(comp.send_login(rpt_contact.public_key, "pw"))
+        await _wait_until(lambda: len(radio.sent) >= 1)
+        ok = _build_login_response_packet(
+            rpt_identity, identity, response_code=0x80, is_admin=1, keep_alive=4, timestamp=42
+        )
+        await handler(ok)
+        result = await task
+        assert result["success"] is True
+        assert result["is_admin"] is True
+        assert result["tag"] == 42
+        assert comp.has_login_connection(rpt_contact.public_key) is True
+
+        sent_before = len(radio.sent)
+        task = asyncio.create_task(comp.send_login(rpt_contact.public_key, "wrong"))
+        await _wait_until(lambda: len(radio.sent) > sent_before)
+        rejected = _build_login_response_packet(
+            rpt_identity, identity, response_code=0x01, is_admin=0, timestamp=43
+        )
+        await handler(rejected)
+        result = await task
+        assert result["success"] is False
+        assert result["reason"] == "Login failed"
