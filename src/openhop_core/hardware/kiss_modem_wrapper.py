@@ -32,12 +32,17 @@ RxCallback = Union[
 
 
 def _invoke_rx_callback(
-    callback: RxCallback,
+    callback: Optional[RxCallback],
     data: bytes,
     rssi: int,
     snr: float,
 ) -> None:
-    """Invoke RX callback with 1 or 3 args depending on what it accepts."""
+    """Invoke RX callback with 1 or 3 args depending on what it accepts.
+
+    Tolerates ``None`` (a callback cleared between dispatch and invoke).
+    """
+    if callback is None:
+        return
     try:
         sig = inspect.signature(callback)
         nparams = len([p for p in sig.parameters if p != "self"])
@@ -1932,13 +1937,17 @@ class KissModemWrapper(LoRaRadio):
             rssi: RSSI in dBm
             snr: SNR in dB
         """
-        if self.on_frame_received is None:
+        # Snapshot once: the callback can be cleared concurrently (dispatcher
+        # RX disarm, wait_for_rx swap), so re-reading the attribute at invoke
+        # time could hand _invoke_rx_callback a None mid-race.
+        callback = self.on_frame_received
+        if callback is None:
             return
 
         if self._event_loop is not None:
             try:
                 self._event_loop.call_soon_threadsafe(
-                    lambda: _invoke_rx_callback(self.on_frame_received, data, rssi, snr)
+                    lambda: _invoke_rx_callback(callback, data, rssi, snr)
                 )
             except RuntimeError as e:
                 logger.warning(f"Failed to schedule RX callback on event loop: {e}")
@@ -1946,12 +1955,10 @@ class KissModemWrapper(LoRaRadio):
             # We're in the RX thread; run callback in executor so we don't block reading
             if self._callback_executor is None:
                 self._callback_executor = ThreadPoolExecutor(max_workers=1)
-            self._callback_executor.submit(
-                _invoke_rx_callback, self.on_frame_received, data, rssi, snr
-            )
+            self._callback_executor.submit(_invoke_rx_callback, callback, data, rssi, snr)
         else:
             # Called from main thread (e.g. unit test); invoke directly
-            _invoke_rx_callback(self.on_frame_received, data, rssi, snr)
+            _invoke_rx_callback(callback, data, rssi, snr)
 
     def _process_received_frame(self):
         """Process a complete received KISS frame (spec: type byte = port | cmd)."""

@@ -753,12 +753,14 @@ class KissSerialWrapper(LoRaRadio):
         data = bytes(self.rx_frame_buffer[1:])
 
         if cmd == KISS_CMD_DATA:
-            # Data frame - emit to callback
-            if self.on_frame_received and len(data) > 0:
+            # Data frame - emit to callback. Snapshot once: the callback can be
+            # cleared concurrently (dispatcher RX disarm, wait_for_rx swap).
+            callback = self.on_frame_received
+            if callback and len(data) > 0:
                 self.stats["frames_received"] += 1
                 self.stats["bytes_received"] += len(data)
                 try:
-                    self.on_frame_received(data)
+                    callback(data)
                 except Exception as e:
                     logger.error(f"Error in frame received callback: {e}")
         else:

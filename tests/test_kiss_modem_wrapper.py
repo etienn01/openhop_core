@@ -2313,3 +2313,45 @@ class TestBulkDecodeEquivalence:
                 chunks.append(size)
                 remaining -= size
             self._assert_equiv(stream, chunks)
+
+
+class TestRxCallbackDisarmRace:
+    """RX dispatch must tolerate the callback being cleared concurrently.
+
+    The dispatcher's RX disarm (and wait_for_rx's callback swap) can null
+    on_frame_received between the dispatch-time guard and the deferred
+    invoke, so dispatch must act on a snapshot, never a re-read.
+    """
+
+    def test_invoke_rx_callback_tolerates_none(self):
+        from openhop_core.hardware.kiss_modem_wrapper import _invoke_rx_callback
+
+        _invoke_rx_callback(None, b"data", -50, 7.5)  # must not raise
+
+    def test_event_loop_dispatch_uses_snapshotted_callback(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        scheduled = []
+        fake_loop = MagicMock()
+        fake_loop.call_soon_threadsafe.side_effect = lambda fn, *a: scheduled.append((fn, a))
+        modem.set_event_loop(fake_loop)
+        received = []
+        modem.on_frame_received = lambda data: received.append(data)
+
+        modem._dispatch_rx_callback(b"payload", -50, 7.5)
+        # Callback cleared (e.g. dispatcher RX disarm) before the loop drains.
+        modem.on_frame_received = None
+
+        assert len(scheduled) == 1
+        fn, args = scheduled[0]
+        fn(*args)  # must invoke the snapshot, not re-read the cleared attribute
+        assert received == [b"payload"]
+
+    def test_dispatch_returns_quietly_when_callback_already_none(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        fake_loop = MagicMock()
+        modem.set_event_loop(fake_loop)
+        modem.on_frame_received = None
+
+        modem._dispatch_rx_callback(b"payload", -50, 7.5)  # must not raise
+
+        fake_loop.call_soon_threadsafe.assert_not_called()
