@@ -924,6 +924,15 @@ they explode the event into the legacy positional form shown below.
 | `on_binary_response` | `(tag: bytes, data: bytes, parsed: dict\|None, request_type: int\|None)` |
 | `on_path_discovery_response` | `(tag: bytes, contact_pubkey: bytes, out_path: bytes, in_path: bytes)` |
 
+!!! warning "Do not combine direct push callbacks with a frame server"
+    `CompanionFrameServer` owns the bridge's push-callback registry: each
+    client connection clears **all** registered push callbacks and installs
+    its own set, so registrations made directly on the bridge are removed on
+    the next (re)connect and never restored. Run either a frame server or
+    direct push subscriptions on a given bridge, not both. To observe events
+    alongside a frame server, consume them from the frame protocol as a
+    client, or subclass the frame server and extend its own callback set.
+
 ---
 
 ## Models Reference
