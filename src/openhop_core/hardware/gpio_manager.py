@@ -24,9 +24,7 @@ try:
         import sys as _sys
 
         _cdev_mod = _sys.modules.get(GPIO.__module__, None)
-        if _cdev_mod is not None and hasattr(
-            _cdev_mod, "_GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME"
-        ):
+        if _cdev_mod is not None and hasattr(_cdev_mod, "_GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME"):
             _cdev_mod._GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME = 0
         elif hasattr(GPIO, "_GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME"):
             GPIO._GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME = 0
@@ -93,9 +91,7 @@ class GPIOPinManager:
                 self._backend = "gpiod"
 
                 class GpiodGPIO:
-                    def __init__(
-                        self, chip_path, lineoffset, direction, bias=None, edge=None
-                    ):
+                    def __init__(self, chip_path, lineoffset, direction, bias=None, edge=None):
                         # chip_path is like '/dev/gpiochip0' — use it directly
                         try:
                             self._chip = gpiod.Chip(chip_path)
@@ -141,9 +137,7 @@ class GPIOPinManager:
                                 if req_type is None:
                                     req_type = 1 if direction == "out" else 0
                                 try:
-                                    self._line.request(
-                                        consumer=self._consumer, type=req_type
-                                    )
+                                    self._line.request(consumer=self._consumer, type=req_type)
                                     requested = True
                                 except Exception:
                                     # try request with older API
@@ -189,16 +183,10 @@ class GPIOPinManager:
         self._gpio_chip = self._resolve_gpio_chip(gpio_chip)
         self._pins: Dict[int, GPIO] = {}
         self._led_threads: Dict[int, threading.Thread] = {}  # Track active LED threads
-        self._led_stop_events: Dict[
-            int, threading.Event
-        ] = {}  # Stop events for LED threads
+        self._led_stop_events: Dict[int, threading.Event] = {}  # Stop events for LED threads
         self._input_callbacks: Dict[int, Callable] = {}  # Track input pin callbacks
-        self._edge_threads: Dict[
-            int, threading.Thread
-        ] = {}  # Track edge detection threads
-        self._edge_stop_events: Dict[
-            int, threading.Event
-        ] = {}  # Stop events for edge threads
+        self._edge_threads: Dict[int, threading.Thread] = {}  # Track edge detection threads
+        self._edge_stop_events: Dict[int, threading.Event] = {}  # Stop events for edge threads
 
         logger.debug(
             f"GPIO Manager initialized with chip: {self._gpio_chip} using backend: {self._backend}"
@@ -231,9 +219,7 @@ class GPIOPinManager:
             line = pin_number % 32
             chip = f"/dev/gpiochip{bank}"
             if os.path.exists(chip):
-                logger.debug(
-                    "Mapped global GPIO %s to %s line %s", pin_number, chip, line
-                )
+                logger.debug("Mapped global GPIO %s to %s line %s", pin_number, chip, line)
                 return chip, line
         return self._gpio_chip, pin_number
 
@@ -259,16 +245,12 @@ class GPIOPinManager:
             gpio.write(initial_value)
             self._pins[pin_number] = gpio
 
-            logger.debug(
-                f"Output pin {pin_number} configured (initial={initial_value})"
-            )
+            logger.debug(f"Output pin {pin_number} configured (initial={initial_value})")
             return True
         except Exception as e:
             error_msg = str(e).lower()
             if "busy" in error_msg or "device or resource busy" in error_msg:
-                logger.error(
-                    f"GPIO pin {pin_number} is already in use by another process: {e}"
-                )
+                logger.error(f"GPIO pin {pin_number} is already in use by another process: {e}")
                 print(f"\nFATAL: GPIO Pin {pin_number} is already in use")
                 print("━" * 60)
                 print("The pin is being used by another process.")
@@ -354,9 +336,7 @@ class GPIOPinManager:
         except Exception as e:
             error_msg = str(e).lower()
             if "busy" in error_msg or "device or resource busy" in error_msg:
-                logger.error(
-                    f"GPIO pin {pin_number} is already in use by another process: {e}"
-                )
+                logger.error(f"GPIO pin {pin_number} is already in use by another process: {e}")
                 print(f"\nFATAL: GPIO Pin {pin_number} is already in use")
                 print("━" * 60)
                 print("The pin is being used by another process.")
@@ -547,9 +527,7 @@ class GPIOPinManager:
         except Exception as e:
             logger.error(f"Polling detection error for pin {pin_number}: {e}")
 
-    def _monitor_edge_events(
-        self, pin_number: int, stop_event: threading.Event
-    ) -> None:
+    def _monitor_edge_events(self, pin_number: int, stop_event: threading.Event) -> None:
         """Monitor hardware edge events using poll() for interrupts"""
         try:
             gpio = self._pins.get(pin_number)

@@ -174,9 +174,7 @@ def create_radio(
                 "host": os.environ.get("PYMC_TCP_HOST", ""),
                 "port": int(os.environ.get("PYMC_TCP_PORT", 5055)),
                 "token": os.environ.get("PYMC_TCP_TOKEN", ""),
-                "connect_timeout": float(
-                    os.environ.get("PYMC_TCP_CONNECT_TIMEOUT", 5.0)
-                ),
+                "connect_timeout": float(os.environ.get("PYMC_TCP_CONNECT_TIMEOUT", 5.0)),
                 "frequency": int(os.environ.get("LORA_FREQ", 869618000)),
                 "bandwidth": int(os.environ.get("LORA_BW", 62500)),
                 "spreading_factor": int(os.environ.get("LORA_SF", 8)),
@@ -190,8 +188,7 @@ def create_radio(
 
             if not tcp_config["host"]:
                 raise ValueError(
-                    "pymc_tcp radio requires PYMC_TCP_HOST env var — "
-                    "modem hostname or LAN IP."
+                    "pymc_tcp radio requires PYMC_TCP_HOST env var — " "modem hostname or LAN IP."
                 )
 
             radio = TCPLoRaRadio(**tcp_config)
@@ -210,7 +207,7 @@ def create_radio(
 
             # Default: EU/UK (Narrow), Switzerland preset
             usb_config = {
-                "port": serial_port,          # e.g. /dev/ttyACM0
+                "port": serial_port,  # e.g. /dev/ttyACM0
                 "baudrate": 921600,
                 "frequency": int(os.environ.get("LORA_FREQ", 869618000)),
                 "bandwidth": int(os.environ.get("LORA_BW", 62500)),

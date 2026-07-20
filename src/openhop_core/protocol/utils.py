@@ -91,9 +91,7 @@ def parse_advert_payload(payload: bytes):
             f"Advert payload too short: {len(payload)} bytes (minimum expected: {min_len})"
         )
     pubkey = payload[:PUB_KEY_SIZE]
-    timestamp = int.from_bytes(
-        payload[PUB_KEY_SIZE : PUB_KEY_SIZE + TIMESTAMP_SIZE], "little"
-    )
+    timestamp = int.from_bytes(payload[PUB_KEY_SIZE : PUB_KEY_SIZE + TIMESTAMP_SIZE], "little")
     sig_start = PUB_KEY_SIZE + TIMESTAMP_SIZE
     signature = payload[sig_start : sig_start + SIGNATURE_SIZE]
     appdata = payload[sig_start + SIGNATURE_SIZE :]

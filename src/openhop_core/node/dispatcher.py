@@ -106,9 +106,9 @@ class Dispatcher:
         self._raw_rx_subscribers: List[Callable[..., Any]] = []
 
         self._handlers: dict[int, Any] = {}  # Keep track of packet handlers
-        self._handler_instances: dict[
-            int, Any
-        ] = {}  # Store actual handler objects for method access
+        self._handler_instances: dict[int, Any] = (
+            {}
+        )  # Store actual handler objects for method access
 
         # Handler references for companion-layer access; populated by
         # register_default_handlers(). Declared here so callers can rely on

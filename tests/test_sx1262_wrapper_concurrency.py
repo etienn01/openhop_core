@@ -1941,7 +1941,6 @@ class TestFIFOCorruptionRace:
         # (which happens inside _handle_interrupt), then restoring it so the
         # rest of send() works normally.
         call_count = [0]
-        original_side_effect = mock_lora.getIrqStatus.side_effect
 
         def _fail_first_irq_read():
             call_count[0] += 1

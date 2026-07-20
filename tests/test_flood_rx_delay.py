@@ -12,6 +12,7 @@ mechanism entirely.
 import asyncio
 
 import pytest
+
 from openhop_core.node.dispatcher import MAX_RX_DELAY_MS, Dispatcher
 from openhop_core.protocol import Packet
 from openhop_core.protocol.constants import (

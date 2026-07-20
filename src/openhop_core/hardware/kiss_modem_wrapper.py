@@ -1703,12 +1703,14 @@ class KissModemWrapper(LoRaRadio):
         status: Dict[str, Any] = {
             "initialized": self.is_connected,
             "frequency": cfg["frequency"] if cfg else self.radio_config.get("frequency", 0),
-            "tx_power": tx_power
-            if tx_power is not None
-            else self.radio_config.get("tx_power", self.radio_config.get("power", 0)),
-            "spreading_factor": cfg["spreading_factor"]
-            if cfg
-            else self.radio_config.get("spreading_factor", 0),
+            "tx_power": (
+                tx_power
+                if tx_power is not None
+                else self.radio_config.get("tx_power", self.radio_config.get("power", 0))
+            ),
+            "spreading_factor": (
+                cfg["spreading_factor"] if cfg else self.radio_config.get("spreading_factor", 0)
+            ),
             "bandwidth": cfg["bandwidth"] if cfg else self.radio_config.get("bandwidth", 0),
             "coding_rate": cfg["coding_rate"] if cfg else self.radio_config.get("coding_rate", 0),
             "last_rssi": self.stats.get("last_rssi", -999),

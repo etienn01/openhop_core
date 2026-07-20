@@ -9,13 +9,12 @@ and encryption to another node in the mesh network.
 import asyncio
 
 from common import create_mesh_node, print_packet_info
+
 from openhop_core.protocol import Packet
 from openhop_core.protocol.packet_builder import PacketBuilder
 
 
-async def send_text_message(
-    radio_type: str = "waveshare", serial_port: str = "/dev/ttyUSB0"
-):
+async def send_text_message(radio_type: str = "waveshare", serial_port: str = "/dev/ttyUSB0"):
     """Send a text message with CRC validation."""
     print("Starting text message send example...")
 
@@ -76,9 +75,7 @@ def main():
     """Main function for running the example."""
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Send a text message to the mesh network"
-    )
+    parser = argparse.ArgumentParser(description="Send a text message to the mesh network")
     parser.add_argument(
         "--radio-type",
         choices=["waveshare", "uconsole", "meshadv-mini", "kiss-tnc", "kiss-modem"],
