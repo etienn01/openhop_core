@@ -26,8 +26,10 @@ class MeshNode:
     Typical usage::
 
         node = MeshNode(radio, identity, config={...})
-        await node.start()       # blocks in dispatcher.run_forever()
-        node.stop()
+        task = asyncio.create_task(node.start())  # blocks in dispatcher.run_forever()
+        ...
+        await node.stop()
+        await task
     """
 
     def __init__(
@@ -89,16 +91,23 @@ class MeshNode:
         """Start the mesh node and begin processing radio communications.
 
         Enters the dispatcher's main event loop for handling incoming/outgoing
-        messages.  This method blocks until the node is stopped.
+        messages.  This method blocks until the node is stopped via
+        :meth:`stop` (typically called from another task).
         """
         await self.dispatcher.run_forever()
 
-    def stop(self):
-        """Stop the mesh node and clean up associated services."""
+    async def stop(self) -> None:
+        """Stop the mesh node: disarm RX and exit the dispatcher loop.
+
+        Does not close the radio; the caller owns hardware lifecycle.
+        Idempotent. In-flight packet tasks are not cancelled.
+        """
         try:
+            await self.dispatcher.stop()
             self.logger.info("Node stopped")
         except Exception as e:
             self.logger.error(f"Error stopping node: {e}")
+            raise
 
     # -------------------------------------------------------------------------
     # Transport

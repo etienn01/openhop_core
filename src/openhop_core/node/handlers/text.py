@@ -1,20 +1,21 @@
 import asyncio
 
-from ...protocol import (
-    CryptoUtils,
-    Identity,
-    Packet,
-    PacketBuilder,
-    PacketTimingUtils,
-    PathUtils,
-)
+from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder, PathUtils
 from ...protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_TXT_MSG,
+    TXT_TYPE_CLI_DATA,
     TXT_TYPE_PLAIN,
     TXT_TYPE_SIGNED_PLAIN,
 )
 from .base import BaseHandler
+from .result import HandlerResult
+
+# Fixed delay before a received DM's ACK response is transmitted, mirroring the
+# firmware TXT_ACK_DELAY (BaseChatMesh.cpp). This is the receiver's response delay
+# and is deliberately independent of the sender's airtime/route-timeout ACK-wait
+# estimation.
+TXT_ACK_DELAY_MS = 200
 
 # Stagger between a multi-ack and the normal ACK on a known direct route, mirroring the
 # firmware's `d += 300` in BaseChatMesh::sendAckTo.
@@ -40,15 +41,33 @@ class TextMessageHandler(BaseHandler):
         self.log = log_fn
         self.send_packet = send_packet_fn
         self.event_service = event_service  # Event service for broadcasting
-        self.command_response_callback = None  # Callback for command responses
-        self.radio_config = (
-            radio_config or {}
-        )  # Radio configuration for airtime calculations
+        # Pending repeater-command responses keyed by the target contact's full
+        # public key (32 bytes). A CLI_DATA reply is delivered to the waiter for
+        # its authenticated sender only; every other message flows to normal
+        # delivery, mirroring firmware BaseChatMesh (only TXT_TYPE_CLI_DATA from a
+        # known contact is routed to onCommandDataRecv).
+        self._pending_command_responses = {}  # pubkey bytes -> callback
+        self.radio_config = radio_config or {}  # Radio configuration for airtime calculations
         self.multi_acks = 0  # multi_acks pref (0=off); set via set_multi_acks()
 
-    def set_command_response_callback(self, callback):
-        """Set callback function for command responses."""
-        self.command_response_callback = callback
+    def register_command_response(self, pubkey: bytes, callback):
+        """Register a callback to receive the next CLI_DATA reply from ``pubkey``.
+
+        Keyed by the target's full public key (not the 1-byte dest hash, which
+        collides). One reply completes one command: the entry is removed when the
+        matching reply arrives.
+        """
+        self._pending_command_responses[bytes(pubkey)] = callback
+
+    def unregister_command_response(self, pubkey: bytes, callback) -> None:
+        """Remove the pending entry for ``pubkey`` only if it is ``callback``.
+
+        Identity-guarded so a timed-out command never clears a different command's
+        pending entry.
+        """
+        key = bytes(pubkey)
+        if self._pending_command_responses.get(key) is callback:
+            del self._pending_command_responses[key]
 
     def set_multi_acks(self, value: int) -> None:
         """Set the ``multi_acks`` preference (mirrors firmware getExtraAckTransmitCount)."""
@@ -112,11 +131,6 @@ class TextMessageHandler(BaseHandler):
           sender without a known reverse path).
         """
 
-        def airtime(pkt) -> float:
-            return PacketTimingUtils.estimate_airtime_ms(
-                len(pkt.write_to()), self.radio_config
-            )
-
         if is_flood:
             incoming_path = list(packet.path if hasattr(packet, "path") else [])
             path_len_encoded = (
@@ -133,9 +147,10 @@ class TextMessageHandler(BaseHandler):
                 extra=ack_hash,
                 path_len_encoded=path_len_encoded,
             )
-            delay_ms = PacketTimingUtils.calc_flood_timeout_ms(airtime(ack_packet))
-            self.log(f"FLOOD ACK timing - delay:{delay_ms:.1f}ms")
-            return [(ack_packet, delay_ms / 1000.0)]
+            # Firmware sends the flood PATH-return (carrying the ACK) via
+            # sendFloodScoped(from, path, TXT_ACK_DELAY).
+            self.log(f"FLOOD ACK timing - delay:{TXT_ACK_DELAY_MS}ms")
+            return [(ack_packet, TXT_ACK_DELAY_MS / 1000.0)]
 
         # DIRECT
         out_path_len = getattr(matched_contact, "out_path_len", -1)
@@ -151,35 +166,29 @@ class TextMessageHandler(BaseHandler):
             # known reverse path (mirrors firmware sendAckTo OUT_PATH_UNKNOWN -> sendFloodScoped;
             # a path-less direct ACK would not be relayed past direct neighbours). The
             # dispatcher applies flood scope at send time.
-            ack_packet = PacketBuilder.create_ack_from_bytes(
-                ack_hash, route_type="flood"
-            )
-            delay_ms = PacketTimingUtils.calc_flood_timeout_ms(airtime(ack_packet))
-            self.log(f"FLOOD ACK timing (no out_path) - delay:{delay_ms:.1f}ms")
-            return [(ack_packet, delay_ms / 1000.0)]
+            ack_packet = PacketBuilder.create_ack_from_bytes(ack_hash, route_type="flood")
+            # Firmware sendAckTo with OUT_PATH_UNKNOWN floods the ACK at TXT_ACK_DELAY.
+            self.log(f"FLOOD ACK timing (no out_path) - delay:{TXT_ACK_DELAY_MS}ms")
+            return [(ack_packet, TXT_ACK_DELAY_MS / 1000.0)]
 
         out_path = bytes(out_path_raw)
         path_hops = PathUtils.get_path_hash_count(out_path_len)
         ack_packet = PacketBuilder.create_ack_from_bytes(
             ack_hash, path=out_path, path_len_encoded=out_path_len
         )
-        base_delay_ms = PacketTimingUtils.calc_direct_timeout_ms(
-            airtime(ack_packet), path_hops
-        )
+        # Firmware sendAckTo (known out_path) sends the routed ACK at TXT_ACK_DELAY.
+        base_delay_ms = TXT_ACK_DELAY_MS
 
         if self.multi_acks <= 0:
-            self.log(
-                f"DIRECT ACK timing (routed) - delay:{base_delay_ms:.1f}ms, hops:{path_hops}"
-            )
+            self.log(f"DIRECT ACK timing (routed) - delay:{base_delay_ms}ms, hops:{path_hops}")
             return [(ack_packet, base_delay_ms / 1000.0)]
 
-        # multi-ack fires at the base delay; the normal ACK is staggered later
+        # multi-ack fires at TXT_ACK_DELAY; the normal ACK is staggered +300ms later
+        # (firmware sendAckTo: d = TXT_ACK_DELAY, then d += 300 for the second send).
         multi_packet = PacketBuilder.create_multi_ack(
             ack_hash, remaining=1, path=out_path, path_len_encoded=out_path_len
         )
-        self.log(
-            f"DIRECT multi-ack timing - base_delay:{base_delay_ms:.1f}ms, hops:{path_hops}"
-        )
+        self.log(f"DIRECT multi-ack timing - base_delay:{base_delay_ms}ms, hops:{path_hops}")
         return [
             (multi_packet, base_delay_ms / 1000.0),
             (ack_packet, (base_delay_ms + MULTI_ACK_STAGGER_MS) / 1000.0),
@@ -197,10 +206,19 @@ class TextMessageHandler(BaseHandler):
         except Exception as ack_send_error:
             self.log(f"Failed to send ACK packet: {ack_send_error}")
 
-    async def __call__(self, packet: Packet) -> None:
+    async def __call__(self, packet: Packet) -> HandlerResult:
+        """Process an inbound TXT_MSG.
+
+        Returns an authenticated HandlerResult when the message was decrypted for
+        one of our contacts — i.e. it is genuinely addressed to this identity and
+        the caller should consume it. Returns a not-for-us result when it could
+        not be decrypted (payload too short, unknown sender, or HMAC failure from
+        a dest-hash collision), so the caller may forward/re-flood it instead of
+        dropping it.
+        """
         if len(packet.payload) < 4:
             self.log("TXT_MSG payload too short to decrypt")
-            return
+            return HandlerResult.not_for_us()
 
         src_hash = packet.payload[1]
         # Collect all contacts whose public key first byte matches src_hash (hash collision
@@ -216,7 +234,7 @@ class TextMessageHandler(BaseHandler):
 
         if not candidates:
             self.log(f"No contact found for src hash: {src_hash:02X}")
-            return
+            return HandlerResult.not_for_us()
 
         payload = packet.payload[2:]  # Skip dest_hash and src_hash
         matched_contact = None
@@ -242,11 +260,15 @@ class TextMessageHandler(BaseHandler):
                 f"Decryption failed: Invalid HMAC for all {len(candidates)} contact(s) "
                 f"with src hash {src_hash:02X}"
             )
-            return
+            return HandlerResult.not_for_us()
 
+        # Decryption succeeded: this message is genuinely for us. From here on we
+        # return a consumed result so the caller keeps it even if the plaintext
+        # turns out to be malformed — forwarding a packet that is cryptographically
+        # ours is wrong.
         if len(decrypted) < 5:  # timestamp(4) + flags(1) minimum
             self.log("Decrypted message too short for CRC calculation")
-            return
+            return HandlerResult.consumed()
 
         # Extract fields from decrypted data
         timestamp = decrypted[:4]  # First 4 bytes are the timestamp
@@ -260,16 +282,18 @@ class TextMessageHandler(BaseHandler):
             # onSignedMessageRecv(&data[5], &data[9])).
             if len(decrypted) < 9:
                 self.log("Signed message too short for author prefix")
-                return
+                return HandlerResult.consumed()
             sender_prefix = bytes(decrypted[5:9])
             message_body = decrypted[9:]
 
         sender_pubkey = self._contact_pubkey_bytes(matched_contact)
         timestamp_int = int.from_bytes(timestamp, "little")
 
-        # Determine message routing type from packet header
+        # Determine message routing type from packet header. Both plain flood
+        # (ROUTE_TYPE_FLOOD) and transport-scoped flood (ROUTE_TYPE_TRANSPORT_FLOOD)
+        # count as flood, matching MeshCore Packet::isRouteFlood.
         route_type = packet.get_route_type()
-        is_flood = route_type == 1  # ROUTE_TYPE_FLOOD = 1
+        is_flood = packet.is_route_flood()
 
         self.log(
             f"Processing message - route_type: {route_type}, is_flood: {is_flood}, "
@@ -321,21 +345,37 @@ class TextMessageHandler(BaseHandler):
 
         # For signed plain the 4-byte author prefix was already split off into
         # ``sender_prefix`` above, so ``message_body`` is the bare text here.
-        decoded_msg = message_body.decode("utf-8", "replace")
+        # Firmware treats the body as a C string (BaseChatMesh::onPeerDataRecv):
+        # the visible text ends at the first NUL. Everything after it — the AES
+        # zero padding and, for attempt > 3, the hidden extended-attempt byte —
+        # is not message content and must not be delivered to the app.
+        visible_len = self._text_len(message_body)
+        decoded_msg = message_body[:visible_len].decode("utf-8", "replace")
         self.log(f"Received TXT_MSG: {decoded_msg}")
 
-        # Check if this is a command response (if callback is set)
-        if self.command_response_callback:
-            try:
-                self.command_response_callback(decoded_msg, matched_contact)
-                self.log(
-                    f"Command response captured from {matched_contact.name}: {decoded_msg}"
-                )
-                # Don't save command responses to regular message database
-                return
-            except Exception as e:
-                self.log(f"Error in command response callback: {e}")
-                # Continue with normal message processing if callback fails
+        # Intercept as a repeater-command response only for CLI_DATA replies whose
+        # authenticated sender has a pending command (firmware routes only
+        # TXT_TYPE_CLI_DATA from a known contact to onCommandDataRecv; everything
+        # else is delivered normally). Match on the full sender public key so a
+        # dest-hash collision cannot cross-resolve. Plain DMs and CLI_DATA with no
+        # pending command fall through to normal delivery.
+        if txt_type == TXT_TYPE_CLI_DATA:
+            callback = self._pending_command_responses.get(sender_pubkey)
+            if callback is not None:
+                # One reply completes one command: remove the entry before
+                # delivering so a second reply within the window is delivered
+                # normally rather than swallowed.
+                del self._pending_command_responses[sender_pubkey]
+                try:
+                    callback(decoded_msg, matched_contact)
+                    self.log(
+                        f"Command response captured from {matched_contact.name}: {decoded_msg}"
+                    )
+                    # Don't save command responses to regular message database
+                    return HandlerResult.consumed()
+                except Exception as e:
+                    self.log(f"Error in command response callback: {e}")
+                    # Continue with normal message processing if callback fails
 
         # Save the incoming message by publishing event for app to handle
         message_timestamp = timestamp_int
@@ -343,8 +383,7 @@ class TextMessageHandler(BaseHandler):
         # Create message event data for the app to handle storage and deduplication
         normalized_timestamp = (message_timestamp // 1000) * 1000
         content_hash = (
-            hash(f"{matched_contact.name}_{decoded_msg}_{normalized_timestamp}")
-            & 0xFFFFFFFF
+            hash(f"{matched_contact.name}_{decoded_msg}_{normalized_timestamp}") & 0xFFFFFFFF
         )
         message_id = f"rx_{normalized_timestamp}_{content_hash:08x}"
 
@@ -363,6 +402,11 @@ class TextMessageHandler(BaseHandler):
                     "is_outgoing": False,
                     "timestamp": message_timestamp,
                     "delivery_status": "received",
+                    # Companion queueMessage() preserves the encoded flood path
+                    # length, but marks every direct route as unknown (0xFF).
+                    # Keep the encoded byte rather than deriving a byte count
+                    # from packet.path: the high bits carry the hash width.
+                    "path_len": packet.path_len if is_flood else 0xFF,
                     "network_info": {
                         "rssi": packet.rssi,
                         "snr": packet.snr,
@@ -382,3 +426,4 @@ class TextMessageHandler(BaseHandler):
 
         # Set packet.decrypted for ACK processing
         packet.decrypted = {"text": decoded_msg}
+        return HandlerResult.consumed()

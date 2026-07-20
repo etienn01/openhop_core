@@ -4,19 +4,14 @@ import logging
 import struct
 import time
 
-from ...protocol.constants import (
-    ADVERT_FLAG_HAS_LOCATION,
-    ADVERT_FLAG_HAS_NAME,
-    ADVERT_FLAG_IS_CHAT_NODE,
-)
 from ...protocol.packet_utils import PathUtils
-from ..binary_parsing import decode_exported_contact
 from ..constants import (
     CONTACT_NAME_SIZE,
     ERR_CODE_ILLEGAL_ARG,
     ERR_CODE_NOT_FOUND,
     ERR_CODE_TABLE_FULL,
     MAX_PATH_SIZE,
+    OUT_PATH_UNKNOWN,
     PUB_KEY_SIZE,
     RESP_CODE_ADVERT_PATH,
     RESP_CODE_CONTACT,
@@ -36,7 +31,11 @@ class _ContactCommandsMixin:
     async def _cmd_get_contacts(self, data: bytes) -> None:
         since = struct.unpack("<I", data[:4])[0] if len(data) >= 4 else 0
         contacts = self.bridge.get_contacts(since=since)
-        self._write_frame(bytes([RESP_CODE_CONTACTS_START]) + struct.pack("<I", len(contacts)))
+        # Firmware reports the total contact-table count here (MyMesh
+        # CMD_GET_CONTACTS uses getNumContacts()), independent of the 'since'
+        # filter; only the emitted frames and the end watermark are filtered.
+        total = self.bridge.get_contact_count()
+        self._write_frame(bytes([RESP_CODE_CONTACTS_START]) + struct.pack("<I", total))
         for i, c in enumerate(contacts):
             self._write_contact_frame(c)
         most_recent = max((c.lastmod for c in contacts), default=0)
@@ -68,12 +67,20 @@ class _ContactCommandsMixin:
         pubkey = data[0:PUB_KEY_SIZE]
         adv_type = data[32]
         flags = data[33]
-        out_path_len = struct.unpack_from("<b", data, 34)[0]
+        # The wire byte is uint8_t (MeshCore CMD_ADD_UPDATE_CONTACT): its top two
+        # bits encode the per-hop hash width, so values 0x80-0xFE are valid paths.
+        # Read it unsigned and map only the 0xFF sentinel to the internal
+        # unknown-path representation (-1).
+        out_path_len = struct.unpack_from("<B", data, 34)[0]
+        if out_path_len == OUT_PATH_UNKNOWN:
+            out_path_len = -1
         out_path_end = 35 + MAX_PATH_SIZE
-        if len(data) >= out_path_end:
-            out_path = data[35:out_path_end].rstrip(b"\x00")
-        else:
-            out_path = data[35 : len(data)].rstrip(b"\x00") if len(data) > 35 else b""
+        path_field = data[35 : min(len(data), out_path_end)]
+        # MeshCore copies all 64 bytes from the frame, but only the byte count
+        # encoded in out_path_len is part of the route. A zero byte within that
+        # range is a valid hash byte, not fixed-field padding.
+        path_byte_len = PathUtils.get_path_byte_len(out_path_len) if out_path_len >= 0 else 0
+        out_path = path_field[:path_byte_len]
         name_start = 35 + MAX_PATH_SIZE
         name_end = name_start + CONTACT_NAME_SIZE
         if len(data) >= name_end:
@@ -175,55 +182,19 @@ class _ContactCommandsMixin:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         pubkey = data[:PUB_KEY_SIZE]
+        # NOT_FOUND only when the contact is absent; an existing contact whose
+        # advert cannot be built or sent is TABLE_FULL, matching MeshCore
+        # CMD_SHARE_CONTACT / shareContactZeroHop.
+        if self.bridge.get_contact_by_key(pubkey) is None:
+            self._write_err(ERR_CODE_NOT_FOUND)
+            return
         ok = await self.bridge.share_contact(pubkey)
-        self._write_ok() if ok else self._write_err(ERR_CODE_NOT_FOUND)
+        self._write_ok() if ok else self._write_err(ERR_CODE_TABLE_FULL)
 
     async def _cmd_export_contact(self, data: bytes) -> None:
-        if len(data) < PUB_KEY_SIZE:
-            raw = self.bridge.export_contact(None)
-            if raw is None:
-                self._write_err(ERR_CODE_NOT_FOUND)
-                return
-            parsed = decode_exported_contact(raw)
-            if parsed is None:
-                self._write_err(ERR_CODE_NOT_FOUND)
-                return
-            pubkey = parsed["public_key"]
-            name_raw = parsed["name_raw"]
-            lat, lon = parsed["lat_microdeg"], parsed["lon_microdeg"]
-            flags = ADVERT_FLAG_IS_CHAT_NODE
-            loc_bytes = b""
-            if lat != 0 or lon != 0:
-                flags |= ADVERT_FLAG_HAS_LOCATION
-                loc_bytes = struct.pack("<ii", lat, lon)
-            max_name = 32 - 1 - len(loc_bytes)
-            name_bytes = name_raw[:max_name]
-            if name_bytes:
-                flags |= ADVERT_FLAG_HAS_NAME
-            appdata = bytes([flags]) + loc_bytes + name_bytes
-            timestamp = int(time.time()) & 0xFFFFFFFF
-            ts_bytes = struct.pack("<I", timestamp)
-            to_sign = pubkey + ts_bytes + appdata
-            try:
-                sig = self.bridge._identity.sign(to_sign)
-                if not sig or len(sig) != 64:
-                    self._write_err(ERR_CODE_NOT_FOUND)
-                    return
-            except Exception as e:
-                logger.warning("export_contact: signing failed: %s", e)
-                self._write_err(ERR_CODE_NOT_FOUND)
-                return
-            packet = bytes([0x11, 0x00]) + pubkey + ts_bytes + sig + appdata
-            self._write_frame(bytes([RESP_CODE_EXPORT_CONTACT]) + packet)
-        else:
-            raw = self.bridge.export_contact(data[:PUB_KEY_SIZE])
-            if raw is None:
-                self._write_err(ERR_CODE_NOT_FOUND)
-                return
-            try:
-                sig = self.bridge._identity.sign(raw)
-                if sig and len(sig) == 64:
-                    raw = raw + sig
-            except Exception as e:
-                logger.warning("export_contact: signing failed: %s", e)
-            self._write_frame(bytes([RESP_CODE_EXPORT_CONTACT]) + raw)
+        pubkey = data[:PUB_KEY_SIZE] if len(data) >= PUB_KEY_SIZE else None
+        raw = self.bridge.export_contact(pubkey)
+        if raw is None:
+            self._write_err(ERR_CODE_NOT_FOUND)
+            return
+        self._write_frame(bytes([RESP_CODE_EXPORT_CONTACT]) + raw)

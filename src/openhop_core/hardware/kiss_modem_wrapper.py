@@ -32,12 +32,17 @@ RxCallback = Union[
 
 
 def _invoke_rx_callback(
-    callback: RxCallback,
+    callback: Optional[RxCallback],
     data: bytes,
     rssi: int,
     snr: float,
 ) -> None:
-    """Invoke RX callback with 1 or 3 args depending on what it accepts."""
+    """Invoke RX callback with 1 or 3 args depending on what it accepts.
+
+    Tolerates ``None`` (a callback cleared between dispatch and invoke).
+    """
+    if callback is None:
+        return
     try:
         sig = inspect.signature(callback)
         nparams = len([p for p in sig.parameters if p != "self"])
@@ -61,13 +66,9 @@ _KISS_FESC_B = bytes([KISS_FESC])
 
 # Standard KISS type bytes (port in bits 7-4, command in bits 3-0)
 CMD_DATA = 0x00  # Data frame (raw packet)
-KISS_CMD_TXDELAY = (
-    0x01  # Transmitter keyup delay in 10ms units (firmware default 50 = 500ms)
-)
+KISS_CMD_TXDELAY = 0x01  # Transmitter keyup delay in 10ms units (firmware default 50 = 500ms)
 KISS_CMD_PERSISTENCE = 0x02  # CSMA persistence 0-255 (firmware default 63)
-KISS_CMD_SLOTTIME = (
-    0x03  # CSMA slot interval in 10ms units (firmware default 10 = 100ms)
-)
+KISS_CMD_SLOTTIME = 0x03  # CSMA slot interval in 10ms units (firmware default 10 = 100ms)
 KISS_CMD_TXTAIL = 0x04  # Post-TX hold time in 10ms units (default: 0)
 KISS_CMD_FULLDUPLEX = 0x05  # 0 = half duplex, nonzero = full duplex (default: 0)
 KISS_CMD_SETHARDWARE = 0x06  # SetHardware: first payload byte is sub-command
@@ -198,9 +199,7 @@ ERR_TX_BUSY = HW_ERR_TX_BUSY
 MAX_FRAME_SIZE = 512
 # Data payload ≤255 bytes (MeshCore MAX_TRANS_UNIT); queue bounds unpaired Data frames
 KISS_MAX_PACKET_SIZE = 255
-MAX_PENDING_RX_FRAMES = (
-    64  # max Data frames queued awaiting RxMeta; each payload ≤255 bytes
-)
+MAX_PENDING_RX_FRAMES = 64  # max Data frames queued awaiting RxMeta; each payload ≤255 bytes
 RX_BUFFER_SIZE = 1024
 TX_BUFFER_SIZE = 1024
 DEFAULT_BAUDRATE = 115200
@@ -210,6 +209,10 @@ DEFAULT_TIMEOUT = 1.0
 # port timeout is min(this, self.timeout) so a caller-supplied lower timeout still wins.
 RX_READ_TIMEOUT_S = 0.1
 RESPONSE_TIMEOUT = 5.0  # Timeout for command responses
+# Max time a received Data frame waits for its trailing RxMeta before being
+# dispatched with sentinel metrics. RxMeta is only emitted when signal reporting
+# is enabled, so a modem that never sends it must not stall reception.
+RX_META_WAIT_SECONDS = 0.25
 # Extra margin added to estimated airtime when waiting for a DATA TX_DONE, so a long
 # transmit (e.g. a high-SF flood advert) is not cut short by the flat command timeout.
 TX_DONE_TIMEOUT_MARGIN_S = 1.0
@@ -252,6 +255,13 @@ class KissModemWrapper(LoRaRadio):
         HW_CMD_SET_TX_POWER,
         HW_CMD_SET_SIGNAL_REPORT,
         HW_CMD_REBOOT,
+    }
+
+    # Some SetHardware setters answer with the GET-form response code rather than
+    # the setter's own command|0x80. SET_SIGNAL_REPORT (0x19) replies with
+    # HW_RESP(HW_CMD_GET_SIGNAL_REPORT) = 0x9A.
+    _SETHW_EXTRA_ACCEPT_RESP: dict[int, int] = {
+        HW_CMD_SET_SIGNAL_REPORT: HW_RESP_SIGNAL_REPORT,
     }
 
     def __init__(
@@ -311,9 +321,7 @@ class KissModemWrapper(LoRaRadio):
         # Radio configuration — instance attributes matching SX1262Wrapper
         # convention.  Seeded from the config dict; updated by configure_radio().
         self.frequency = self.radio_config.get("frequency", int(869.618 * 1000000))
-        self.tx_power = self.radio_config.get(
-            "power", self.radio_config.get("tx_power", 22)
-        )
+        self.tx_power = self.radio_config.get("power", self.radio_config.get("tx_power", 22))
         self.spreading_factor = self.radio_config.get("spreading_factor", 8)
         self.bandwidth = self.radio_config.get("bandwidth", int(62500))
         self.coding_rate = self.radio_config.get("coding_rate", 8)
@@ -348,9 +356,7 @@ class KissModemWrapper(LoRaRadio):
         self._reconnect_max_delay_s = float(
             self.radio_config.get("reconnect_max_delay_seconds", 15.0)
         )
-        self._reconnect_max_attempts = int(
-            self.radio_config.get("reconnect_max_attempts", 0)
-        )
+        self._reconnect_max_attempts = int(self.radio_config.get("reconnect_max_attempts", 0))
         self._post_connect_settle_s = max(
             0.0,
             float(
@@ -408,8 +414,11 @@ class KissModemWrapper(LoRaRadio):
         self._tx_done_event = threading.Event()
         self._tx_done_result: Optional[bool] = None
 
-        # Pending RX data payloads (Data frame) waiting for RxMeta frame
-        self._pending_rx_queue: deque = deque()
+        # Pending RX data payloads (Data frame) awaiting their RxMeta frame.
+        # Each entry is (payload, deadline_monotonic); a frame is dispatched with
+        # sentinel metrics once its deadline passes if no RxMeta has arrived.
+        self._pending_rx_queue: deque[tuple[bytes, float]] = deque()
+        self._pending_rx_lock = threading.Lock()
 
         self.stats = {
             "frames_sent": 0,
@@ -493,6 +502,7 @@ class KissModemWrapper(LoRaRadio):
 
         self._stop_io_threads(join_timeout=2.0)
         self._stop_reconnect_thread(join_timeout=2.0)
+        self._clear_pending_rx()
 
         if self._callback_executor is not None:
             self._callback_executor.shutdown(wait=False)
@@ -504,6 +514,9 @@ class KissModemWrapper(LoRaRadio):
         """Open serial device and start RX/TX workers."""
         try:
             self._shutting_down = False
+            # Drop any Data frames left over from a prior session so a stale payload
+            # cannot pair with an RxMeta from the freshly opened link.
+            self._clear_pending_rx()
             self.serial_conn = serial.Serial(
                 port=self.port,
                 baudrate=self.baudrate,
@@ -520,9 +533,7 @@ class KissModemWrapper(LoRaRadio):
             self.tx_thread = threading.Thread(target=self._tx_worker, daemon=True)
             self.rx_thread.start()
             self.tx_thread.start()
-            logger.info(
-                "KISS modem connected to %s at %s baud", self.port, self.baudrate
-            )
+            logger.info("KISS modem connected to %s at %s baud", self.port, self.baudrate)
 
             if not self._wait_for_modem_ready():
                 logger.warning("KISS modem did not become ready after reconnect")
@@ -578,17 +589,9 @@ class KissModemWrapper(LoRaRadio):
     def _stop_io_threads(self, join_timeout: float = 2.0) -> None:
         """Join RX/TX threads, skipping current thread to avoid deadlock."""
         current = threading.current_thread()
-        if (
-            self.rx_thread
-            and self.rx_thread.is_alive()
-            and self.rx_thread is not current
-        ):
+        if self.rx_thread and self.rx_thread.is_alive() and self.rx_thread is not current:
             self.rx_thread.join(timeout=join_timeout)
-        if (
-            self.tx_thread
-            and self.tx_thread.is_alive()
-            and self.tx_thread is not current
-        ):
+        if self.tx_thread and self.tx_thread.is_alive() and self.tx_thread is not current:
             self.tx_thread.join(timeout=join_timeout)
 
     def _stop_reconnect_thread(self, join_timeout: float = 2.0) -> None:
@@ -652,9 +655,7 @@ class KissModemWrapper(LoRaRadio):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            delay = min(
-                backoff_seconds[min(attempt, len(backoff_seconds) - 1)], remaining
-            )
+            delay = min(backoff_seconds[min(attempt, len(backoff_seconds) - 1)], remaining)
             threading.Event().wait(delay)
 
         return False
@@ -671,9 +672,7 @@ class KissModemWrapper(LoRaRadio):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            delay = min(
-                backoff_seconds[min(attempt, len(backoff_seconds) - 1)], remaining
-            )
+            delay = min(backoff_seconds[min(attempt, len(backoff_seconds) - 1)], remaining)
             threading.Event().wait(delay)
         return False
 
@@ -721,9 +720,7 @@ class KissModemWrapper(LoRaRadio):
 
         now = time.time()
         with self._failure_log_lock:
-            should_log = (
-                now - self._last_failure_log_ts
-            ) >= self._failure_log_interval_s
+            should_log = (now - self._last_failure_log_ts) >= self._failure_log_interval_s
             if should_log:
                 self._last_failure_log_ts = now
                 logger.warning("Marking KISS serial link degraded: %s", reason)
@@ -745,9 +742,7 @@ class KissModemWrapper(LoRaRadio):
         if self.stop_event.is_set() or self._reconnecting_event.is_set():
             return
         self._reconnecting_event.set()
-        self.reconnect_thread = threading.Thread(
-            target=self._reconnect_worker, daemon=True
-        )
+        self.reconnect_thread = threading.Thread(target=self._reconnect_worker, daemon=True)
         self.reconnect_thread.start()
 
     def _reconnect_worker(self) -> None:
@@ -755,10 +750,7 @@ class KissModemWrapper(LoRaRadio):
         attempts = 0
         while not self.stop_event.is_set():
             attempts += 1
-            if (
-                self._reconnect_max_attempts > 0
-                and attempts > self._reconnect_max_attempts
-            ):
+            if self._reconnect_max_attempts > 0 and attempts > self._reconnect_max_attempts:
                 logger.error(
                     "KISS modem reconnect exhausted after %s attempts (last reason: %s)",
                     self._reconnect_max_attempts,
@@ -788,9 +780,7 @@ class KissModemWrapper(LoRaRadio):
                 self.is_connected = True
                 self._degraded = False
                 self._degraded_reason = None
-                logger.info(
-                    "KISS modem serial reconnect successful on attempt %s", attempts
-                )
+                logger.info("KISS modem serial reconnect successful on attempt %s", attempts)
                 self._reconnecting_event.clear()
                 return
 
@@ -903,21 +893,13 @@ class KissModemWrapper(LoRaRadio):
         try:
             # Get version
             version_resp = self._send_command(CMD_GET_VERSION)
-            if (
-                version_resp
-                and version_resp[0] == RESP_VERSION
-                and len(version_resp[1]) >= 1
-            ):
+            if version_resp and version_resp[0] == RESP_VERSION and len(version_resp[1]) >= 1:
                 self.modem_version = version_resp[1][0]
                 logger.info(f"Modem version: {self.modem_version}")
 
             # Get identity (public key)
             identity_resp = self._send_command(CMD_GET_IDENTITY)
-            if (
-                identity_resp
-                and identity_resp[0] == RESP_IDENTITY
-                and len(identity_resp[1]) == 32
-            ):
+            if identity_resp and identity_resp[0] == RESP_IDENTITY and len(identity_resp[1]) == 32:
                 self.modem_identity = identity_resp[1]
                 logger.info(f"Modem identity: {self.modem_identity.hex()[:16]}...")
 
@@ -968,14 +950,8 @@ class KissModemWrapper(LoRaRadio):
                 if spreading_factor is not None
                 else self.radio_config.get("spreading_factor", 8)
             )
-            cr = (
-                coding_rate
-                if coding_rate is not None
-                else self.radio_config.get("coding_rate", 8)
-            )
-            power = self.radio_config.get(
-                "power", self.radio_config.get("tx_power", 22)
-            )
+            cr = coding_rate if coding_rate is not None else self.radio_config.get("coding_rate", 8)
+            power = self.radio_config.get("power", self.radio_config.get("tx_power", 22))
 
             # Set radio parameters (frequency, bandwidth, SF, CR)
             # Format: Freq (4) + BW (4) + SF (1) + CR (1) - all little-endian
@@ -1048,9 +1024,7 @@ class KissModemWrapper(LoRaRadio):
             logger.error(f"Failed to send frame: {e}")
             return False
 
-    def send_frame_and_wait(
-        self, data: bytes, timeout: float = RESPONSE_TIMEOUT
-    ) -> bool:
+    def send_frame_and_wait(self, data: bytes, timeout: float = RESPONSE_TIMEOUT) -> bool:
         """
         Send a data frame and wait for the modem's TX_DONE.
 
@@ -1072,18 +1046,13 @@ class KissModemWrapper(LoRaRadio):
 
         # Don't enqueue DATA while the link is down/reconnecting (mirror _send_command).
         in_reconnect_thread = threading.current_thread() is self.reconnect_thread
-        if (
-            self._reconnecting_event.is_set() or self._degraded
-        ) and not in_reconnect_thread:
+        if (self._reconnecting_event.is_set() or self._degraded) and not in_reconnect_thread:
             return False
 
         # Extend the wait to cover real airtime; a high-SF flood advert can exceed the
         # flat command timeout, which would otherwise look like a spurious TX_DONE timeout.
         try:
-            airtime_s = (
-                PacketTimingUtils.estimate_airtime_ms(len(data), self.radio_config)
-                / 1000.0
-            )
+            airtime_s = PacketTimingUtils.estimate_airtime_ms(len(data), self.radio_config) / 1000.0
         except Exception:
             airtime_s = 0.0
         effective_timeout = max(timeout, airtime_s + TX_DONE_TIMEOUT_MARGIN_S)
@@ -1149,6 +1118,9 @@ class KissModemWrapper(LoRaRadio):
             acceptable: set[int] = {expected, HW_RESP_ERROR}
             if sub_cmd in self._SETHW_ALLOW_OK_FOR:
                 acceptable.add(HW_RESP_OK)
+            extra_resp = self._SETHW_EXTRA_ACCEPT_RESP.get(sub_cmd)
+            if extra_resp is not None:
+                acceptable.add(extra_resp)
 
             # Check queued responses first (late/out-of-order arrivals).
             with self._response_lock:
@@ -1171,9 +1143,7 @@ class KissModemWrapper(LoRaRadio):
 
             try:
                 # SetHardware frame: type 0x06, payload = sub_cmd (1 byte) + data
-                kiss_frame = self._encode_kiss_frame(
-                    KISS_CMD_SETHARDWARE, bytes([sub_cmd]) + data
-                )
+                kiss_frame = self._encode_kiss_frame(KISS_CMD_SETHARDWARE, bytes([sub_cmd]) + data)
 
                 if not self._write_frame(kiss_frame):
                     logger.warning("SetHardware frame write failed")
@@ -1199,9 +1169,7 @@ class KissModemWrapper(LoRaRadio):
                     self._expected_response_subcmds = None
                     self._active_request_subcmd = None
 
-    def get_radio_config(
-        self, timeout: Optional[float] = None
-    ) -> Optional[Dict[str, Any]]:
+    def get_radio_config(self, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """
         Get current radio configuration from modem.
 
@@ -1292,9 +1260,7 @@ class KissModemWrapper(LoRaRadio):
             return resp[1][0] == 0x01
         return False
 
-    def get_airtime(
-        self, packet_length: int, timeout: Optional[float] = None
-    ) -> Optional[int]:
+    def get_airtime(self, packet_length: int, timeout: Optional[float] = None) -> Optional[int]:
         """
         Get estimated airtime for a packet from the modem.
 
@@ -1330,9 +1296,7 @@ class KissModemWrapper(LoRaRadio):
             return noise
         return None
 
-    def get_modem_stats(
-        self, timeout: Optional[float] = None
-    ) -> Optional[Dict[str, int]]:
+    def get_modem_stats(self, timeout: Optional[float] = None) -> Optional[Dict[str, int]]:
         """
         Get modem statistics.
 
@@ -1467,9 +1431,7 @@ class KissModemWrapper(LoRaRadio):
             return resp[1]
         return None
 
-    def verify_signature(
-        self, pubkey: bytes, signature: bytes, data: bytes
-    ) -> Optional[bool]:
+    def verify_signature(self, pubkey: bytes, signature: bytes, data: bytes) -> Optional[bool]:
         """
         Verify a signature
 
@@ -1490,9 +1452,7 @@ class KissModemWrapper(LoRaRadio):
             return resp[1][0] == 0x01
         return None
 
-    def encrypt_data(
-        self, key: bytes, plaintext: bytes
-    ) -> Optional[tuple[bytes, bytes]]:
+    def encrypt_data(self, key: bytes, plaintext: bytes) -> Optional[tuple[bytes, bytes]]:
         """
         Encrypt data using a shared key
 
@@ -1514,9 +1474,7 @@ class KissModemWrapper(LoRaRadio):
             return (mac, ciphertext)
         return None
 
-    def decrypt_data(
-        self, key: bytes, mac: bytes, ciphertext: bytes
-    ) -> Optional[bytes]:
+    def decrypt_data(self, key: bytes, mac: bytes, ciphertext: bytes) -> Optional[bytes]:
         """
         Decrypt data using a shared key
 
@@ -1645,9 +1603,7 @@ class KissModemWrapper(LoRaRadio):
                         "channel still busy, transmitting anyway"
                     )
             except Exception as e:
-                logger.warning(
-                    f"Channel busy check failed: {e}, proceeding with transmission"
-                )
+                logger.warning(f"Channel busy check failed: {e}, proceeding with transmission")
                 break
 
         return True, lbt_backoff_delays
@@ -1676,9 +1632,7 @@ class KissModemWrapper(LoRaRadio):
 
         # Wait for modem-level TX_DONE instead of treating queueing as success.
         # Run the blocking wait off the event loop.
-        success = await asyncio.to_thread(
-            self.send_frame_and_wait, data, RESPONSE_TIMEOUT
-        )
+        success = await asyncio.to_thread(self.send_frame_and_wait, data, RESPONSE_TIMEOUT)
         if not success:
             raise Exception("Failed to send frame via KISS modem (no TX_DONE)")
 
@@ -1687,9 +1641,7 @@ class KissModemWrapper(LoRaRadio):
         # Run off the event loop: get_airtime uses blocking SetHardware wait.
         airtime = await asyncio.to_thread(self.get_airtime, len(data), 1.0)
         if airtime is None:
-            airtime = int(
-                PacketTimingUtils.estimate_airtime_ms(len(data), self.radio_config)
-            )
+            airtime = int(PacketTimingUtils.estimate_airtime_ms(len(data), self.radio_config))
         return {
             "airtime_ms": airtime,
             "lbt_attempts": len(lbt_backoff_delays),
@@ -1708,9 +1660,7 @@ class KissModemWrapper(LoRaRadio):
 
         original_callback = self.on_frame_received
 
-        def temp_callback(
-            data: bytes, rssi: Optional[int] = None, snr: Optional[float] = None
-        ):
+        def temp_callback(data: bytes, rssi: Optional[int] = None, snr: Optional[float] = None):
             if not future.done():
                 future.set_result(data)
             if original_callback:
@@ -1752,21 +1702,17 @@ class KissModemWrapper(LoRaRadio):
         tx_power = self.get_tx_power(timeout=timeout)
         status: Dict[str, Any] = {
             "initialized": self.is_connected,
-            "frequency": cfg["frequency"]
-            if cfg
-            else self.radio_config.get("frequency", 0),
-            "tx_power": tx_power
-            if tx_power is not None
-            else self.radio_config.get("tx_power", self.radio_config.get("power", 0)),
-            "spreading_factor": cfg["spreading_factor"]
-            if cfg
-            else self.radio_config.get("spreading_factor", 0),
-            "bandwidth": cfg["bandwidth"]
-            if cfg
-            else self.radio_config.get("bandwidth", 0),
-            "coding_rate": cfg["coding_rate"]
-            if cfg
-            else self.radio_config.get("coding_rate", 0),
+            "frequency": cfg["frequency"] if cfg else self.radio_config.get("frequency", 0),
+            "tx_power": (
+                tx_power
+                if tx_power is not None
+                else self.radio_config.get("tx_power", self.radio_config.get("power", 0))
+            ),
+            "spreading_factor": (
+                cfg["spreading_factor"] if cfg else self.radio_config.get("spreading_factor", 0)
+            ),
+            "bandwidth": cfg["bandwidth"] if cfg else self.radio_config.get("bandwidth", 0),
+            "coding_rate": cfg["coding_rate"] if cfg else self.radio_config.get("coding_rate", 0),
             "last_rssi": self.stats.get("last_rssi", -999),
             "last_snr": self.stats.get("last_snr", -999.0),
             "last_signal_rssi": self.stats.get("last_rssi", -999),
@@ -1796,9 +1742,7 @@ class KissModemWrapper(LoRaRadio):
         """Async-safe :meth:`get_radio_config`; runs blocking modem I/O in a worker thread."""
         return await asyncio.to_thread(self.get_radio_config, timeout)
 
-    async def get_tx_power_async(
-        self, timeout: Optional[float] = None
-    ) -> Optional[int]:
+    async def get_tx_power_async(self, timeout: Optional[float] = None) -> Optional[int]:
         """Async-safe :meth:`get_tx_power`; runs blocking modem I/O in a worker thread."""
         return await asyncio.to_thread(self.get_tx_power, timeout)
 
@@ -1810,9 +1754,7 @@ class KissModemWrapper(LoRaRadio):
         """Async-safe :meth:`is_channel_busy`; runs blocking modem I/O in a worker thread."""
         return await asyncio.to_thread(self.is_channel_busy, timeout)
 
-    async def get_noise_floor_async(
-        self, timeout: Optional[float] = None
-    ) -> Optional[int]:
+    async def get_noise_floor_async(self, timeout: Optional[float] = None) -> Optional[int]:
         """Async-safe :meth:`get_noise_floor`; runs blocking modem I/O in a worker thread."""
         return await asyncio.to_thread(self.get_noise_floor, timeout)
 
@@ -1894,9 +1836,7 @@ class KissModemWrapper(LoRaRadio):
                 if len(self.rx_frame_buffer) >= MAX_FRAME_SIZE:
                     # Frame too long (e.g. lost FEND); reset and resync at next FEND
                     self.stats["frame_errors"] += 1
-                    logger.warning(
-                        "KISS frame exceeded max size (%d), resyncing", MAX_FRAME_SIZE
-                    )
+                    logger.warning("KISS frame exceeded max size (%d), resyncing", MAX_FRAME_SIZE)
                     self.rx_frame_buffer.clear()
                     self.in_frame = False
                 else:
@@ -1962,9 +1902,7 @@ class KissModemWrapper(LoRaRadio):
                     if space > 0:
                         buf += run[:space]
                     self.stats["frame_errors"] += 1
-                    logger.warning(
-                        "KISS frame exceeded max size (%d), resyncing", MAX_FRAME_SIZE
-                    )
+                    logger.warning("KISS frame exceeded max size (%d), resyncing", MAX_FRAME_SIZE)
                     buf.clear()
                     in_frame = False
 
@@ -2001,28 +1939,28 @@ class KissModemWrapper(LoRaRadio):
             rssi: RSSI in dBm
             snr: SNR in dB
         """
-        if self.on_frame_received is None:
+        # Snapshot once: the callback can be cleared concurrently (dispatcher
+        # RX disarm, wait_for_rx swap), so re-reading the attribute at invoke
+        # time could hand _invoke_rx_callback a None mid-race.
+        callback = self.on_frame_received
+        if callback is None:
             return
 
         if self._event_loop is not None:
             try:
                 self._event_loop.call_soon_threadsafe(
-                    lambda: _invoke_rx_callback(self.on_frame_received, data, rssi, snr)
+                    lambda: _invoke_rx_callback(callback, data, rssi, snr)
                 )
             except RuntimeError as e:
                 logger.warning(f"Failed to schedule RX callback on event loop: {e}")
-        elif (
-            self.rx_thread is not None and threading.current_thread() is self.rx_thread
-        ):
+        elif self.rx_thread is not None and threading.current_thread() is self.rx_thread:
             # We're in the RX thread; run callback in executor so we don't block reading
             if self._callback_executor is None:
                 self._callback_executor = ThreadPoolExecutor(max_workers=1)
-            self._callback_executor.submit(
-                _invoke_rx_callback, self.on_frame_received, data, rssi, snr
-            )
+            self._callback_executor.submit(_invoke_rx_callback, callback, data, rssi, snr)
         else:
             # Called from main thread (e.g. unit test); invoke directly
-            _invoke_rx_callback(self.on_frame_received, data, rssi, snr)
+            _invoke_rx_callback(callback, data, rssi, snr)
 
     def _process_received_frame(self):
         """Process a complete received KISS frame (spec: type byte = port | cmd)."""
@@ -2041,16 +1979,20 @@ class KissModemWrapper(LoRaRadio):
         self.stats["bytes_received"] += len(self.rx_frame_buffer) - 1
 
         if cmd == CMD_DATA:
-            # Data frame: raw packet only (≤255 bytes per spec); queue until RxMeta arrives
+            # Data frame: raw packet only (≤255 bytes per spec). Queue it with a
+            # deadline; RxMeta (only sent when signal reporting is on) pairs metrics,
+            # otherwise the frame is flushed with sentinel metrics once it times out.
             payload = bytes(self.rx_frame_buffer[1:])
-            if len(self._pending_rx_queue) >= MAX_PENDING_RX_FRAMES:
-                self.stats["frame_errors"] += 1
-                logger.warning(
-                    "Pending RX queue full (max %d), dropping Data frame",
-                    MAX_PENDING_RX_FRAMES,
-                )
-            else:
-                self._pending_rx_queue.append(payload)
+            with self._pending_rx_lock:
+                if len(self._pending_rx_queue) >= MAX_PENDING_RX_FRAMES:
+                    self.stats["frame_errors"] += 1
+                    logger.warning(
+                        "Pending RX queue full (max %d), dropping Data frame",
+                        MAX_PENDING_RX_FRAMES,
+                    )
+                else:
+                    deadline = time.monotonic() + RX_META_WAIT_SECONDS
+                    self._pending_rx_queue.append((payload, deadline))
 
         elif cmd == KISS_CMD_SETHARDWARE:
             # SetHardware: first byte is sub_cmd, rest is payload
@@ -2074,14 +2016,18 @@ class KissModemWrapper(LoRaRadio):
                     self.stats["last_snr"] = snr_db
                     self.stats["last_rssi"] = rssi_raw
                     self.stats["rx_packets"] += 1
-                if self._pending_rx_queue:
-                    packet_data = self._pending_rx_queue.popleft()
+                with self._pending_rx_lock:
+                    packet_data = (
+                        self._pending_rx_queue.popleft()[0] if self._pending_rx_queue else None
+                    )
+                if packet_data is not None:
                     if self.on_frame_received:
                         try:
                             self._dispatch_rx_callback(packet_data, rssi_raw, snr_db)
                         except Exception as e:
                             logger.error(f"Error in frame received callback: {e}")
                 else:
+                    # Leftover RxMeta from a desynced/flushed head: nothing to pair.
                     logger.warning("RxMeta received with no pending Data frame")
 
             elif sub_cmd == HW_RESP_TX_DONE:
@@ -2134,6 +2080,35 @@ class KissModemWrapper(LoRaRadio):
                         self._response_queue.append((sub_cmd, payload))
         # cmd 0xFF (Return) has port=15 so is already discarded above
 
+    def _flush_expired_rx_frames(self) -> None:
+        """
+        Dispatch Data frames whose RxMeta never arrived within RX_META_WAIT_SECONDS.
+
+        Only the head is inspected: deadlines are monotonically increasing, so once
+        the head has time remaining the rest do too. Flushing strictly from the head
+        preserves arrival order even when a later frame's RxMeta arrives promptly.
+        Sentinel metrics (-999) are used; rx_packets is still counted but last_snr /
+        last_rssi are left untouched so no fake signal reading is recorded.
+        """
+        now = time.monotonic()
+        while True:
+            with self._pending_rx_lock:
+                if not self._pending_rx_queue or self._pending_rx_queue[0][1] > now:
+                    break
+                payload = self._pending_rx_queue.popleft()[0]
+                self.stats["rx_packets"] += 1
+            if self.on_frame_received:
+                try:
+                    self._dispatch_rx_callback(payload, -999, -999.0)
+                except Exception as e:
+                    logger.error(f"Error in frame received callback: {e}")
+
+    def _clear_pending_rx(self) -> None:
+        """Drop any queued Data frames (e.g. on disconnect/reconnect) so a stale
+        payload never pairs with an RxMeta from a different link session."""
+        with self._pending_rx_lock:
+            self._pending_rx_queue.clear()
+
     def _rx_worker(self):
         """Background thread for receiving data"""
         while (
@@ -2145,6 +2120,10 @@ class KissModemWrapper(LoRaRadio):
                 conn = self.serial_conn
                 if conn is None:
                     break
+                # Flush Data frames whose RxMeta timed out. Runs every loop, including
+                # idle wakeups (the read below caps at RX_READ_TIMEOUT_S), so a stalled
+                # head is released within roughly RX_META_WAIT_SECONDS.
+                self._flush_expired_rx_frames()
                 # Blocking read of >=1 byte: sleeps in the kernel (releasing the GIL) until
                 # data or the port timeout, instead of busy-polling. On wake, drain whatever
                 # else has arrived and bulk-decode it in one pass.
@@ -2181,9 +2160,7 @@ class KissModemWrapper(LoRaRadio):
                             logger.warning("TX frame write failed, dropping frame")
                     else:
                         logger.warning("Serial connection not open")
-                        self._mark_serial_failure(
-                            "Serial connection not open in TX worker"
-                        )
+                        self._mark_serial_failure("Serial connection not open in TX worker")
                 else:
                     threading.Event().wait(0.01)
 

@@ -35,9 +35,9 @@ from .packet_utils import PacketDataUtils, PacketHashingUtils, PacketValidationU
 ╠════════════════════╬══════════════════════════════════════════════════════╣
 ║ Path (N bytes)     ║ Node hashes (1-3 bytes each), N = count × hash_size  ║
 ╠════════════════════╬══════════════════════════════════════════════════════╣
-║ Payload (N bytes)  ║ Actual encrypted or plain payload. Max: 254 bytes    ║
+║ Payload (N bytes)  ║ Actual encrypted or plain payload. Max: 184 bytes    ║
 ╠════════════════════╬══════════════════════════════════════════════════════╣
-║ Total Size         ║ <= 256 bytes (hard limit)                            ║
+║ Total Size         ║ Bounded by MAX_PACKET_PAYLOAD for the payload field   ║
 ╚════════════════════╩══════════════════════════════════════════════════════╝
 
 Header Layout (1 byte):
@@ -56,7 +56,7 @@ Header Layout (1 byte):
 Notes:
 - `write_to()` and `read_from()` enforce the exact structure used in firmware.
 - Transport codes are included only for route types 0x00 and 0x03.
-- Payload size must be ≤ MAX_PACKET_PAYLOAD (typically 254).
+- Payload size must be ≤ MAX_PACKET_PAYLOAD (currently 184).
 - `calculate_packet_hash()` includes payload type + path_len (only for TRACE).
 """
 
@@ -355,8 +355,15 @@ class Packet:
             ValueError: If any declared length doesn't match the actual buffer length.
         """
         PacketValidationUtils.validate_buffer_lengths(
-            self.get_path_byte_len(), len(self.path), self.payload_len, len(self.payload)
+            self.get_path_byte_len(),
+            len(self.path),
+            self.payload_len,
+            len(self.payload),
         )
+
+    def _validate_payload_size(self) -> None:
+        """Validate that payload_len does not exceed MAX_PACKET_PAYLOAD."""
+        PacketValidationUtils.validate_payload_size(self.payload_len)
 
     def _check_bounds(self, idx: int, required: int, data_len: int, error_msg: str) -> None:
         """
@@ -387,9 +394,11 @@ class Packet:
 
         Raises:
             ValueError: If internal length values don't match actual buffer lengths,
-                indicating data corruption or incorrect packet construction.
+                indicating data corruption or incorrect packet construction, or if
+                the payload exceeds MAX_PACKET_PAYLOAD.
         """
         self._validate_lengths()
+        self._validate_payload_size()
 
         out = bytearray([self.header])
 
@@ -470,12 +479,19 @@ class Packet:
         - Message integrity validation
 
         Returns:
-            bytes: First MAX_HASH_SIZE bytes of SHA256 digest computed over
-                the payload type, path length, and payload data.
+            bytes: First MAX_HASH_SIZE bytes of a SHA256 digest computed over
+                the payload type and payload data. The path length (path_len) is
+                included ONLY for TRACE packets; it is excluded for every other
+                type.
 
         Note:
-            The hash includes payload type and path_len to ensure packets with
-            different routing or content types produce different hashes.
+            path_len is deliberately NOT hashed for non-TRACE packets: echo and
+            duplicate suppression depend on it, so a rebroadcast that arrives with
+            a longer accumulated path must hash identically to the original. Only
+            TRACE packets fold in path_len — per firmware's CAVEAT (Packet.cpp),
+            a TRACE can revisit the same node on its return path, so its hash must
+            differ by route. Matches PacketHashingUtils.calculate_packet_hash and
+            MeshCore Packet::calculatePacketHash.
         """
         return PacketHashingUtils.calculate_packet_hash(
             self.get_payload_type(), self.path_len, self.payload[: self.payload_len]

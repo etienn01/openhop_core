@@ -40,6 +40,7 @@ from ...protocol.constants import (
 from ...protocol.packet_utils import PathUtils
 from .base import BaseHandler
 from .login_server import LoginServerHandler
+from .result import HandlerResult
 
 # Server response delay (ms) — matches firmware SERVER_RESPONSE_DELAY.
 SERVER_RESPONSE_DELAY_MS = 300
@@ -127,17 +128,28 @@ class AnonRequestHandler(BaseHandler):
         # Keep the wrapped login handler wired through the same sender.
         self.login_handler.set_send_packet_callback(callback)
 
-    async def __call__(self, packet: Packet) -> None:
-        """Handle an ANON_REQ packet: decrypt, then dispatch on the sub-type byte."""
+    async def __call__(self, packet: Packet) -> HandlerResult:
+        """Handle an ANON_REQ packet: decrypt, then dispatch on the sub-type byte.
+
+        Returns an authenticated HandlerResult when the request was decrypted for
+        this identity — i.e. it is genuinely addressed to us and the caller should
+        consume it (this holds even when we decline to answer, e.g. a rate-limited
+        or non-direct discovery query). Returns a not-for-us result when it was not
+        for us (wrong dest hash, or an HMAC failure from a dest-hash collision) so
+        the caller may forward/re-flood it.
+        """
+        # Flipped to True once decryption succeeds; used by the outer handler so a
+        # post-decrypt error still counts as "for us" while a pre-decrypt error forwards.
+        for_us = False
         try:
             # Parse ANON_REQ: dest_hash(1) + client_pubkey(32) + encrypted_data
             if len(packet.payload) < 34:
-                return
+                return HandlerResult.not_for_us()
 
             dest_hash = packet.payload[0]
             our_hash = self.local_identity.get_public_key()[0]
             if dest_hash != our_hash:
-                return  # Not for us
+                return HandlerResult.not_for_us()  # Not for us
 
             client_pubkey = bytes(packet.payload[1:33])
             encrypted_data = bytes(packet.payload[33:])
@@ -152,20 +164,25 @@ class AnonRequestHandler(BaseHandler):
                 plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_data)
             except Exception as e:
                 self.log(f"[AnonReq] Failed to decrypt request: {e}")
-                return
+                return HandlerResult.not_for_us()
+
+            # Decryption succeeded: this ANON_REQ is genuinely for us. Consume it
+            # from here on regardless of sub-type or whether we choose to reply.
+            for_us = True
+
             # Firmware parity (simple_room_server): room servers do not subtype
             # dispatch ANON_REQ by plaintext byte 4. Their login payload is:
             # timestamp(4) + sync_since(4) + password...
             # so byte 4 is sync_since[0], not an anon request code.
             if getattr(self.login_handler, "is_room_server", False):
                 await self.login_handler(packet)
-                return
+                return HandlerResult.consumed()
 
             if len(plaintext) < 5:
                 # Too short to carry a sub-type byte; treat as login (let it
                 # apply its own length checks).
                 await self.login_handler(packet)
-                return
+                return HandlerResult.consumed()
 
             subtype = plaintext[4]
 
@@ -173,7 +190,7 @@ class AnonRequestHandler(BaseHandler):
             # i.e. an actual password. Delegate verbatim to the login handler.
             if subtype == 0x00 or subtype >= 0x20:
                 await self.login_handler(packet)
-                return
+                return HandlerResult.consumed()
 
             # Regions/owner/basic discovery: route-direct only (firmware parity).
             if subtype in (ANON_REQ_TYPE_REGIONS, ANON_REQ_TYPE_OWNER, ANON_REQ_TYPE_BASIC):
@@ -188,21 +205,23 @@ class AnonRequestHandler(BaseHandler):
                         f"[AnonReq] {kind} request from {client_hex} ignored "
                         f"(not route-direct — firmware only answers direct)"
                     )
-                    return
+                    return HandlerResult.consumed()
                 if not self.anon_limiter.allow(time.time()):
                     self.log(f"[AnonReq] {kind} request from {client_hex} rate limited, dropping")
-                    return
+                    return HandlerResult.consumed()
                 self.log(f"[AnonReq] {kind} request from {client_hex} -> replying")
                 await self._handle_discovery(
                     packet, client_identity, shared_secret, subtype, plaintext
                 )
-                return
+                return HandlerResult.consumed()
 
             # Unknown/invalid sub-type: ignore.
             self.log(f"[AnonReq] Unknown anon sub-type 0x{subtype:02X}, ignoring")
+            return HandlerResult.consumed()
 
         except Exception as e:
             self.log(f"[AnonReq] Error handling anon request: {e}")
+            return HandlerResult(authenticated=for_us)
 
     async def _handle_discovery(
         self,

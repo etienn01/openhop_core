@@ -22,6 +22,7 @@ from openhop_core.node.handlers.anon_request import (
 from openhop_core.node.handlers.login_server import LoginServerHandler
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet
 from openhop_core.protocol.constants import (
+    MAX_PACKET_PAYLOAD,
     PAYLOAD_TYPE_ANON_REQ,
     PAYLOAD_TYPE_RESPONSE,
     ROUTE_TYPE_DIRECT,
@@ -164,6 +165,56 @@ class TestAnonRequestHandler:
 
         assert len(sent) == 1
 
+    # -- consume-vs-forward return contract (#353) --------------------------
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_decrypted_for_us(self):
+        """A request that decrypts for our identity is consumed (return True)."""
+        assert (await self.handler(self._build_login(route_type="flood"))).authenticated is True
+        assert (
+            await self.handler(self._build_discovery(ANON_REQ_TYPE_REGIONS))
+        ).authenticated is True
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_for_us_but_reply_declined(self):
+        """Rate-limited / non-direct discovery is still ours — consume, don't forward."""
+        # Non-direct discovery: firmware only answers direct, but it decrypted for us.
+        assert (
+            await self.handler(self._build_discovery(ANON_REQ_TYPE_OWNER, route_type="flood"))
+        ).authenticated is True
+        assert self.sent == []
+        # Exhaust the limiter, then a direct discovery is declined but still consumed.
+        for _ in range(4):
+            self.limiter.allow(1000.0)
+        assert (
+            await self.handler(self._build_discovery(ANON_REQ_TYPE_OWNER))
+        ).authenticated is True
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_dest_hash_mismatch(self):
+        """A packet addressed to a different identity is not ours (forward)."""
+        pkt = self._build_login(route_type="flood")
+        pkt.payload[0] = (pkt.payload[0] + 1) & 0xFF  # break the dest-hash match
+        assert (await self.handler(pkt)).authenticated is False
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_decrypt_failure_collision(self):
+        """dest hash matches ours but HMAC fails (hash collision): not ours, forward (#353)."""
+        pkt = self._build_login(route_type="flood")
+        pkt.payload[-1] ^= 0xFF  # corrupt ciphertext/MAC so decryption fails
+        assert (await self.handler(pkt)).authenticated is False
+        assert self.sent == []
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_short_payload(self):
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_ANON_REQ << 2) | ROUTE_TYPE_FLOOD
+        pkt.payload = bytearray([0x01, 0x02])
+        pkt.payload_len = 2
+        pkt.path = bytearray()
+        pkt.path_len = 0
+        assert (await self.handler(pkt)).authenticated is False
+
     # -- regions / owner / basic responders --------------------------------
 
     @pytest.mark.asyncio
@@ -195,7 +246,7 @@ class TestAnonRequestHandler:
         assert names.startswith("REGION000,")
         assert not names.endswith(",")
         assert all(part.startswith("REGION") for part in names.split(","))
-        assert self.sent[0][0].payload_len <= 256
+        assert self.sent[0][0].payload_len <= MAX_PACKET_PAYLOAD
 
     @pytest.mark.asyncio
     async def test_owner_reply(self):

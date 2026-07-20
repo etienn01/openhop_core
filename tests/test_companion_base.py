@@ -218,6 +218,55 @@ class TestApplyPathHashMode:
 
 
 # ---------------------------------------------------------------------------
+# set_advert_name — 31-byte firmware field (char node_name[32], NodePrefs.h),
+# truncation is on UTF-8 bytes, not Python characters.
+# ---------------------------------------------------------------------------
+
+
+class TestSetAdvertName:
+    def test_ascii_name_longer_than_limit_truncates_to_31_bytes(self):
+        bridge = _make_bridge()
+        bridge.set_advert_name("a" * 40)
+        assert bridge.prefs.node_name == "a" * 31
+        assert len(bridge.prefs.node_name.encode("utf-8")) == 31
+
+    def test_ascii_name_exactly_at_limit_is_unchanged(self):
+        bridge = _make_bridge()
+        name = "a" * 31
+        bridge.set_advert_name(name)
+        assert bridge.prefs.node_name == name
+        assert len(bridge.prefs.node_name.encode("utf-8")) == 31
+
+    def test_multibyte_utf8_name_straddling_boundary_cuts_at_codepoint(self):
+        """30 ASCII bytes + one 3-byte codepoint (e.g. 'ééé' would be
+
+        2 bytes each; use a 3-byte char, e.g. '☃' SNOWMAN, so it can only
+        fit whole or not at all across the 31-byte boundary.
+        """
+        bridge = _make_bridge()
+        # 30 'a' bytes + a 3-byte snowman = 33 raw bytes; the snowman straddles
+        # byte 31 and must be dropped whole, never split into invalid UTF-8.
+        name = ("a" * 30) + "☃" + "b"
+        bridge.set_advert_name(name)
+        stored = bridge.prefs.node_name
+        encoded = stored.encode("utf-8")
+        assert len(encoded) <= 31
+        # Round-trips cleanly (no partial multi-byte sequence survived).
+        assert encoded.decode("utf-8") == stored
+        # The snowman didn't fit in the remaining 1 byte, so it (and the
+        # trailing 'b') were dropped; only the 30 leading ASCII bytes remain.
+        assert stored == "a" * 30
+
+    def test_multibyte_utf8_name_that_fits_is_preserved_whole(self):
+        """A multi-byte codepoint that fits cleanly within 31 bytes is kept intact."""
+        bridge = _make_bridge()
+        name = ("a" * 28) + "☃"  # 28 + 3 = 31 bytes exactly
+        bridge.set_advert_name(name)
+        assert bridge.prefs.node_name == name
+        assert len(bridge.prefs.node_name.encode("utf-8")) == 31
+
+
+# ---------------------------------------------------------------------------
 # share_contact — replay cached ADVERT blob (firmware shareContactZeroHop)
 # ---------------------------------------------------------------------------
 
@@ -594,3 +643,41 @@ async def test_send_text_to_old_key_still_addresses_old_key():
     assert b"for the old one" in _decrypt_dm(pkt, sender_pub, old)
     with pytest.raises(Exception):
         _decrypt_dm(pkt, sender_pub, new)
+
+
+# ---------------------------------------------------------------------------
+# Login-session connection registry (mirrors BaseChatMesh connections[])
+# ---------------------------------------------------------------------------
+
+
+def test_login_connection_registry_note_has_clear():
+    bridge = CompanionBridge(LocalIdentity(), lambda *a, **k: None)
+    pubkey = b"\x11" * 32
+    assert bridge.has_login_connection(pubkey) is False
+    bridge.note_login_connection(pubkey, 4)  # 4 * 16 = 64s window
+    assert bridge.has_login_connection(pubkey) is True
+    bridge.clear_login_connection(pubkey)
+    assert bridge.has_login_connection(pubkey) is False
+
+
+def test_login_connection_zero_interval_not_recorded():
+    """Firmware only startConnection() with keep_alive_secs > 0 (MyMesh.cpp:688)."""
+    bridge = CompanionBridge(LocalIdentity(), lambda *a, **k: None)
+    pubkey = b"\x12" * 32
+    bridge.note_login_connection(pubkey, 0)
+    assert bridge.has_login_connection(pubkey) is False
+
+
+def test_login_connection_expires(monkeypatch):
+    """Expiry window is 2.5x the keep-alive interval (BaseChatMesh.cpp:749)."""
+    import openhop_core.companion.base_send as base_send
+
+    clock = {"now": 500.0}
+    monkeypatch.setattr(base_send.time, "monotonic", lambda: clock["now"])
+    bridge = CompanionBridge(LocalIdentity(), lambda *a, **k: None)
+    pubkey = b"\x13" * 32
+    bridge.note_login_connection(pubkey, 4)  # 64s keep-alive -> 160s window
+    clock["now"] = 500.0 + 159.9
+    assert bridge.has_login_connection(pubkey) is True
+    clock["now"] = 500.0 + 160.1
+    assert bridge.has_login_connection(pubkey) is False

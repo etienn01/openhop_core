@@ -722,6 +722,7 @@ class TestCADAndLBT:
         assert "det_peak" in result
         assert "sf" in result
         assert "timestamp" in result
+
     async def test_perform_cad_calibration_reports_done_without_detected(self, radio):
         asyncio.get_running_loop().create_task(
             self._fire_cad_event(radio, detected=False, delay=0.01)
@@ -761,7 +762,9 @@ class TestCADAndLBT:
     async def test_perform_cad_invalid_symbol_count_returns_error_in_calibration_mode(
         self, radio
     ):
-        result = await radio.perform_cad(timeout=0.05, calibration=True, cad_symbol_num=3)
+        result = await radio.perform_cad(
+            timeout=0.05, calibration=True, cad_symbol_num=3
+        )
         assert "error" in result
         assert "cad_symbol_num must be one of" in result["error"]
 
@@ -1191,6 +1194,138 @@ class TestEventOrdering:
             await task
         except (asyncio.CancelledError, Exception):
             pass
+
+    async def test_completed_rx_packet_is_not_lost_when_send_starts(
+        self, radio, mock_lora
+    ):
+        received = []
+        radio.set_rx_callback(received.append)
+
+        # Simulate a fully received packet whose IRQ handler has run,
+        # but whose background RX task has not consumed it yet.
+        mock_lora.getIrqStatus.return_value = mock_lora.IRQ_RX_DONE
+        radio._handle_interrupt()
+
+        mock_lora.getRxBufferStatus.return_value = (4, 0x80)
+        mock_lora.readBuffer.return_value = list(b"test")
+
+        _make_tx_succeed(radio, mock_lora)
+        await radio.send(b"outbound")
+
+        assert received == [b"test"]
+
+        read_idx = next(
+            i
+            for i, c in enumerate(mock_lora.mock_calls)
+            if c == call.readBuffer(0x80, 4)
+        )
+        write_idx = next(
+            i
+            for i, c in enumerate(mock_lora.mock_calls)
+            if c == call.writeBuffer(0x00, list(b"outbound"), len(b"outbound"))
+        )
+        assert read_idx < write_idx
+
+    async def test_rx_done_while_tx_lock_held_is_latched_and_drained_before_tx_reuse(
+        self, radio, mock_lora
+    ):
+        received = []
+        radio.set_rx_callback(received.append)
+
+        await radio._tx_lock.acquire()
+        try:
+            # IRQ arrives while TX lock is held: hardware IRQ is cleared and
+            # background RX task is not woken, so software latch must preserve it.
+            mock_lora.getIrqStatus.return_value = mock_lora.IRQ_RX_DONE
+            radio._handle_interrupt()
+        finally:
+            radio._tx_lock.release()
+
+        assert radio._pending_rx_irq_status & mock_lora.IRQ_RX_DONE
+        assert not radio._rx_done_event.is_set()
+
+        mock_lora.getRxBufferStatus.return_value = (4, 0x80)
+        mock_lora.readBuffer.return_value = list(b"test")
+
+        _make_tx_succeed(radio, mock_lora)
+        await radio.send(b"outbound")
+
+        assert received == [b"test"]
+
+        read_idx = next(
+            i
+            for i, c in enumerate(mock_lora.mock_calls)
+            if c == call.readBuffer(0x80, 4)
+        )
+        write_idx = next(
+            i
+            for i, c in enumerate(mock_lora.mock_calls)
+            if c == call.writeBuffer(0x00, list(b"outbound"), len(b"outbound"))
+        )
+        assert read_idx < write_idx
+
+    async def test_background_rx_processing_claims_and_clears_pending_latch(
+        self, radio, mock_lora
+    ):
+        received = []
+        radio.set_rx_callback(received.append)
+
+        mock_lora.getRxBufferStatus.return_value = (4, 0x80)
+        mock_lora.readBuffer.return_value = list(b"test")
+        mock_lora.getIrqStatus.return_value = mock_lora.IRQ_RX_DONE
+
+        radio._handle_interrupt()
+        assert radio._pending_rx_irq_status & mock_lora.IRQ_RX_DONE
+
+        task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
+        await _wait_condition(lambda: received == [b"test"], timeout=1.0)
+
+        # The RX consumer must claim and clear the corresponding software latch,
+        # preventing the pre-TX drain from delivering the same packet again.
+        assert (radio._pending_rx_irq_status & mock_lora.IRQ_RX_DONE) == 0
+
+        await radio._drain_pending_rx_irq_before_buffer_reuse()
+        assert received == [b"test"]
+
+        radio._initialized = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def test_standalone_cad_acquires_tx_lock_before_pending_rx_drain(
+        self, radio, mock_lora
+    ):
+        drain_lock_states = []
+
+        async def _drain_spy():
+            drain_lock_states.append(radio._tx_lock.locked())
+
+        radio._drain_pending_rx_irq_before_buffer_reuse = AsyncMock(
+            side_effect=_drain_spy
+        )
+        mock_lora.getIrqStatus.return_value = IRQ_NONE
+
+        result = await radio.perform_cad(timeout=0.05)
+        assert result is False
+        assert drain_lock_states == [True]
+
+    async def test_pending_drain_crc_and_rx_done_uses_crc_branch_only(
+        self, radio, mock_lora
+    ):
+        received = []
+        radio.set_rx_callback(received.append)
+
+        radio._pending_rx_irq_status = mock_lora.IRQ_CRC_ERR | mock_lora.IRQ_RX_DONE
+        start_crc_errors = radio.crc_error_count
+
+        mock_lora.getRxBufferStatus.return_value = (4, 0x80)
+        mock_lora.readBuffer.return_value = list(b"test")
+
+        await radio._drain_pending_rx_irq_before_buffer_reuse()
+
+        assert radio.crc_error_count == start_crc_errors + 1
+        mock_lora.readBuffer.assert_not_called()
+        assert received == []
 
     async def test_stale_cad_detected_not_inherited_by_next_cad(self, radio):
         """
@@ -1806,7 +1941,6 @@ class TestFIFOCorruptionRace:
         # (which happens inside _handle_interrupt), then restoring it so the
         # rest of send() works normally.
         call_count = [0]
-        original_side_effect = mock_lora.getIrqStatus.side_effect
 
         def _fail_first_irq_read():
             call_count[0] += 1

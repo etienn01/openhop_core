@@ -41,6 +41,7 @@ def create_core_handlers(
     node_name: str,
     radio_config: Optional[dict] = None,
     ack_handler: Any = None,
+    group_packet_seen_callback: Optional[Callable[[Any], bool]] = None,
 ) -> CoreHandlers:
     """Create and wire the standard set of MeshCore protocol handlers.
 
@@ -60,6 +61,8 @@ def create_core_handlers(
         ack_handler: ACK handler instance (varies between Dispatcher and
             Bridge).  If ``None``, the :class:`PathHandler` is constructed
             without ACK forwarding.
+        group_packet_seen_callback: Optional shared full-hash cache callback
+            for companion group text/data loopback suppression.
     """
     protocol_response_handler = ProtocolResponseHandler(log_fn, identity, contacts)
 
@@ -92,7 +95,7 @@ def create_core_handlers(
         send_packet_fn,
         channels,
         event_service,
-        node_name,
+        group_packet_seen_callback,
     )
 
     return CoreHandlers(

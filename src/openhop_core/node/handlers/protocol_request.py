@@ -5,16 +5,15 @@ Handles REQ packets and sends RESPONSE packets with requested data.
 """
 
 import struct
+import time
 from typing import Callable, Optional
 
 from openhop_core.protocol import PacketBuilder
-from openhop_core.protocol.constants import (
-    MAX_PATH_SIZE,
-    PAYLOAD_TYPE_REQ,
-    PAYLOAD_TYPE_RESPONSE,
-)
+from openhop_core.protocol.constants import MAX_PATH_SIZE, PAYLOAD_TYPE_REQ, PAYLOAD_TYPE_RESPONSE
 from openhop_core.protocol.crypto import CryptoUtils
 from openhop_core.protocol.packet_utils import PathUtils
+
+from .result import HandlerResult
 
 # Request type codes (matching C++ implementation)
 REQ_TYPE_GET_STATUS = 0x01
@@ -68,7 +67,7 @@ class ProtocolRequestHandler:
         self.request_handlers = request_handlers or {}
         self.log = log_fn if log_fn else lambda msg: None
 
-    async def __call__(self, packet):
+    async def __call__(self, packet) -> HandlerResult:
         """
         Process a protocol request packet.
 
@@ -76,11 +75,20 @@ class ProtocolRequestHandler:
             packet: Packet instance with REQ payload
 
         Returns:
-            Packet: RESPONSE packet to send, or None
+            HandlerResult: ``authenticated`` is True once the REQ has been
+            MAC-verified and decrypted for a concrete local client (the caller
+            must consume it even when no response is produced); False when the
+            one-byte dest prefix collided with ours but no local client
+            authenticated it, so the caller must leave the packet for the
+            forwarding engine. ``response`` carries the RESPONSE packet to send,
+            or None.
         """
+        # Flipped to True once decryption succeeds; used so a post-decrypt error
+        # still counts as "for us" while a pre-decrypt error is forwarded.
+        for_us = False
         try:
             if len(packet.payload) < 2:
-                return None
+                return HandlerResult.not_for_us()
 
             dest_hash = packet.payload[0]
             src_hash = packet.payload[1]
@@ -88,7 +96,7 @@ class ProtocolRequestHandler:
             # Verify this packet is for us
             our_hash = self.local_identity.get_public_key()[0]
             if dest_hash != our_hash:
-                return None
+                return HandlerResult.not_for_us()
 
             self.log(f"Processing REQ from 0x{src_hash:02X}")
 
@@ -96,7 +104,7 @@ class ProtocolRequestHandler:
             clients = self._get_clients(src_hash)
             if not clients:
                 self.log(f"REQ from unknown client 0x{src_hash:02X}")
-                return None
+                return HandlerResult.not_for_us()
 
             # Decrypt request
             encrypted_data = packet.payload[2:]
@@ -128,12 +136,17 @@ class ProtocolRequestHandler:
                         f"Failed to decrypt REQ for all {decrypt_attempted} candidate(s) "
                         f"with src hash 0x{src_hash:02X}"
                     )
-                return None
+                return HandlerResult.not_for_us()
+
+            # MAC verified for a concrete client: this REQ is genuinely for us.
+            # Consume it from here on even if parsing fails or no response is built —
+            # forwarding a packet that is cryptographically ours would be wrong.
+            for_us = True
 
             # Parse request
             if len(plaintext) < 5:
                 self.log("REQ packet too short")
-                return None
+                return HandlerResult.consumed()
 
             timestamp = struct.unpack("<I", plaintext[0:4])[0]
             req_type = plaintext[4]
@@ -141,21 +154,34 @@ class ProtocolRequestHandler:
 
             self.log(f"REQ type=0x{req_type:02X}, timestamp={timestamp}")
 
-            # Handle request
-            response_data = await self._handle_request(
-                client, timestamp, req_type, req_data
-            )
-
-            if response_data:
-                return self._build_response(
-                    packet, client, response_data, shared_secret
+            # Replay protection (simple_repeater onPeerDataRecv PAYLOAD_TYPE_REQ):
+            # accept only a strictly newer timestamp than the last accepted request
+            # from this authenticated client, so a captured admin REQ cannot be
+            # replayed. Enforced here in the core handler, not left to app code.
+            last_ts = self._get_last_req_ts(client)
+            if timestamp <= last_ts:
+                self.log(
+                    f"Possible REQ replay from 0x{src_hash:02X}: "
+                    f"timestamp={timestamp} <= last={last_ts}"
                 )
+                return HandlerResult.consumed()
 
-            return None
+            # Handle request
+            response_data = await self._handle_request(client, timestamp, req_type, req_data)
+
+            # Firmware advances last_timestamp only after a valid command (reply_len > 0):
+            # an unhandled/invalid request must not move the replay watermark.
+            if not response_data:
+                return HandlerResult.consumed()
+
+            self._advance_client_watermark(client, timestamp)
+            return HandlerResult.consumed(
+                self._build_response(packet, client, response_data, shared_secret)
+            )
 
         except Exception as e:
             self.log(f"Error processing REQ: {e}")
-            return None
+            return HandlerResult(authenticated=for_us)
 
     def _get_clients(self, src_hash: int):
         """Get all client candidates by source hash."""
@@ -204,9 +230,31 @@ class ProtocolRequestHandler:
 
         return None
 
-    async def _handle_request(
-        self, client, timestamp: int, req_type: int, req_data: bytes
-    ):
+    def _get_last_req_ts(self, client) -> int:
+        """Last accepted REQ timestamp for this client (0 if none).
+
+        Reads the client's own ``last_timestamp`` (firmware
+        ``client->last_timestamp``) so REQ shares the login/ACL replay watermark.
+        """
+        ts = getattr(client, "last_timestamp", 0)
+        try:
+            return int(ts) if ts is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _advance_client_watermark(self, client, timestamp: int) -> None:
+        """Advance the replay watermark (and last_activity) after a valid REQ."""
+        try:
+            # Monotonic: the watermark must never move backwards, even if
+            # another accepted request advanced it between our replay check
+            # and this write.
+            client.last_timestamp = max(self._get_last_req_ts(client), timestamp)
+            if hasattr(client, "last_activity"):
+                client.last_activity = int(time.time())
+        except Exception:
+            pass
+
+    async def _handle_request(self, client, timestamp: int, req_type: int, req_data: bytes):
         """
         Handle request and generate response.
 
@@ -237,9 +285,7 @@ class ProtocolRequestHandler:
         self.log(f"No handler for request type 0x{req_type:02X}")
         return None
 
-    def _build_response(
-        self, original_packet, client, response_data: bytes, shared_secret: bytes
-    ):
+    def _build_response(self, original_packet, client, response_data: bytes, shared_secret: bytes):
         """
         Build RESPONSE packet to send back to client.
 
@@ -274,9 +320,7 @@ class ProtocolRequestHandler:
                 raw_path = getattr(original_packet, "path", None) or b""
                 path_list = list(raw_path[:path_byte_len]) if path_byte_len else []
                 path_len_encoded_arg = (
-                    path_len_byte
-                    if PathUtils.is_valid_path_len(path_len_byte)
-                    else None
+                    path_len_byte if PathUtils.is_valid_path_len(path_len_byte) else None
                 )
                 reply_packet = PacketBuilder.create_path_return(
                     dest_hash=client_hash,

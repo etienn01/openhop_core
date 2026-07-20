@@ -5,9 +5,11 @@ import asyncio
 import logging
 import struct
 
+from ...protocol.cayenne_lpp import TELEM_CHANNEL_SELF, encode_voltage
 from ...protocol.constants import TELEM_PERM_BASE, TELEM_PERM_ENVIRONMENT, TELEM_PERM_LOCATION
 from ...protocol.packet_utils import PathUtils
 from ..constants import (
+    ERR_CODE_BAD_STATE,
     ERR_CODE_ILLEGAL_ARG,
     ERR_CODE_NOT_FOUND,
     ERR_CODE_TABLE_FULL,
@@ -15,6 +17,7 @@ from ..constants import (
     FIRMWARE_VER_CODE,
     LOGIN_TIMEOUT_HINT_MS,
     MAX_CHANNEL_DATA_LENGTH,
+    MAX_GROUP_DATA_LENGTH,
     MAX_PATH_SIZE,
     OUT_PATH_UNKNOWN,
     PUB_KEY_SIZE,
@@ -30,10 +33,9 @@ from ..constants import (
     RESP_CODE_NO_MORE_MESSAGES,
     STATUS_TIMEOUT_HINT_MS,
     TELEMETRY_TIMEOUT_HINT_MS,
-    TRACE_BASE_TIMEOUT_MS,
-    TRACE_PER_PATH_BYTE_TIMEOUT_MS,
     TXT_MSG_TIMEOUT_HINT_MS,
     TXT_TYPE_CLI_DATA,
+    TXT_TYPE_PLAIN,
     TXT_TYPE_SIGNED_PLAIN,
 )
 from ..models import QueuedMessage
@@ -41,12 +43,49 @@ from ..models import QueuedMessage
 logger = logging.getLogger("CompanionFrameServer")
 
 
+def _encode_lpp_voltage(channel: int, millivolts: int) -> bytes:
+    """Encode a CayenneLPP voltage entry the way the firmware does.
+
+    Firmware: `telemetry.addVoltage(TELEM_CHANNEL_SELF, battMilliVolts/1000.0f)`
+    (MyMesh.cpp:1644). CayenneLPP computes `uint32_t v = value * multiplier`
+    entirely in single-precision float and truncates toward zero, so the float
+    rounding is reproduced here (e.g. 4200 mV -> 4.2f*100 = 419.99998 -> 419)
+    to stay byte-identical. Unknown battery (0 mV) still emits a 0 V entry.
+    """
+    return encode_voltage(channel, millivolts / 1000.0)
+
+
 class _MessagingCommandsMixin:
     """Messaging and request _cmd_* handlers of :class:`CompanionFrameServer`."""
 
+    def _spawn_request_task(self, coro, label: str) -> asyncio.Task:
+        """Track request completion on a real companion, with a test-safe fallback."""
+        spawn = getattr(self.bridge, "_spawn_background_task", None)
+        if getattr(spawn, "__self__", None) is self.bridge:
+            return spawn(coro, label)
+        return asyncio.create_task(coro)
+
+    def _write_request_start_error(self, started: dict) -> None:
+        error = started.get("error")
+        if error == "not_found":
+            code = ERR_CODE_NOT_FOUND
+        elif error == "send_failed":
+            code = ERR_CODE_TABLE_FULL
+        else:
+            code = ERR_CODE_BAD_STATE
+        self._write_err(code)
+
     async def _cmd_send_txt_msg(self, data: bytes) -> None:
-        if len(data) < 12:
-            self._write_err(ERR_CODE_ILLEGAL_ARG)
+        # Firmware: `cmd_frame[0] == CMD_SEND_TXT_MSG && len >= 14` (MyMesh.cpp
+        # handleCmdFrame), where len includes the command byte. `data` here has
+        # already had the command byte stripped, so the equivalent minimum is
+        # 13: 12 header bytes (txt_type, attempt, timestamp, pubkey_prefix)
+        # plus at least 1 text byte. Frames that fail this length check don't
+        # match any `else if` branch and fall through to the catch-all
+        # `else { writeErrFrame(ERR_CODE_UNSUPPORTED_CMD); }` at the end of
+        # handleCmdFrame, so that's the code we mirror here (not ILLEGAL_ARG).
+        if len(data) < 13:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         txt_type = data[0]
         attempt = data[1]
@@ -63,6 +102,16 @@ class _MessagingCommandsMixin:
         contact = self.bridge.contacts.get_by_key_prefix(pubkey_prefix)
         if not contact:
             self._write_err(ERR_CODE_NOT_FOUND)
+            return
+        # Firmware (MyMesh.cpp CMD_SEND_TXT_MSG) only sends for TXT_TYPE_PLAIN
+        # and TXT_TYPE_CLI_DATA; any other txt_type (e.g. reserved/unknown
+        # values, or TXT_TYPE_SIGNED_PLAIN which this command doesn't support)
+        # falls into the `else` branch. That branch picks
+        # ERR_CODE_NOT_FOUND if the recipient lookup failed, else
+        # ERR_CODE_UNSUPPORTED_CMD for the unsupported txt_type — so the
+        # not-found check above must run first, and this check second.
+        if txt_type not in (TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA):
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         result = await self.bridge.send_text_message(
             contact.public_key_bytes,
@@ -125,7 +174,7 @@ class _MessagingCommandsMixin:
             return
         data_type = int.from_bytes(data[offset : offset + 2], "little")
         payload = data[offset + 2 :]
-        if data_type == 0 or len(payload) > MAX_CHANNEL_DATA_LENGTH:
+        if data_type == 0 or len(payload) > MAX_GROUP_DATA_LENGTH:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         send_channel_data = getattr(self.bridge, "send_channel_data", None)
@@ -161,7 +210,9 @@ class _MessagingCommandsMixin:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         if not result.success:
-            self._write_err(ERR_CODE_NOT_FOUND)
+            self._write_err(
+                ERR_CODE_NOT_FOUND if result.error == "not_found" else ERR_CODE_TABLE_FULL
+            )
             return
         self._write_sent_result(result, own_binary_tag=True)
 
@@ -189,11 +240,14 @@ class _MessagingCommandsMixin:
         self._write_sent_result(result, own_binary_tag=True)
 
     async def _cmd_send_control_data(self, data: bytes) -> None:
-        if len(data) < 2:
-            self._write_err(ERR_CODE_ILLEGAL_ARG)
-            return
-        if (data[0] & 0x80) == 0:
-            self._write_err(ERR_CODE_ILLEGAL_ARG)
+        # Firmware: `len >= 2 && (cmd_frame[1] & 0x80) != 0`, where `len` includes
+        # the command byte. `data` here has the command byte already stripped, so
+        # the minimum is 1 byte, and `data[0]` is the firmware's `cmd_frame[1]`.
+        # A failure of either condition falls through the else-if chain to the
+        # catch-all `else { writeErrFrame(ERR_CODE_UNSUPPORTED_CMD); }`, not
+        # ILLEGAL_ARG.
+        if len(data) < 1 or (data[0] & 0x80) == 0:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         # Discovery request: register a no-op response callback
         if self._control_handler and len(data) >= 6 and (data[0] & 0xF0) == 0x80:
@@ -235,7 +289,9 @@ class _MessagingCommandsMixin:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         if not result.success:
-            self._write_err(ERR_CODE_NOT_FOUND)
+            self._write_err(
+                ERR_CODE_NOT_FOUND if result.error == "not_found" else ERR_CODE_TABLE_FULL
+            )
             return
         self._write_sent_result(result)
 
@@ -257,30 +313,20 @@ class _MessagingCommandsMixin:
             self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         try:
-            ok = await send_raw(tag, auth_code, flags, path_bytes)
+            result = await send_raw(tag, auth_code, flags, path_bytes)
         except Exception as e:
             logger.error("send_trace_path error: %s", e, exc_info=True)
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
-        if not ok:
+        if not result.success:
             self._write_err(ERR_CODE_TABLE_FULL)
             return
-        est_timeout_ms = TRACE_BASE_TIMEOUT_MS + (path_len * TRACE_PER_PATH_BYTE_TIMEOUT_MS)
-        self._write_sent_response(False, tag, est_timeout_ms)
-        # If we are the final hop, push trace data immediately
-        if path_bytes and self.local_hash is not None and path_bytes[-1] == self.local_hash:
-            snr_len = path_len // hash_width
-            path_snrs = bytes(snr_len)
-            final_snr_byte = 0
-            self.push_trace_data(
-                path_len,
-                flags,
-                tag,
-                auth_code,
-                path_bytes,
-                path_snrs,
-                final_snr_byte,
-            )
+        # Firmware CMD_SEND_TRACE_PATH only sends and returns SENT with the
+        # est_timeout hint (MyMesh.cpp:1750-1775); trace completion (the
+        # PUSH_CODE_TRACE_DATA frame) is produced by the receive pipeline when the
+        # echoed trace reaches the end of its path (Mesh.cpp:41-64 -> onTraceRecv),
+        # never synthesised here at send time.
+        self._write_sent_response(result.is_flood, tag, result.timeout_ms)
 
     def _build_message_frame(self, msg: "QueuedMessage") -> bytes:
         """Encode a QueuedMessage into a response frame (shared by base and subclasses)."""
@@ -386,53 +432,82 @@ class _MessagingCommandsMixin:
             if len(data) > PUB_KEY_SIZE
             else ""
         )
-        self._write_sent_response(True, 0, LOGIN_TIMEOUT_HINT_MS)
-        result = await self.bridge.send_login(pubkey, password)
-        if result.get("success"):
-            # Layout matches MeshCore companion_radio onContactResponse
-            fw_level = result.get("firmware_ver_level")
-            if fw_level is None:
-                fw_level = FIRMWARE_VER_CODE  # fallback so app sees >= 2 for owner info
-            self._write_frame(
-                bytes(
-                    [
-                        PUSH_CODE_LOGIN_SUCCESS,
-                        1 if result.get("is_admin") else 0,
-                    ]
+        started = await self.bridge._start_login_request(pubkey, password)
+        if not started.get("success"):
+            self._write_request_start_error(started)
+            return
+        self._write_sent_result(started["sent"], default_timeout_ms=LOGIN_TIMEOUT_HINT_MS)
+
+        async def _write_login_result() -> None:
+            result = await started["task"]
+            if result.get("timeout"):
+                logger.debug("Login request timed out for %s; no login push sent", pubkey[:6].hex())
+                return
+            if result.get("success"):
+                # Layout matches MeshCore companion_radio onContactResponse
+                fw_level = result.get("firmware_ver_level")
+                if fw_level is None:
+                    fw_level = FIRMWARE_VER_CODE  # fallback so app sees >= 2 for owner info
+                self._write_frame(
+                    bytes(
+                        [
+                            PUSH_CODE_LOGIN_SUCCESS,
+                            1 if result.get("is_admin") else 0,
+                        ]
+                    )
+                    + pubkey[:6]
+                    + struct.pack("<I", result.get("tag", 0))
+                    + bytes([result.get("acl_permissions", 0)])
+                    + bytes([min(255, max(0, int(fw_level)))])
                 )
-                + pubkey[:6]
-                + struct.pack("<I", result.get("tag", 0))
-                + bytes([result.get("acl_permissions", 0)])
-                + bytes([min(255, max(0, int(fw_level)))])
-            )
-        else:
-            self._write_frame(bytes([PUSH_CODE_LOGIN_FAIL, 0]) + pubkey[:6])
+            else:
+                self._write_frame(bytes([PUSH_CODE_LOGIN_FAIL, 0]) + pubkey[:6])
+
+        self._spawn_request_task(_write_login_result(), "companion login response")
 
     async def _cmd_send_status_req(self, data: bytes) -> None:
         if len(data) < PUB_KEY_SIZE:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         pubkey = data[0:PUB_KEY_SIZE]
-        self._write_sent_response(False, 0, STATUS_TIMEOUT_HINT_MS)
-        result = await self.bridge.send_status_request(pubkey)
-        if not result.get("success"):
-            logger.debug("Status request failed for %s; no push sent)", pubkey[:6].hex())
+        started = await self.bridge._start_status_request(pubkey)
+        if not started.get("success"):
+            self._write_request_start_error(started)
             return
-        stats_data = result.get("stats", {})
-        raw_bytes = stats_data.get("raw_bytes", b"")
-        if not raw_bytes:
-            logger.debug(
-                "Status response had no raw_bytes for %s; no push sent",
-                pubkey[:6].hex(),
-            )
-            return
-        self._write_frame(bytes([PUSH_CODE_STATUS_RESPONSE, 0]) + pubkey[:6] + raw_bytes)
+        self._write_sent_result(started["sent"], default_timeout_ms=STATUS_TIMEOUT_HINT_MS)
+
+        async def _write_status_result() -> None:
+            result = await started["task"]
+            if not result.get("success"):
+                logger.debug("Status request failed for %s; no push sent", pubkey[:6].hex())
+                return
+            stats_data = result.get("stats", {})
+            raw_bytes = stats_data.get("raw_bytes", b"")
+            if not raw_bytes:
+                logger.debug(
+                    "Status response had no raw_bytes for %s; no push sent",
+                    pubkey[:6].hex(),
+                )
+                return
+            self._write_frame(bytes([PUSH_CODE_STATUS_RESPONSE, 0]) + pubkey[:6] + raw_bytes)
+
+        self._spawn_request_task(_write_status_result(), "companion status response")
 
     async def _cmd_send_telemetry_req(self, data: bytes) -> None:
-        # Protocol: CMD_SEND_TELEMETRY_REQ has reserved bytes(3) then pub_key bytes(32).
-        # See MeshCore Companion-Radio-Protocol: CMD_SEND_TELEMETRY_REQ frame format.
+        # Firmware CMD_SEND_TELEMETRY_REQ has two forms, split by frame length
+        # (MyMesh.cpp:1622-1656). Frame length includes the command byte;
+        # OpenHop's `data` is cmd-byte-stripped, so subtract one from each guard:
+        #   - remote/contact form: firmware `len >= 4 + PUB_KEY_SIZE` -> data >= 35
+        #     (3 reserved bytes then a 32-byte pub key).
+        #   - self form: firmware `len == 4` -> data == 3 (3 reserved/unused bytes).
+        #     Firmware builds local telemetry synchronously and pushes it.
+        # Anything else falls through the else-if chain to the catch-all
+        # writeErrFrame(ERR_CODE_UNSUPPORTED_CMD).
+        if len(data) == 3:
+            self._push_self_telemetry()
+            return
         if len(data) < 3 + PUB_KEY_SIZE:
-            self._write_err(ERR_CODE_ILLEGAL_ARG)
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         pubkey = data[3 : 3 + PUB_KEY_SIZE]
         # Request all: base + location + environment
@@ -440,39 +515,94 @@ class _MessagingCommandsMixin:
         want_base = bool(flags & TELEM_PERM_BASE)
         want_location = bool(flags & TELEM_PERM_LOCATION)
         want_environment = bool(flags & TELEM_PERM_ENVIRONMENT)
-        self._write_sent_response(False, 0, TELEMETRY_TIMEOUT_HINT_MS)
-        result = await self.bridge.send_telemetry_request(
+        started = await self.bridge._start_telemetry_request(
             pubkey,
             want_base=want_base,
             want_location=want_location,
             want_environment=want_environment,
         )
-        if not result.get("success"):
-            logger.debug("Telemetry request failed for %s; no push sent", pubkey[:6].hex())
+        if not started.get("success"):
+            self._write_request_start_error(started)
             return
-        telem_data = result.get("telemetry_data", {})
-        raw_bytes = telem_data.get("raw_bytes", b"")
-        if not raw_bytes:
-            logger.debug(
-                "Telemetry response had no raw_bytes for %s; no push sent",
-                pubkey[:6].hex(),
-            )
+        self._write_sent_result(started["sent"], default_timeout_ms=TELEMETRY_TIMEOUT_HINT_MS)
+
+        async def _write_telemetry_result() -> None:
+            result = await started["task"]
+            if not result.get("success"):
+                logger.debug("Telemetry request failed for %s; no push sent", pubkey[:6].hex())
+                return
+            telem_data = result.get("telemetry_data", {})
+            raw_bytes = telem_data.get("raw_bytes", b"")
+            if not raw_bytes:
+                logger.debug(
+                    "Telemetry response had no raw_bytes for %s; no push sent",
+                    pubkey[:6].hex(),
+                )
+                return
+            self._write_frame(bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + pubkey[:6] + raw_bytes)
+            logger.info("Telemetry push sent to client: %d bytes LPP", len(raw_bytes))
+
+        self._spawn_request_task(_write_telemetry_result(), "companion telemetry response")
+
+    def _push_self_telemetry(self) -> None:
+        """Build and synchronously push this node's own telemetry.
+
+        Mirrors the firmware 'self' telemetry request (MyMesh.cpp:1642-1656):
+        it seeds a CayenneLPP buffer with a battery-voltage entry
+        (`telemetry.addVoltage(TELEM_CHANNEL_SELF, battMilliVolts/1000)`),
+        appends any local sensor LPP bytes (`sensors.querySensors(0xFF, ...)`),
+        and writes a single push frame
+        `[PUSH_CODE_TELEMETRY_RESPONSE][0x00][self pubkey[0:6]][CayenneLPP]`.
+        The push is always emitted, even with no sensors (voltage-only floor),
+        and is written synchronously in the handler like the firmware.
+        """
+        millivolts = self._get_batt_and_storage()[0]
+        lpp = _encode_lpp_voltage(TELEM_CHANNEL_SELF, millivolts)
+        lpp += self._get_self_telemetry_lpp()
+        pubkey_prefix = self.bridge.get_public_key()[:6]
+        self._write_frame(bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + pubkey_prefix + lpp)
+        logger.info("Self telemetry push sent to client: %d bytes LPP", len(lpp))
+
+    async def _cmd_has_connection(self, data: bytes) -> None:
+        # Firmware MyMesh.cpp:1678-1684 gates this branch on
+        # `len >= 1 + PUB_KEY_SIZE` (length includes the command byte). OpenHop's
+        # `data` is cmd-byte-stripped, so a full pub key is 32 bytes; a shorter
+        # frame fails the guard and falls through the else-if chain to
+        # writeErrFrame(ERR_CODE_UNSUPPORTED_CMD).
+        if len(data) < PUB_KEY_SIZE:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
-        self._write_frame(bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + pubkey[:6] + raw_bytes)
-        logger.info("Telemetry push sent to client: %d bytes LPP", len(raw_bytes))
+        pubkey = data[:PUB_KEY_SIZE]
+        # hasConnectionTo (BaseChatMesh.cpp:707-712): OK if a live login
+        # connection exists, else ERR_CODE_NOT_FOUND.
+        if self.bridge.has_login_connection(pubkey):
+            self._write_ok()
+        else:
+            self._write_err(ERR_CODE_NOT_FOUND)
 
     async def _cmd_logout(self, data: bytes) -> None:
         if len(data) < PUB_KEY_SIZE:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         pubkey = data[:PUB_KEY_SIZE]
+        # Firmware CMD_LOGOUT (MyMesh.cpp:1685-1688) calls stopConnection before
+        # writeOKFrame, unconditionally clearing the connection slot.
+        self.bridge.clear_login_connection(pubkey)
         await self.bridge.send_logout(pubkey)
         self._write_ok()
 
     async def _cmd_send_raw_data(self, data: bytes) -> None:
         """Handle CMD_SEND_RAW_DATA (25).
-        Format: [path_len_encoded][path][payload] (min 4-byte payload)."""
-        if len(data) < 6:
+        Format: [path_len_encoded][path][payload] (min 4-byte payload).
+
+        Firmware (MyMesh.cpp handleCmdFrame): `len >= 6` (len includes the
+        command byte, so the stripped `data` here only needs the path_len
+        byte to be present) then `path_len >= 0 && i + path_len + 4 <= len`,
+        which is exactly `1 + path_byte_len + 4 <= len(data)` below. A
+        zero-hop frame (path_len=0, 4-byte payload -> len(data) == 5) is the
+        firmware minimum and must not be rejected here.
+        """
+        if len(data) < 1:
             self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         path_len_byte = data[0]

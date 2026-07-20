@@ -19,7 +19,9 @@ from .constants import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Exported-contact binary format (CMD_EXPORT_CONTACT / CMD_IMPORT_CONTACT):
+# Historical 73-byte contact record.  It is retained for source compatibility
+# with callers that use these helpers directly, but is not a companion-wire
+# format: CMD_EXPORT_CONTACT/CMD_IMPORT_CONTACT use signed ADVERT packets.
 # pubkey(32) + adv_type(1) + name(32, NUL padded) + lat(i32 µdeg) + lon(i32 µdeg)
 # ---------------------------------------------------------------------------
 EXPORTED_CONTACT_STRUCT = "<32sB32sii"
@@ -29,7 +31,7 @@ EXPORTED_CONTACT_SIZE = struct.calcsize(EXPORTED_CONTACT_STRUCT)  # 73 bytes
 def encode_exported_contact(
     pub_key: bytes, adv_type: int, name: str, gps_lat: float, gps_lon: float
 ) -> bytes:
-    """Encode the 73-byte exported-contact blob."""
+    """Encode the historical 73-byte contact record."""
     name_field = name.encode("utf-8")[:CONTACT_NAME_SIZE].ljust(CONTACT_NAME_SIZE, b"\x00")
     return struct.pack(
         EXPORTED_CONTACT_STRUCT,
@@ -42,7 +44,7 @@ def encode_exported_contact(
 
 
 def decode_exported_contact(data: bytes) -> Optional[dict]:
-    """Decode a 73-byte exported-contact blob; returns None if too short.
+    """Decode a historical 73-byte contact record; return None if too short.
 
     ``name_raw`` preserves the undecoded name bytes (up to the first NUL) for
     callers that re-encode the name on the wire.

@@ -5,13 +5,16 @@ from __future__ import annotations
 import copy
 import logging
 import time
-from typing import Any, Optional
+from typing import Optional
 
 from ..protocol import Packet
 from ..protocol.constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
 from ..protocol.transport_keys import calc_transport_code, get_auto_key_for
 from .constants import (
+    DEFAULT_ALLOWED_REPEAT_FREQ_RANGES,
+    DEFAULT_MAX_TX_POWER_DBM,
     MAX_SIGN_DATA_SIZE,
+    NODE_NAME_MAX_BYTES,
     STATS_TYPE_CORE,
     STATS_TYPE_PACKETS,
     STATS_TYPE_RADIO,
@@ -30,20 +33,17 @@ class _DeviceConfigMixin:
     # -------------------------------------------------------------------------
 
     def set_advert_name(self, name: str) -> None:
-        """Set the node's advertised name (max 31 chars)."""
-        self.prefs.node_name = name[:31]
+        """Set the node's advertised name.
+
+        Firmware stores this in a fixed ``char node_name[32]`` (NodePrefs.h),
+        so the limit is 31 *bytes* of UTF-8, not 31 characters. Truncate on
+        the encoded bytes and decode leniently so a multi-byte codepoint
+        straddling the cut is dropped whole rather than split.
+        """
+        self.prefs.node_name = name.encode("utf-8")[:NODE_NAME_MAX_BYTES].decode(
+            "utf-8", errors="ignore"
+        )
         self._save_prefs()
-        self._sync_our_node_name_to_handlers()
-
-    def _get_group_text_handler(self) -> Optional[Any]:
-        """Return the group text handler for name sync, or None. Override in Radio/Bridge."""
-        return None
-
-    def _sync_our_node_name_to_handlers(self) -> None:
-        """Sync node name to group text handler for echo detection."""
-        handler = self._get_group_text_handler()
-        if handler is not None:
-            handler.set_our_node_name(self.prefs.node_name)
 
     def set_advert_latlon(self, lat: float, lon: float) -> None:
         """Set the GPS coordinates included in advertisements."""
@@ -73,6 +73,54 @@ class _DeviceConfigMixin:
         self.prefs.tx_power_dbm = power_dbm
         self._save_prefs()
         return True
+
+    def supports_radio_params_mutation(self) -> bool:
+        """Return whether this companion can apply radio-parameter changes."""
+        return True
+
+    def supports_tx_power_mutation(self) -> bool:
+        """Return whether this companion can apply TX-power changes."""
+        return True
+
+    def supports_client_repeat(self) -> bool:
+        """Return whether this companion can act as a client repeater.
+
+        A concrete companion that owns a radio can forward mesh traffic
+        (MeshCore ``_prefs.client_repeat``). Host-shared virtual companions
+        must override this to False.
+        """
+        return True
+
+    def get_allowed_repeat_freqs(self) -> tuple:
+        """Return the (lower_khz, upper_khz) ranges where client-repeat is allowed.
+
+        Mirrors firmware's ``repeat_freq_ranges`` (MyMesh.cpp). Defaults to the
+        three single-frequency LoRa bands; a companion can override the set via
+        the ``allowed_repeat_freq_ranges`` key of its ``radio_config`` dict.
+        """
+        ranges = self._radio_config.get(
+            "allowed_repeat_freq_ranges", DEFAULT_ALLOWED_REPEAT_FREQ_RANGES
+        )
+        return tuple((int(lower), int(upper)) for lower, upper in ranges)
+
+    def set_client_repeat(self, value: int) -> None:
+        """Persist the client-repeat preference (advertised in DEVICE_QUERY byte 80)."""
+        self.prefs.client_repeat = int(value) & 0xFF
+        self._save_prefs()
+
+    def get_max_tx_power_dbm(self) -> int:
+        """Return the maximum supported TX power for companion SELF_INFO.
+
+        A concrete radio or host integration can override this capability.
+        ``max_tx_power_dbm`` is intentionally separate from the current
+        ``tx_power`` preference: lowering the active power must not lower the
+        radio's advertised capability.
+        """
+        value = self._radio_config.get("max_tx_power_dbm", DEFAULT_MAX_TX_POWER_DBM)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_TX_POWER_DBM
 
     def set_tuning_params(self, rx_delay: float, airtime_factor: float) -> None:
         """Set RX delay and airtime factor tuning parameters."""
@@ -150,6 +198,10 @@ class _DeviceConfigMixin:
         """Begin a signing session; returns the maximum sign buffer size."""
         self._sign_buffer = bytearray()
         return MAX_SIGN_DATA_SIZE
+
+    def is_signing(self) -> bool:
+        """Return whether a companion signing session is active."""
+        return self._sign_buffer is not None
 
     def sign_data(self, data: bytes) -> bool:
         """Append data to the signing buffer."""

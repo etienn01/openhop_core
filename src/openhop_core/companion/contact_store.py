@@ -197,6 +197,15 @@ class ContactStore:
         """Return the number of stored contacts."""
         return len(self._contacts)
 
+    def count(self) -> int:
+        """Return the real contact count for CONTACTS_START (firmware getNumContacts()).
+
+        Excludes transient/anon (ADV_TYPE_NONE) entries, matching get_all()/
+        get_contacts filtering: firmware has no transient contacts, so the total
+        must equal the number of contacts actually emitted on a full sync.
+        """
+        return sum(1 for c in self._contacts.values() if c.adv_type != ADV_TYPE_NONE)
+
     def is_full(self) -> bool:
         """Check if the contact store is at capacity."""
         return len(self._contacts) >= self._max_contacts

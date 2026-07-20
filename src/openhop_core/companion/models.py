@@ -148,8 +148,12 @@ class NodePrefs:
     telemetry_mode_environment: int = 0
     manual_add_contacts: int = 0
     autoadd_config: int = 0
+    # Max hops away an advert may be for automatic contact creation. 0 = no
+    # limit; N rejects adverts N or more hops away (firmware getAutoAddMaxHops).
+    autoadd_max_hops: int = 0
     rx_delay_base: float = 0.0
-    airtime_factor: float = 0.0
+    # Firmware companion default (NodePrefs airtime_factor 1.0 = 50% TX duty).
+    airtime_factor: float = 1.0
     # Reported in CMD_DEVICE_QUERY device info frame (byte 80).
     client_repeat: int = 0
     path_hash_mode: int = 0  # 0=1-byte, 1=2-byte, 2=3-byte hashes
@@ -165,6 +169,7 @@ class SentResult:
     is_flood: bool = False
     expected_ack: Optional[int] = None
     timeout_ms: Optional[int] = None
+    error: Optional[str] = None
 
 
 @dataclass
@@ -207,3 +212,68 @@ class QueuedMessage:
     # 4-byte author pubkey prefix for TXT_TYPE_SIGNED_PLAIN (room server posts);
     # emitted between timestamp and text in the CONTACT_MSG_RECV frame.
     sender_prefix: bytes = b""
+
+
+@dataclass(frozen=True)
+class MessageEvent:
+    """A received direct message with its delivery metadata.
+
+    Passed as the single argument to ``on_message_event`` callbacks so new
+    metadata fields never change the callback signature. ``queued`` is False
+    when the protected offline queue could not retain the message.
+    """
+
+    sender_key: bytes  # 32 bytes
+    text: str
+    timestamp: int
+    txt_type: int
+    packet_hash: Optional[str] = None
+    snr: Optional[float] = None
+    rssi: Optional[int] = None
+    # 4-byte author pubkey prefix for TXT_TYPE_SIGNED_PLAIN (room server posts).
+    sender_prefix: bytes = b""
+    # Companion-format route byte: encoded path_len for floods, 0xFF for direct.
+    path_len: int = 0
+    queued: bool = True
+    # The exact in-memory offline-queue entry this event describes, so a
+    # persistence layer can remove that entry by identity instead of guessing.
+    # None when the protected queue rejected the push.
+    queue_entry: Optional[QueuedMessage] = None
+
+
+@dataclass(frozen=True)
+class ChannelMessageEvent:
+    """A received channel text message (single ``on_channel_message_event`` argument)."""
+
+    channel_name: str
+    sender_name: str
+    text: str
+    timestamp: int
+    path_len: int = 0
+    channel_idx: int = 0
+    packet_hash: Optional[str] = None
+    snr: Optional[float] = None
+    rssi: Optional[int] = None
+    queued: bool = True
+    # The exact in-memory offline-queue entry this event describes, so a
+    # persistence layer can remove that entry by identity instead of guessing.
+    # None when the protected queue rejected the push.
+    queue_entry: Optional[QueuedMessage] = None
+
+
+@dataclass(frozen=True)
+class ChannelDataEvent:
+    """A received binary channel payload (single ``on_channel_data_event`` argument)."""
+
+    channel_idx: int
+    path_len: int
+    data_type: int
+    payload: bytes
+    packet_hash: Optional[str] = None
+    snr: Optional[float] = None
+    rssi: Optional[int] = None
+    queued: bool = True
+    # The exact in-memory offline-queue entry this event describes, so a
+    # persistence layer can remove that entry by identity instead of guessing.
+    # None when the protected queue rejected the push.
+    queue_entry: Optional[QueuedMessage] = None

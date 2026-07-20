@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import struct
 import time
@@ -13,7 +12,14 @@ from ..protocol import Packet
 from ..protocol.constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
 from ..protocol.crypto import CryptoUtils
 from ..protocol.utils import derive_channel_hash, normalize_channel_secret
-from .models import Channel, Contact, QueuedMessage
+from .models import (
+    Channel,
+    ChannelDataEvent,
+    ChannelMessageEvent,
+    Contact,
+    MessageEvent,
+    QueuedMessage,
+)
 
 logger = logging.getLogger("CompanionBase")
 
@@ -49,6 +55,18 @@ class _RxEventsMixin:
                 if isinstance(raw_blob, (bytes, bytearray)) and len(raw_blob) > 0:
                     contact.last_advert_packet = bytes(raw_blob)
                 if len(contact.public_key) >= 7 and contact.name:
+                    # Replay protection (BaseChatMesh::onAdvertRecv): for a contact we
+                    # already know, ignore any advert whose timestamp is not strictly
+                    # newer than the stored one. This prevents a delayed or replayed
+                    # advert from overwriting newer name/location/type/app data (and
+                    # from downgrading the cached path). Matches the firmware's early
+                    # return, so no store update and no client notification fire.
+                    existing = self.contacts.get_by_key(contact.public_key)
+                    if (
+                        existing is not None
+                        and contact.last_advert_timestamp <= existing.last_advert_timestamp
+                    ):
+                        return
                     inbound_path = data.get("inbound_path")
                     path_len_encoded = data.get("path_len_encoded")
                     applied = await self._apply_advert_to_stores(
@@ -88,28 +106,38 @@ class _RxEventsMixin:
             sender_prefix = bytes.fromhex(sender_prefix_hex)
         except ValueError:
             sender_prefix = b""
+        # MeshCore queueMessage() writes the packet's encoded path length for
+        # floods and 0xFF for direct routes.  TextMessageHandler supplies that
+        # byte; retain the old zero default for third-party event producers
+        # that have not supplied route metadata.
+        path_len = data.get("path_len", 0)
         msg = QueuedMessage(
             sender_key=sender_key,
             txt_type=data.get("txt_type", data.get("flags", 0)),
             timestamp=data.get("timestamp", int(time.time())),
             text=message_text,
             is_channel=False,
-            path_len=0,
+            path_len=path_len,
             snr=snr if snr is not None else 0.0,
             rssi=rssi if rssi is not None else 0,
             sender_prefix=sender_prefix,
         )
-        self.message_queue.push(msg)
+        was_queued = self.message_queue.push(msg)
         await self._fire_callbacks(
-            "message_received",
-            sender_key,
-            message_text,
-            msg.timestamp,
-            msg.txt_type,
-            pkt_hash,
-            snr if snr is not None else 0.0,
-            rssi if rssi is not None else 0,
-            sender_prefix,
+            "message_event",
+            MessageEvent(
+                sender_key=sender_key,
+                text=message_text,
+                timestamp=msg.timestamp,
+                txt_type=msg.txt_type,
+                packet_hash=pkt_hash,
+                snr=snr if snr is not None else 0.0,
+                rssi=rssi if rssi is not None else 0,
+                sender_prefix=sender_prefix,
+                path_len=path_len,
+                queued=was_queued,
+                queue_entry=msg if was_queued else None,
+            ),
         )
 
     async def _handle_new_channel_message(self, data: dict) -> None:
@@ -151,19 +179,23 @@ class _RxEventsMixin:
             snr=snr if snr is not None else 0.0,
             rssi=rssi if rssi is not None else 0,
         )
-        self.message_queue.push(msg)
+        was_queued = self.message_queue.push(msg)
 
         await self._fire_callbacks(
-            "channel_message_received",
-            data.get("channel_name", ""),
-            data.get("sender_name", ""),
-            display_text,
-            msg.timestamp,
-            path_len,
-            channel_idx,
-            pkt_hash,
-            snr,
-            rssi,
+            "channel_message_event",
+            ChannelMessageEvent(
+                channel_name=data.get("channel_name", ""),
+                sender_name=data.get("sender_name", ""),
+                text=display_text,
+                timestamp=msg.timestamp,
+                path_len=path_len,
+                channel_idx=channel_idx,
+                packet_hash=pkt_hash,
+                snr=snr,
+                rssi=rssi,
+                queued=was_queued,
+                queue_entry=msg if was_queued else None,
+            ),
         )
 
     def _get_channel_candidates_by_hash(self, channel_hash: int) -> list[tuple[int, Channel]]:
@@ -184,8 +216,6 @@ class _RxEventsMixin:
         if len(payload) < 4:
             return
         packet_hash = packet.calculate_packet_hash().hex().upper()
-        if self._seen_grp_data.check_and_add(packet_hash):
-            return
 
         channel_hash = payload[0]
         cipher_mac = payload[1:3]
@@ -197,7 +227,7 @@ class _RxEventsMixin:
             secret = normalize_channel_secret(channel.secret)
             try:
                 plaintext = CryptoUtils.mac_then_decrypt(
-                    hashlib.sha256(secret).digest(), secret, cipher_mac + ciphertext
+                    secret[:16], secret, cipher_mac + ciphertext
                 )
             except Exception:
                 plaintext = None
@@ -213,6 +243,11 @@ class _RxEventsMixin:
             return
         blob = bytes(plaintext[3 : 3 + data_len])
 
+        # Cache only validated group data. Outbound packets are recorded
+        # before injection, so a locally looped-back packet stops here.
+        if self._check_and_track_group_packet(packet):
+            return
+
         route_type = packet.get_route_type()
         path_len = (
             packet.path_len
@@ -221,7 +256,7 @@ class _RxEventsMixin:
         )
         snr = packet.get_snr() if hasattr(packet, "get_snr") else getattr(packet, "_snr", 0.0)
         rssi = packet.rssi if hasattr(packet, "rssi") else getattr(packet, "_rssi", 0)
-        queued = QueuedMessage(
+        queued_message = QueuedMessage(
             sender_key=b"",
             txt_type=0,
             timestamp=0,
@@ -234,14 +269,18 @@ class _RxEventsMixin:
             channel_data_type=data_type,
             channel_data_payload=blob,
         )
-        self.message_queue.push(queued)
+        was_queued = self.message_queue.push(queued_message)
         await self._fire_callbacks(
-            "channel_data_received",
-            selected_idx,
-            path_len,
-            data_type,
-            blob,
-            packet_hash,
-            snr,
-            rssi,
+            "channel_data_event",
+            ChannelDataEvent(
+                channel_idx=selected_idx,
+                path_len=path_len,
+                data_type=data_type,
+                payload=blob,
+                packet_hash=packet_hash,
+                snr=snr,
+                rssi=rssi,
+                queued=was_queued,
+                queue_entry=queued_message if was_queued else None,
+            ),
         )

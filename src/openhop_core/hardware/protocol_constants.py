@@ -89,6 +89,7 @@ STATUS_RESP_SIZE = struct.calcsize(STATUS_RESP_FMT)
 
 # ─── Framing helpers ─────────────────────────────────────────────────
 
+
 def crc16_ccitt(data: bytes) -> int:
     """CRC-16/CCITT-FALSE. Matches the firmware reference implementation."""
     crc = 0xFFFF
@@ -126,27 +127,56 @@ __all__ = [
     "PROTO_SYNC",
     "MAX_LORA_PAYLOAD",
     # Host → Modem
-    "CMD_TX_REQUEST", "CMD_SET_CONFIG", "CMD_GET_CONFIG",
-    "CMD_STATUS_REQ", "CMD_NOISE_REQ",
-    "CMD_CAD_REQUEST", "CMD_RX_START", "CMD_SET_CAD_PARAMS",
-    "CMD_SET_WIFI", "CMD_AUTH", "CMD_WIFI_RESET",
-    "CMD_GET_WIFI", "CMD_GET_VERSION", "CMD_PING",
+    "CMD_TX_REQUEST",
+    "CMD_SET_CONFIG",
+    "CMD_GET_CONFIG",
+    "CMD_STATUS_REQ",
+    "CMD_NOISE_REQ",
+    "CMD_CAD_REQUEST",
+    "CMD_RX_START",
+    "CMD_SET_CAD_PARAMS",
+    "CMD_SET_WIFI",
+    "CMD_AUTH",
+    "CMD_WIFI_RESET",
+    "CMD_GET_WIFI",
+    "CMD_GET_VERSION",
+    "CMD_PING",
     # Modem → Host
-    "CMD_TX_DONE", "CMD_TX_FAIL", "CMD_RX_PACKET",
-    "CMD_CONFIG_RESP", "CMD_STATUS_RESP", "CMD_NOISE_RESP",
-    "CMD_CAD_RESP", "CMD_RX_STARTED", "CMD_CAD_PARAMS_RESP",
-    "CMD_AUTH_OK", "CMD_WIFI_STATUS", "CMD_VERSION_RESP",
-    "CMD_ERROR", "CMD_PONG",
+    "CMD_TX_DONE",
+    "CMD_TX_FAIL",
+    "CMD_RX_PACKET",
+    "CMD_CONFIG_RESP",
+    "CMD_STATUS_RESP",
+    "CMD_NOISE_RESP",
+    "CMD_CAD_RESP",
+    "CMD_RX_STARTED",
+    "CMD_CAD_PARAMS_RESP",
+    "CMD_AUTH_OK",
+    "CMD_WIFI_STATUS",
+    "CMD_VERSION_RESP",
+    "CMD_ERROR",
+    "CMD_PONG",
     # Errors
-    "ERR_CRC_MISMATCH", "ERR_INVALID_CMD", "ERR_RADIO_BUSY",
-    "ERR_TX_TIMEOUT", "ERR_PAYLOAD_TOO_BIG", "ERR_INVALID_CONFIG",
-    "ERR_CAD_FAILED", "ERR_RADIO_INIT", "ERR_UNAUTHORIZED",
+    "ERR_CRC_MISMATCH",
+    "ERR_INVALID_CMD",
+    "ERR_RADIO_BUSY",
+    "ERR_TX_TIMEOUT",
+    "ERR_PAYLOAD_TOO_BIG",
+    "ERR_INVALID_CONFIG",
+    "ERR_CAD_FAILED",
+    "ERR_RADIO_INIT",
+    "ERR_UNAUTHORIZED",
     # WIFI_STATUS modes
-    "WIFI_MODE_OFFLINE", "WIFI_MODE_STA_CONNECTING",
-    "WIFI_MODE_STA_CONNECTED", "WIFI_MODE_AP_CONFIG",
+    "WIFI_MODE_OFFLINE",
+    "WIFI_MODE_STA_CONNECTING",
+    "WIFI_MODE_STA_CONNECTED",
+    "WIFI_MODE_AP_CONFIG",
     # Structs
-    "RADIO_CONFIG_FMT", "RADIO_CONFIG_SIZE",
-    "STATUS_RESP_FMT", "STATUS_RESP_SIZE",
+    "RADIO_CONFIG_FMT",
+    "RADIO_CONFIG_SIZE",
+    "STATUS_RESP_FMT",
+    "STATUS_RESP_SIZE",
     # Framing
-    "crc16_ccitt", "build_frame",
+    "crc16_ccitt",
+    "build_frame",
 ]

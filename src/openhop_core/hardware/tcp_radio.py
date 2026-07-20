@@ -86,6 +86,7 @@ if _HAS_BASE:
 
     class _RadioBase(LoRaRadio):
         pass
+
 else:
 
     class _RadioBase:
@@ -232,9 +233,7 @@ class TCPLoRaRadio(_RadioBase):
         # so the repeater UI can stay up while the user sets pymc_tcp.host
         # via /api/setup_wizard or /api/update_radio_config.
         self._stop_event.clear()
-        self._rx_thread = threading.Thread(
-            target=self._rx_worker, daemon=True, name="tcp-lora-rx"
-        )
+        self._rx_thread = threading.Thread(target=self._rx_worker, daemon=True, name="tcp-lora-rx")
         self._rx_thread.start()
 
         self._initialized = True
@@ -649,9 +648,7 @@ class TCPLoRaRadio(_RadioBase):
             received_crc = struct.unpack("<H", crc_bytes)[0]
             computed_crc = crc16_ccitt(hdr + payload)
             if received_crc != computed_crc:
-                logger.warning(
-                    f"CRC mismatch: recv=0x{received_crc:04X} comp=0x{computed_crc:04X}"
-                )
+                logger.warning(f"CRC mismatch: recv=0x{received_crc:04X} comp=0x{computed_crc:04X}")
                 return None
             return (cmd, payload)
         except socket.timeout:
@@ -752,9 +749,7 @@ class TCPLoRaRadio(_RadioBase):
                     # Remote closed — try to reopen instead of dying; the
                     # previous behaviour left tcp_radio permanently offline
                     # until systemctl restart (known_issue_tcp_no_reconnect).
-                    logger.warning(
-                        "TCP connection closed by peer — attempting reconnect"
-                    )
+                    logger.warning("TCP connection closed by peer — attempting reconnect")
                     self._close_sock()
                     buf.clear()
                     if self._reconnect_with_backoff():
@@ -831,9 +826,7 @@ class TCPLoRaRadio(_RadioBase):
             self.last_signal_rssi = signal_rssi
             self._rx_count += 1
 
-            logger.debug(
-                f"RX: {len(lora_data)}B RSSI={rssi}dBm SNR={snr_x10 / 10:.1f}dB"
-            )
+            logger.debug(f"RX: {len(lora_data)}B RSSI={rssi}dBm SNR={snr_x10 / 10:.1f}dB")
 
             if self.rx_callback:
                 if self._event_loop is None:
@@ -916,9 +909,7 @@ class TCPLoRaRadio(_RadioBase):
             try:
                 await asyncio.wait_for(evt.wait(), timeout=timeout)
             except asyncio.TimeoutError:
-                logger.warning(
-                    f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}"
-                )
+                logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
                 return None
 
             return self._response_data.get(expect_cmd)
@@ -994,9 +985,7 @@ class TCPLoRaRadio(_RadioBase):
             self.preamble_length,
         )
         ok = self._run_async_safe(
-            self._send_command(
-                CMD_SET_CONFIG, payload, expect_cmd=CMD_CONFIG_RESP, timeout=5.0
-            ),
+            self._send_command(CMD_SET_CONFIG, payload, expect_cmd=CMD_CONFIG_RESP, timeout=5.0),
             wait_timeout=6.0,
         )
         logger.info(f"Live config push ({changed}): {'OK' if ok else 'TIMEOUT'}")
@@ -1088,9 +1077,7 @@ class TCPLoRaRadio(_RadioBase):
             ),
             wait_timeout=4.0,
         )
-        logger.info(
-            f"CAD thresholds pushed peak={peak} min={min_val}: {'OK' if ok else 'TIMEOUT'}"
-        )
+        logger.info(f"CAD thresholds pushed peak={peak} min={min_val}: {'OK' if ok else 'TIMEOUT'}")
         return ok
 
     def clear_custom_cad_thresholds(self) -> None:

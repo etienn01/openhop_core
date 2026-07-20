@@ -26,11 +26,13 @@ from ..protocol.constants import (
     ROUTE_TYPE_DIRECT,
     TELEM_PERM_BASE,
 )
-from .base_support import ResponseWaiter, _fmt_path, adv_type_to_flags
+from ..protocol.packet_utils import PathUtils
+from .base_support import ResponseWaiter, _fmt_path, _fmt_path_len, adv_type_to_flags
 from .constants import (
     ADV_TYPE_NONE,
     ADVERT_LOC_SHARE,
     DEFAULT_RESPONSE_TIMEOUT_MS,
+    MAX_GROUP_DATA_LENGTH,
     MAX_PENDING_ACK_CRCS,
     PROTOCOL_CODE_ANON_REQ,
     PROTOCOL_CODE_BINARY_REQ,
@@ -40,7 +42,12 @@ from .constants import (
     TXT_TYPE_PLAIN,
 )
 from .models import Contact, QueuedMessage, SentResult
-from .timing import DEFAULT_MAX_ATTEMPTS, response_timeout_ms
+from .timing import (
+    DEFAULT_MAX_ATTEMPTS,
+    calc_direct_timeout_ms_for_hops,
+    estimate_airtime_ms,
+    response_timeout_ms,
+)
 
 logger = logging.getLogger("CompanionBase")
 
@@ -58,9 +65,12 @@ class _SendOpsMixin:
         flags |= ADVERT_FLAG_HAS_NAME
         lat, lon = 0.0, 0.0
         if self.prefs.advert_loc_policy == ADVERT_LOC_SHARE:
+            # The location-sharing policy decides inclusion, not the coordinate
+            # value: (0.0, 0.0) is a valid position and must be advertised when
+            # sharing is enabled (matches MeshCore CommonCLI::buildAdvertData,
+            # which serializes the coordinate for any non-NONE policy).
             lat, lon = self.prefs.latitude, self.prefs.longitude
-            if lat != 0.0 or lon != 0.0:
-                flags |= ADVERT_FLAG_HAS_LOCATION
+            flags |= ADVERT_FLAG_HAS_LOCATION
         route = "flood" if flood else "direct"
         pkt = PacketBuilder.create_advert(
             local_identity=self._identity,
@@ -125,17 +135,47 @@ class _SendOpsMixin:
         auth_code: int,
         flags: int,
         path_bytes: bytes,
-    ) -> bool:
-        """Send a trace packet with an explicit path."""
+    ) -> SentResult:
+        """Send a trace packet with an explicit path.
+
+        Returns a :class:`SentResult` whose ``timeout_ms`` is the firmware
+        est_timeout hint for the RESP_CODE_SENT frame. Firmware
+        (MyMesh.cpp:1764-1765) sizes it from the packet's airtime and route:
+        ``t = getEstAirtimeFor(payload_len + path_len + 2)`` fed through
+        ``calcDirectTimeoutMillisFor(t, path_len >> path_sz)`` — i.e. the direct
+        per-hop formula with a hop count of ``path_len // hash_width``. Here the
+        whole trace (tag/auth/flags + path) lives in the payload, so
+        ``pkt.get_raw_length()`` already equals firmware's
+        ``payload_len + path_len + 2``.
+        """
         try:
             path_list = list(path_bytes)
             pkt = PacketBuilder.create_trace(tag, auth_code, flags, path=path_list)
             self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
-            return await self._send_packet(pkt, wait_for_ack=False)
+            success = await self._send_packet(pkt, wait_for_ack=False)
+            if not success:
+                return SentResult(success=False, error="send_failed")
+            hash_width = PathUtils.trace_payload_hash_width(flags)
+            hop_count = len(path_bytes) // hash_width if hash_width else 0
+            airtime_ms = estimate_airtime_ms(
+                pkt.get_raw_length(),
+                int(getattr(self.prefs, "spreading_factor", 10)),
+                int(getattr(self.prefs, "bandwidth_hz", 250000)),
+                int(getattr(self.prefs, "coding_rate", 5)),
+            )
+            est_timeout_ms = calc_direct_timeout_ms_for_hops(airtime_ms, hop_count)
+            # Firmware sends the trace via sendDirect and reports the SENT frame
+            # with the flood byte cleared (MyMesh.cpp:1768).
+            return SentResult(
+                success=True,
+                is_flood=False,
+                expected_ack=tag,
+                timeout_ms=est_timeout_ms,
+            )
         except Exception as e:
             logger.error("Error sending trace (raw path): %s", e)
-            return False
+            return SentResult(success=False, error="send_failed")
 
     async def send_binary_req(
         self, pub_key: bytes, data: bytes, timeout_seconds: float = 15.0
@@ -147,13 +187,13 @@ class _SendOpsMixin:
         """
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
-            return SentResult(success=False)
+            return SentResult(success=False, error="not_found")
         # Resolve by exact public key, not name: two contacts can share a name
         # (e.g. a re-keyed node) and get_by_name returns the first match, which
         # would encrypt/route to the wrong key.
         proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
-            return SentResult(success=False)
+            return SentResult(success=False, error="not_found")
         request_type = data[0] if len(data) >= 1 else 0
         # C++ companion pattern (BaseChatMesh::sendRequest):
         #   tag = getRTCClock()->getCurrentTimeUnique()
@@ -188,13 +228,16 @@ class _SendOpsMixin:
             logger.error("Binary request send error: %s", e)
             if "tag_hex" in locals():
                 self._pending_binary_requests.pop(tag_hex, None)
-            return SentResult(success=False)
+            return SentResult(success=False, error="send_failed")
         if not success:
             self._pending_binary_requests.pop(tag_hex, None)
-            return SentResult(success=False)
+            return SentResult(success=False, error="send_failed")
         return SentResult(
+            # Only OUT_PATH_UNKNOWN (-1) floods; out_path_len == 0 is a known
+            # zero-hop direct route, matching the builder's route selection and
+            # MeshCore sendRequest.
             success=True,
-            is_flood=contact.out_path_len <= 0,
+            is_flood=contact.out_path_len < 0,
             expected_ack=tag_int,
             timeout_ms=DEFAULT_RESPONSE_TIMEOUT_MS,
         )
@@ -290,28 +333,24 @@ class _SendOpsMixin:
         """
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
-            return SentResult(success=False)
+            return SentResult(success=False, error="not_found")
         # Resolve by exact public key, not name: two contacts can share a name
         # (e.g. a re-keyed node) and get_by_name returns the first match, which
         # would encrypt/route to the wrong key.
         proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
-            return SentResult(success=False)
-        tag_int = random.randint(0, 0xFFFFFFFF)
-        tag_bytes = tag_int.to_bytes(4, "little")
+            return SentResult(success=False, error="not_found")
         inv_perm = 0xFF & ~TELEM_PERM_BASE
-        req_payload = tag_bytes + bytes([REQ_TYPE_GET_TELEMETRY_DATA, inv_perm, 0, 0, 0])
-        old_path_len = contact.out_path_len
-        old_path = contact.out_path
-        contact.out_path_len = -1
-        contact.out_path = b""
-        self.contacts.update(contact)
+        req_data = bytes([REQ_TYPE_GET_TELEMETRY_DATA, inv_perm, 0, 0, 0]) + random.getrandbits(
+            32
+        ).to_bytes(4, "little")
         try:
-            pkt, _ = PacketBuilder.create_protocol_request(
+            pkt, tag_int = PacketBuilder.create_protocol_request(
                 contact=proxy,
                 local_identity=self._identity,
-                protocol_code=REQ_TYPE_GET_TELEMETRY_DATA,
-                data=req_payload,
+                protocol_code=req_data[0],
+                data=req_data[1:],
+                route_type="flood",
             )
             self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
@@ -323,16 +362,11 @@ class _SendOpsMixin:
                 is_flood=True,
                 expected_ack=tag_int,
                 timeout_ms=DEFAULT_RESPONSE_TIMEOUT_MS,
+                error=None if success else "send_failed",
             )
         except Exception as e:
             logger.error("Error in path discovery: %s", e)
-            return SentResult(success=False)
-        finally:
-            current = self.contacts.get_by_key(pub_key)
-            if current and current.out_path_len == -1:
-                current.out_path_len = old_path_len
-                current.out_path = old_path
-                self.contacts.update(current)
+            return SentResult(success=False, error="send_failed")
 
     async def send_text_message(
         self,
@@ -379,7 +413,7 @@ class _SendOpsMixin:
             if txt_type != TXT_TYPE_CLI_DATA:
                 self._track_pending_ack(ack_crc)
             if effective_wait_ack:
-                success = await self._send_packet(pkt, wait_for_ack=True)
+                success = await self._send_packet(pkt, wait_for_ack=True, expected_crc=ack_crc)
                 if success:
                     self.stats.record_tx(is_flood=is_flood)
                 else:
@@ -425,6 +459,9 @@ class _SendOpsMixin:
             )
             self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
+            # Record before awaiting the transport because Repeater can queue
+            # a local transmission back through its companion bridges first.
+            self._check_and_track_group_packet(pkt)
             success = await self._send_packet(pkt, wait_for_ack=False)
             if success:
                 self.stats.record_tx(is_flood=True)
@@ -450,7 +487,7 @@ class _SendOpsMixin:
         if not channel or data_type <= 0 or data_type > 0xFFFF:
             return False
         payload = bytes(payload or b"")
-        if len(payload) > 255:
+        if len(payload) > MAX_GROUP_DATA_LENGTH:
             return False
         try:
             secret_bytes = bytes(channel.secret or b"")
@@ -482,6 +519,7 @@ class _SendOpsMixin:
                 pkt.set_path(path or b"", path_len_encoded=path_len_encoded)
             self._apply_path_hash_mode(pkt)
 
+            self._check_and_track_group_packet(pkt)
             success = await self._send_packet(pkt, wait_for_ack=False)
             if success:
                 self.stats.record_tx(is_flood=is_flood)
@@ -615,15 +653,15 @@ class _SendOpsMixin:
     async def send_control_data(self, data: Any = None) -> bool:
         """Send a CONTROL packet (e.g. discovery request).
 
-        If *data* is provided it must be 1-254 bytes with the first byte having
-        the 0x80 bit set (e.g. ``DISCOVER_REQ``).  Returns ``False`` for
-        invalid payloads.
+        If *data* is provided it must be 1-MAX_PACKET_PAYLOAD bytes with the first
+        byte having the 0x80 bit set (e.g. ``DISCOVER_REQ``).  Returns ``False``
+        for invalid payloads.
 
         When called with no *data* (or ``None``), a default discovery request
         is sent for backward compatibility.
         """
         try:
-            if data and len(data) <= 254 and (data[0] & 0x80) != 0:
+            if data and len(data) <= MAX_PACKET_PAYLOAD and (data[0] & 0x80) != 0:
                 pkt = Packet()
                 pkt.header = PacketBuilder._create_header(PAYLOAD_TYPE_CONTROL, route_type="direct")
                 pkt.path_len = 0
@@ -644,20 +682,144 @@ class _SendOpsMixin:
             logger.error("Error sending control data: %s", e)
             return False
 
-    async def send_login(self, pub_key: bytes, password: str) -> dict:
-        """Send a login request to a repeater and wait for the response."""
+    async def _finish_started_request(
+        self,
+        build_packet: Callable[[], tuple[Packet, Optional[int]]],
+        wait_for_response: Callable[[float], Awaitable[dict]],
+        proxy: Any,
+        *,
+        first_timeout_s: float,
+        deadline: Optional[float],
+        log_label: str,
+        cleanup: Optional[Callable[[], None]],
+        response_tag_registered: Optional[Callable[[int], None]],
+    ) -> dict:
+        """Finish a request after its first packet has already been sent."""
+        try:
+            result = await wait_for_response(first_timeout_s)
+            if not result.get("timeout"):
+                return result
+
+            for attempt in range(1, DEFAULT_MAX_ATTEMPTS):
+                pkt, packet_tag = build_packet()
+                if response_tag_registered is not None and packet_tag is not None:
+                    response_tag_registered(packet_tag)
+                self._apply_path_hash_mode(pkt)
+                timeout_s = self._response_timeout_s(pkt, proxy)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    timeout_s = min(timeout_s, remaining)
+                logger.debug(
+                    "[PATHDIAG] %s: route=%s attempt=%d/%d timeout=%.1fs out_path_len=%s",
+                    log_label,
+                    "FLOOD" if pkt.is_route_flood() else "DIRECT",
+                    attempt + 1,
+                    DEFAULT_MAX_ATTEMPTS,
+                    timeout_s,
+                    _fmt_path_len(getattr(proxy, "out_path_len", -1)),
+                )
+                if not await self._send_packet(pkt, wait_for_ack=False):
+                    return {"success": False, "error": "send_failed", "reason": "Send failed"}
+                result = await wait_for_response(timeout_s)
+                if not result.get("timeout"):
+                    break
+            return result
+        except Exception as e:
+            logger.error("%s request error: %s", log_label, e)
+            return {"success": False, "reason": str(e)}
+        finally:
+            if cleanup is not None:
+                cleanup()
+
+    async def _start_request(
+        self,
+        build_packet: Callable[[], tuple[Packet, Optional[int]]],
+        wait_for_response: Callable[[float], Awaitable[dict]],
+        proxy: Any,
+        *,
+        total_timeout_s: Optional[float],
+        log_label: str,
+        sent_tag: Optional[int] = None,
+        cleanup: Optional[Callable[[], None]] = None,
+        response_tag_registered: Optional[Callable[[int], None]] = None,
+    ) -> dict:
+        """Send the first packet and return its metadata plus a waiter task."""
+        deadline = time.monotonic() + total_timeout_s if total_timeout_s is not None else None
+        try:
+            pkt, packet_tag = build_packet()
+            if response_tag_registered is not None and packet_tag is not None:
+                response_tag_registered(packet_tag)
+            self._apply_path_hash_mode(pkt)
+            estimated_timeout_s = self._response_timeout_s(pkt, proxy)
+            wait_timeout_s = estimated_timeout_s
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    wait_timeout_s = min(wait_timeout_s, remaining)
+
+            logger.debug(
+                "[PATHDIAG] %s: route=%s attempt=1/%d timeout=%.1fs out_path_len=%s",
+                log_label,
+                "FLOOD" if pkt.is_route_flood() else "DIRECT",
+                DEFAULT_MAX_ATTEMPTS,
+                wait_timeout_s,
+                _fmt_path_len(getattr(proxy, "out_path_len", -1)),
+            )
+            if not await self._send_packet(pkt, wait_for_ack=False):
+                if cleanup is not None:
+                    cleanup()
+                return {"success": False, "error": "send_failed", "reason": "Send failed"}
+
+            tag = sent_tag if sent_tag is not None else packet_tag
+            task = self._spawn_background_task(
+                self._finish_started_request(
+                    build_packet,
+                    wait_for_response,
+                    proxy,
+                    first_timeout_s=wait_timeout_s,
+                    deadline=deadline,
+                    log_label=log_label,
+                    cleanup=cleanup,
+                    response_tag_registered=response_tag_registered,
+                ),
+                f"{log_label} response",
+            )
+            return {
+                "success": True,
+                "sent": SentResult(
+                    success=True,
+                    is_flood=pkt.is_route_flood(),
+                    expected_ack=tag,
+                    timeout_ms=int(estimated_timeout_s * 1000),
+                ),
+                "task": task,
+            }
+        except Exception as e:
+            if cleanup is not None:
+                cleanup()
+            logger.error("%s send error: %s", log_label, e)
+            return {"success": False, "error": "send_failed", "reason": str(e)}
+
+    async def _start_login_request(self, pub_key: bytes, password: str) -> dict:
+        """Start a login request and return SENT metadata plus its result task."""
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
-            return {"success": False, "reason": "Contact not found"}
+            return {"success": False, "error": "not_found", "reason": "Contact not found"}
         # Resolve by exact public key, not name: two contacts can share a name
         # (e.g. a re-keyed node) and get_by_name returns the first match, which
         # would encrypt/route to the wrong key.
         proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
-            return {"success": False, "reason": "Contact not found"}
+            return {"success": False, "error": "not_found", "reason": "Contact not found"}
         login_handler = self._get_login_response_handler()
         if not login_handler:
-            return {"success": False, "reason": "Login handler not available"}
+            return {
+                "success": False,
+                "error": "bad_state",
+                "reason": "Login handler not available",
+            }
         dest_hash = proxy.dest_hash
         login_handler.store_login_password(dest_hash, password)
         login_result: dict = {"success": False, "data": {}}
@@ -668,30 +830,62 @@ class _SendOpsMixin:
             login_result["data"] = data
             login_event.set()
 
-        login_handler.set_login_callback(_login_cb)
-        try:
-            # The login callback fires on any decryptable login response from this
-            # repeater (keyed by password/dest_hash, not by tag), so we can resend
-            # a freshly-built login packet each attempt and a single event resolves
-            # whichever attempt's reply arrives.
-            async def _wait_login(timeout_s: float) -> dict:
-                try:
-                    await asyncio.wait_for(login_event.wait(), timeout=timeout_s)
-                    return {"timeout": False}
-                except asyncio.TimeoutError:
-                    return {"timeout": True}
+        login_target_key = proxy.public_key_bytes
+        login_handler.register_login_callback(login_target_key, _login_cb)
 
-            await self._request_with_retries(
-                lambda: PacketBuilder.create_login_packet(
+        async def _wait_login(timeout_s: float) -> dict:
+            try:
+                await asyncio.wait_for(login_event.wait(), timeout=timeout_s)
+                return {"timeout": False}
+            except asyncio.TimeoutError:
+                return {"timeout": True}
+
+        def _build_login_packet() -> tuple[Packet, Optional[int]]:
+            return (
+                PacketBuilder.create_login_packet(
                     contact=proxy, local_identity=self._identity, password=password
                 ),
-                _wait_login,
-                proxy,
-                log_label=f"login -> 0x{dest_hash:02X} ({contact.name})",
+                None,
             )
+
+        login_sent_tag = int.from_bytes(proxy.public_key_bytes[:4], "little")
+
+        def _cleanup_login() -> None:
+            login_handler.remove_login_callback(login_target_key, _login_cb)
+            login_handler.clear_login_password(dest_hash)
+
+        # MeshCore exposes the first four public-key bytes as the login SENT
+        # tag, rather than the timestamp inside the login packet.
+        login_log_label = f"login -> 0x{dest_hash:02X} ({contact.name})"
+        started = await self._start_request(
+            _build_login_packet,
+            _wait_login,
+            proxy,
+            total_timeout_s=None,
+            log_label=login_log_label,
+            sent_tag=login_sent_tag,
+            cleanup=_cleanup_login,
+        )
+        if not started.get("success"):
+            return started
+
+        raw_task = started["task"]
+
+        async def _format_login_result() -> dict:
+            await raw_task
             if not login_event.is_set():
-                return {"success": False, "reason": "Login response timeout"}
+                return {
+                    "success": False,
+                    "timeout": True,
+                    "reason": "Login response timeout",
+                }
             data = login_result["data"]
+            if login_result["success"]:
+                # Mirror firmware onContactResponse (MyMesh.cpp:686-690):
+                # open a connection on a successful login response. This is the
+                # single point every login response (frame server or direct API)
+                # flows through, matching the firmware's onContactResponse.
+                self.note_login_connection(pub_key, data.get("keep_alive_interval", 0))
             return {
                 "success": login_result["success"],
                 "repeater": contact.name,
@@ -700,14 +894,20 @@ class _SendOpsMixin:
                 "tag": data.get("timestamp", 0),
                 "acl_permissions": data.get("reserved", data.get("permissions", 0)),
                 "firmware_ver_level": data.get("firmware_ver_level"),
-                "reason": "Login successful" if login_result["success"] else "Login failed",
+                "reason": ("Login successful" if login_result["success"] else "Login failed"),
             }
-        except Exception as e:
-            logger.error("Login error: %s", e)
-            return {"success": False, "reason": str(e)}
-        finally:
-            login_handler.set_login_callback(None)
-            login_handler.clear_login_password(dest_hash)
+
+        started["task"] = self._spawn_background_task(
+            _format_login_result(), "login result formatting"
+        )
+        return started
+
+    async def send_login(self, pub_key: bytes, password: str) -> dict:
+        """Send a login request to a repeater and wait for the response."""
+        started = await self._start_login_request(pub_key, password)
+        if not started.get("success"):
+            return {"success": False, "reason": started.get("reason", "Login failed")}
+        return await started["task"]
 
     async def send_logout(self, pub_key: bytes) -> bool:
         """Send a logout / disconnect to a repeater contact."""
@@ -724,6 +924,57 @@ class _SendOpsMixin:
         except Exception as e:
             logger.error("Logout error: %s", e)
             return False
+
+    # -------------------------------------------------------------------------
+    # Login-session connection registry
+    #
+    # Mirrors firmware BaseChatMesh connections[] (src/helpers/BaseChatMesh.cpp).
+    # A successful login response carrying a non-zero keep-alive interval opens a
+    # connection (startConnection, BaseChatMesh.cpp:674-693); hasConnectionTo
+    # (BaseChatMesh.cpp:707-712) reports it live until logout (stopConnection,
+    # BaseChatMesh.cpp:695-705) or expiry. Firmware expires a slot 2.5x the
+    # keep-alive interval after the last server activity (checkConnections,
+    # BaseChatMesh.cpp:743-755), refreshing that deadline on every keep-alive ack
+    # (checkConnectionsAck, :726-741). Core has no keep-alive traffic on this
+    # path, so the window simply runs from login time — the closest faithful
+    # equivalent without inventing keep-alive machinery.
+    # -------------------------------------------------------------------------
+
+    def note_login_connection(self, pub_key: bytes, keep_alive_interval: int) -> None:
+        """Record a live login connection after a successful login response.
+
+        ``keep_alive_interval`` is the raw keep-alive byte from the login
+        response (login_response.py). Firmware onContactResponse
+        (MyMesh.cpp:686-690) computes ``keep_alive_secs = data[5] * 16`` and only
+        calls startConnection when that is > 0, so a zero interval records
+        nothing.
+        """
+        keep_alive_secs = int(keep_alive_interval) * 16
+        if keep_alive_secs <= 0:
+            return
+        # checkConnections (BaseChatMesh.cpp:749): expire_secs = keep_alive_secs * 5 / 2.
+        self._login_connections[bytes(pub_key)] = time.monotonic() + keep_alive_secs * 2.5
+
+    def has_login_connection(self, pub_key: bytes) -> bool:
+        """Return whether a non-expired login connection exists for ``pub_key``.
+
+        Mirrors hasConnectionTo (BaseChatMesh.cpp:707-712). Expired entries are
+        pruned lazily on lookup, standing in for firmware's checkConnections
+        sweep.
+        """
+        key = bytes(pub_key)
+        expiry = self._login_connections.get(key)
+        if expiry is None:
+            return False
+        if time.monotonic() >= expiry:
+            del self._login_connections[key]
+            return False
+        return True
+
+    def clear_login_connection(self, pub_key: bytes) -> None:
+        """Drop any login connection for ``pub_key`` (mirrors stopConnection,
+        BaseChatMesh.cpp:695-705)."""
+        self._login_connections.pop(bytes(pub_key), None)
 
     def _response_timeout_s(self, pkt: Packet, proxy: Any) -> float:
         """Adaptive response timeout (seconds) for a request packet.
@@ -748,12 +999,13 @@ class _SendOpsMixin:
 
     async def _request_with_retries(
         self,
-        build_packet: Callable[[], Packet],
+        build_packet: Callable[[], tuple[Packet, Optional[int]]],
         wait_for_response: Callable[[float], Awaitable[dict]],
         proxy: Any,
         *,
         total_timeout_s: Optional[float] = None,
         log_label: str = "request",
+        response_tag_registered: Optional[Callable[[int], None]] = None,
     ) -> dict:
         """Send a request up to DEFAULT_MAX_ATTEMPTS times until a response lands.
 
@@ -768,7 +1020,9 @@ class _SendOpsMixin:
         result: dict = {"timeout": True}
         deadline = time.monotonic() + total_timeout_s if total_timeout_s else None
         for attempt in range(DEFAULT_MAX_ATTEMPTS):
-            pkt = build_packet()
+            pkt, packet_tag = build_packet()
+            if response_tag_registered is not None and packet_tag is not None:
+                response_tag_registered(packet_tag)
             self._apply_path_hash_mode(pkt)
             timeout_s = self._response_timeout_s(pkt, proxy)
             if deadline is not None:
@@ -783,7 +1037,7 @@ class _SendOpsMixin:
                 attempt + 1,
                 DEFAULT_MAX_ATTEMPTS,
                 timeout_s,
-                getattr(proxy, "out_path_len", -1),
+                _fmt_path_len(getattr(proxy, "out_path_len", -1)),
             )
             await self._send_packet(pkt, wait_for_ack=False)
             result = await wait_for_response(timeout_s)
@@ -808,55 +1062,142 @@ class _SendOpsMixin:
             _fmt_path(out_path_len, out_path),
         )
 
-    async def send_status_request(self, pub_key: bytes, timeout: float = 15.0) -> dict:
-        """Send a protocol request for repeater status/stats.
-
-        ``timeout`` caps the total wait across retries (seconds); each attempt
-        still uses the adaptive per-attempt timeout.
-        """
+    async def _start_protocol_request(
+        self,
+        pub_key: bytes,
+        protocol_code: int,
+        data: bytes,
+        *,
+        timeout: float,
+        log_label: str,
+    ) -> dict:
+        """Start a protocol request and return SENT metadata plus its result task."""
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
-            return {"success": False, "reason": "Contact not found"}
-        # Resolve by exact public key, not name: two contacts can share a name
-        # (e.g. a re-keyed node) and get_by_name returns the first match, which
-        # would encrypt/route to the wrong key.
+            return {"success": False, "error": "not_found", "reason": "Contact not found"}
         proxy = self.contacts.get_proxy_by_key(pub_key)
         if not proxy:
-            return {"success": False, "reason": "Contact not found"}
+            return {"success": False, "error": "not_found", "reason": "Contact not found"}
         proto_handler = self._get_protocol_response_handler()
         if not proto_handler:
-            return {"success": False, "reason": "Protocol handler not available"}
-        contact_hash = proxy.dest_hash
+            return {
+                "success": False,
+                "error": "bad_state",
+                "reason": "Protocol handler not available",
+            }
         waiter = ResponseWaiter()
-        proto_handler.set_response_callback(contact_hash, waiter.callback)
+        request_tags: set[int] = set()
+
+        def _register_response_tag(request_tag: int) -> None:
+            request_tags.add(request_tag)
+            proto_handler.set_response_callback(pub_key, request_tag, waiter.callback)
+
+        def _clear_response_tags() -> None:
+            for request_tag in request_tags:
+                proto_handler.clear_response_callback(pub_key, request_tag)
+
         try:
-            await self._wait_for_path_propagation(proxy, "stats request")
-            # Status responses resolve the waiter by contact_hash (not tag), so a
-            # fresh REQ each attempt is fine and dodges the repeater's flood dedup.
-            result = await self._request_with_retries(
-                lambda: PacketBuilder.create_protocol_request(
+            await self._wait_for_path_propagation(proxy, log_label)
+
+            def _build_packet() -> tuple[Packet, Optional[int]]:
+                return PacketBuilder.create_protocol_request(
                     contact=proxy,
                     local_identity=self._identity,
-                    protocol_code=REQ_TYPE_GET_STATUS,
-                    data=b"",
-                )[0],
+                    protocol_code=protocol_code,
+                    data=data,
+                )
+
+            started = await self._start_request(
+                _build_packet,
                 waiter.wait,
                 proxy,
                 total_timeout_s=timeout,
-                log_label="stats REQ",
+                log_label=log_label,
+                cleanup=_clear_response_tags,
+                response_tag_registered=_register_response_tag,
             )
-            return {
-                "success": result.get("success", False),
-                "repeater": contact.name,
-                "stats": result.get("parsed", {}),
-                "response_text": result.get("text"),
-                "reason": "Stats received" if result.get("success") else "Stats request failed",
-            }
+            if not started.get("success"):
+                return started
+
+            raw_task = started["task"]
+            if protocol_code == REQ_TYPE_GET_STATUS:
+
+                async def _format_status_result() -> dict:
+                    result = await raw_task
+                    return {
+                        "success": result.get("success", False),
+                        "repeater": contact.name,
+                        "stats": result.get("parsed", {}),
+                        "response_text": result.get("text"),
+                        "reason": (
+                            "Stats received" if result.get("success") else "Stats request failed"
+                        ),
+                    }
+
+                started["task"] = self._spawn_background_task(
+                    _format_status_result(), "stats response formatting"
+                )
+            else:
+
+                async def _format_telemetry_result() -> dict:
+                    result = await raw_task
+                    telemetry_data = dict(result.get("parsed", {}))
+                    raw_bytes = telemetry_data.get("raw_bytes", b"")
+                    if raw_bytes and len(pub_key) >= 6:
+                        telemetry_data["frame_bytes"] = (
+                            bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + pub_key[:6] + raw_bytes
+                        )
+                    return {
+                        "success": result.get("success", False),
+                        "contact": contact.name,
+                        "telemetry_data": telemetry_data,
+                        "response_text": result.get("text"),
+                        "reason": (
+                            "Telemetry received" if result.get("success") else "Telemetry failed"
+                        ),
+                    }
+
+                started["task"] = self._spawn_background_task(
+                    _format_telemetry_result(), "telemetry response formatting"
+                )
+            return started
         except Exception as e:
-            logger.error("Status request error: %s", e)
-            return {"success": False, "reason": str(e)}
-        finally:
-            proto_handler.clear_response_callback(contact_hash)
+            _clear_response_tags()
+            logger.error("%s request error: %s", log_label, e)
+            return {"success": False, "error": "bad_state", "reason": str(e)}
+
+    async def _start_status_request(self, pub_key: bytes, timeout: float = 15.0) -> dict:
+        return await self._start_protocol_request(
+            pub_key,
+            REQ_TYPE_GET_STATUS,
+            b"",
+            timeout=timeout,
+            log_label="stats REQ",
+        )
+
+    async def send_status_request(self, pub_key: bytes, timeout: float = 15.0) -> dict:
+        """Send a protocol request for repeater status/stats and wait for its response."""
+        started = await self._start_status_request(pub_key, timeout=timeout)
+        if not started.get("success"):
+            return {"success": False, "reason": started.get("reason", "Stats request failed")}
+        return await started["task"]
+
+    async def _start_telemetry_request(
+        self,
+        pub_key: bytes,
+        want_base: bool = True,
+        want_location: bool = True,
+        want_environment: bool = True,
+        timeout: float = 10.0,
+    ) -> dict:
+        inv = PacketBuilder._compute_inverse_perm_mask(want_base, want_location, want_environment)
+        return await self._start_protocol_request(
+            pub_key,
+            REQ_TYPE_GET_TELEMETRY_DATA,
+            bytes([inv]),
+            timeout=timeout,
+            log_label="telemetry REQ",
+        )
 
     async def send_telemetry_request(
         self,
@@ -866,62 +1207,17 @@ class _SendOpsMixin:
         want_environment: bool = True,
         timeout: float = 10.0,
     ) -> dict:
-        """Send a telemetry request to a contact and wait for the response.
-
-        ``timeout`` caps the total wait across retries (seconds); each attempt
-        still uses the adaptive per-attempt timeout.
-        """
-        contact = self.contacts.get_by_key(pub_key)
-        if not contact:
-            return {"success": False, "reason": "Contact not found"}
-        # Resolve by exact public key, not name: two contacts can share a name
-        # (e.g. a re-keyed node) and get_by_name returns the first match, which
-        # would encrypt/route to the wrong key.
-        proxy = self.contacts.get_proxy_by_key(pub_key)
-        if not proxy:
-            return {"success": False, "reason": "Contact not found"}
-        proto_handler = self._get_protocol_response_handler()
-        if not proto_handler:
-            return {"success": False, "reason": "Protocol handler not available"}
-        contact_hash = proxy.dest_hash
-        waiter = ResponseWaiter()
-        proto_handler.set_response_callback(contact_hash, waiter.callback)
-        try:
-            await self._wait_for_path_propagation(proxy, "telemetry request")
-            inv = PacketBuilder._compute_inverse_perm_mask(
-                want_base, want_location, want_environment
-            )
-            result = await self._request_with_retries(
-                lambda: PacketBuilder.create_protocol_request(
-                    contact=proxy,
-                    local_identity=self._identity,
-                    protocol_code=REQ_TYPE_GET_TELEMETRY_DATA,
-                    data=bytes([inv]),
-                )[0],
-                waiter.wait,
-                proxy,
-                total_timeout_s=timeout,
-                log_label="telemetry REQ",
-            )
-            telemetry_data = dict(result.get("parsed", {}))
-            raw_bytes = telemetry_data.get("raw_bytes", b"")
-            if raw_bytes and len(pub_key) >= 6:
-                # Companion-style frame: 0x8B + reserved + 6-byte pubkey prefix + LPP
-                telemetry_data["frame_bytes"] = (
-                    bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + pub_key[:6] + raw_bytes
-                )
-            return {
-                "success": result.get("success", False),
-                "contact": contact.name,
-                "telemetry_data": telemetry_data,
-                "response_text": result.get("text"),
-                "reason": ("Telemetry received" if result.get("success") else "Telemetry failed"),
-            }
-        except Exception as e:
-            logger.error("Telemetry error: %s", e)
-            return {"success": False, "reason": str(e)}
-        finally:
-            proto_handler.clear_response_callback(contact_hash)
+        """Send a telemetry request and wait for its response."""
+        started = await self._start_telemetry_request(
+            pub_key,
+            want_base=want_base,
+            want_location=want_location,
+            want_environment=want_environment,
+            timeout=timeout,
+        )
+        if not started.get("success"):
+            return {"success": False, "reason": started.get("reason", "Telemetry failed")}
+        return await started["task"]
 
     async def send_binary_request(self, pub_key: bytes, data: bytes) -> dict:
         """Legacy: send binary request and wait.
@@ -948,9 +1244,13 @@ class _SendOpsMixin:
         proto_handler = self._get_protocol_response_handler()
         if not proto_handler:
             return {"success": False, "reason": "Protocol handler not available"}
-        contact_hash = proxy.dest_hash
         waiter = ResponseWaiter()
-        proto_handler.set_response_callback(contact_hash, waiter.callback)
+        request_tags: set[int] = set()
+
+        def _register_response_tag(request_tag: int) -> None:
+            request_tags.add(request_tag)
+            proto_handler.set_response_callback(pub_key, request_tag, waiter.callback)
+
         try:
             result = await self._request_with_retries(
                 lambda: PacketBuilder.create_protocol_request(
@@ -958,10 +1258,11 @@ class _SendOpsMixin:
                     local_identity=self._identity,
                     protocol_code=protocol_code,
                     data=data,
-                )[0],
+                ),
                 waiter.wait,
                 proxy,
                 log_label=f"protocol REQ 0x{protocol_code:02X}",
+                response_tag_registered=_register_response_tag,
             )
             return {
                 "success": result.get("success", False),
@@ -973,7 +1274,8 @@ class _SendOpsMixin:
             logger.error("Protocol request error: %s", e)
             return {"success": False, "reason": str(e)}
         finally:
-            proto_handler.clear_response_callback(contact_hash)
+            for request_tag in request_tags:
+                proto_handler.clear_response_callback(pub_key, request_tag)
 
     async def send_repeater_command(
         self, pub_key: bytes, command: str, parameters: Optional[str] = None
@@ -1002,7 +1304,8 @@ class _SendOpsMixin:
             response_data["success"] = True
             response_event.set()
 
-        text_handler.set_command_response_callback(_response_cb)
+        target_key = proxy.public_key_bytes
+        text_handler.register_command_response(target_key, _response_cb)
         try:
             msg_type = "flood" if proxy.out_path_len < 0 else "direct"
             pkt, _ = PacketBuilder.create_text_message(
@@ -1030,19 +1333,32 @@ class _SendOpsMixin:
             logger.error("Repeater command error: %s", e)
             return {"success": False, "reason": str(e)}
         finally:
-            text_handler.set_command_response_callback(None)
+            text_handler.unregister_command_response(target_key, _response_cb)
 
     def _track_pending_ack(self, ack_crc: int) -> None:
-        """Track pending ACK CRC for send_confirmed (capped)."""
-        if len(self._pending_ack_crcs) < MAX_PENDING_ACK_CRCS:
-            self._pending_ack_crcs.add(ack_crc)
+        """Record a pending expected ACK with its send time (send_confirmed).
+
+        Bounded circular table (firmware expected_ack_table): when full, the
+        oldest entry is evicted rather than dropping the newest, so a current
+        send is never silently untracked in favour of a stale one.
+        """
+        # Re-inserting refreshes both position and send time for a resend.
+        self._pending_ack_crcs.pop(ack_crc, None)
+        self._pending_ack_crcs[ack_crc] = time.monotonic()
+        while len(self._pending_ack_crcs) > MAX_PENDING_ACK_CRCS:
+            self._pending_ack_crcs.popitem(last=False)  # evict oldest
 
     async def _try_confirm_send(self, crc: int) -> bool:
-        """If CRC is pending, discard it and fire send_confirmed. Returns True if fired."""
-        if crc not in self._pending_ack_crcs:
+        """If CRC is pending, discard it and fire send_confirmed. Returns True if fired.
+
+        Passes the round-trip time in milliseconds (now - send time), mirroring
+        firmware processAck (trip_time = getMillis() - expected_ack_table[i].msg_sent).
+        """
+        sent_at = self._pending_ack_crcs.pop(crc, None)
+        if sent_at is None:
             return False
-        self._pending_ack_crcs.discard(crc)
-        await self._fire_callbacks("send_confirmed", crc)
+        trip_ms = max(0, int(round((time.monotonic() - sent_at) * 1000)))
+        await self._fire_callbacks("send_confirmed", crc, trip_ms)
         return True
 
     def sync_next_message(self) -> Optional[QueuedMessage]:

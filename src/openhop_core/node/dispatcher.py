@@ -4,31 +4,53 @@ import asyncio
 import enum
 import inspect
 import logging
+import random
+import time
 from typing import Any, Awaitable, Callable, List, Optional
 
 from ..protocol import Packet
 from ..protocol.constants import (  # Payload types
+    MAX_PATH_SIZE,
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_TRACE,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
-from ..protocol.packet_utils import PathUtils
+from ..protocol.packet_utils import PathUtils, calculate_lora_airtime_ms, flood_rx_metrics
 from ..protocol.transport_keys import calc_transport_code
-from ..protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES, format_packet_info
+from ..protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES
+from ..util.callbacks import invoke_maybe_awaitable
 
 # Import handler classes
 from .handlers import (
     AckHandler,
     AnonReqResponseHandler,
     ControlHandler,
+    HandlerResult,
     MultipartAckHandler,
     TraceHandler,
     create_core_handlers,
 )
 
 ACK_TIMEOUT = 5.0  # seconds to wait for an ACK
+
+# Flood reception-quality delay bounds (MeshCore Dispatcher::checkRecv):
+# delays under the threshold process immediately, longer ones are capped.
+MIN_RX_DELAY_MS = 50.0
+MAX_RX_DELAY_MS = 32000.0
+
+# TX airtime duty-cycle budget (MeshCore Dispatcher.cpp / Dispatcher.h). The
+# leaky bucket refills at the duty cycle 1/(1+airtime_factor) over a rolling
+# window and is spent on each transmit's estimated airtime. These reproduce the
+# firmware constants; the bucket is active only while client-repeat is enabled.
+DUTY_CYCLE_WINDOW_MS = 3_600_000  # Dispatcher.h getDutyCycleWindowMs() (1 hour)
+MIN_TX_BUDGET_RESERVE_MS = 100  # Dispatcher.cpp MIN_TX_BUDGET_RESERVE_MS
+MIN_TX_BUDGET_AIRTIME_DIV = 2  # Dispatcher.cpp MIN_TX_BUDGET_AIRTIME_DIV
+MAX_TRANS_UNIT = 255  # MeshCore.h MAX_TRANS_UNIT (worst-case reserve packet size)
+# NodePrefs default airtime_factor for the companion (MyMesh.cpp: "one half"),
+# i.e. a 50% duty cycle. Live value comes from prefs.airtime_factor.
+DEFAULT_AIRTIME_BUDGET_FACTOR = 1.0
 
 
 class DispatcherState(str, enum.Enum):
@@ -76,16 +98,17 @@ class Dispatcher:
         # Optional callback for PAYLOAD_TYPE_RAW_CUSTOM (companion raw_data_received)
         self.raw_data_received_callback: Optional[Callable[[Packet], Awaitable[None]]] = None
 
-        # Raw packet callbacks: single callback (legacy) and list of subscribers (after parse)
-        self.raw_packet_callback: Optional[Callable[[Packet, bytes], Awaitable[None] | None]] = None
+        # Raw packet callbacks: single callback (legacy) and list of subscribers (after parse).
+        # Callbacks accept (pkt, data) or (pkt, data, analysis).
+        self.raw_packet_callback: Optional[Callable[..., Awaitable[None] | None]] = None
         self._raw_packet_subscribers: List[Callable[..., Any]] = []
         # Raw RX subscribers: notified for every reception (data, rssi, snr) before duplicate/parse
         self._raw_rx_subscribers: List[Callable[..., Any]] = []
 
         self._handlers: dict[int, Any] = {}  # Keep track of packet handlers
-        self._handler_instances: dict[
-            int, Any
-        ] = {}  # Store actual handler objects for method access
+        self._handler_instances: dict[int, Any] = (
+            {}
+        )  # Store actual handler objects for method access
 
         # Handler references for companion-layer access; populated by
         # register_default_handlers(). Declared here so callers can rely on
@@ -112,6 +135,25 @@ class Dispatcher:
         # When None, no default is applied.
         self.path_hash_mode: Optional[int] = None
 
+        # Base for the flood reception-quality delay (MeshCore rx_delay_base,
+        # the "set rxdelay" tuning param). 0 disables the delay, which is the
+        # firmware default. Synced from prefs/config by the owning layer.
+        self.rx_delay_base: float = 0.0
+
+        # Client-repeat forwarding (MeshCore _prefs.client_repeat). Off by
+        # default; only CompanionRadio.set_client_repeat toggles it. Nodes that
+        # do their own forwarding (e.g. the repeater) leave this False.
+        self._client_repeat_enabled: bool = False
+
+        # TX airtime duty-cycle budget (MeshCore getAirtimeBudgetFactor =
+        # prefs.airtime_factor). The leaky bucket is consulted ONLY while
+        # client-repeat is enabled; when disabled the send path is untouched.
+        # Synced from prefs by the owning layer (CompanionRadio).
+        self.airtime_budget_factor: float = DEFAULT_AIRTIME_BUDGET_FACTOR
+        self._tx_budget_ms: float = 0.0
+        self._tx_budget_last_update: float = 0.0
+        self._tx_next_time: float = 0.0
+
         self._logger = logging.getLogger("Dispatcher")
         self._current_expected_crc: Optional[int] = None
         self._recent_acks: dict[int, float] = {}  # {crc: timestamp}
@@ -136,9 +178,48 @@ class Dispatcher:
         # Initialize fallback handler
         self._fallback_handler = None
 
+        # Cooperative shutdown for run_forever / MeshNode.stop. Events are
+        # created lazily on the running loop (Python 3.9 binds Event to a loop
+        # at construction; __init__ may run before the test/app loop exists).
+        self._stop_event: Optional[asyncio.Event] = None
+        self._stopped_event: Optional[asyncio.Event] = None
+        self._run_forever_active = False
+        self._rx_enabled = True
+
         # Hook up the radio's receive callback - all radios should support this
-        self.radio.set_rx_callback(self._on_packet_received)
-        self._logger.info("Registered RX callback with radio")
+        self._arm_rx()
+
+    def _ensure_lifecycle_events(self) -> tuple:
+        """Create stop/stopped events on the running loop if needed."""
+        if self._stop_event is None:
+            self._stop_event = asyncio.Event()
+            self._stopped_event = asyncio.Event()
+            self._stopped_event.set()
+        return self._stop_event, self._stopped_event
+
+    def _arm_rx(self) -> None:
+        """Register the RX callback and allow new packet tasks."""
+        self._rx_enabled = True
+        if self.radio is None:
+            return
+        if hasattr(self.radio, "set_rx_callback"):
+            self.radio.set_rx_callback(self._on_packet_received)
+            self._logger.info("Registered RX callback with radio")
+        else:
+            self._logger.warning(
+                "Radio %s has no set_rx_callback; the dispatcher will never "
+                "receive packets from this radio",
+                type(self.radio).__name__,
+            )
+
+    def _disarm_rx(self) -> None:
+        """Stop spawning new packet tasks; best-effort clear the radio callback."""
+        self._rx_enabled = False
+        if self.radio is not None and hasattr(self.radio, "set_rx_callback"):
+            try:
+                self.radio.set_rx_callback(None)
+            except Exception:
+                self._logger.debug("Clearing radio RX callback failed", exc_info=True)
 
     def set_contact_book(self, contact_book):
         """Set the contact book for decryption operations."""
@@ -281,29 +362,6 @@ class Dispatcher:
         """Get handler for payload type, or fallback if not found."""
         return self._handlers.get(ptype, self._fallback_handler)
 
-    def _is_own_packet(self, pkt: Packet) -> bool:
-        """Check if this packet came from us by comparing the source hash."""
-        if not self.local_identity or not pkt.payload:
-            return False
-
-        our_pubkey = self.local_identity.get_public_key()
-        our_hash = our_pubkey[0] if len(our_pubkey) > 0 else 0
-
-        ptype = pkt.get_payload_type()
-        if ptype == PAYLOAD_TYPE_ADVERT:
-            if len(pkt.payload) < 1:
-                return False
-            is_own = pkt.payload[0] == our_hash
-        else:
-            if len(pkt.payload) < 2:
-                return False
-            is_own = pkt.payload[1] == our_hash
-
-        if is_own:
-            self._log(f"Own packet detected: our_hash={our_hash:02X}")
-
-        return is_own
-
     def set_packet_received_callback(
         self, callback: Callable[[Packet], Awaitable[None] | None]
     ) -> None:
@@ -321,10 +379,11 @@ class Dispatcher:
         """Set optional listener for ACK CRCs (e.g. companion send_confirmed)."""
         self._ack_received_listener = callback
 
-    def set_raw_packet_callback(
-        self, callback: Callable[[Packet, bytes], Awaitable[None] | None]
-    ) -> None:
-        """Set callback for raw packet data (includes both parsed packet and raw bytes)."""
+    def set_raw_packet_callback(self, callback: Callable[..., Awaitable[None] | None]) -> None:
+        """Set callback for raw packet data.
+
+        Callback receives ``(pkt, data)`` or ``(pkt, data, analysis)``.
+        """
         self.raw_packet_callback = callback
 
     def add_raw_packet_subscriber(self, callback: Callable[..., Any]) -> None:
@@ -364,11 +423,50 @@ class Dispatcher:
         snr: Optional[float] = None,
     ) -> None:
         """Called by the radio when a packet comes in. rssi/snr are per-packet when provided."""
+        if not self._rx_enabled:
+            return
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self._process_received_packet(data, rssi, snr))
         except RuntimeError:
             self._log("No event loop running, cannot process received packet")
+
+    def calc_rx_delay(self, score: float, air_time_ms: float) -> float:
+        """Reception-quality delay in ms before a flood packet is processed.
+
+        Matches the MeshCore node firmwares' calcRxDelay override: disabled
+        (0) when rx_delay_base <= 0, otherwise scaled so poorly received
+        packets wait longer, in units of the packet's airtime.
+        """
+        if self.rx_delay_base <= 0.0:
+            return 0.0
+        return (self.rx_delay_base ** (0.85 - score) - 1.0) * air_time_ms
+
+    def _flood_rx_delay_ms(self, frame_len: int, snr: float) -> float:
+        """Effective hold time for a flood packet, 0 when it should process now.
+
+        Scores the reception against the live radio settings and applies the
+        firmware thresholds: below 50 ms processes immediately, above 32 s is
+        capped. Radios that don't expose their LoRa settings fall back to the
+        same assumptions as the firmware base wrapper (SF10) and the default
+        MeshCore preset.
+        """
+        metrics = flood_rx_metrics(
+            frame_len,
+            snr,
+            getattr(self.radio, "spreading_factor", 10),
+            getattr(self.radio, "bandwidth", 250000),
+            getattr(self.radio, "coding_rate", 5),
+            getattr(self.radio, "preamble_length", 8),
+            rx_delay_base=self.rx_delay_base,
+            min_delay_ms=MIN_RX_DELAY_MS,
+            max_delay_ms=MAX_RX_DELAY_MS,
+        )
+        return metrics.delay_ms
+
+    async def _hold_flood_packet(self, delay_ms: float) -> None:
+        """Wait out a flood reception delay (overridable by tests/subclasses)."""
+        await asyncio.sleep(delay_ms / 1000.0)
 
     async def _process_received_packet(
         self,
@@ -392,10 +490,7 @@ class Dispatcher:
             snr_val = 0.0
         for cb in self._raw_rx_subscribers:
             try:
-                if inspect.iscoroutinefunction(cb):
-                    await cb(data, rssi_val, snr_val)
-                else:
-                    cb(data, rssi_val, snr_val)
+                await invoke_maybe_awaitable(cb, data, rssi_val, snr_val)
             except Exception as e:
                 self._log(f"Raw RX subscriber error: {e}")
 
@@ -415,10 +510,6 @@ class Dispatcher:
             self._log(f"Blacklisted malformed packet (raw hash: {raw_hash})")
             return
 
-        # Packets at max hops for their path encoding must not be retransmitted
-        if PathUtils.is_path_at_max_hops(pkt.path_len):
-            pkt.mark_do_not_retransmit()
-
         # Use per-packet rssi/snr when provided (avoids race); else fall back to radio last values
         pkt._rssi = rssi if rssi is not None else self.radio.get_last_rssi()
         pkt._snr = snr if snr is not None else self.radio.get_last_snr()
@@ -426,10 +517,7 @@ class Dispatcher:
         # Let the node know about this packet for analysis (statistics, caching, etc.)
         if self.packet_analysis_callback:
             try:
-                if inspect.iscoroutinefunction(self.packet_analysis_callback):
-                    await self.packet_analysis_callback(pkt, data)
-                else:
-                    self.packet_analysis_callback(pkt, data)
+                await invoke_maybe_awaitable(self.packet_analysis_callback, pkt, data)
                 self._log("[RX DEBUG] Packet analysis callback completed")
             except Exception as e:
                 self._log(f"Error in packet analysis callback: {e}")
@@ -444,6 +532,18 @@ class Dispatcher:
         if self._raw_packet_subscribers or self.raw_packet_callback:
             self._log("[RX DEBUG] Raw packet callback completed")
 
+        # MeshCore holds flood packets for a reception-quality delay before
+        # processing: a better-received copy (shorter delay, here or at
+        # another node) processes first, and the dedupe check below — which
+        # must run after the hold, like firmware's hasSeen — then drops this
+        # copy when it wakes. Direct routes are never delayed, and the
+        # firmware-default rx_delay_base of 0 keeps processing immediate.
+        if pkt.is_route_flood():
+            delay_ms = self._flood_rx_delay_ms(len(data), snr_val)
+            if delay_ms > 0.0:
+                self._log(f"Holding flood packet {delay_ms:.0f}ms (reception-quality delay)")
+                await self._hold_flood_packet(delay_ms)
+
         # When disabled, packet_filter still tracks hashes for stats/visibility.
         packet_hash = pkt.calculate_packet_hash().hex()[:16]
         if self.dedupe_enabled and self.packet_filter.is_duplicate(packet_hash):
@@ -451,19 +551,27 @@ class Dispatcher:
             return
         self.packet_filter.track_packet(packet_hash)
 
-        # Check if this is our own packet before processing handlers
-        if self._is_own_packet(pkt):
-            packet_info = format_packet_info(pkt.header, len(pkt.payload))
-
-            self._log(f"OWN PACKET RECEIVED! {packet_info}")
-            self._log(
-                "   This suggests your packet was repeated by another node and came back to you!"
-            )
-            self._log(f"Ignoring own packet (type={pkt.get_payload_type():02X}) to prevent loops")
-            return
+        # Client-repeat: build the retransmit from the just-received packet
+        # BEFORE handlers run, so a copy is taken while path/payload are intact
+        # (no Core handler mutates the received packet's path/payload). The
+        # forward is only scheduled after _dispatch so a flood packet consumed
+        # by this node (a handler marked it do-not-retransmit, mirroring
+        # firmware Mesh::onRecvPacket) is not re-flooded. Direct/TRACE forwards
+        # keep their next-hop guards and are unaffected by the mark, matching
+        # firmware which forwards those before payload processing. Our own
+        # retransmit re-tracks the same hash in the send funnel, so a copy
+        # echoed back over RF is dropped by the dedupe check above.
+        forward_pkt = None
+        if self._client_repeat_enabled:
+            forward_pkt = self._build_client_repeat_forward(pkt)
 
         # Handle ACK matching for waiting senders
         await self._dispatch(pkt)
+
+        if forward_pkt is not None and not (
+            forward_pkt.is_route_flood() and pkt.is_marked_do_not_retransmit()
+        ):
+            asyncio.create_task(self._client_repeat_transmit(forward_pkt))
 
     # ------------------------------------------------------------------
     # Public interface - sending and receiving packets
@@ -519,6 +627,264 @@ class Dispatcher:
             return
         pkt.apply_path_hash_mode(self.path_hash_mode, mark_applied=False)
 
+    # ------------------------------------------------------------------
+    # Client-repeat forwarding (MeshCore Mesh::onRecvPacket forward paths)
+    # ------------------------------------------------------------------
+
+    def set_client_repeat_enabled(self, enabled: bool) -> None:
+        """Enable/disable client-repeat forwarding of received packets.
+
+        Enabling also arms the TX airtime budget (firmware Dispatcher::begin
+        starts the bucket full at ``window * duty_cycle``).
+        """
+        enabled = bool(enabled)
+        if enabled and not self._client_repeat_enabled:
+            self._reset_tx_budget()
+        self._client_repeat_enabled = enabled
+
+    # ------------------------------------------------------------------
+    # TX airtime duty-cycle budget (MeshCore Dispatcher budget mechanics)
+    # ------------------------------------------------------------------
+
+    def _duty_cycle(self) -> float:
+        """duty_cycle = 1/(1+airtime_factor) (Dispatcher.cpp updateTxBudget)."""
+        return 1.0 / (1.0 + max(0.0, float(self.airtime_budget_factor)))
+
+    def _reset_tx_budget(self) -> None:
+        """Start the bucket full, matching Dispatcher::begin()."""
+        now = time.monotonic()
+        self._tx_budget_ms = DUTY_CYCLE_WINDOW_MS * self._duty_cycle()
+        self._tx_budget_last_update = now
+        self._tx_next_time = now
+
+    def _refill_tx_budget(self, now: float) -> None:
+        """Accrue budget at the duty cycle, capped at the window max.
+
+        Mirrors Dispatcher::updateTxBudget: ``refill = elapsed * duty_cycle``
+        added to ``tx_budget_ms`` and clamped to ``window * duty_cycle``.
+        """
+        duty = self._duty_cycle()
+        max_budget = DUTY_CYCLE_WINDOW_MS * duty
+        elapsed_ms = (now - self._tx_budget_last_update) * 1000.0
+        refill = elapsed_ms * duty
+        if refill > 0.0:
+            self._tx_budget_ms = min(self._tx_budget_ms + refill, max_budget)
+            self._tx_budget_last_update = now
+
+    def _tx_est_airtime_ms(self, byte_len: int) -> float:
+        """Estimated LoRa airtime for ``byte_len`` on-air bytes (live radio settings)."""
+        return calculate_lora_airtime_ms(
+            byte_len,
+            getattr(self.radio, "spreading_factor", 10),
+            getattr(self.radio, "bandwidth", 250000),
+            getattr(self.radio, "coding_rate", 5),
+            getattr(self.radio, "preamble_length", 8),
+        )
+
+    def _tx_budget_wait_s(self) -> float:
+        """Seconds this transmit must wait for the airtime budget; <= 0 admits.
+
+        Reproduces the Dispatcher::checkSend TX gate synchronously: refill, then
+        require at least ``est_airtime(MAX_TRANS_UNIT) / MIN_TX_BUDGET_AIRTIME_DIV``
+        of budget and honour the ``next_tx_time`` pacing the send-complete path
+        set when the budget last dipped below MIN_TX_BUDGET_RESERVE_MS. The
+        shortfall is scaled by ``1/duty_cycle`` to the firmware-computed
+        ``needed / duty_cycle`` wait. Refill is the only budget mutation here and
+        is monotonically increasing, so this is safe to call both before and
+        again under ``_tx_lock`` as the admission recheck.
+        """
+        now = time.monotonic()
+        self._refill_tx_budget(now)
+        reserve_ms = self._tx_est_airtime_ms(MAX_TRANS_UNIT) / MIN_TX_BUDGET_AIRTIME_DIV
+        wait_ms = 0.0
+        if self._tx_budget_ms < reserve_ms:
+            wait_ms = (reserve_ms - self._tx_budget_ms) / self._duty_cycle()
+        # next_tx_time pacing from the previous debit.
+        pace_s = self._tx_next_time - now
+        return max(wait_ms / 1000.0, pace_s)
+
+    async def _await_tx_budget(self, packet: Packet) -> None:
+        """Sleep (never under ``_tx_lock``) until the airtime budget admits; never drops.
+
+        This is the pre-lock throttle only; admission is re-decided under
+        ``_tx_lock`` in ``send_packet`` (via ``_tx_budget_wait_s``) so a snapshot
+        taken here can never authorise a transmit past a debit another task
+        committed under the lock. Because only ``_tx_lock`` holders debit and the
+        sole out-of-lock mutation (``_refill_tx_budget``) is monotonically
+        increasing, an under-lock pass cannot be invalidated before ``radio.send``.
+        Sleeps happen only here, off the lock, so a throttled forward never
+        blocks other transmits and ``asyncio.sleep`` stays cancellation-safe. A
+        client-repeat toggle mid-wait releases the waiter after its current sleep.
+        """
+        while self._client_repeat_enabled:
+            wait_s = self._tx_budget_wait_s()
+            if wait_s <= 0.0:
+                return
+            await asyncio.sleep(wait_s)
+
+    def _debit_tx_budget(self, packet: Packet) -> None:
+        """Spend this transmit's estimated airtime (Dispatcher send-complete path).
+
+        Mirrors the isSendComplete block: refill, subtract the airtime (clamped
+        at zero), then set ``next_tx_time`` so the next send waits when the
+        budget fell below MIN_TX_BUDGET_RESERVE_MS.
+        """
+        now = time.monotonic()
+        self._refill_tx_budget(now)
+        airtime_ms = self._tx_est_airtime_ms(packet.get_raw_length())
+        if airtime_ms > self._tx_budget_ms:
+            self._tx_budget_ms = 0.0
+        else:
+            self._tx_budget_ms -= airtime_ms
+        duty = self._duty_cycle()
+        if self._tx_budget_ms < MIN_TX_BUDGET_RESERVE_MS:
+            needed = MIN_TX_BUDGET_RESERVE_MS - self._tx_budget_ms
+            self._tx_next_time = now + (needed / duty) / 1000.0
+        else:
+            self._tx_next_time = now
+
+    def _copy_packet_for_forward(self, pkt: Packet) -> Packet:
+        """Copy a received packet for retransmission with an independent path buffer.
+
+        Marks the copy as already-scoped and already-hash-moded so the send
+        funnel retransmits it verbatim (never re-scoping a forwarded flood or
+        overwriting the path hash width we set here).
+        """
+        fwd = Packet()
+        fwd.header = pkt.header
+        fwd.path_len = pkt.path_len
+        fwd.path = bytearray(pkt.path)
+        fwd.payload = bytearray(pkt.payload[: pkt.payload_len])
+        fwd.payload_len = pkt.payload_len
+        fwd.transport_codes = list(pkt.transport_codes)
+        fwd._snr = pkt._snr
+        fwd._rssi = pkt._rssi
+        fwd._flood_scope_applied = True
+        fwd._path_hash_mode_applied = True
+        return fwd
+
+    def _build_client_repeat_forward(self, pkt: Packet) -> Optional[Packet]:
+        """Build the retransmit packet for a received packet, or None to drop.
+
+        Mirrors the forwarding branches of MeshCore ``Mesh::onRecvPacket``:
+        direct TRACE appends an SNR byte, routed-direct traffic strips self and
+        retransmits, and flood traffic appends our hash unless it was consumed
+        by this node. ``allowPacketForward`` (``_prefs.client_repeat != 0``) is
+        the ``_client_repeat_enabled`` gate checked by the caller.
+        """
+        if self.local_identity is None:
+            return None
+        self_key = self.local_identity.get_public_key()
+        ptype = pkt.get_payload_type()
+
+        if pkt.is_route_direct() and ptype == PAYLOAD_TYPE_TRACE:
+            return self._build_trace_forward(pkt, self_key)
+        if pkt.is_route_direct() and pkt.get_path_hash_count() > 0:
+            return self._build_direct_forward(pkt, self_key)
+        if pkt.is_route_flood():
+            return self._build_flood_forward(pkt, self_key)
+        return None
+
+    def _build_flood_forward(self, pkt: Packet, self_key: bytes) -> Optional[Packet]:
+        """Append this node's hash to a flood path (Mesh::routeRecvPacket).
+
+        Whether the forward is actually sent is decided after ``_dispatch``:
+        firmware's ``!isMarkedDoNotRetransmit()`` guard is honoured there via
+        the do-not-retransmit mark a handler sets when it genuinely consumes the
+        packet (a real decrypt, not a bare dest-hash collision). Own-advert
+        echoes and any other copy we hear back are dropped earlier by the RX
+        seen-table (the TX-side track_packet), matching firmware's hasSeen; a
+        self-advert is never re-received without this node first transmitting
+        (and thus tracking) it, so no self-advert special case is needed here.
+        """
+        hash_size = pkt.get_path_hash_size()
+        hop_count = pkt.get_path_hash_count()
+        # Firmware guards: (n+1)*hashSize <= MAX_PATH_SIZE and the 6-bit hop cap.
+        if hop_count >= 63:
+            return None
+        if (hop_count + 1) * hash_size > MAX_PATH_SIZE:
+            return None
+        fwd = self._copy_packet_for_forward(pkt)
+        fwd.path.extend(self_key[:hash_size])
+        fwd.path_len = PathUtils.encode_path_len(hash_size, hop_count + 1)
+        return fwd
+
+    def _build_direct_forward(self, pkt: Packet, self_key: bytes) -> Optional[Packet]:
+        """Strip self and retransmit a routed-direct packet when we are the next hop."""
+        hash_size = pkt.get_path_hash_size()
+        if len(pkt.path) < hash_size:
+            return None
+        if bytes(pkt.path[:hash_size]) != self_key[:hash_size]:
+            return None  # this node is not the next hop
+        hop_count = pkt.get_path_hash_count()
+        fwd = self._copy_packet_for_forward(pkt)
+        fwd.path = bytearray(fwd.path[hash_size:])
+        fwd.path_len = PathUtils.encode_path_len(hash_size, hop_count - 1)
+        return fwd
+
+    def _build_trace_forward(self, pkt: Packet, self_key: bytes) -> Optional[Packet]:
+        """Append this node's scaled SNR to a direct TRACE (Mesh::onRecvPacket TRACE)."""
+        if pkt.path_len >= MAX_PATH_SIZE:
+            return None
+        # payload: trace_tag(4) auth_code(4) flags(1), then the routing hashes.
+        if pkt.payload_len < 9:
+            return None
+        flags = pkt.payload[8]
+        path_sz = flags & 0x03
+        hash_width = 1 << path_sz
+        header_len = 9
+        length = pkt.payload_len - header_len
+        offset = pkt.path_len << path_sz
+        if offset >= length:
+            return None  # TRACE has reached the end of its path (consume, not forward)
+        start = header_len + offset
+        if bytes(pkt.payload[start : start + hash_width]) != self_key[:hash_width]:
+            return None  # not the next hop in the trace path
+        fwd = self._copy_packet_for_forward(pkt)
+        snr_byte = int(pkt.get_snr() * 4) & 0xFF
+        while len(fwd.path) <= fwd.path_len:
+            fwd.path.append(0)
+        fwd.path[fwd.path_len] = snr_byte
+        fwd.path_len += 1
+        return fwd
+
+    def _client_repeat_delay_ms(self, pkt: Packet) -> float:
+        """Random retransmit jitter for a forward (MyMesh getRetransmitDelay).
+
+        Flood uses t = estAirtime*0.5, direct uses t = estAirtime*0.2, and the
+        delay is uniform in [0, 5*t] ms. Airtime is estimated over the on-air
+        length (path bytes + payload + 2) against the live radio settings.
+        """
+        frame_len = pkt.get_path_byte_len() + pkt.payload_len + 2
+        airtime_ms = calculate_lora_airtime_ms(
+            frame_len,
+            getattr(self.radio, "spreading_factor", 10),
+            getattr(self.radio, "bandwidth", 250000),
+            getattr(self.radio, "coding_rate", 5),
+            getattr(self.radio, "preamble_length", 8),
+        )
+        factor = 0.5 if pkt.is_route_flood() else 0.2
+        t = airtime_ms * factor
+        if t <= 0:
+            return 0.0
+        return float(random.randint(0, int(5 * t)))
+
+    async def _client_repeat_transmit(self, pkt: Packet) -> None:
+        """Wait out the retransmit jitter then send the forward through the funnel.
+
+        Stage 2 airtime budgeting slots in here / in the send funnel: the
+        forward is a plain send_packet, so a budget gate can suppress it.
+        """
+        try:
+            delay_ms = self._client_repeat_delay_ms(pkt)
+            if delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000.0)
+            await self.send_packet(pkt, wait_for_ack=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            self._log(f"Client-repeat forward failed: {err}")
+
     async def send_packet(
         self,
         packet: Packet,
@@ -543,8 +909,24 @@ class Dispatcher:
                 return False
         self._apply_flood_scope(packet)
         self._apply_default_path_hash_mode(packet)
-        async with self._tx_lock:  # Wait our turn
-            return await self._send_packet_immediate(packet, wait_for_ack, expected_crc)
+        # Airtime duty-cycle budget: only while client-repeat is on. When
+        # disabled the send path is unchanged (a recorded deliberate deferral).
+        if not self._client_repeat_enabled:
+            async with self._tx_lock:  # Wait our turn
+                return await self._send_packet_immediate(packet, wait_for_ack, expected_crc)
+        # Throttle off-lock, then re-decide admission under the lock so a
+        # snapshot taken before queueing cannot transmit past a debit another
+        # task committed under _tx_lock. _debit_tx_budget runs only under the
+        # lock and the sole out-of-lock mutation (_refill_tx_budget) only
+        # increases the budget, so an under-lock pass holds until radio.send.
+        # Livelock is bounded: every debit sets _tx_next_time pacing that all
+        # later admissions honour (firmware's next_tx_time property). Never
+        # sleep under the lock -- fall out of the async with to wait again.
+        while True:
+            await self._await_tx_budget(packet)
+            async with self._tx_lock:  # Wait our turn
+                if not self._client_repeat_enabled or self._tx_budget_wait_s() <= 0.0:
+                    return await self._send_packet_immediate(packet, wait_for_ack, expected_crc)
 
     async def _send_packet_immediate(
         self,
@@ -554,6 +936,15 @@ class Dispatcher:
     ) -> bool:
         """Send a packet immediately (assumes lock is held)."""
         payload_type = packet.get_payload_type()
+
+        # Mark this packet seen before transmitting, matching firmware's
+        # hasSeen() call right before sendPacket() in Mesh::sendFlood/
+        # sendDirect/sendZeroHop: if a neighbor rebroadcasts it back to us,
+        # the RX-path dedupe check (packet_filter.is_duplicate) must catch
+        # it. Uses the same hash the RX path tracks with, so a returned copy
+        # with a mutated path (path excluded from the hash) still matches.
+        packet_hash = packet.calculate_packet_hash().hex()[:16]
+        self.packet_filter.track_packet(packet_hash)
 
         # ------------------------------------------------------------------ #
         #  Send the packet (lock ensures only one transmission at a time)
@@ -571,6 +962,9 @@ class Dispatcher:
             self._log("Radio transmit returned no confirmation metadata")
             self.state = DispatcherState.IDLE
             return False
+        # Spend the airtime budget on the completed transmit (client-repeat only).
+        if self._client_repeat_enabled:
+            self._debit_tx_budget(packet)
         # Log what we sent
         type_name = PAYLOAD_TYPES.get(payload_type, f"UNKNOWN_{payload_type}")
         route_name = ROUTE_TYPES.get(packet.get_route_type(), f"UNKNOWN_{packet.get_route_type()}")
@@ -626,6 +1020,14 @@ class Dispatcher:
         except asyncio.TimeoutError:
             self._log(f"wait_for_ack() timeout for CRC {crc:08X}")
             return False
+        finally:
+            # Clean up our registration on every exit path (normal return,
+            # timeout, or cancellation) so `_waiting_acks` never leaks.
+            # Identity-guarded: if the receive path already popped our entry
+            # (the normal-ACK case) this is a no-op; if a *different* waiter
+            # has since registered under the same CRC, don't delete theirs.
+            if self._waiting_acks.get(crc) is event:
+                del self._waiting_acks[crc]
 
     # ------------------------------------------------------------------#
     # ACK tracking and management
@@ -669,7 +1071,15 @@ class Dispatcher:
             return
 
         try:
-            await handler(pkt)
+            result = await handler(pkt)
+            # Mirror firmware Mesh::onRecvPacket markDoNotRetransmit: a data or
+            # anon packet genuinely decrypted for this identity is consumed and
+            # must not be re-flooded. HandlerResult.authenticated is that
+            # verdict (False on a bare dest-hash collision), so the client-repeat
+            # flood forward is suppressed only on real consumption. ACK marking
+            # is done inside AckHandler (it does not return a HandlerResult).
+            if isinstance(result, HandlerResult) and result.authenticated:
+                pkt.mark_do_not_retransmit()
             if self.packet_received_callback:
                 await self._invoke_callback(self.packet_received_callback, pkt)
         except Exception as err:
@@ -696,25 +1106,67 @@ class Dispatcher:
             await self._invoke_ack_listener(crc)
 
     async def run_forever(self) -> None:
-        """Run the dispatcher maintenance loop indefinitely (call this in an asyncio task)."""
+        """Run the dispatcher maintenance loop until :meth:`stop` is awaited.
+
+        Call this in an asyncio task. Re-arming RX on entry supports restart
+        after a previous stop. The loop exits cooperatively when the stop
+        event is set (checked at least once per second).
+        """
+        # Sync prelude runs until the first await below, so a concurrent
+        # stop() cannot interleave between these assignments.
+        stop_event, stopped_event = self._ensure_lifecycle_events()
+        stop_event.clear()
+        stopped_event.clear()
+        self._run_forever_active = True
+        self._arm_rx()
         health_check_counter = 0
-        while True:
-            # Clean out old ACK CRCs (older than 5 seconds)
-            now = asyncio.get_running_loop().time()
-            self._recent_acks = {crc: ts for crc, ts in self._recent_acks.items() if now - ts < 5}
+        try:
+            while not stop_event.is_set():
+                # Clean out old ACK CRCs (older than 5 seconds)
+                now = asyncio.get_running_loop().time()
+                self._recent_acks = {
+                    crc: ts for crc, ts in self._recent_acks.items() if now - ts < 5
+                }
 
-            # Clean old packet hashes for deduplication
-            self.packet_filter.cleanup_old_hashes()
+                # Clean old packet hashes for deduplication
+                self.packet_filter.cleanup_old_hashes()
 
-            # Simple health check every 60 seconds
-            health_check_counter += 1
-            if health_check_counter >= 60:
-                health_check_counter = 0
-                if hasattr(self.radio, "check_radio_health"):
-                    await asyncio.to_thread(self.radio.check_radio_health)
+                # Simple health check every 60 seconds
+                health_check_counter += 1
+                if health_check_counter >= 60:
+                    health_check_counter = 0
+                    if hasattr(self.radio, "check_radio_health"):
+                        await asyncio.to_thread(self.radio.check_radio_health)
 
-            # With callback-based RX, just do maintenance tasks
-            await asyncio.sleep(1.0)  # Check every second for cleanup
+                # Wait for stop or the next maintenance tick
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            self._run_forever_active = False
+            self._disarm_rx()
+            stopped_event.set()
+
+    async def stop(self) -> None:
+        """Disarm RX and exit :meth:`run_forever` cooperatively. Idempotent.
+
+        Does not cancel in-flight packet tasks or close the radio; callers
+        own hardware lifecycle. If the maintenance loop is not running,
+        returns after disarming without waiting.
+        """
+        stop_event, stopped_event = self._ensure_lifecycle_events()
+        self._disarm_rx()
+        stop_event.set()
+        if not self._run_forever_active:
+            # A just-scheduled run_forever may clear the stop event during its
+            # sync prelude; yield and re-assert so that race still exits.
+            await asyncio.sleep(0)
+            stop_event.set()
+            self._disarm_rx()
+            if not self._run_forever_active:
+                return
+        await stopped_event.wait()
 
     # ------------------------------------------------------------------
     # Internal helper methods
@@ -732,40 +1184,66 @@ class Dispatcher:
         await self._process_received_packet(data)
 
     async def _invoke_callback(self, cb, pkt: Packet) -> None:
-        if inspect.iscoroutinefunction(cb):
-            await cb(pkt)
-        else:
-            cb(pkt)
+        await invoke_maybe_awaitable(cb, pkt)
 
     async def _invoke_ack_listener(self, crc: int) -> None:
         """Invoke ack-received listener (sync or async)."""
         cb = self._ack_received_listener
         if cb is None:
             return
-        if inspect.iscoroutinefunction(cb):
-            await cb(crc)
-        else:
-            cb(crc)
+        await invoke_maybe_awaitable(cb, crc)
 
     async def _invoke_enhanced_raw_callback(
         self, callback, pkt: Packet, data: bytes, analysis: dict
     ) -> None:
-        """Call raw packet callback with extra analysis data."""
+        """Call raw packet callback with extra analysis data.
+
+        Concrete signatures (no *args/**kwargs) are bound once so a handler
+        exception is never retried as a 2-arg call. Variadic or uninspectable
+        callables try the enhanced form first and fall back to 2-arg only on
+        TypeError, so bare decorators around legacy 2-arg handlers still work.
+        """
         try:
-            if inspect.iscoroutinefunction(callback):
-                await callback(pkt, data, analysis)
-            else:
-                callback(pkt, data, analysis)
-        except Exception as e:
-            self._log(f"Raw callback error: {e}")
-            # Fallback to original callback format
+            # signature() follows __wrapped__ when present (functools.wraps).
+            sig = inspect.signature(callback)
+            is_variadic = any(
+                p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+                for p in sig.parameters.values()
+            )
+        except (ValueError, TypeError):
+            sig = None
+            is_variadic = True
+
+        if not is_variadic:
+            use_enhanced = True
             try:
-                if inspect.iscoroutinefunction(callback):
-                    await callback(pkt, data)
+                sig.bind(pkt, data, analysis)
+            except TypeError:
+                try:
+                    sig.bind(pkt, data)
+                    use_enhanced = False
+                except TypeError:
+                    use_enhanced = True
+            try:
+                if use_enhanced:
+                    await invoke_maybe_awaitable(callback, pkt, data, analysis)
                 else:
-                    callback(pkt, data)
+                    await invoke_maybe_awaitable(callback, pkt, data)
+            except Exception as e:
+                self._log(f"Raw callback error: {e}")
+            return
+
+        # Variadic / uninspectable: try enhanced, TypeError-only 2-arg rescue.
+        try:
+            await invoke_maybe_awaitable(callback, pkt, data, analysis)
+        except TypeError as e:
+            self._log(f"Raw callback error: {e}")
+            try:
+                await invoke_maybe_awaitable(callback, pkt, data)
             except Exception as e2:
                 self._log(f"Fallback raw callback error: {e2}")
+        except Exception as e:
+            self._log(f"Raw callback error: {e}")
 
     # ------------------------------------------------------------------
     # Logging helper
@@ -800,5 +1278,12 @@ class Dispatcher:
         return None
 
     def cleanup(self):
-        """Clean up resources when shutting down."""
+        """Sync signal to stop the maintenance loop and disarm RX.
+
+        Does not await loop exit. Prefer ``await stop()`` for awaitable
+        shutdown from an async caller.
+        """
+        self._disarm_rx()
+        if self._stop_event is not None:
+            self._stop_event.set()
         self._log("Dispatcher cleanup completed")

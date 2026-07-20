@@ -396,7 +396,8 @@ from openhop_core.protocol.constants import PacketType
 async def send_message_example():
     # Setup node (same as above)
     node = MeshNode(radio=radio, local_identity=identity)
-    await node.start()
+    # start() blocks in the dispatcher loop — run it as a task so stop can run
+    start_task = asyncio.create_task(node.start())
 
     # Create a destination address (example)
     destination = bytes.fromhex("0123456789abcdef")
@@ -413,6 +414,7 @@ async def send_message_example():
     print("Message sent!")
 
     await node.stop()
+    await start_task
 
 asyncio.run(send_message_example())
 ```

@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from typing import Any, Callable, Iterable, Optional
 
 from ..node.events import EventService, EventSubscriber
 from ..protocol import LocalIdentity, Packet
+from ..protocol.packet_filter import PacketHashCache
 from .base_callbacks import _CallbackMixin
 from .base_config import _DeviceConfigMixin
 from .base_contacts import _ContactChannelMixin
@@ -79,7 +81,10 @@ class CompanionBase(
     ) -> None:
         """Initialize shared stores, prefs, event service, and push callbacks."""
         self._identity = identity
-        self._radio_config = radio_config or {}
+        # Preserve a host-provided mapping by reference. A repeater can update
+        # it after an administrative change, and bridges must not report a
+        # stale startup snapshot.
+        self._radio_config = radio_config if radio_config is not None else {}
         self._running = False
 
         self.contacts = ContactStore(max_contacts)
@@ -99,6 +104,12 @@ class CompanionBase(
         )
 
         self._custom_vars: dict[str, str] = {}
+        # Login-session connection registry, mirroring firmware BaseChatMesh
+        # connections[] (src/helpers/BaseChatMesh.cpp:74). Maps a full 32-byte
+        # server public key to a monotonic expiry deadline. See the
+        # note_login_connection / has_login_connection / clear_login_connection
+        # methods in base_send.py for the lifecycle.
+        self._login_connections: dict[bytes, float] = {}
         self._sign_buffer: Optional[bytearray] = None
         self._flood_transport_key: Optional[bytes] = None
         # Sticky "force unscoped flood" flag (FW PR #2492 / FIRMWARE_VER_CODE 12+):
@@ -116,17 +127,23 @@ class CompanionBase(
         self._pending_binary_requests: dict[str, dict] = {}
         # Pending path discovery tags for matching responses
         self._pending_discovery_tags: set[int] = set()
-        # Pending ACK CRCs for send_confirmed (Bridge and Radio)
-        self._pending_ack_crcs: set[int] = set()
+        # Pending expected ACKs for send_confirmed (Bridge and Radio), mapping
+        # ACK CRC -> monotonic send time. Bounded circular table mirroring the
+        # firmware expected_ack_table (AckTableEntry.msg_sent + ack): when full,
+        # the oldest entry is evicted so a current send is never dropped.
+        self._pending_ack_crcs: "OrderedDict[int, float]" = OrderedDict()
         # Fire-and-forget tasks kept alive until done (see _spawn_background_task)
         self._background_tasks: set[asyncio.Task] = set()
 
-        # Per-payload-type dedup caches keyed by packet hash, matching Mesh.cpp
-        # (!_tables->hasSeen(pkt)): the companion queues one frame per logical
-        # message and reconnects don't re-queue the same packet.
-        self._seen_grp_txt = _SeenCache()
+        # Event-level de-dup caches keep reconnects from re-queuing text.
+        self._seen_grp_txt = _SeenCache(ttl=60.0, max_size=4096)
         self._seen_txt = _SeenCache()
-        self._seen_grp_data = _SeenCache()
+        # Group packets have no sender identity, so local echoes are matched
+        # by full packet hash marked at send time. MeshCore's seen table never
+        # expires (cyclic displacement only); keep the window generous so
+        # echoes via slow multi-hop or store-and-forward paths still match.
+        # The capacity is a safety limit for untrusted RX.
+        self._seen_group_packets = PacketHashCache(ttl_seconds=600.0, max_entries=4096)
 
         # Allow subclasses to restore persisted preferences on startup.
         self._load_prefs()
@@ -134,6 +151,10 @@ class CompanionBase(
         # Optional bulk load of contacts (e.g. from persistence on boot).
         if initial_contacts is not None:
             self.contacts.load_from(initial_contacts)
+
+    def _check_and_track_group_packet(self, packet: Packet) -> bool:
+        """Record a group packet and report whether it was recently seen."""
+        return self._seen_group_packets.check_and_add(packet.calculate_packet_hash().hex())
 
     # -------------------------------------------------------------------------
     # Preference Persistence Hooks
@@ -166,7 +187,12 @@ class CompanionBase(
     # -------------------------------------------------------------------------
 
     @abstractmethod
-    async def _send_packet(self, pkt: Packet, wait_for_ack: bool = False) -> bool:
+    async def _send_packet(
+        self,
+        pkt: Packet,
+        wait_for_ack: bool = False,
+        expected_crc: Optional[int] = None,
+    ) -> bool:
         """Send a packet via the subclass transport (radio or packet_injector)."""
 
     @abstractmethod
@@ -200,6 +226,10 @@ class CompanionBase(
 
     def _get_text_handler(self) -> Any:
         """Return the text message handler, or ``None``."""
+        return None
+
+    def _get_advert_handler(self) -> Any:
+        """Return the normal ADVERT handler used for imported-contact loopback."""
         return None
 
     def _apply_multi_acks_pref(self) -> None:

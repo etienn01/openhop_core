@@ -11,6 +11,8 @@ from enum import IntEnum
 from ..protocol.constants import ANON_REQ_TYPE_BASIC  # noqa: F401
 from ..protocol.constants import ANON_REQ_TYPE_OWNER  # noqa: F401
 from ..protocol.constants import ANON_REQ_TYPE_REGIONS  # noqa: F401
+from ..protocol.constants import CIPHER_BLOCK_SIZE  # noqa: F401
+from ..protocol.constants import MAX_PACKET_PAYLOAD  # noqa: F401
 from ..protocol.constants import MAX_PATH_SIZE  # noqa: F401
 from ..protocol.constants import PUB_KEY_SIZE  # noqa: F401
 from ..protocol.constants import TXT_TYPE_CLI_DATA  # noqa: F401
@@ -119,11 +121,24 @@ DEFAULT_RESPONSE_TIMEOUT_MS = 10000
 DEFAULT_MAX_CONTACTS = 1000
 DEFAULT_OFFLINE_QUEUE_SIZE = 512
 DEFAULT_MAX_CHANNELS = 40
+# SELF_INFO always carries a maximum TX-power byte. Backends which own or
+# represent a concrete radio should override this generic capability.
+DEFAULT_MAX_TX_POWER_DBM = 22
 CONTACT_NAME_SIZE = 32
 CHANNEL_NAME_SIZE = 32  # channel name field width (CHANNEL_INFO / SET_CHANNEL)
+# Firmware `char node_name[32]` (NodePrefs.h); usable bytes exclude the NUL terminator
+# (see MyMesh.cpp CMD_SET_ADVERT_NAME: `nlen > sizeof(_prefs.node_name) - 1`).
+NODE_NAME_MAX_BYTES = 31
 MAX_SIGN_DATA_SIZE = 8192  # 8KB signing buffer (matches firmware)
 MAX_PENDING_ACK_CRCS = 64
 ZERO_FLOOD_SCOPE_KEY = b"\x00" * 16  # firmware's null scope override (send_scope.isNull())
+
+# Frequencies (kHz) at which client-repeat may be enabled, as inclusive
+# (lower, upper) ranges. Mirrors firmware's default ``repeat_freq_ranges``
+# (MyMesh.cpp), single-frequency entries for the three default LoRa bands.
+# A concrete companion may override this via the ``allowed_repeat_freq_ranges``
+# key in its ``radio_config`` dict (list of (lower_khz, upper_khz) pairs).
+DEFAULT_ALLOWED_REPEAT_FREQ_RANGES = ((433000, 433000), (869495, 869495), (918000, 918000))
 
 # ---------------------------------------------------------------------------
 # Response-timeout hints (ms) returned in RESP_CODE_SENT frames. The firmware
@@ -135,9 +150,9 @@ BINARY_REQ_TIMEOUT_HINT_MS = 10000
 LOGIN_TIMEOUT_HINT_MS = 10000
 STATUS_TIMEOUT_HINT_MS = 15000
 TELEMETRY_TIMEOUT_HINT_MS = 15000
-# Trace estimate: base + per-path-byte increment (CMD_SEND_TRACE_PATH).
-TRACE_BASE_TIMEOUT_MS = 5000
-TRACE_PER_PATH_BYTE_TIMEOUT_MS = 200
+# CMD_SEND_TRACE_PATH returns a per-packet est_timeout computed from the trace
+# packet's airtime and hop count (firmware calcDirectTimeoutMillisFor); see
+# CompanionBase.send_trace_path_raw. No fixed hint constant is needed.
 
 # ===========================================================================
 # Frame Protocol Constants (MeshCore Companion Radio Protocol)
@@ -295,9 +310,15 @@ FRAME_INBOUND_PREFIX = 0x3C  # '<'
 # is set to this (e.g. BLEDevice::setMTU(MAX_FRAME_SIZE)). Frame = prefix(1) + len(2) + payload.
 # 176 since MeshCore PR #2022 (+4 over the old 172 for region-scoping transport codes).
 MAX_FRAME_SIZE = 176
-MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE - 3  # max bytes after prefix + 2-byte length
+# Firmware writeFrame() accepts up to MAX_FRAME_SIZE payload bytes and writes the
+# 3-byte serial prefix (">", len_lsb, len_msb) *in addition*. So the framed
+# payload maximum equals MAX_FRAME_SIZE, not MAX_FRAME_SIZE - 3.
+MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE
 # Firmware companion command parser uses MAX_FRAME_SIZE - 9 for channel binary payloads.
 MAX_CHANNEL_DATA_LENGTH = MAX_FRAME_SIZE - 9
+# Firmware MeshCore.h: MAX_GROUP_DATA_LENGTH = MAX_PACKET_PAYLOAD - CIPHER_BLOCK_SIZE - 3.
+# BaseChatMesh::sendGroupData rejects group application data longer than this.
+MAX_GROUP_DATA_LENGTH = MAX_PACKET_PAYLOAD - CIPHER_BLOCK_SIZE - 3
 OUT_PATH_UNKNOWN = 0xFF
 # PUB_KEY_SIZE and MAX_PATH_SIZE are re-exported from protocol.constants at
 # the top of this module.

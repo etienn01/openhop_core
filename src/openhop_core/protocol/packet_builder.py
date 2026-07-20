@@ -76,6 +76,7 @@ class PacketBuilder:
     @staticmethod
     def _create_packet(header: int, payload: bytes) -> Packet:
         """Create a packet with the given header and payload."""
+        PacketValidationUtils.validate_payload_size(len(payload))
         pkt = Packet()
         pkt.header = header
         pkt.payload = bytearray(payload)
@@ -433,7 +434,12 @@ class PacketBuilder:
             # Returns: 3
             ```
         """
-        timestamp = PacketBuilder._get_timestamp()
+        # Plain wall time, matching firmware Mesh::createAdvert's getCurrentTime().
+        # The strictly-increasing _get_timestamp() is reserved for request/login
+        # tags: sharing it here would let a burst of requests inflate the counter
+        # past real time, and peers would then drop this node's later wall-time
+        # adverts as replays until the clock caught up.
+        timestamp = int(time.time())
         pubkey = local_identity.get_public_key()
         ts_bytes = struct.pack("<I", timestamp)
         appdata = PacketBuilder._encode_advert_data(name, lat, lon, feature1, feature2, flags)
@@ -646,8 +652,10 @@ class PacketBuilder:
             Packet: Encrypted login packet ready for transmission.
         """
         timestamp = PacketBuilder._get_timestamp()
-        password_truncated = password[:15]
-        password_bytes = password_truncated.encode("utf-8")
+        # Firmware BaseChatMesh::sendLogin bounds the password at 15 *bytes* of the
+        # encoded buffer (strlen + memcpy). Encode first, then truncate so a
+        # multibyte character cannot push the field past the wire limit.
+        password_bytes = password.encode("utf-8")[:15]
 
         is_room = getattr(contact, "type", 0) == CONTACT_TYPE_ROOM_SERVER
 
@@ -805,7 +813,7 @@ class PacketBuilder:
         if ptype not in (PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_GRP_DATA):
             raise ValueError("invalid payload type")
 
-        aes_key = CryptoUtils.sha256(secret)
+        aes_key = secret[:16]
         cipher = PacketBuilder._encrypt_payload(aes_key, secret, plaintext)
         payload = bytearray([channel_hash]) + cipher
 
@@ -922,7 +930,13 @@ class PacketBuilder:
         else:
             first_byte = len(path)
 
-        inner = bytes([first_byte]) + bytes(path) + bytes([extra_type]) + extra
+        if extra:
+            inner = bytes([first_byte]) + bytes(path) + bytes([extra_type]) + extra
+        else:
+            # No extra payload: MeshCore Mesh::createPathReturn appends 0xFF and
+            # four RNG bytes so repeated PATH returns for the same path do not
+            # encrypt to identical packets (and identical packet hashes).
+            inner = bytes([first_byte]) + bytes(path) + b"\xff" + os.urandom(4)
         aes_key = secret[:16]
         cipher = PacketBuilder._encrypt_payload(aes_key, secret, inner)
         payload = bytearray([dest_hash, src_hash]) + cipher
@@ -979,18 +993,38 @@ class PacketBuilder:
             # Returns: 0
             ```
         """
-        attempt &= 0x03
+        # Firmware composeMsgPacket stores only the low two bits of the attempt in
+        # the flag byte (temp[4] = attempt & 3); the full attempt is preserved for
+        # the tail below so retries above three still produce unique packets.
+        attempt_full = attempt & 0xFF
         txt_type &= 0x3F
-        flags_byte = (txt_type << 2) | attempt
+        flags_byte = (txt_type << 2) | (attempt_full & 0x03)
         timestamp = timestamp if timestamp is not None else PacketBuilder._get_timestamp()
+
+        # Firmware BaseChatMesh::composeMsgPacket rejects text longer than
+        # MAX_TEXT_LEN (measured in bytes). Match it on the UTF-8 encoded length
+        # so a valid MeshCore peer can build the same packet. For attempt > 3 the
+        # tail carries an extra NUL + attempt byte, so the text budget shrinks by
+        # two (composeMsgPacket: attempt > 3 && text_len > MAX_TEXT_LEN-2).
+        text_len = len(message.encode("utf-8"))
+        if text_len > MAX_TEXT_LEN:
+            raise ValueError(f"text message too long: {text_len} bytes (max {MAX_TEXT_LEN})")
+        if attempt_full > 3 and text_len > MAX_TEXT_LEN - 2:
+            raise ValueError(
+                f"text message too long for extended attempt: {text_len} bytes "
+                f"(max {MAX_TEXT_LEN - 2})"
+            )
 
         signed_sender_prefix = (
             local_identity.get_public_key()[:4] if txt_type == TXT_TYPE_SIGNED_PLAIN else b""
         )
 
-        # Use  timestamp+data packing
+        # Body is packed as a C string (text + NUL). When attempt > 3 the firmware
+        # hides the full attempt byte after that terminator so retries whose low
+        # two bits repeat (4 → 0, 5 → 1, …) still hash uniquely.
+        tail = b"\x00" + bytes([attempt_full]) if attempt_full > 3 else b"\x00"
         plaintext = PacketBuilder._pack_timestamp_data(
-            timestamp, flags_byte, signed_sender_prefix, message, b"\x00"
+            timestamp, flags_byte, signed_sender_prefix, message, tail
         )
 
         # Use  encryption and payload creation
@@ -1078,6 +1112,7 @@ class PacketBuilder:
         protocol_code: int,
         data: bytes = b"",
         timestamp: Optional[int] = None,
+        route_type: Optional[str] = None,
     ) -> tuple[Packet, int]:
         """
         Create a protocol request packet for repeater commands.
@@ -1091,6 +1126,8 @@ class PacketBuilder:
             protocol_code: The protocol command code.
             data: Additional binary data for the request.
             timestamp: Optional timestamp (uses current time if None).
+            route_type: Optional explicit routing mode ("direct" or "flood").
+                When omitted, routing is selected from the contact's known path.
 
         Returns:
             tuple: (packet, timestamp) - The created packet and the timestamp used.
@@ -1123,7 +1160,7 @@ class PacketBuilder:
         # path is known; flood only when the out_path is unknown (-1). Mirrors
         # create_anon_request and firmware sendRequest (OUT_PATH_UNKNOWN -> flood,
         # else sendDirect, which works with a 0-length path).
-        route_type = "direct" if out_path_len >= 0 else "flood"
+        route_type = route_type or ("direct" if out_path_len >= 0 else "flood")
 
         header = PacketBuilder._create_header(PAYLOAD_TYPE_REQ, route_type)
         packet = PacketBuilder._create_packet(header, payload)
@@ -1190,7 +1227,7 @@ class PacketBuilder:
         want_location: bool = True,
         want_environment: bool = True,
         include_entropy: bool = True,
-        route_type: str = "direct",
+        route_type: Optional[str] = None,
     ) -> tuple[Packet, int]:
         """
         Create a telemetry request packet for sensor data collection.
@@ -1205,7 +1242,8 @@ class PacketBuilder:
             want_location: Include location/GPS data.
             want_environment: Include environmental sensors.
             include_entropy: Include entropy/randomness data.
-            route_type: Routing method ("direct" or "flood").
+            route_type: Optional routing override ("direct" or "flood").
+                When omitted, routing is selected from the contact's known path.
 
         Returns:
             tuple: (packet, timestamp) - The telemetry request packet and timestamp.
@@ -1228,6 +1266,7 @@ class PacketBuilder:
             local_identity=local_identity,
             protocol_code=REQ_TYPE_GET_TELEMETRY_DATA,
             data=bytes([inv]),  # Just the permission mask as additional data
+            route_type=route_type,
         )
 
     # ---------- Control/Discovery Packets ----------

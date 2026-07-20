@@ -105,48 +105,60 @@ def parse_advert_payload(payload: bytes):
 
 def decode_appdata(appdata: bytes) -> dict:
     result = {}
-    offset = 0
     if len(appdata) < 1:
         raise ValueError("Appdata too short to contain flags")
-    flags = appdata[offset]
+    flags = appdata[0]
     result["flags"] = flags
-    offset += 1
+
+    offset = 1
+    required_len = 1
+    if flags & 0x10:  # has_location
+        required_len += 8
+    if flags & 0x20:  # has_feature_1
+        required_len += 2
+    if flags & 0x40:  # has_feature_2
+        required_len += 2
+    if len(appdata) < required_len:
+        raise ValueError(
+            f"Advert appdata truncated for required fields: {len(appdata)} bytes available, "
+            f"need at least {required_len}"
+        )
 
     # Parse conditional fields based on flags (following the same logic as packet_analyzer)
     if flags & 0x10:  # has_location
-        if len(appdata) >= offset + 8:
-            import struct
+        import struct
 
-            lat_raw = struct.unpack("<i", appdata[offset : offset + 4])[0]
-            lon_raw = struct.unpack("<i", appdata[offset + 4 : offset + 8])[0]
-            result["latitude"] = lat_raw / 1000000.0
-            result["longitude"] = lon_raw / 1000000.0
-            offset += 8
+        lat_raw = struct.unpack("<i", appdata[offset : offset + 4])[0]
+        lon_raw = struct.unpack("<i", appdata[offset + 4 : offset + 8])[0]
+        result["latitude"] = lat_raw / 1000000.0
+        result["longitude"] = lon_raw / 1000000.0
+        offset += 8
 
     if flags & 0x20:  # has_feature_1
-        if len(appdata) >= offset + 2:
-            import struct
+        import struct
 
-            result["feature_1"] = struct.unpack("<H", appdata[offset : offset + 2])[0]
-            offset += 2
+        result["feature_1"] = struct.unpack("<H", appdata[offset : offset + 2])[0]
+        offset += 2
 
     if flags & 0x40:  # has_feature_2
-        if len(appdata) >= offset + 2:
-            import struct
+        import struct
 
-            result["feature_2"] = struct.unpack("<H", appdata[offset : offset + 2])[0]
-            offset += 2
+        result["feature_2"] = struct.unpack("<H", appdata[offset : offset + 2])[0]
+        offset += 2
 
     if flags & 0x80:  # has_name
         if len(appdata) > offset:
+            # MeshCore stores the advertised name as bounded wire bytes and does
+            # not require the display form to be valid UTF-8.
+            name_bytes = appdata[offset:].split(b"\x00", 1)[0]
             try:
-                name = appdata[offset:].decode("utf-8").rstrip("\x00").strip()
-                if name:  # Only add if non-empty
-                    result["node_name"] = name
+                name = name_bytes.decode("utf-8")
             except UnicodeDecodeError:
-                # If UTF-8 decoding fails, store as hex for debugging
-                result["raw_name_bytes"] = appdata[offset:].hex()
+                result["raw_name_bytes"] = name_bytes.hex()
                 result["name_decode_error"] = True
+                name = name_bytes.decode("utf-8", errors="replace")
+            if name:
+                result["node_name"] = name
 
     return result
 
@@ -175,7 +187,13 @@ def determine_contact_type_from_flags(flags: int) -> int:
 
 
 def get_contact_type_name(contact_type: int) -> str:
-    type_names = {0: "Unknown", 1: "Chat Node", 2: "Repeater", 3: "Room Server", 4: "Sensor"}
+    type_names = {
+        0: "Unknown",
+        1: "Chat Node",
+        2: "Repeater",
+        3: "Room Server",
+        4: "Sensor",
+    }
     return type_names.get(contact_type, f"Unknown Type ({contact_type})")
 
 

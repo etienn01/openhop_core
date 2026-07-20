@@ -654,6 +654,26 @@ class TestBadPacketDeserialization:
         with pytest.raises(ValueError, match="Unsupported packet version"):
             pkt.read_from(wire)
 
+    def test_only_payload_version_zero_accepted(self):
+        """Firmware Dispatcher rejects payload version > PAYLOAD_VER_1 (0), so
+        version 0 must parse and every reserved version (1-3) must be rejected."""
+        # Version 0 parses.
+        header0 = ROUTE_TYPE_FLOOD | (PAYLOAD_TYPE_TXT_MSG << PH_TYPE_SHIFT) | (0 << PH_VER_SHIFT)
+        pkt = Packet()
+        pkt.read_from(bytes([header0, 0]))
+        assert pkt.get_payload_ver() == 0
+
+        # Reserved versions 1, 2, 3 are all rejected (1 is the regression:
+        # it used to be accepted while MAX_SUPPORTED_PAYLOAD_VERSION was 1).
+        for bad_version in (1, 2, 3):
+            header = (
+                ROUTE_TYPE_FLOOD
+                | (PAYLOAD_TYPE_TXT_MSG << PH_TYPE_SHIFT)
+                | (bad_version << PH_VER_SHIFT)
+            )
+            with pytest.raises(ValueError, match="Unsupported packet version"):
+                Packet().read_from(bytes([header, 0]))
+
     def test_path_len_exceeds_max(self):
         """Encoded path_len that decodes to > MAX_PATH_SIZE (64) bytes must be rejected."""
         from openhop_core.protocol.packet_utils import PathUtils
@@ -707,6 +727,35 @@ class TestBadPacketDeserialization:
         with pytest.raises(ValueError, match="payload too large"):
             pkt.read_from(wire)
 
+    def test_max_payload_wire_literal_accepted(self):
+        """Flood wire with exactly MAX_PACKET_PAYLOAD payload bytes parses."""
+        header = _make_header(PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_FLOOD)
+        payload = bytes(range(256))[:MAX_PACKET_PAYLOAD]
+        assert len(payload) == MAX_PACKET_PAYLOAD
+        wire = bytes([header, 0]) + payload
+        pkt = Packet()
+        pkt.read_from(wire)
+        assert pkt.payload_len == MAX_PACKET_PAYLOAD
+        assert bytes(pkt.payload) == payload
+
+    def test_transport_flood_max_payload_wire_literal(self):
+        """Transport-flood wire at the payload ceiling includes 4 transport bytes."""
+        header = _make_header(PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_TRANSPORT_FLOOD)
+        payload = bytes([0xA5]) * MAX_PACKET_PAYLOAD
+        # header | transport_codes(4 LE) | path_len | payload
+        wire = (
+            bytes([header])
+            + (0x1111).to_bytes(2, "little")
+            + (0x2222).to_bytes(2, "little")
+            + bytes([0])
+            + payload
+        )
+        pkt = Packet()
+        pkt.read_from(wire)
+        assert pkt.transport_codes == [0x1111, 0x2222]
+        assert pkt.payload_len == MAX_PACKET_PAYLOAD
+        assert bytes(pkt.payload) == payload
+
     def test_path_len_exact_max_accepted(self):
         """Encoded path_len that decodes to exactly MAX_PATH_SIZE (64) bytes should be accepted."""
         from openhop_core.protocol.packet_utils import PathUtils
@@ -746,6 +795,43 @@ class TestBadPacketSerialization:
         pkt.payload_len = 0
         with pytest.raises(ValueError, match="payload_len mismatch"):
             pkt.write_to()
+
+    def test_write_max_payload_round_trip(self):
+        """write_to/read_from preserve an exactly-MAX_PACKET_PAYLOAD flood packet."""
+        payload = bytes([(i * 7) & 0xFF for i in range(MAX_PACKET_PAYLOAD)])
+        pkt = _build_packet(PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_FLOOD, payload)
+        wire = pkt.write_to()
+        assert wire == bytes([pkt.header, 0]) + payload
+        restored = Packet()
+        restored.read_from(wire)
+        assert restored.write_to() == wire
+        assert restored.payload_len == MAX_PACKET_PAYLOAD
+
+    def test_write_rejects_oversized_payload(self):
+        """write_to refuses payloads that exceed MeshCore's payload buffer."""
+        pkt = _build_packet(PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_FLOOD, bytes(MAX_PACKET_PAYLOAD + 1))
+        with pytest.raises(ValueError, match="payload too large"):
+            pkt.write_to()
+
+
+class TestPacketPayloadCeilingCreate:
+    """Create-time enforcement of MAX_PACKET_PAYLOAD via PacketBuilder."""
+
+    def test_create_packet_accepts_max_payload(self):
+        from openhop_core.protocol.packet_builder import PacketBuilder
+
+        header = _make_header(PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_FLOOD)
+        payload = bytes([0x5A]) * MAX_PACKET_PAYLOAD
+        pkt = PacketBuilder._create_packet(header, payload)
+        assert pkt.payload_len == MAX_PACKET_PAYLOAD
+        assert pkt.write_to() == bytes([header, 0]) + payload
+
+    def test_create_packet_rejects_oversized_payload(self):
+        from openhop_core.protocol.packet_builder import PacketBuilder
+
+        header = _make_header(PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_FLOOD)
+        with pytest.raises(ValueError, match="payload too large"):
+            PacketBuilder._create_packet(header, bytes(MAX_PACKET_PAYLOAD + 1))
 
 
 class TestBadPacketRoutingPath:

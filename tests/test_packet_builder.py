@@ -1,3 +1,5 @@
+import pytest
+
 from openhop_core import LocalIdentity
 from openhop_core.protocol import CryptoUtils
 from openhop_core.protocol.constants import (
@@ -218,6 +220,26 @@ def test_packet_builder_create_path_return_no_encoded_uses_len_path():
     decrypted = CryptoUtils.mac_then_decrypt(aes_key, secret, bytes(pkt.payload[2:]))
     assert decrypted[0] == 3
     assert decrypted[1:4] == bytes(path)
+    # No extra payload: 0xFF dummy type followed by 4 random uniqueness bytes.
+    assert decrypted[4] == 0xFF
+    assert len(decrypted) >= 4 + 1 + 4
+
+
+def test_packet_builder_create_path_return_empty_extra_is_unique():
+    """Two identical empty-extra PATH returns must differ (random filler),
+    matching MeshCore Mesh::createPathReturn."""
+    path = [0x11, 0x22, 0x33]
+    secret = bytes(32)
+    kwargs = dict(dest_hash=0x01, src_hash=0x02, secret=secret, path=path, extra=b"")
+    a = PacketBuilder.create_path_return(**kwargs)
+    b = PacketBuilder.create_path_return(**kwargs)
+    assert bytes(a.payload) != bytes(b.payload)
+    # Both remain valid and decrypt with the shared secret.
+    for pkt in (a, b):
+        dec = CryptoUtils.mac_then_decrypt(secret[:16], secret, bytes(pkt.payload[2:]))
+        assert dec[0] == 3
+        assert dec[1:4] == bytes(path)
+        assert dec[4] == 0xFF
 
 
 def test_create_text_message_cli_data_flags_byte():
@@ -251,6 +273,58 @@ def test_create_text_message_cli_data_flags_byte():
     assert dec_p[4] == 0x01  # PLAIN: (0 << 2) | attempt 1
     assert dec_c[4] == 0x05  # CLI_DATA: (1 << 2) | attempt 1
     assert crc_plain != crc_cli
+
+
+def test_create_text_message_extended_attempt_hidden_in_tail():
+    """attempt > 3 hides the full attempt byte after the text's NUL terminator so
+    retries whose low two bits repeat still produce a unique packet (composeMsgPacket)."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = type(
+        "Contact",
+        (),
+        {"public_key": other.get_public_key().hex(), "out_path": [], "out_path_len": -1},
+    )()
+    peer_pub = local.get_public_key()
+    secret = Identity(peer_pub).calc_shared_secret(other.get_private_key())
+    aes_key = secret[:16]
+
+    def _dec(p):
+        return CryptoUtils.mac_then_decrypt(aes_key, secret, bytes(p.payload[2:]))
+
+    text = "hi"
+    ts = 1000  # pin the timestamp so attempt 0 and 4 are comparable
+    pkt4, crc4 = PacketBuilder.create_text_message(
+        contact, local, text, 4, "direct", None, 0, timestamp=ts
+    )
+    dec4 = _dec(pkt4)
+    # Low two bits of attempt live in the flag byte: 4 & 3 == 0
+    assert dec4[4] == 0x00
+    # Layout: timestamp(4) + flags(1) + text + NUL + attempt
+    tail_start = 5 + len(text.encode("utf-8"))
+    assert dec4[tail_start] == 0x00  # C-string terminator
+    assert dec4[tail_start + 1] == 4  # hidden full attempt byte
+
+    # attempt <= 3 carries no hidden attempt byte (only the terminator + padding).
+    pkt0, crc0 = PacketBuilder.create_text_message(
+        contact, local, text, 0, "direct", None, 0, timestamp=ts
+    )
+    dec0 = _dec(pkt0)
+    assert dec0[tail_start] == 0x00
+    assert dec0[tail_start + 1] == 0x00  # AES zero padding, not an attempt byte
+
+    # The ACK CRC is computed over timestamp+flags+text only, so attempt 0 and 4
+    # (same low bits, same text) expect the same ACK, but the packets differ.
+    assert crc0 == crc4
+    assert bytes(pkt0.payload) != bytes(pkt4.payload)
+
+    # Extended attempt shrinks the text budget by two bytes.
+    long_text = "x" * (MAX_TEXT_LEN - 1)
+    with pytest.raises(ValueError):
+        PacketBuilder.create_text_message(contact, local, long_text, 4, "direct", None, 0)
+    # The same length is still fine for attempt <= 3.
+    ok_pkt, _ = PacketBuilder.create_text_message(contact, local, long_text, 1, "direct", None, 0)
+    assert ok_pkt is not None
 
 
 def test_create_text_message_truncated_path_path_len_consistency():
@@ -432,6 +506,73 @@ def test_create_protocol_request_unknown_path_is_flood():
     contact = _make_contact(other, out_path=b"", out_path_len=-1)
     pkt, _ = PacketBuilder.create_protocol_request(contact, local, 0x01, b"")
     assert pkt.is_route_flood()
+
+
+def test_create_protocol_request_can_force_flood_for_known_path():
+    """A request may explicitly flood without changing the stored contact path."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    path = b"\x01\x02\x03"
+    contact = _make_contact(other, out_path=path, out_path_len=3)
+    pkt, _ = PacketBuilder.create_protocol_request(contact, local, 0x01, b"", route_type="flood")
+
+    assert pkt.is_route_flood()
+    assert pkt.path_len == 0
+    assert bytes(pkt.path) == b""
+    assert contact.out_path_len == 3
+    assert contact.out_path == path
+
+
+def test_create_telem_request_honors_explicit_route_type():
+    """Telemetry requests use the same explicit routing override as protocol requests."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = _make_contact(other, out_path=b"\x01\x02\x03", out_path_len=3)
+
+    pkt, _ = PacketBuilder.create_telem_request(contact, local, route_type="flood")
+
+    assert pkt.is_route_flood()
+    assert pkt.path_len == 0
+    assert bytes(pkt.path) == b""
+
+
+def test_advert_timestamp_uses_wall_time_not_the_unique_request_clock():
+    """Adverts carry plain wall time (firmware Mesh::createAdvert uses
+    getCurrentTime, not getCurrentTimeUnique). If the advert shared the
+    strictly-increasing request clock, a burst of requests would inflate the
+    advert timestamp into the future and peers would drop this node's later
+    wall-time adverts as replays until real time caught up."""
+    import struct
+    from unittest.mock import patch
+
+    with patch("time.time", return_value=1_700_000_000.0):
+        # Inflate the shared request clock well past the frozen wall time.
+        for _ in range(5):
+            PacketBuilder._get_timestamp()
+        assert PacketBuilder._last_unique_timestamp > 1_700_000_000
+
+        identity = LocalIdentity()
+        pkt = PacketBuilder.create_advert(identity, "TestNode", 1)
+
+        # Advert payload: pubkey(32) + timestamp(4 LE) + signature + appdata.
+        advert_ts = struct.unpack("<I", bytes(pkt.payload[32:36]))[0]
+        assert advert_ts == 1_700_000_000
+
+
+def test_advert_timestamps_follow_the_wall_clock():
+    """Two adverts in successive seconds carry those wall-clock seconds; two in
+    the same second may carry the same value (getCurrentTime semantics)."""
+    import struct
+    from unittest.mock import patch
+
+    identity = LocalIdentity()
+    stamps = []
+    for now in (2_000_000_000.0, 2_000_000_000.0, 2_000_000_001.0):
+        with patch("time.time", return_value=now):
+            pkt = PacketBuilder.create_advert(identity, "TestNode", 1)
+        stamps.append(struct.unpack("<I", bytes(pkt.payload[32:36]))[0])
+
+    assert stamps == [2_000_000_000, 2_000_000_000, 2_000_000_001]
 
 
 def test_get_timestamp_is_strictly_monotonic_within_same_second():

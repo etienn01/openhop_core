@@ -6,13 +6,22 @@ import logging
 import time
 from typing import Optional
 
-from .binary_parsing import decode_exported_contact, encode_exported_contact
+from ..protocol import Packet, PacketBuilder
+from ..protocol.constants import (
+    ADVERT_FLAG_HAS_LOCATION,
+    ADVERT_FLAG_HAS_NAME,
+    PAYLOAD_TYPE_ADVERT,
+    ROUTE_TYPE_FLOOD,
+)
+from ..protocol.packet_utils import PathUtils
+from .base_support import adv_type_to_flags
 from .constants import (
     ADV_TYPE_CHAT,
     ADV_TYPE_NONE,
     ADV_TYPE_REPEATER,
     ADV_TYPE_ROOM,
     ADV_TYPE_SENSOR,
+    ADVERT_LOC_SHARE,
     AUTOADD_CHAT,
     AUTOADD_OVERWRITE_OLDEST,
     AUTOADD_REPEATER,
@@ -40,6 +49,14 @@ class _ContactChannelMixin:
         """
         return [c for c in self.contacts.get_all(since=since) if c.adv_type != ADV_TYPE_NONE]
 
+    def get_contact_count(self) -> int:
+        """Return the total real-contact count (firmware getNumContacts()).
+
+        Independent of any ``since`` filter; used for the CONTACTS_START total.
+        Excludes transient/anon entries, mirroring get_contacts.
+        """
+        return self.contacts.count()
+
     def get_contact_by_key(self, pub_key: bytes) -> Optional[Contact]:
         """Look up a contact by its full 32-byte public key."""
         return self.contacts.get_by_key(pub_key)
@@ -62,45 +79,81 @@ class _ContactChannelMixin:
         return self.contacts.remove(pub_key)
 
     def export_contact(self, pub_key: Optional[bytes] = None) -> Optional[bytes]:
-        """Export a contact (or self) as a 73-byte binary packet."""
+        """Export a signed MeshCore ADVERT for self or a stored peer.
+
+        MeshCore makes peer exports from the raw, verified ADVERT blob retained
+        when that contact was received.  The self export is the sole exception:
+        the firmware creates and signs a fresh flood ADVERT for the local node.
+        """
         if pub_key is None:
-            return encode_exported_contact(
-                self._identity.get_public_key(),
-                self.prefs.adv_type,
-                self.prefs.node_name,
-                self.prefs.latitude,
-                self.prefs.longitude,
+            flags = adv_type_to_flags(self.prefs.adv_type) | ADVERT_FLAG_HAS_NAME
+            lat, lon = 0.0, 0.0
+            if self.prefs.advert_loc_policy == ADVERT_LOC_SHARE:
+                flags |= ADVERT_FLAG_HAS_LOCATION
+                lat, lon = self.prefs.latitude, self.prefs.longitude
+            packet = PacketBuilder.create_advert(
+                local_identity=self._identity,
+                name=self.prefs.node_name,
+                lat=lat,
+                lon=lon,
+                flags=flags,
+                route_type="flood",
             )
+            return packet.write_to()
         contact = self.contacts.get_by_key(pub_key)
-        if not contact:
+        if not contact or not contact.last_advert_packet:
             return None
-        return encode_exported_contact(
-            contact.public_key,
-            contact.adv_type,
-            contact.name,
-            contact.gps_lat,
-            contact.gps_lon,
-        )
+        return bytes(contact.last_advert_packet)
 
     def import_contact(self, packet_data: bytes) -> bool:
-        """Import a contact from a 73-byte binary packet."""
-        parsed = decode_exported_contact(packet_data)
-        if parsed is None:
-            logger.warning("Import data too short: %s bytes", len(packet_data))
-            return False
+        """Queue a raw ADVERT for normal verified advert handling.
+
+        This intentionally follows ``BaseChatMesh::importContact``: command
+        success means the packet parsed and is an ADVERT, not that its signature
+        was accepted.  Signature validation, contact policy, and storage happen
+        through the regular advert handler in a deferred loopback task.
+        """
         try:
-            contact = Contact(
-                public_key=parsed["public_key"],
-                name=parsed["name"],
-                adv_type=parsed["adv_type"],
-                gps_lat=parsed["gps_lat"],
-                gps_lon=parsed["gps_lon"],
-                lastmod=int(time.time()),
-            )
-            return self.contacts.add(contact)
-        except Exception as e:
-            logger.error("Error importing contact: %s", e)
+            raw_packet = bytes(packet_data)
+            packet = Packet()
+            if not packet.read_from(raw_packet):
+                return False
+        except (IndexError, TypeError, ValueError) as exc:
+            logger.warning("Invalid contact import packet: %s", exc)
             return False
+
+        if packet.get_payload_type() != PAYLOAD_TYPE_ADVERT:
+            logger.warning("Import packet is not an ADVERT")
+            return False
+
+        # MeshCore ORs the flood route bit before its pending loopback.  Do not
+        # re-parse serialized bytes after this mutation: an imported direct
+        # packet may change route encoding, while firmware keeps the parsed
+        # Packet object intact for onRecvPacket().
+        packet.header |= ROUTE_TYPE_FLOOD
+        try:
+            self._spawn_background_task(
+                self._loopback_imported_advert(packet), "import contact loopback"
+            )
+        except RuntimeError:
+            # The firmware command runs from its event loop; a synchronous
+            # caller without one cannot faithfully queue the deferred loopback.
+            logger.warning("Cannot import contact without a running event loop")
+            return False
+        return True
+
+    async def _loopback_imported_advert(self, packet: Packet) -> None:
+        """Deliver an imported ADVERT through the normal verified handler."""
+        payload = packet.get_payload()
+        if len(payload) >= 32 and payload[:32] == self._identity.get_public_key():
+            # Mesh::onRecvPacket ignores a self ADVERT after import, while the
+            # command itself has already succeeded because its packet parsed.
+            return
+        handler = self._get_advert_handler()
+        if handler is None:
+            logger.error("No advert handler available for imported contact")
+            return
+        await handler(packet)
 
     # -------------------------------------------------------------------------
     # Path & Routing
@@ -156,9 +209,19 @@ class _ContactChannelMixin:
         """Return the current auto-add configuration bitmask."""
         return self.prefs.autoadd_config
 
-    def set_autoadd_config(self, config: int) -> None:
-        """Set the auto-add configuration bitmask."""
+    def get_autoadd_max_hops(self) -> int:
+        """Return the auto-add maximum-hop limit (0 = no limit)."""
+        return self.prefs.autoadd_max_hops
+
+    def set_autoadd_config(self, config: int, max_hops: Optional[int] = None) -> None:
+        """Set the auto-add configuration bitmask and optional max-hop limit.
+
+        Mirrors firmware CMD_SET_AUTOADD_CONFIG: the config byte is always
+        stored; the max-hop byte is optional and capped at 64 when present.
+        """
         self.prefs.autoadd_config = config
+        if max_hops is not None:
+            self.prefs.autoadd_max_hops = min(max_hops, 64)
         self._save_prefs()
 
     # Map ADV_TYPE_* → AUTOADD_* bitmask bits (mirrors C++ shouldAutoAddContactType)
@@ -231,6 +294,20 @@ class _ContactChannelMixin:
             if not self.should_auto_add_contact_type(contact.adv_type):
                 logger.debug("Auto-add filtered: type %d not allowed", contact.adv_type)
                 return None
+            # Hop-count cap (BaseChatMesh::onAdvertRecv): for a new contact, reject
+            # auto-add when the advert is at least ``autoadd_max_hops`` hops away.
+            # 0 = no limit; 1 = direct only (0 hops). Existing contacts are updated
+            # above regardless. The caller still notifies the client for every
+            # valid advert, matching the firmware's onDiscoveredContact.
+            max_hops = self.prefs.autoadd_max_hops
+            if max_hops > 0:
+                if path_len_encoded is not None:
+                    hop_count = PathUtils.get_path_hash_count(path_len_encoded)
+                else:
+                    hop_count = len(inbound_path)
+                if hop_count >= max_hops:
+                    logger.debug("Auto-add filtered: %d hops >= max_hops %d", hop_count, max_hops)
+                    return None
             if self.should_overwrite_when_full() and self.contacts.is_full():
                 ok, overwritten = self.contacts.add_or_overwrite(contact)
                 if ok and overwritten:

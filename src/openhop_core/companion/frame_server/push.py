@@ -23,7 +23,7 @@ from ..constants import (
     PUSH_CODE_SEND_CONFIRMED,
     PUSH_CODE_TRACE_DATA,
 )
-from ..models import Contact
+from ..models import ChannelDataEvent, ChannelMessageEvent, Contact, MessageEvent
 from .frames import _build_advert_push_frames
 
 logger = logging.getLogger("CompanionFrameServer")
@@ -38,9 +38,9 @@ class _PushMixin:
         # Clear any callbacks registered by a previous connection so they
         # don't accumulate across reconnections.
         self.bridge.clear_push_callbacks()
-        self.bridge.on_message_received(self._on_message_received)
-        self.bridge.on_channel_message_received(self._on_channel_message_received)
-        self.bridge.on_channel_data_received(self._on_channel_data_received)
+        self.bridge.on_message_event(self._on_message_event)
+        self.bridge.on_channel_message_event(self._on_channel_message_event)
+        self.bridge.on_channel_data_event(self._on_channel_data_event)
         self.bridge.on_send_confirmed(self._on_send_confirmed)
         self.bridge.on_advert_received(self._on_advert_received)
         self.bridge.on_node_discovered(self._on_node_discovered)
@@ -50,98 +50,74 @@ class _PushMixin:
         self.bridge.on_contact_deleted(self._on_contact_deleted)
         self.bridge.on_contacts_full(self._on_contacts_full)
         self.bridge.on_raw_data_received(self._on_raw_data_received)
+        self.bridge.on_trace_received(self._on_trace_received)
 
     # -------------------------------------------------------------------------
     # Bridge event callbacks (registered by _setup_push_callbacks)
     # -------------------------------------------------------------------------
 
-    async def _on_message_received(
-        self,
-        sender_key,
-        text,
-        timestamp,
-        txt_type,
-        packet_hash=None,
-        snr=None,
-        rssi=None,
-        sender_prefix=b"",
-    ):
+    async def _on_message_event(self, event: MessageEvent):
         msg_dict = {
-            "sender_key": sender_key,
-            "text": text,
-            "timestamp": timestamp,
-            "txt_type": txt_type,
+            "sender_key": event.sender_key,
+            "text": event.text,
+            "timestamp": event.timestamp,
+            "txt_type": event.txt_type,
             "is_channel": False,
             "channel_idx": 0,
-            "path_len": 0,
-            "packet_hash": packet_hash,
-            "snr": snr,
-            "rssi": rssi,
-            "sender_prefix": sender_prefix,
+            "path_len": event.path_len,
+            "packet_hash": event.packet_hash,
+            "snr": event.snr,
+            "rssi": event.rssi,
+            "sender_prefix": event.sender_prefix,
         }
-        await self._persist_companion_message(msg_dict)
+        if event.queued:
+            await self._persist_companion_message(msg_dict, event.queue_entry)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))
 
-    async def _on_channel_message_received(
-        self,
-        channel_name,
-        sender_name,
-        message_text,
-        timestamp,
-        path_len=0,
-        channel_idx=0,
-        packet_hash=None,
-        snr=None,
-        rssi=None,
-    ):
+    async def _on_channel_message_event(self, event: ChannelMessageEvent):
         msg_dict = {
             "sender_key": b"",
-            "text": message_text,
-            "timestamp": timestamp,
+            "text": event.text,
+            "timestamp": event.timestamp,
             "txt_type": 0,
             "is_channel": True,
-            "channel_idx": channel_idx,
-            "path_len": path_len,
-            "packet_hash": packet_hash,
-            "snr": snr,
-            "rssi": rssi,
+            "channel_idx": event.channel_idx,
+            "path_len": event.path_len,
+            "packet_hash": event.packet_hash,
+            "snr": event.snr,
+            "rssi": event.rssi,
         }
-        await self._persist_companion_message(msg_dict)
+        if event.queued:
+            await self._persist_companion_message(msg_dict, event.queue_entry)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))
 
-    async def _on_channel_data_received(
-        self,
-        channel_idx,
-        path_len,
-        data_type,
-        payload,
-        packet_hash=None,
-        snr=None,
-        rssi=None,
-    ):
+    async def _on_channel_data_event(self, event: ChannelDataEvent):
         msg_dict = {
             "sender_key": b"",
             "text": "",
             "timestamp": 0,
             "txt_type": 0,
             "is_channel": True,
-            "channel_idx": channel_idx,
-            "path_len": path_len,
-            "packet_hash": packet_hash,
-            "snr": snr,
-            "rssi": rssi,
-            "channel_data_type": data_type,
-            "channel_data_payload": bytes(payload or b""),
+            "channel_idx": event.channel_idx,
+            "path_len": event.path_len,
+            "packet_hash": event.packet_hash,
+            "snr": event.snr,
+            "rssi": event.rssi,
+            "channel_data_type": event.data_type,
+            "channel_data_payload": bytes(event.payload or b""),
         }
-        await self._persist_companion_message(msg_dict)
+        if event.queued:
+            await self._persist_companion_message(msg_dict, event.queue_entry)
         self._enqueue_frame(bytes([PUSH_CODE_MSG_WAITING]))
 
-    def _on_send_confirmed(self, crc):
+    def _on_send_confirmed(self, crc, trip_ms=0):
+        # Final 4 bytes are the elapsed milliseconds from send to ACK (firmware
+        # processAck writes trip_time here); 0 only when the send time is unknown.
         data = struct.pack(
             "<B4sI",
             PUSH_CODE_SEND_CONFIRMED,
             struct.pack("<I", crc)[:4],
-            0,
+            int(trip_ms) & 0xFFFFFFFF,
         )
         self._enqueue_frame(data)
 
@@ -236,18 +212,33 @@ class _PushMixin:
         )
         self._enqueue_frame(frame)
 
-    def _on_path_discovery_response(self, tag_bytes, contact_pubkey, out_path, in_path):
+    def _on_path_discovery_response(
+        self, tag_bytes, contact_pubkey, out_len_byte, out_path, in_len_byte, in_path
+    ):
         pub_key_prefix = (
             contact_pubkey if isinstance(contact_pubkey, bytes) else bytes.fromhex(contact_pubkey)
         )[:6]
         out_path = out_path if isinstance(out_path, bytes) else bytes(out_path)
         in_path = in_path if isinstance(in_path, bytes) else bytes(in_path)
+        # Re-announce the ENCODED path_len bytes verbatim, matching the firmware
+        # (MyMesh.cpp:757-765). Drop the whole frame if either encoded byte is
+        # invalid, mirroring the isValidPathLen guard at MyMesh.cpp:754-755.
+        if not (
+            PathUtils.is_valid_path_len(out_len_byte) and PathUtils.is_valid_path_len(in_len_byte)
+        ):
+            logger.debug(
+                "[PUSH] dropping path_discovery frame: invalid encoded path_len "
+                "(out=0x%02X, in=0x%02X)",
+                out_len_byte,
+                in_len_byte,
+            )
+            return
         frame = (
             bytes([PUSH_CODE_PATH_DISCOVERY_RESPONSE, 0])
             + pub_key_prefix
-            + bytes([len(out_path)])
+            + bytes([out_len_byte])
             + out_path
-            + bytes([len(in_path)])
+            + bytes([in_len_byte])
             + in_path
         )
         self._enqueue_frame(frame)
@@ -272,6 +263,18 @@ class _PushMixin:
             + payload_bytes[:payload_len]
         )
         self._enqueue_frame(data)
+
+    def _on_trace_received(self, info: dict) -> None:
+        """Push PUSH_CODE_TRACE_DATA (0x89) when a trace completes at this node."""
+        self.push_trace_data(
+            path_len=info["path_len"],
+            flags=info["flags"],
+            tag=info["tag"],
+            auth_code=info["auth_code"],
+            path_hashes=info["path_hashes"],
+            path_snrs=info["path_snrs"],
+            final_snr_byte=info["final_snr_byte"],
+        )
 
     # -------------------------------------------------------------------------
     # Public push methods (called directly by host application)

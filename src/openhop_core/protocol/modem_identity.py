@@ -188,8 +188,7 @@ class ModemIdentity:
             RuntimeError: Always, as signing key is not accessible
         """
         raise RuntimeError(
-            "ModemIdentity does not expose signing keys. "
-            "Use sign() for signing operations."
+            "ModemIdentity does not expose signing keys. " "Use sign() for signing operations."
         )
 
     # Additional modem-specific methods
@@ -267,9 +266,7 @@ class ModemIdentity:
         """
         result = self._modem.decrypt_data(key, mac, ciphertext)
         if result is None:
-            raise RuntimeError(
-                "Modem decryption failed (MAC verification may have failed)"
-            )
+            raise RuntimeError("Modem decryption failed (MAC verification may have failed)")
         return result
 
     @property

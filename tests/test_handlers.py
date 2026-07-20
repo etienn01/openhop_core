@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-# from openhop_core.node.events import MeshEvents  # Not currently used
+from openhop_core.node.events import MeshEvents
 from openhop_core.node.handlers import (
     AckHandler,
     AdvertHandler,
@@ -19,13 +19,8 @@ from openhop_core.node.handlers import (
     TraceHandler,
 )
 from openhop_core.node.handlers.login_server import FIRMWARE_VER_LEVEL
-from openhop_core.protocol import (
-    CryptoUtils,
-    Identity,
-    LocalIdentity,
-    Packet,
-    PacketBuilder,
-)
+from openhop_core.node.handlers.result import HandlerResult
+from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
@@ -40,10 +35,14 @@ from openhop_core.protocol.constants import (
     PUB_KEY_SIZE,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
+    ROUTE_TYPE_TRANSPORT_FLOOD,
     SIGNATURE_SIZE,
     TIMESTAMP_SIZE,
+    TXT_TYPE_CLI_DATA,
+    TXT_TYPE_PLAIN,
 )
 from openhop_core.protocol.packet_utils import PathUtils
+from openhop_core.protocol.utils import decode_appdata
 
 
 # Mock classes for testing
@@ -76,6 +75,27 @@ class MockEventService:
     def __init__(self):
         self.publish = AsyncMock()
         self.publish_sync = MagicMock()
+
+
+def _build_direct_dm(sender_identity, receiver_identity, text, txt_type=TXT_TYPE_PLAIN):
+    """Build a real encrypted direct DM packet from sender to receiver."""
+
+    class _SendContact:
+        def __init__(self, pubkey_hex):
+            self.public_key = pubkey_hex
+            self.out_path = []
+            self.out_path_len = -1
+
+    receiver_contact = _SendContact(receiver_identity.get_public_key().hex())
+    packet, _ = PacketBuilder.create_text_message(
+        receiver_contact,
+        sender_identity,
+        text,
+        attempt=0,
+        message_type="direct",
+        txt_type=txt_type,
+    )
+    return packet
 
 
 # Base Handler Tests
@@ -225,11 +245,89 @@ class TestTextMessageHandler:
         assert self.handler.send_packet == self.send_packet_fn
         assert self.handler.event_service == self.event_service
 
-    def test_set_command_response_callback(self):
-        """Test setting command response callback."""
+    def test_register_command_response(self):
+        """Registering/unregistering a command response is keyed by full pubkey."""
         callback = MagicMock()
-        self.handler.set_command_response_callback(callback)
-        assert self.handler.command_response_callback == callback
+        pubkey = bytes(range(32))
+        self.handler.register_command_response(pubkey, callback)
+        assert self.handler._pending_command_responses[pubkey] is callback
+        # Identity-guarded removal: a different callback does not clear the entry.
+        self.handler.unregister_command_response(pubkey, MagicMock())
+        assert self.handler._pending_command_responses[pubkey] is callback
+        self.handler.unregister_command_response(pubkey, callback)
+        assert pubkey not in self.handler._pending_command_responses
+
+    @pytest.mark.asyncio
+    async def test_cli_data_reply_completes_pending_command_one_shot(self):
+        """A CLI_DATA reply from the pending sender is captured exactly once."""
+        sender = LocalIdentity()
+        self.contacts.contacts = [MockContact(public_key=sender.get_public_key().hex(), name="rpt")]
+        captured = []
+        self.handler.register_command_response(
+            sender.get_public_key(), lambda text, contact: captured.append(text)
+        )
+
+        pkt = _build_direct_dm(sender, self.local_identity, "reply one", TXT_TYPE_CLI_DATA)
+        result = await self.handler(pkt)
+        assert result.authenticated is True
+        assert captured == ["reply one"]
+        # One reply completes one command: the entry is gone and the next
+        # CLI_DATA from the same sender is delivered as a normal message.
+        assert sender.get_public_key() not in self.handler._pending_command_responses
+        self.event_service.publish_sync.assert_not_called()
+
+        pkt2 = _build_direct_dm(sender, self.local_identity, "reply two", TXT_TYPE_CLI_DATA)
+        await self.handler(pkt2)
+        assert captured == ["reply one"]
+        self.event_service.publish_sync.assert_called_once()
+        event_name, event_data = self.event_service.publish_sync.call_args.args
+        assert event_name == MeshEvents.NEW_MESSAGE
+        assert event_data["message_text"] == "reply two"
+
+    @pytest.mark.asyncio
+    async def test_plain_dm_from_pending_sender_not_intercepted(self):
+        """A plain DM is delivered normally even while its sender has a pending command."""
+        sender = LocalIdentity()
+        self.contacts.contacts = [MockContact(public_key=sender.get_public_key().hex(), name="rpt")]
+        captured = []
+        self.handler.register_command_response(
+            sender.get_public_key(), lambda text, contact: captured.append(text)
+        )
+
+        pkt = _build_direct_dm(sender, self.local_identity, "just a dm", TXT_TYPE_PLAIN)
+        await self.handler(pkt)
+
+        assert captured == []
+        assert sender.get_public_key() in self.handler._pending_command_responses
+        self.event_service.publish_sync.assert_called_once()
+        event_name, event_data = self.event_service.publish_sync.call_args.args
+        assert event_name == MeshEvents.NEW_MESSAGE
+        assert event_data["message_text"] == "just a dm"
+
+    @pytest.mark.asyncio
+    async def test_cli_data_from_other_contact_delivered_normally(self):
+        """CLI_DATA from a contact with no pending command flows to normal delivery."""
+        target = LocalIdentity()
+        other = LocalIdentity()
+        self.contacts.contacts = [
+            MockContact(public_key=target.get_public_key().hex(), name="rpt"),
+            MockContact(public_key=other.get_public_key().hex(), name="other"),
+        ]
+        captured = []
+        self.handler.register_command_response(
+            target.get_public_key(), lambda text, contact: captured.append(text)
+        )
+
+        pkt = _build_direct_dm(other, self.local_identity, "unrelated cli", TXT_TYPE_CLI_DATA)
+        await self.handler(pkt)
+
+        assert captured == []
+        # The target's pending entry is untouched.
+        assert target.get_public_key() in self.handler._pending_command_responses
+        self.event_service.publish_sync.assert_called_once()
+        event_name, event_data = self.event_service.publish_sync.call_args.args
+        assert event_name == MeshEvents.NEW_MESSAGE
+        assert event_data["message_text"] == "unrelated cli"
 
     @pytest.mark.asyncio
     async def test_call_with_short_payload(self):
@@ -286,6 +384,203 @@ class TestTextMessageHandler:
         assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
         assert len(ack_packet.payload) == 6
         assert int.from_bytes(ack_packet.payload[:4], "little") == ack_crc
+
+    def test_ack_response_delays_use_fixed_txt_ack_delay(self):
+        """Receiver ACK responses use the firmware TXT_ACK_DELAY (200 ms), with the
+        multi-ack staggered +300 ms — not an airtime/route-timeout estimate."""
+        import types
+
+        from openhop_core.node.handlers.text import MULTI_ACK_STAGGER_MS, TXT_ACK_DELAY_MS
+        from openhop_core.protocol.packet_utils import PathUtils
+
+        ack_hash = bytes(range(6))
+        base = TXT_ACK_DELAY_MS / 1000.0
+
+        # DIRECT with a known out_path, no multi-ack: single ACK at 200 ms.
+        contact = types.SimpleNamespace(
+            out_path_len=PathUtils.encode_path_len(1, 1), out_path=b"\x05"
+        )
+        self.handler.multi_acks = 0
+        res = self.handler._build_ack_responses(
+            packet=Packet(),
+            matched_contact=contact,
+            shared_secret=b"\x00" * 32,
+            pubkey=b"\x01" * 32,
+            ack_hash=ack_hash,
+            is_flood=False,
+        )
+        assert len(res) == 1
+        assert res[0][1] == base
+
+        # DIRECT known path with multi-ack: multi at 200 ms, ACK at 500 ms.
+        self.handler.multi_acks = 1
+        res = self.handler._build_ack_responses(
+            packet=Packet(),
+            matched_contact=contact,
+            shared_secret=b"\x00" * 32,
+            pubkey=b"\x01" * 32,
+            ack_hash=ack_hash,
+            is_flood=False,
+        )
+        assert len(res) == 2
+        assert res[0][1] == base
+        assert res[1][1] == (TXT_ACK_DELAY_MS + MULTI_ACK_STAGGER_MS) / 1000.0
+
+        # DIRECT with unknown out_path: flooded ACK at 200 ms.
+        self.handler.multi_acks = 0
+        contact_nopath = types.SimpleNamespace(out_path_len=-1, out_path=b"")
+        res = self.handler._build_ack_responses(
+            packet=Packet(),
+            matched_contact=contact_nopath,
+            shared_secret=b"\x00" * 32,
+            pubkey=b"\x01" * 32,
+            ack_hash=ack_hash,
+            is_flood=False,
+        )
+        assert len(res) == 1
+        assert res[0][1] == base
+
+    def test_flood_ack_response_uses_txt_ack_delay(self):
+        """A flood DM's PATH-return ACK is scheduled at TXT_ACK_DELAY (200 ms)."""
+        from openhop_core.node.handlers.text import TXT_ACK_DELAY_MS
+
+        sender = LocalIdentity()
+        shared = Identity(sender.get_public_key()).calc_shared_secret(
+            self.local_identity.get_private_key()
+        )
+        pkt = Packet()
+        pkt.path = bytearray([0x01, 0x02])
+        pkt.path_len = 2
+        res = self.handler._build_ack_responses(
+            packet=pkt,
+            matched_contact=MockContact(public_key=sender.get_public_key().hex()),
+            shared_secret=shared,
+            pubkey=sender.get_public_key(),
+            ack_hash=bytes(range(6)),
+            is_flood=True,
+        )
+        assert len(res) == 1
+        assert res[0][1] == TXT_ACK_DELAY_MS / 1000.0
+
+    @pytest.mark.asyncio
+    async def test_received_text_stops_at_first_nul(self):
+        """The delivered message text ends at the first NUL: AES zero padding and the
+        hidden extended-attempt byte (attempt > 3) must not leak into the content."""
+        from openhop_core.protocol.packet_builder import PacketBuilder
+
+        sender = LocalIdentity()
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        receiver_contact = _SendContact(self.local_identity.get_public_key().hex())
+        # attempt=4 appends NUL + attempt byte after the text, on top of AES padding.
+        packet, _ = PacketBuilder.create_text_message(
+            receiver_contact, sender, "hello", attempt=4, message_type="direct"
+        )
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        ]
+
+        await self.handler(packet)
+
+        assert self.event_service.publish_sync.called
+        message_data = self.event_service.publish_sync.call_args.args[1]
+        assert message_data["message_text"] == "hello"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("route", "path", "path_len"),
+        [
+            pytest.param("direct", b"", 0xFF, id="direct-out-path-unknown-ff"),
+            pytest.param("flood", b"\xAA", 0x01, id="flood-one-byte-hash-01"),
+            pytest.param(
+                "flood",
+                b"\xAA\xBB\xCC\xDD",
+                0x42,
+                id="flood-two-byte-hashes-42",
+            ),
+            pytest.param(
+                "transport_flood",
+                b"\xAA\xBB\xCC\xDD\xEE\xFF\x10\x20\x30",
+                0x83,
+                id="transport-flood-three-byte-hashes-83",
+            ),
+        ],
+    )
+    async def test_received_text_publishes_companion_route_path_len(self, route, path, path_len):
+        """Firmware-compatible companion route-byte vectors reach the event.
+
+        MeshCore's queueMessage() passes a flood packet's encoded path_len
+        unchanged and uses OUT_PATH_UNKNOWN (0xFF) for any direct route.
+        The literal vectors include hash-width bits, so a conversion to raw
+        path bytes would fail this compatibility check.
+        """
+        sender = LocalIdentity()
+        packet_route = "flood" if path else route
+        packet = self._build_dm_to_self(sender, route=packet_route)
+        if route == "transport_flood":
+            route_type = packet.header & ~0x03
+            packet.header = route_type | ROUTE_TYPE_TRANSPORT_FLOOD
+        if path:
+            packet.set_path(path, path_len)
+        sender_key = sender.get_public_key().hex()
+        self.contacts.contacts = [MockContact(public_key=sender_key, name="sender")]
+
+        await self.handler(packet)
+
+        message_data = self.event_service.publish_sync.call_args.args[1]
+        assert message_data["path_len"] == path_len
+
+    # -- consume-vs-forward return contract (#353) --------------------------
+
+    def _build_dm_to_self(self, sender, text="hi", route="flood"):
+        """Build a DM addressed to this handler's identity, sent by ``sender``."""
+        from openhop_core.protocol.packet_builder import PacketBuilder
+
+        class _SendContact:
+            def __init__(self, pubkey_hex):
+                self.public_key = pubkey_hex
+                self.out_path = []
+                self.out_path_len = -1
+
+        receiver_contact = _SendContact(self.local_identity.get_public_key().hex())
+        packet, _ = PacketBuilder.create_text_message(
+            receiver_contact, sender, text, attempt=0, message_type=route
+        )
+        return packet
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_decrypted_for_known_contact(self):
+        """A DM that decrypts for a known contact is genuinely ours -> consume (True)."""
+        sender = LocalIdentity()
+        packet = self._build_dm_to_self(sender)
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        ]
+        assert (await self.handler(packet)).authenticated is True
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_sender_unknown(self):
+        """No contact matches the src hash: can't decrypt -> forward (False)."""
+        sender = LocalIdentity()
+        packet = self._build_dm_to_self(sender)
+        self.contacts.contacts = []
+        assert (await self.handler(packet)).authenticated is False
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_decrypt_failure_collision(self):
+        """src hash matches a contact but HMAC fails (collision): forward (False) (#353)."""
+        sender = LocalIdentity()
+        packet = self._build_dm_to_self(sender)
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="sender")
+        ]
+        packet.payload[-1] ^= 0xFF  # corrupt ciphertext/MAC so decryption fails
+        assert (await self.handler(packet)).authenticated is False
 
     def _make_direct_dm_with_path(self, text="multi ack route"):
         """Build a direct DM addressed to the handler, with the sender registered as a
@@ -467,6 +762,18 @@ class TestAdvertHandler:
         self.log_fn = MagicMock()
         self.handler = AdvertHandler(self.log_fn)
 
+    def _build_signed_advert_packet(self, appdata: bytes) -> Packet:
+        identity = LocalIdentity()
+        timestamp = 1234567890
+        pubkey = identity.get_public_key()
+        ts_bytes = struct.pack("<I", timestamp)
+        signature = identity.sign(pubkey + ts_bytes + appdata)
+        packet = Packet()
+        packet.header = PacketBuilder._create_header(PAYLOAD_TYPE_ADVERT, route_type="flood")
+        packet.payload = bytearray(pubkey + ts_bytes + signature + appdata)
+        packet.payload_len = len(packet.payload)
+        return packet
+
     def test_payload_type(self):
         """Test advert handler payload type."""
         assert AdvertHandler.payload_type() == PAYLOAD_TYPE_ADVERT
@@ -517,6 +824,21 @@ class TestAdvertHandler:
         assert result is not None
         assert result["name"] == "SelfNode"
 
+    def test_decode_appdata_rejects_truncated_optional_fields(self):
+        with pytest.raises(ValueError, match="truncated"):
+            decode_appdata(bytes([0x10, 0x01, 0x02, 0x03, 0x04]))
+
+    @pytest.mark.asyncio
+    async def test_advert_handler_preserves_invalid_utf8_name(self):
+        appdata = bytes([0x80]) + b"Bad\xffName"
+        packet = self._build_signed_advert_packet(appdata)
+
+        result = await self.handler(packet)
+
+        assert result is not None
+        assert result["name"] == "Bad�Name"
+        assert result["valid"] is True
+
 
 # Path Handler Tests
 class TestPathHandler:
@@ -524,9 +846,7 @@ class TestPathHandler:
         self.log_fn = MagicMock()
         self.ack_handler = AckHandler(self.log_fn)
         self.protocol_response_handler = MagicMock()
-        self.handler = PathHandler(
-            self.log_fn, self.ack_handler, self.protocol_response_handler
-        )
+        self.handler = PathHandler(self.log_fn, self.ack_handler, self.protocol_response_handler)
 
     def test_payload_type(self):
         """Test path handler payload type."""
@@ -537,6 +857,18 @@ class TestPathHandler:
         assert self.handler._log == self.log_fn
         assert self.handler._ack_handler == self.ack_handler
         assert self.handler._protocol_response_handler == self.protocol_response_handler
+
+    @pytest.mark.asyncio
+    async def test_authenticated_subhandler_result_marks_path_consumed(self):
+        protocol_handler = AsyncMock(return_value=HandlerResult.consumed())
+        login_handler = AsyncMock(return_value=HandlerResult.not_for_us())
+        ack_handler = MagicMock()
+        ack_handler.process_path_ack_variants = AsyncMock(return_value=None)
+        handler = PathHandler(self.log_fn, ack_handler, protocol_handler, login_handler)
+
+        result = await handler(Packet())
+
+        assert result.authenticated is True
 
 
 # Group Text Handler Tests
@@ -554,44 +886,7 @@ class TestGroupTextHandler:
             self.send_packet_fn,
             channel_db=None,
             event_service=self.event_service,
-            our_node_name="InitialName",
         )
-
-    def test_set_our_node_name_updates_stored_name(self):
-        """set_our_node_name updates the name used for echo detection."""
-        assert self.handler.our_node_name == "InitialName"
-        self.handler.set_our_node_name("NewName")
-        assert self.handler.our_node_name == "NewName"
-        self.handler.set_our_node_name(None)
-        assert self.handler.our_node_name is None
-
-    def test_is_own_message_uses_current_name_after_set_our_node_name(self):
-        """_is_own_message uses the current our_node_name after it is updated."""
-        self.handler.set_our_node_name("Howl 🏝️")
-        packet = Packet()
-        packet.decrypted = {"group_text_data": {"sender_name": "Howl 🏝️"}}
-        assert self.handler._is_own_message(packet) is True
-        packet.decrypted = {"group_text_data": {"sender_name": "Howl 🧱"}}
-        assert self.handler._is_own_message(packet) is False
-        # After updating name, old name no longer matches
-        self.handler.set_our_node_name("Howl 🧱")
-        assert self.handler._is_own_message(packet) is True
-
-    def test_is_own_message_false_when_sender_name_missing(self):
-        """_is_own_message returns False when packet has no sender_name in group_text_data."""
-        self.handler.set_our_node_name("Me")
-        packet = Packet()
-        packet.decrypted = {}
-        assert self.handler._is_own_message(packet) is False
-        packet.decrypted = {"group_text_data": {}}
-        assert self.handler._is_own_message(packet) is False
-
-    def test_is_own_message_false_when_no_match(self):
-        """_is_own_message returns False when sender name differs from our_node_name."""
-        self.handler.set_our_node_name("Me")
-        packet = Packet()
-        packet.decrypted = {"group_text_data": {"sender_name": "Other"}}
-        assert self.handler._is_own_message(packet) is False
 
     def test_payload_type(self):
         """Test group text handler payload type."""
@@ -603,7 +898,82 @@ class TestGroupTextHandler:
         assert self.handler.contacts == self.contacts
         assert self.handler.log == self.log_fn
         assert self.handler.send_packet == self.send_packet_fn
-        assert self.handler.our_node_name == "InitialName"
+
+    def _grp_plaintext(self, flag_byte: int, text: bytes, pad: int = 0) -> bytes:
+        """timestamp(4) + flag byte + text (+ optional trailing NUL padding)."""
+        return (1234).to_bytes(4, "little") + bytes([flag_byte]) + text + b"\x00" * pad
+
+    def _group_packet(self, sender_name: str = "InitialName", text: str = "hello") -> Packet:
+        channels = [{"name": "Public", "secret": "11" * 32}]
+        self.handler.channel_db = MagicMock()
+        self.handler.channel_db.get_channels.return_value = channels
+        return PacketBuilder.create_group_datagram(
+            "Public",
+            self.local_identity,
+            text,
+            sender_name,
+            channels,
+            timestamp=1_700_000_000,
+        )
+
+    @pytest.mark.asyncio
+    async def test_peer_with_matching_display_name_is_published(self):
+        """A display-name collision is not evidence that the packet is ours."""
+        packet = self._group_packet(sender_name="InitialName")
+
+        await self.handler(packet)
+
+        self.event_service.publish.assert_awaited_once()
+        event, data = self.event_service.publish.await_args.args
+        assert event == MeshEvents.NEW_CHANNEL_MESSAGE
+        assert data["sender_name"] == "InitialName"
+        assert data["message_text"] == "hello"
+        assert data["is_outgoing"] is False
+
+    @pytest.mark.asyncio
+    async def test_exact_outgoing_packet_hash_suppresses_its_echo(self):
+        packet = self._group_packet()
+        self.handler.mark_outgoing_packet(packet)
+
+        await self.handler(packet)
+
+        self.event_service.publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_received_group_packet_is_published_once_per_packet_hash(self):
+        packet = self._group_packet(sender_name="Peer")
+
+        await self.handler(packet)
+        await self.handler(packet)
+
+        self.event_service.publish.assert_awaited_once()
+
+    def test_group_parse_ignores_attempt_low_bits(self):
+        """The low two bits of the group flag byte are an attempt number, not a
+        subtype: values 1, 2, 3 are still plain text (firmware onGroupDataRecv)."""
+        for attempt in range(4):
+            parsed = self.handler._parse_plaintext_message(
+                self._grp_plaintext(attempt, b"Alice: hi", pad=3)
+            )
+            assert parsed is not None
+            assert parsed["message_type"] == "plain_text"
+            assert parsed["content"] == "Alice: hi"
+
+    def test_group_parse_drops_unsupported_type(self):
+        """A flag byte with any of the upper six bits set is an unsupported group
+        text type and is dropped, matching the firmware."""
+        parsed = self.handler._parse_plaintext_message(
+            self._grp_plaintext(0x04, b"Alice: hi")  # (1 << 2): upper bits non-zero
+        )
+        assert parsed is None
+
+    def test_group_parse_stops_at_first_nul(self):
+        """Visible group text ends at the first NUL (no trailing padding leaks)."""
+        parsed = self.handler._parse_plaintext_message(
+            self._grp_plaintext(0x00, b"Bob: hey", pad=7)
+        )
+        assert parsed is not None
+        assert parsed["content"] == "Bob: hey"
 
 
 # Login Response Handler Tests
@@ -613,9 +983,7 @@ class TestLoginResponseHandler:
         self.log_fn = MagicMock()
         self.send_packet_fn = AsyncMock()
         self.local_identity = LocalIdentity()
-        self.handler = LoginResponseHandler(
-            self.local_identity, self.contacts, self.log_fn
-        )
+        self.handler = LoginResponseHandler(self.local_identity, self.contacts, self.log_fn)
 
     def test_payload_type(self):
         """Test login response handler payload type."""
@@ -628,6 +996,19 @@ class TestLoginResponseHandler:
         assert self.handler.local_identity == self.local_identity
         assert self.handler.local_identity == self.local_identity
 
+    def test_register_login_callback_identity_guard(self):
+        """Pending logins are keyed by full pubkey; removal is identity-guarded."""
+        callback = MagicMock()
+        pubkey = bytes(range(32))
+        self.handler.register_login_callback(pubkey, callback)
+        assert self.handler._pending_logins[pubkey] is callback
+        # A different callback (e.g. a newer login's cleanup racing an older
+        # one) must not clear this entry.
+        self.handler.remove_login_callback(pubkey, MagicMock())
+        assert self.handler._pending_logins[pubkey] is callback
+        self.handler.remove_login_callback(pubkey, callback)
+        assert pubkey not in self.handler._pending_logins
+
 
 # Protocol Response Handler Tests
 class TestProtocolResponseHandler:
@@ -636,9 +1017,7 @@ class TestProtocolResponseHandler:
         self.log_fn = MagicMock()
         self.send_packet_fn = AsyncMock()
         self.local_identity = LocalIdentity()
-        self.handler = ProtocolResponseHandler(
-            self.log_fn, self.local_identity, self.contacts
-        )
+        self.handler = ProtocolResponseHandler(self.log_fn, self.local_identity, self.contacts)
 
     def test_payload_type(self):
         """Test protocol response handler payload type."""
@@ -725,9 +1104,7 @@ class TestProtocolResponseHandler:
 
         callback_calls = []
 
-        async def on_path_updated(
-            pub: bytes, path_len: int, path_bytes_arg: bytes
-        ) -> None:
+        async def on_path_updated(pub: bytes, path_len: int, path_bytes_arg: bytes) -> None:
             callback_calls.append((pub, path_len, path_bytes_arg))
 
         handler.set_contact_path_updated_callback(on_path_updated)
@@ -738,6 +1115,91 @@ class TestProtocolResponseHandler:
         assert callback_calls[0][0] == peer_pubkey
         assert callback_calls[0][1] == path_len_byte
         assert callback_calls[0][2] == path_bytes
+
+    @pytest.mark.asyncio
+    async def test_response_authenticates_without_pending_callback(self):
+        """A valid RESPONSE MAC proves ownership even when no waiter is registered."""
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.companion.models import Contact
+
+        local_identity = LocalIdentity()
+        peer_identity = LocalIdentity()
+        peer_pubkey = peer_identity.get_public_key()
+        contacts = ContactStore(5)
+        contacts.add(Contact(public_key=peer_pubkey, name="Peer"))
+        handler = ProtocolResponseHandler(MagicMock(), local_identity, contacts)
+
+        shared_secret = Identity(peer_pubkey).calc_shared_secret(local_identity.get_private_key())
+        encrypted = CryptoUtils.encrypt_then_mac(
+            shared_secret[:16], shared_secret, b"\x01\x02\x03\x04\x99"
+        )
+        pkt = Packet()
+        pkt.header = PAYLOAD_TYPE_RESPONSE << 2
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(
+            bytes([local_identity.get_public_key()[0], peer_pubkey[0]]) + encrypted
+        )
+        pkt.payload_len = len(pkt.payload)
+
+        result = await handler(pkt)
+
+        assert isinstance(result, HandlerResult)
+        assert result.authenticated is True
+
+    @pytest.mark.asyncio
+    async def test_response_with_wrong_destination_is_forwardable(self):
+        """A valid MAC for another destination must not be consumed locally."""
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.companion.models import Contact
+
+        local_identity = LocalIdentity()
+        peer_identity = LocalIdentity()
+        peer_pubkey = peer_identity.get_public_key()
+        contacts = ContactStore(5)
+        contacts.add(Contact(public_key=peer_pubkey, name="Peer"))
+        handler = ProtocolResponseHandler(MagicMock(), local_identity, contacts)
+
+        shared_secret = Identity(peer_pubkey).calc_shared_secret(local_identity.get_private_key())
+        encrypted = CryptoUtils.encrypt_then_mac(shared_secret[:16], shared_secret, b"response")
+        pkt = Packet()
+        pkt.header = PAYLOAD_TYPE_RESPONSE << 2
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(bytes([0xFF, peer_pubkey[0]]) + encrypted)
+        pkt.payload_len = len(pkt.payload)
+
+        result = await handler(pkt)
+
+        assert result.authenticated is False
+
+    @pytest.mark.asyncio
+    async def test_authenticated_path_with_invalid_envelope_remains_forwardable(self):
+        """MAC success is not enough when a PATH envelope is malformed."""
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.companion.models import Contact
+
+        local_identity = LocalIdentity()
+        peer_identity = LocalIdentity()
+        peer_pubkey = peer_identity.get_public_key()
+        contacts = ContactStore(5)
+        contacts.add(Contact(public_key=peer_pubkey, name="Peer"))
+        handler = ProtocolResponseHandler(MagicMock(), local_identity, contacts)
+
+        shared_secret = Identity(peer_pubkey).calc_shared_secret(local_identity.get_private_key())
+        encrypted = CryptoUtils.encrypt_then_mac(shared_secret[:16], shared_secret, b"\x7f")
+        pkt = Packet()
+        pkt.header = PAYLOAD_TYPE_PATH << 2
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(
+            bytes([local_identity.get_public_key()[0], peer_pubkey[0]]) + encrypted
+        )
+        pkt.payload_len = len(pkt.payload)
+
+        result = await handler(pkt)
+
+        assert result.authenticated is False
 
     @pytest.mark.asyncio
     async def test_contact_path_updated_with_2byte_hashes(self):
@@ -780,9 +1242,7 @@ class TestProtocolResponseHandler:
 
         callback_calls = []
 
-        async def on_path_updated(
-            pub: bytes, path_len: int, path_bytes_arg: bytes
-        ) -> None:
+        async def on_path_updated(pub: bytes, path_len: int, path_bytes_arg: bytes) -> None:
             callback_calls.append((pub, path_len, path_bytes_arg))
 
         handler.set_contact_path_updated_callback(on_path_updated)
@@ -830,9 +1290,7 @@ class TestProtocolResponseHandler:
         reply[4] = 0x00  # RESP_SERVER_LOGIN_OK
         client_hash = local_identity.get_public_key()[0]
         server_hash = server_pubkey[0]
-        secret = Identity(server_pubkey).calc_shared_secret(
-            local_identity.get_private_key()
-        )
+        secret = Identity(server_pubkey).calc_shared_secret(local_identity.get_private_key())
         pkt = PacketBuilder.create_path_return(
             dest_hash=client_hash,
             src_hash=server_hash,
@@ -878,6 +1336,146 @@ class TestProtocolRequestHandler:
         c.out_path_len = -1
         return c
 
+    @pytest.mark.asyncio
+    async def test_call_not_for_us_returns_for_us_false(self):
+        """A REQ whose dest hash does not match ours is not for us."""
+        packet = Packet()
+        packet.header = (ROUTE_TYPE_FLOOD & 0x03) | (PAYLOAD_TYPE_REQ << 2)
+        our_hash = self.local_identity.get_public_key()[0]
+        wrong_dest = our_hash ^ 0xFF
+        packet.payload = bytes([wrong_dest, 0x01, 0x02, 0x03])
+
+        result = await self.handler(packet)
+
+        assert result.authenticated is False
+        assert result.response is None
+
+    @pytest.mark.asyncio
+    async def test_call_prefix_match_but_undecryptable_returns_for_us_false(self):
+        """Dest prefix collides with ours but no client authenticates."""
+        packet = Packet()
+        packet.header = (ROUTE_TYPE_FLOOD & 0x03) | (PAYLOAD_TYPE_REQ << 2)
+        our_hash = self.local_identity.get_public_key()[0]
+        # dest matches us, but MockContactBook has no matching client / secret,
+        # so decryption cannot succeed -> must report not-for-us for forwarding.
+        packet.payload = bytes([our_hash, 0x01]) + b"\x00" * 16
+
+        result = await self.handler(packet)
+
+        assert result.authenticated is False
+        assert result.response is None
+
+    @pytest.mark.asyncio
+    async def test_call_short_payload_returns_for_us_false(self):
+        packet = Packet()
+        packet.header = (ROUTE_TYPE_FLOOD & 0x03) | (PAYLOAD_TYPE_REQ << 2)
+        packet.payload = b"\x01"
+
+        result = await self.handler(packet)
+
+        assert result.authenticated is False
+
+    def _req_handler_with_client(self, request_handlers=None):
+        """Build a handler wired to one ACL-style client that shares last_timestamp."""
+        from openhop_core.node.handlers.protocol_request import REQ_TYPE_GET_STATUS
+        from openhop_core.protocol.identity import Identity
+
+        peer = LocalIdentity()
+        secret = Identity(peer.get_public_key()).calc_shared_secret(
+            self.local_identity.get_private_key()
+        )
+
+        class Client:
+            pass
+
+        client = Client()
+        client.id = Identity(peer.get_public_key())
+        client.public_key = peer.get_public_key()
+        client.shared_secret = secret
+        client.last_timestamp = 0
+        client.last_activity = 0
+        client.out_path = b""
+        client.out_path_len = -1
+
+        handler = ProtocolRequestHandler(
+            self.local_identity,
+            self.contacts,
+            get_clients_fn=lambda h: [client],
+            request_handlers=request_handlers
+            or {REQ_TYPE_GET_STATUS: lambda c, ts, data: b"\x02\x02"},
+            log_fn=self.log_fn,
+        )
+
+        our_hash = self.local_identity.get_public_key()[0]
+        src_hash = peer.get_public_key()[0]
+
+        def build_req(ts, req_type=REQ_TYPE_GET_STATUS):
+            plaintext = struct.pack("<I", ts) + bytes([req_type])
+            enc = CryptoUtils.encrypt_then_mac(secret[:16], secret, plaintext)
+            pkt = Packet()
+            pkt.header = (ROUTE_TYPE_DIRECT & 0x03) | (PAYLOAD_TYPE_REQ << 2)
+            pkt.path_len = 0
+            pkt.path = bytearray()
+            pkt.payload = bytes([our_hash, src_hash]) + enc
+            pkt.payload_len = len(pkt.payload)
+            return pkt
+
+        return handler, client, build_req
+
+    @pytest.mark.asyncio
+    async def test_req_replay_is_rejected(self):
+        """A REQ is accepted only when strictly newer than the client's last accepted
+        timestamp; replays and older timestamps are rejected (firmware parity)."""
+        handler, client, build_req = self._req_handler_with_client()
+
+        r1 = await handler(build_req(1000))
+        assert r1.authenticated is True
+        assert r1.response is not None
+        assert client.last_timestamp == 1000
+
+        # Exact replay: rejected, no response, watermark unchanged.
+        r2 = await handler(build_req(1000))
+        assert r2.authenticated is True
+        assert r2.response is None
+        assert client.last_timestamp == 1000
+
+        # Older timestamp: rejected.
+        r3 = await handler(build_req(999))
+        assert r3.response is None
+        assert client.last_timestamp == 1000
+
+        # Strictly newer: accepted, watermark advances.
+        r4 = await handler(build_req(1001))
+        assert r4.response is not None
+        assert client.last_timestamp == 1001
+
+    @pytest.mark.asyncio
+    async def test_req_invalid_command_does_not_advance_watermark(self):
+        """An unhandled request type produces no reply and must not move the watermark,
+        so a later valid request with a lower timestamp is still accepted."""
+        handler, client, build_req = self._req_handler_with_client()
+
+        r = await handler(build_req(1000, req_type=0x99))  # no handler for 0x99
+        assert r.response is None
+        assert client.last_timestamp == 0
+
+        r = await handler(build_req(500))  # default req_type has a handler
+        assert r.response is not None
+        assert client.last_timestamp == 500
+
+    def test_advance_client_watermark_is_monotonic(self):
+        """The watermark never moves backwards: if another accepted request
+        advanced it between the replay check and the write, an older (but
+        already-validated) timestamp must not regress it."""
+        handler, client, _ = self._req_handler_with_client()
+
+        client.last_timestamp = 2000
+        handler._advance_client_watermark(client, 1500)
+        assert client.last_timestamp == 2000
+
+        handler._advance_client_watermark(client, 2500)
+        assert client.last_timestamp == 2500
+
     def test_flood_req_returns_path_packet(self):
         """REQ via flood → path-return PATH packet (firmware createPathReturn + sendFlood)."""
         peer_identity = LocalIdentity()
@@ -893,13 +1491,9 @@ class TestProtocolRequestHandler:
         assert original.is_route_flood()
 
         response_data = b"\x39\x30\x00\x00\x00"  # timestamp LE + req_type 0
-        shared_secret = peer_identity.calc_shared_secret(
-            self.local_identity.get_private_key()
-        )
+        shared_secret = peer_identity.calc_shared_secret(self.local_identity.get_private_key())
 
-        result = self.handler._build_response(
-            original, client, response_data, shared_secret
-        )
+        result = self.handler._build_response(original, client, response_data, shared_secret)
 
         assert result is not None
         assert result.get_payload_type() == PAYLOAD_TYPE_PATH
@@ -913,9 +1507,7 @@ class TestProtocolRequestHandler:
 
         peer_identity = LocalIdentity()
         client = self._client_with_key(peer_identity.get_public_key())
-        shared_secret = peer_identity.calc_shared_secret(
-            self.local_identity.get_private_key()
-        )
+        shared_secret = peer_identity.calc_shared_secret(self.local_identity.get_private_key())
 
         original = Packet()
         original.header = (ROUTE_TYPE_FLOOD & 0x03) | (PAYLOAD_TYPE_REQ << 2)
@@ -924,9 +1516,7 @@ class TestProtocolRequestHandler:
         original.path = bytearray([0x01, 0x02, 0x03, 0x04])
         response_data = b"\x00\x00\x00\x00\x00"
 
-        result = self.handler._build_response(
-            original, client, response_data, shared_secret
-        )
+        result = self.handler._build_response(original, client, response_data, shared_secret)
 
         assert result is not None
         assert result.get_payload_type() == PAYLOAD_TYPE_PATH
@@ -939,9 +1529,7 @@ class TestProtocolRequestHandler:
         client = self._client_with_key(peer_identity.get_public_key())
         client.out_path = b""
         client.out_path_len = -1
-        shared_secret = peer_identity.calc_shared_secret(
-            self.local_identity.get_private_key()
-        )
+        shared_secret = peer_identity.calc_shared_secret(self.local_identity.get_private_key())
 
         original = Packet()
         original.header = (ROUTE_TYPE_DIRECT & 0x03) | (PAYLOAD_TYPE_REQ << 2)
@@ -950,9 +1538,7 @@ class TestProtocolRequestHandler:
         assert not original.is_route_flood()
 
         response_data = b"\x01\x00\x00\x00\x00"
-        result = self.handler._build_response(
-            original, client, response_data, shared_secret
-        )
+        result = self.handler._build_response(original, client, response_data, shared_secret)
 
         assert result is not None
         assert result.get_payload_type() == PAYLOAD_TYPE_RESPONSE
@@ -965,9 +1551,7 @@ class TestProtocolRequestHandler:
         client = self._client_with_key(peer_identity.get_public_key())
         client.out_path = bytes([0x01, 0x02])
         client.out_path_len = 2
-        shared_secret = peer_identity.calc_shared_secret(
-            self.local_identity.get_private_key()
-        )
+        shared_secret = peer_identity.calc_shared_secret(self.local_identity.get_private_key())
 
         original = Packet()
         original.header = (ROUTE_TYPE_DIRECT & 0x03) | (PAYLOAD_TYPE_REQ << 2)
@@ -975,9 +1559,7 @@ class TestProtocolRequestHandler:
         original.path = bytearray()
 
         response_data = b"\x02\x00\x00\x00\x00"
-        result = self.handler._build_response(
-            original, client, response_data, shared_secret
-        )
+        result = self.handler._build_response(original, client, response_data, shared_secret)
 
         assert result is not None
         assert result.get_payload_type() == PAYLOAD_TYPE_RESPONSE
@@ -1002,9 +1584,7 @@ class TestTraceHandler:
 
     def test_parse_trace_payload_one_byte_hashes(self):
         """flags=0: 1 byte per hop; path 0x01 0x02 = two hops."""
-        payload = struct.pack("<IIB", 0x11111111, 0x22222222, 0x00) + bytes(
-            [0x01, 0x02]
-        )
+        payload = struct.pack("<IIB", 0x11111111, 0x22222222, 0x00) + bytes([0x01, 0x02])
         r = self.handler._parse_trace_payload(payload)
         assert r["valid"]
         assert r["path_hash_width"] == 1
@@ -1081,9 +1661,7 @@ async def test_handlers_can_be_called():
 
     handlers = [
         AckHandler(log_fn),
-        TextMessageHandler(
-            local_identity, contacts, log_fn, send_packet_fn, event_service
-        ),
+        TextMessageHandler(local_identity, contacts, log_fn, send_packet_fn, event_service),
         AdvertHandler(log_fn),
         PathHandler(log_fn),
         GroupTextHandler(local_identity, contacts, log_fn, send_packet_fn),
@@ -1103,9 +1681,7 @@ async def test_handlers_can_be_called():
         except Exception as e:
             # Some handlers may raise exceptions due to incomplete setup,
             # but they should be callable
-            assert isinstance(
-                e, (ValueError, AttributeError, TypeError)
-            )  # Expected exceptions
+            assert isinstance(e, (ValueError, AttributeError, TypeError))  # Expected exceptions
 
 
 # AnonReqResponseHandler Tests (separate from LoginResponseHandler)
@@ -1161,9 +1737,7 @@ class TestLoginServerHandler:
 
         # Calculate shared secret (client side)
         server_id = Identity(server_pubkey)
-        shared_secret = server_id.calc_shared_secret(
-            self.client_identity_local.get_private_key()
-        )
+        shared_secret = server_id.calc_shared_secret(self.client_identity_local.get_private_key())
         aes_key = shared_secret[:16]
 
         # Repeater format plaintext: timestamp(4) + password + null
@@ -1200,6 +1774,33 @@ class TestLoginServerHandler:
         from openhop_core.node.handlers.login_server import LoginServerHandler
 
         assert LoginServerHandler.payload_type() == PAYLOAD_TYPE_ANON_REQ
+
+    # -- consume-vs-forward return contract (#353) --------------------------
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_decrypted_for_us(self):
+        """A login that decrypts for us is consumed (True), even on auth failure."""
+        assert (
+            await self.handler(self._build_login_packet(password="admin123"))
+        ).authenticated is True
+        # Wrong password still decrypted for us — it's ours to reject, not a collision.
+        self.auth_callback.return_value = (False, 0x00)
+        assert (await self.handler(self._build_login_packet(password="nope"))).authenticated is True
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_dest_hash_mismatch(self):
+        """A login addressed to a different identity is not ours (forward)."""
+        pkt = self._build_login_packet()
+        pkt.payload[0] = (pkt.payload[0] + 1) & 0xFF
+        assert (await self.handler(pkt)).authenticated is False
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_decrypt_failure_collision(self):
+        """dest hash matches ours but HMAC fails (collision): forward (False) (#353)."""
+        pkt = self._build_login_packet()
+        pkt.payload[-1] ^= 0xFF  # corrupt ciphertext/MAC
+        assert (await self.handler(pkt)).authenticated is False
+        assert self.sent_packets == []
 
     @pytest.mark.asyncio
     async def test_flood_login_sends_path_packet(self):
@@ -1255,9 +1856,7 @@ class TestLoginServerHandler:
 
         # Decrypt the PATH payload to verify inner structure
         client_id = Identity(self.client_identity_local.get_public_key())
-        shared_secret = client_id.calc_shared_secret(
-            self.server_identity.get_private_key()
-        )
+        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
         aes_key = shared_secret[:16]
 
         # PATH payload: dest_hash(1) + src_hash(1) + mac_and_ciphertext
@@ -1341,9 +1940,7 @@ class TestLoginServerHandler:
 
         # Decrypt and verify is_admin field
         client_id = Identity(self.client_identity_local.get_public_key())
-        shared_secret = client_id.calc_shared_secret(
-            self.server_identity.get_private_key()
-        )
+        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
         aes_key = shared_secret[:16]
         encrypted_part = bytes(response_pkt.payload[2:])
         plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_part)
@@ -1371,9 +1968,7 @@ class TestLoginServerHandler:
     async def test_flood_login_with_path_includes_path_in_response(self):
         """Flood login with path hashes → PATH response includes those hashes."""
         path_hashes = [0xAA, 0xBB]
-        pkt = self._build_login_packet(
-            password="admin123", route_type="flood", path=path_hashes
-        )
+        pkt = self._build_login_packet(password="admin123", route_type="flood", path=path_hashes)
         # path_len encodes hash size and count: (hash_size-1)<<6 | count
         # For 1-byte hashes with 2 hops: (0<<6) | 2 = 2
         pkt.path_len = 2
@@ -1386,9 +1981,7 @@ class TestLoginServerHandler:
 
         # Decrypt and verify path is included
         client_id = Identity(self.client_identity_local.get_public_key())
-        shared_secret = client_id.calc_shared_secret(
-            self.server_identity.get_private_key()
-        )
+        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
         aes_key = shared_secret[:16]
         encrypted_part = bytes(response_pkt.payload[2:])
         plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_part)

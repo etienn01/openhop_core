@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import inspect
 from typing import Awaitable, Callable, Optional
 
 from ...protocol import Packet
 from ...protocol.constants import PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_MULTIPART
+from ...util.callbacks import invoke_maybe_awaitable
 from .base import BaseHandler
 
 
@@ -28,9 +28,7 @@ class MultipartAckHandler(BaseHandler):
 
     def __init__(self, log_fn):
         self.log = log_fn
-        self._ack_received_callback: Optional[
-            Callable[[int], Awaitable[None] | None]
-        ] = None
+        self._ack_received_callback: Optional[Callable[[int], Awaitable[None] | None]] = None
 
     def set_ack_received_callback(
         self, callback: Optional[Callable[[int], Awaitable[None] | None]]
@@ -64,7 +62,4 @@ class MultipartAckHandler(BaseHandler):
     async def _notify_ack_received(self, crc: int):
         """Notify the dispatcher that an ACK was received."""
         if self._ack_received_callback:
-            cb = self._ack_received_callback
-            result = cb(crc)
-            if inspect.isawaitable(result):
-                await result
+            await invoke_maybe_awaitable(self._ack_received_callback, crc)

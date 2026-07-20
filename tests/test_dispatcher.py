@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -8,6 +9,7 @@ from openhop_core.protocol import Packet
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
+    PAYLOAD_TYPE_GRP_TXT,
     PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_TRACE,
     PAYLOAD_TYPE_TXT_MSG,
@@ -17,15 +19,60 @@ from openhop_core.protocol.constants import (
 from openhop_core.protocol.packet_filter import PacketFilter
 from openhop_core.protocol.packet_utils import PathUtils
 
+# Literal MeshCore Packet::writeTo vectors: header | [transport codes] |
+# path_len | path | payload.  Keep path_len literal rather than deriving it
+# through OpenHop's PathUtils so these stay independent firmware fixtures.
+FIRMWARE_MAX_DIRECT_PATH_VECTORS = (
+    pytest.param(
+        b"\x0A\x3F" + b"\xAB" + b"\x11" * 62 + b"\xA1",
+        0x0A,
+        0x3F,
+        b"\xAB" + b"\x11" * 62,
+        1,
+        63,
+        id="direct-1-byte-63-hop-0x3f",
+    ),
+    pytest.param(
+        b"\x0A\x60" + b"\xAB\xCD" + b"\x11" * 62 + b"\xA2",
+        0x0A,
+        0x60,
+        b"\xAB\xCD" + b"\x11" * 62,
+        2,
+        32,
+        id="direct-2-byte-32-hop-0x60",
+    ),
+    pytest.param(
+        b"\x0A\x95" + b"\xAB\xCD\xEF" + b"\x11" * 60 + b"\xA3",
+        0x0A,
+        0x95,
+        b"\xAB\xCD\xEF" + b"\x11" * 60,
+        3,
+        21,
+        id="direct-3-byte-21-hop-0x95",
+    ),
+    pytest.param(
+        b"\x0B\x34\x12\x78\x56\x60" + b"\xAB\xCD" + b"\x11" * 62 + b"\xA4",
+        0x0B,
+        0x60,
+        b"\xAB\xCD" + b"\x11" * 62,
+        2,
+        32,
+        id="transport-direct-2-byte-32-hop-0x60",
+    ),
+)
+
 
 def create_test_packet(payload_type: int, payload: bytes) -> bytes:
     """Create a simple test packet bytes for testing."""
     packet = Packet()
-    # Set header with payload type (route type = direct = 1)
     # Ensure payload_type is valid (0-15)
     if payload_type > 15:
         payload_type = 15  # Max valid payload type
-    packet.header = (1 << 6) | (payload_type << 2)  # Version 0, route type 1, payload type
+    # Bits: version (6-7) = 0, payload type (2-5), route type (0-1) = 0.
+    # (The old value OR'd in (1 << 6), which sets the *version* field to 1, not
+    # the route type; version 1 is a reserved/unsupported wire format and is now
+    # rejected on parse, so the header must leave the version bits clear.)
+    packet.header = payload_type << 2
     packet.payload = bytearray(payload)
     packet.payload_len = len(payload)
     packet.path_len = 0  # No path
@@ -200,6 +247,30 @@ class TestDispatcherInitialization:
         assert crc not in dispatcher._waiting_acks
 
 
+class TestDispatcherRxArming:
+    """RX arming behavior for radios without a push callback interface."""
+
+    def test_warns_when_radio_lacks_set_rx_callback(self, caplog):
+        """A radio with no set_rx_callback yields a silent no-RX dispatcher;
+        construction must say so loudly instead of quietly never receiving."""
+
+        class PullOnlyRadio:
+            async def send(self, data):
+                return {}
+
+            async def wait_for_rx(self):
+                return b""
+
+        with caplog.at_level(logging.WARNING, logger="Dispatcher"):
+            Dispatcher(radio=PullOnlyRadio(), packet_filter=PacketFilter())
+        assert any("set_rx_callback" in rec.message for rec in caplog.records)
+
+    def test_no_warning_when_radio_supports_set_rx_callback(self, mock_radio, caplog):
+        with caplog.at_level(logging.WARNING, logger="Dispatcher"):
+            Dispatcher(radio=mock_radio, packet_filter=PacketFilter())
+        assert not [rec for rec in caplog.records if "set_rx_callback" in rec.message]
+
+
 class TestDispatcherPacketProcessing:
     """Test packet processing and routing."""
 
@@ -321,6 +392,91 @@ class TestDispatcherACKSystem:
 
         # Old ACK should be cleaned up
         assert crc not in dispatcher._recent_acks
+
+
+class TestDispatcherWaitForAckCleanup:
+    """wait_for_ack() must never leak entries in `_waiting_acks`, on any exit path."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_path_removes_waiting_ack(self, dispatcher):
+        """A wait_for_ack() call that times out must clean up its own registration."""
+        crc = 0xAABBCCDD
+
+        result = await dispatcher.wait_for_ack(crc, timeout=0.01)
+
+        assert result is False
+        assert crc not in dispatcher._waiting_acks
+
+    @pytest.mark.asyncio
+    async def test_cancellation_removes_waiting_ack(self, dispatcher):
+        """A wait_for_ack() task that is cancelled mid-wait must clean up its
+        own registration rather than leaking it forever."""
+        crc = 0xAABBCCDD
+
+        task = asyncio.create_task(dispatcher.wait_for_ack(crc, timeout=10))
+        await asyncio.sleep(0)  # let the task register and start waiting
+        assert crc in dispatcher._waiting_acks
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert crc not in dispatcher._waiting_acks
+
+    @pytest.mark.asyncio
+    async def test_stale_waiter_does_not_remove_newer_registration(self, dispatcher):
+        """If a stale waiter's cleanup runs after a *different* Event has been
+        registered under the same CRC (e.g. a fresh wait_for_ack() call took
+        over that slot), the stale cleanup must be a no-op rather than
+        deleting the newer registration out from under it."""
+        crc = 0xAABBCCDD
+
+        task = asyncio.create_task(dispatcher.wait_for_ack(crc, timeout=10))
+        await asyncio.sleep(0)  # let the task register
+        stale_event = dispatcher._waiting_acks[crc]
+
+        # Simulate a newer waiter taking over the same CRC slot.
+        newer_event = asyncio.Event()
+        dispatcher._waiting_acks[crc] = newer_event
+        assert stale_event is not newer_event
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The stale task's finally-block cleanup must not have clobbered
+        # the newer registration.
+        assert dispatcher._waiting_acks.get(crc) is newer_event
+
+    @pytest.mark.asyncio
+    async def test_normal_ack_receipt_still_works_and_cleans_up_once(self, dispatcher):
+        """The happy path (ACK arrives while waiting) must still return True
+        and leave `_waiting_acks` clean, with no double-delete errors."""
+        crc = 0xAABBCCDD
+
+        task = asyncio.create_task(dispatcher.wait_for_ack(crc, timeout=5))
+        await asyncio.sleep(0)  # let the task register
+        assert crc in dispatcher._waiting_acks
+
+        await dispatcher._register_ack_received(crc)
+
+        result = await task
+        assert result is True
+        assert crc not in dispatcher._waiting_acks
+
+    @pytest.mark.asyncio
+    async def test_cached_ack_early_fire_does_not_leak(self, dispatcher):
+        """expect_ack() fires its Event immediately when the CRC is already in
+        the recent-ACK cache (e.g. the ACK arrived just before we started
+        waiting). wait_for_ack() must still clean up its registration in that
+        case instead of leaving a permanently orphaned entry."""
+        crc = 0xAABBCCDD
+        dispatcher._recent_acks[crc] = asyncio.get_event_loop().time()
+
+        result = await dispatcher.wait_for_ack(crc, timeout=5)
+
+        assert result is True
+        assert crc not in dispatcher._waiting_acks
 
 
 class TestDispatcherStateManagement:
@@ -532,42 +688,74 @@ class TestDispatcherSendPacket:
 
         assert result is False
 
-    def test_own_packet_detection(self, dispatcher):
-        """Test detection of own packets (TXT uses payload[1] as src hash)."""
+    @pytest.mark.asyncio
+    async def test_advert_with_colliding_first_byte_reaches_handler(self, dispatcher):
+        """A genuine peer advert whose payload[0] happens to equal our pubkey hash
+        (1-byte hash collision) is no longer dropped by a payload-based "own
+        packet" heuristic — only the seen table suppresses loopback now."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_ADVERT)
+        dispatcher.register_handler(PAYLOAD_TYPE_ADVERT, mock_handler)
+
+        our_hash = dispatcher.local_identity.get_public_key()[0]
+        # Peer pubkey collides with ours in the first byte, but this packet
+        # was never sent by us, so it must not be in the seen table.
+        peer_pubkey = bytes([our_hash]) + bytes(31)
+        packet_data = create_test_packet(PAYLOAD_TYPE_ADVERT, peer_pubkey + b"\x00" * 8)
+
+        await dispatcher._process_received_packet(packet_data)
+
+        assert mock_handler.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_txt_msg_with_colliding_src_hash_reaches_handler(self, dispatcher):
+        """A genuine peer TXT_MSG whose payload[1] (src hash) collides with our
+        pubkey hash is no longer dropped as "own" — it was never sent by us."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_TXT_MSG)
+        dispatcher.register_handler(PAYLOAD_TYPE_TXT_MSG, mock_handler)
+
         our_hash = dispatcher.local_identity.get_public_key()[0]
         payload = bytes([0, our_hash]) + b"test"  # dest_hash=0, src_hash=our_hash
         packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, payload)
 
-        packet = Packet()
-        packet.read_from(packet_data)
+        await dispatcher._process_received_packet(packet_data)
 
-        assert dispatcher._is_own_packet(packet) is True
+        assert mock_handler.call_count == 1
 
-    def test_own_advert_uses_payload_first_byte(self, dispatcher):
-        """ADVERT packets carry pubkey at payload[0]; must not use payload[1]."""
+    @pytest.mark.asyncio
+    async def test_ack_with_colliding_crc_byte_reaches_handler(self, dispatcher):
+        """ACK payload byte 1 is CRC data, not a sender hash; a peer ACK whose
+        CRC byte happens to equal our pubkey hash must still be dispatched."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_ACK)
+        dispatcher.register_handler(PAYLOAD_TYPE_ACK, mock_handler)
+
         our_hash = dispatcher.local_identity.get_public_key()[0]
-        # Second pubkey byte matches our_hash but first byte does not — must not drop.
-        other_pubkey = bytes([our_hash ^ 0xFF]) + bytes([our_hash]) + bytes(30)
-        packet = Packet()
-        packet.header = (1 << 6) | (PAYLOAD_TYPE_ADVERT << 2)
-        packet.payload = bytearray(other_pubkey + b"\x00" * 40)
-        packet.payload_len = len(packet.payload)
-        packet.path_len = 0
+        payload = bytes([0x11, our_hash, 0x22, 0x33])
+        packet_data = create_test_packet(PAYLOAD_TYPE_ACK, payload)
 
-        assert packet.payload[1] == our_hash
-        assert packet.payload[0] != our_hash
-        assert dispatcher._is_own_packet(packet) is False
+        await dispatcher._process_received_packet(packet_data)
 
-    def test_own_advert_detected_by_first_pubkey_byte(self, dispatcher):
-        """Own advert: payload[0] equals our pubkey hash."""
+        assert mock_handler.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_sent_advert_dropped_on_loopback(self, dispatcher):
+        """Guard: our own genuinely-sent advert fed back is still dropped, via
+        the seen-table mark applied at send time (not a payload heuristic)."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_ADVERT)
+        dispatcher.register_handler(PAYLOAD_TYPE_ADVERT, mock_handler)
+
         our_pubkey = dispatcher.local_identity.get_public_key()
-        packet = Packet()
-        packet.header = (1 << 6) | (PAYLOAD_TYPE_ADVERT << 2)
-        packet.payload = bytearray(our_pubkey + b"\x00" * 40)
-        packet.payload_len = len(packet.payload)
-        packet.path_len = 0
+        pkt = Packet()
+        pkt.header = PAYLOAD_TYPE_ADVERT << 2  # version 0
+        pkt.payload = bytearray(our_pubkey + b"\x00" * 40)
+        pkt.payload_len = len(pkt.payload)
+        pkt.path_len = 0
+        pkt.path = bytearray()
 
-        assert dispatcher._is_own_packet(packet) is True
+        assert await dispatcher.send_packet(pkt, wait_for_ack=False) is True
+
+        await dispatcher._process_received_packet(pkt.write_to())
+
+        assert mock_handler.call_count == 0
 
 
 class TestDispatcherCallbacks:
@@ -602,8 +790,14 @@ class TestDispatcherCallbacks:
         assert received_data == packet_data
 
     @pytest.mark.asyncio
-    async def test_full_hop_count_packet_marked_do_not_retransmit(self, dispatcher):
-        """Packet with path at max hops for its encoding is marked do not retransmit."""
+    @pytest.mark.parametrize(
+        "packet_data,header,path_len,expected_path,hash_size,hop_count",
+        FIRMWARE_MAX_DIRECT_PATH_VECTORS,
+    )
+    async def test_firmware_maximum_direct_path_is_not_marked_do_not_retransmit(
+        self, dispatcher, packet_data, header, path_len, expected_path, hash_size, hop_count
+    ):
+        """MeshCore direct frames at every valid maximum remain forwardable."""
         received_packet = None
 
         def capture(packet, data, analysis):
@@ -612,46 +806,15 @@ class TestDispatcherCallbacks:
 
         dispatcher.set_raw_packet_callback(capture)
 
-        # 1-byte hashes: max 63 hops
-        pkt = Packet()
-        pkt.header = (1 << 6) | (PAYLOAD_TYPE_TXT_MSG << 2)
-        pkt.path_len = PathUtils.encode_path_len(1, 63)
-        pkt.path = bytearray(bytes(63))
-        pkt.payload = bytearray(b"x")
-        pkt.payload_len = 1
-        packet_data = pkt.write_to()
-
         await dispatcher._process_received_packet(packet_data)
 
         assert received_packet is not None
-        assert received_packet.is_marked_do_not_retransmit() is True
-        assert received_packet.get_path_hash_count() == 63
-
-    @pytest.mark.asyncio
-    async def test_2byte_path_at_max_hops_marked_do_not_retransmit(self, dispatcher):
-        """Packet with 2-byte path at 32 hops (64 bytes) is marked do not retransmit."""
-        received_packet = None
-
-        def capture(packet, data, analysis):
-            nonlocal received_packet
-            received_packet = packet
-
-        dispatcher.set_raw_packet_callback(capture)
-
-        pkt = Packet()
-        pkt.header = (1 << 6) | (PAYLOAD_TYPE_TXT_MSG << 2)
-        pkt.path_len = PathUtils.encode_path_len(2, 32)
-        pkt.path = bytearray(64)  # 32 * 2
-        pkt.payload = bytearray(b"x")
-        pkt.payload_len = 1
-        packet_data = pkt.write_to()
-
-        await dispatcher._process_received_packet(packet_data)
-
-        assert received_packet is not None
-        assert received_packet.is_marked_do_not_retransmit() is True
-        assert received_packet.get_path_hash_count() == 32
-        assert received_packet.get_path_byte_len() == 64
+        assert received_packet.is_marked_do_not_retransmit() is False
+        assert received_packet.header == header
+        assert received_packet.path_len == path_len
+        assert received_packet.get_path_hash_count() == hop_count
+        assert received_packet.get_path_byte_len() == hash_size * hop_count
+        assert bytes(received_packet.path) == expected_path
 
     @pytest.mark.asyncio
     async def test_async_callback(self, dispatcher):
@@ -716,17 +879,25 @@ class TestDispatcherMaintenance:
         """Health checks should run via asyncio.to_thread to avoid loop blocking."""
         dispatcher.radio.check_radio_health = Mock(return_value=True)
 
-        sleep_calls = {"count": 0}
+        wait_calls = {"count": 0}
 
-        async def fake_sleep(_seconds):
-            sleep_calls["count"] += 1
-            if sleep_calls["count"] >= 60:
+        async def fake_wait_for(awaitable, timeout=None):
+            wait_calls["count"] += 1
+            if wait_calls["count"] >= 60:
+                # Close the awaitable to avoid "coroutine was never awaited"
+                # when we cancel out of the maintenance wait.
+                if hasattr(awaitable, "close"):
+                    awaitable.close()
                 raise asyncio.CancelledError()
+            # Maintenance tick: treat as timeout so the loop continues
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise asyncio.TimeoutError()
 
         to_thread_mock = AsyncMock(return_value=True)
 
         with (
-            patch("openhop_core.node.dispatcher.asyncio.sleep", side_effect=fake_sleep),
+            patch("openhop_core.node.dispatcher.asyncio.wait_for", side_effect=fake_wait_for),
             patch("openhop_core.node.dispatcher.asyncio.to_thread", to_thread_mock),
         ):
             with pytest.raises(asyncio.CancelledError):
@@ -743,7 +914,7 @@ class TestDispatcherErrorHandling:
         """Test handling radio transmit errors."""
         # Create a proper Packet object
         packet = Packet()
-        packet.header = (1 << 6) | (PAYLOAD_TYPE_ADVERT << 2)  # ADVERT packets don't wait for ACK
+        packet.header = PAYLOAD_TYPE_ADVERT << 2  # version 0; ADVERT packets don't wait for ACK
         packet.payload = bytearray(b"test_data")
         packet.payload_len = len(packet.payload)
         packet.path_len = 0
@@ -782,6 +953,112 @@ class TestDispatcherErrorHandling:
         await dispatcher._process_received_packet(packet_data)
 
         # Should not crash
+
+    @pytest.mark.asyncio
+    async def test_enhanced_raw_callback_raise_invoked_once(self, dispatcher):
+        """A 3-arg callback that raises must not be retried with 2 args."""
+        calls = []
+
+        def failing_callback(packet, data, analysis):
+            calls.append(len([packet, data, analysis]))
+            raise RuntimeError("handler failed")
+
+        dispatcher.set_raw_packet_callback(failing_callback)
+        packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"test_payload")
+        await dispatcher._process_received_packet(packet_data)
+
+        assert calls == [3]
+
+    @pytest.mark.asyncio
+    async def test_variadic_raw_callback_raise_invoked_once(self, dispatcher):
+        """Variadic callbacks must not double-fire when the enhanced call raises."""
+        calls = []
+
+        def failing_callback(*args):
+            calls.append(len(args))
+            if len(args) == 3:
+                raise RuntimeError("enhanced path failed")
+
+        dispatcher.set_raw_packet_callback(failing_callback)
+        packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"test_payload")
+        await dispatcher._process_received_packet(packet_data)
+
+        assert calls == [3]
+
+    @pytest.mark.asyncio
+    async def test_legacy_two_arg_raw_callback(self, dispatcher):
+        """Strict 2-arg callbacks still receive (pkt, data) once."""
+        calls = []
+
+        def legacy_callback(packet, data):
+            calls.append((packet, data))
+
+        dispatcher.set_raw_packet_callback(legacy_callback)
+        packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"test_payload")
+        await dispatcher._process_received_packet(packet_data)
+
+        assert len(calls) == 1
+        assert calls[0][1] == packet_data
+
+    @pytest.mark.asyncio
+    async def test_bare_decorator_two_arg_raw_callback_rescued(self, dispatcher):
+        """Bare *args wrappers around 2-arg handlers must still run (TypeError rescue)."""
+        calls = []
+
+        def wrap(fn):
+            def wrapper(*args, **kwargs):
+                return fn(*args, **kwargs)
+
+            return wrapper
+
+        @wrap
+        def legacy(packet, data):
+            calls.append((packet, data))
+
+        dispatcher.set_raw_packet_callback(legacy)
+        packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"test_payload")
+        await dispatcher._process_received_packet(packet_data)
+
+        assert len(calls) == 1
+        assert calls[0][1] == packet_data
+
+    @pytest.mark.asyncio
+    async def test_bare_decorator_three_arg_raise_invoked_once(self, dispatcher):
+        """Bare wrapper around 3-arg that raises RuntimeError must not 2-arg retry."""
+        calls = []
+
+        def wrap(fn):
+            def wrapper(*args, **kwargs):
+                return fn(*args, **kwargs)
+
+            return wrapper
+
+        @wrap
+        def enhanced(packet, data, analysis):
+            calls.append(len([packet, data, analysis]))
+            raise RuntimeError("handler failed")
+
+        dispatcher.set_raw_packet_callback(enhanced)
+        packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"test_payload")
+        await dispatcher._process_received_packet(packet_data)
+
+        assert calls == [3]
+
+    @pytest.mark.asyncio
+    async def test_variadic_typeerror_falls_back_to_two_arg(self, dispatcher):
+        """Variadic arity miss (TypeError on 3-arg) still rescues with 2-arg."""
+        calls = []
+
+        def callback(*args):
+            calls.append(len(args))
+            if len(args) == 3:
+                raise TypeError("takes 2 positional arguments but 3 were given")
+
+        dispatcher.set_raw_packet_callback(callback)
+        packet_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"test_payload")
+        await dispatcher._process_received_packet(packet_data)
+
+        assert calls == [3, 2]
 
 
 class TestDispatcherIntegration:
@@ -851,7 +1128,7 @@ class TestDispatcherPayloadBasedDedup:
 
         # Packet 1: 1-byte hash mode, 0 hops
         pkt1 = Packet()
-        pkt1.header = (1 << 6) | (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD
+        pkt1.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
         pkt1.path_len = PathUtils.encode_path_len(1, 0)
         pkt1.path = bytearray()
         pkt1.payload = bytearray(b"Hello mesh!")
@@ -860,7 +1137,7 @@ class TestDispatcherPayloadBasedDedup:
 
         # Packet 2: same payload, 2 hops in path
         pkt2 = Packet()
-        pkt2.header = (1 << 6) | (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD
+        pkt2.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
         pkt2.path_len = PathUtils.encode_path_len(1, 2)
         pkt2.path = bytearray(b"\xAA\xBB")
         pkt2.payload = bytearray(b"Hello mesh!")
@@ -903,3 +1180,98 @@ class TestDispatcherPayloadBasedDedup:
 
         # Second attempt should be rejected at blacklist check (not re-parsed)
         await dispatcher._process_received_packet(bad_data)
+
+
+class TestDispatcherSendMarksSeen:
+    """Sending a packet marks it seen in the packet filter, matching firmware's
+    hasSeen() call right before sendPacket() in Mesh::sendFlood/sendDirect/
+    sendZeroHop: a neighbor rebroadcasting our own packet back to us must be
+    dropped as a duplicate rather than dispatched to handlers."""
+
+    @pytest.mark.asyncio
+    async def test_sent_flood_packet_dropped_on_loopback(self, dispatcher):
+        """Identical bytes fed back through the receive path are deduplicated."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_TXT_MSG)
+        dispatcher.register_handler(PAYLOAD_TYPE_TXT_MSG, mock_handler)
+
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(b"outbound message")
+        pkt.payload_len = len(pkt.payload)
+
+        assert await dispatcher.send_packet(pkt, wait_for_ack=False) is True
+
+        looped_data = pkt.write_to()
+        await dispatcher._process_received_packet(looped_data)
+
+        assert mock_handler.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_sent_flood_packet_dropped_on_loopback_with_mutated_path(self, dispatcher):
+        """A rebroadcast copy with a different path/path_len is still recognized as
+        our own send, since calculate_packet_hash() excludes path for non-TRACE."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_TXT_MSG)
+        dispatcher.register_handler(PAYLOAD_TYPE_TXT_MSG, mock_handler)
+
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(b"outbound message")
+        pkt.payload_len = len(pkt.payload)
+
+        assert await dispatcher.send_packet(pkt, wait_for_ack=False) is True
+
+        looped = Packet()
+        looped.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
+        looped.path_len = 2
+        looped.path = bytearray(b"\xAA\xBB")
+        looped.payload = bytearray(b"outbound message")
+        looped.payload_len = len(looped.payload)
+
+        await dispatcher._process_received_packet(looped.write_to())
+
+        assert mock_handler.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_distinct_inbound_packet_not_suppressed_after_send(self, dispatcher):
+        """A genuinely different inbound packet is not caught by the send-time mark."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_TXT_MSG)
+        dispatcher.register_handler(PAYLOAD_TYPE_TXT_MSG, mock_handler)
+
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(b"outbound message")
+        pkt.payload_len = len(pkt.payload)
+
+        assert await dispatcher.send_packet(pkt, wait_for_ack=False) is True
+
+        other_data = create_test_packet(PAYLOAD_TYPE_TXT_MSG, b"a completely different message")
+        await dispatcher._process_received_packet(other_data)
+
+        assert mock_handler.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_sent_group_packet_dropped_on_loopback(self, dispatcher):
+        """GRP_TXT: _is_own_packet always returns False for group payload types, so
+        this loopback would previously reach handlers — the send-time seen-table
+        mark is the only thing that catches it."""
+        mock_handler = MockHandler(PAYLOAD_TYPE_GRP_TXT)
+        dispatcher.register_handler(PAYLOAD_TYPE_GRP_TXT, mock_handler)
+
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_GRP_TXT << 2) | ROUTE_TYPE_FLOOD  # version 0
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(b"\x11" * 4 + b"group message ciphertext")
+        pkt.payload_len = len(pkt.payload)
+
+        assert await dispatcher.send_packet(pkt, wait_for_ack=False) is True
+
+        await dispatcher._process_received_packet(pkt.write_to())
+
+        assert mock_handler.call_count == 0

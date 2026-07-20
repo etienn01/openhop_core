@@ -1,12 +1,15 @@
 """Tests for CompanionBridge (repeater-integrated companion with packet_injector)."""
 
 import asyncio
+from typing import Optional
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from openhop_core.companion import CompanionBridge
 from openhop_core.companion.constants import ADV_TYPE_CHAT, AUTOADD_CHAT
-from openhop_core.companion.models import Contact
+from openhop_core.companion.models import Contact, MessageEvent, QueuedMessage
+from openhop_core.companion.timing import estimate_airtime_ms
 from openhop_core.node.events import MeshEvents
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
 from openhop_core.protocol.constants import (
@@ -16,7 +19,9 @@ from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_RAW_CUSTOM,
     PAYLOAD_TYPE_RESPONSE,
     PAYLOAD_TYPE_TXT_MSG,
+    REQ_TYPE_GET_TELEMETRY_DATA,
     ROUTE_TYPE_FLOOD,
+    TELEM_PERM_BASE,
 )
 from openhop_core.protocol.packet_utils import PathUtils
 
@@ -32,9 +37,13 @@ class MockPacketInjector:
 
     def __init__(self):
         self.calls: list[tuple] = []
+        self.expected_crcs: list[Optional[int]] = []
 
-    async def __call__(self, pkt: Packet, wait_for_ack: bool = False) -> bool:
+    async def __call__(
+        self, pkt: Packet, wait_for_ack: bool = False, expected_crc: Optional[int] = None
+    ) -> bool:
         self.calls.append((pkt, wait_for_ack))
+        self.expected_crcs.append(expected_crc)
         return True
 
 
@@ -80,6 +89,63 @@ class TestCompanionBridgeInit:
 
         bridge.set_other_params(manual_add=0, telemetry_modes=0, advert_loc_policy=0, multi_acks=0)
         assert text_handler.multi_acks == 0
+
+    def test_host_radio_settings_are_reported_but_not_mutable(self):
+        host_settings = {
+            "frequency": 915_000_000,
+            "bandwidth": 250_000,
+            "spreading_factor": 10,
+            "coding_rate": 5,
+            "tx_power": 14,
+            "max_tx_power_dbm": 17,
+        }
+        bridge = CompanionBridge(LocalIdentity(), MockPacketInjector(), radio_config=host_settings)
+
+        assert bridge.get_radio_params() == {
+            "frequency_hz": 915_000_000,
+            "bandwidth_hz": 250_000,
+            "spreading_factor": 10,
+            "coding_rate": 5,
+            "tx_power_dbm": 14,
+            "rx_delay_base": 0.0,
+            "airtime_factor": 1.0,
+        }
+        assert bridge.get_max_tx_power_dbm() == 17
+
+        before = bridge.get_self_info()
+        assert bridge.set_radio_params(868_000_000, 125_000, 7, 8) is False
+        assert bridge.set_tx_power(20) is False
+        assert bridge.get_self_info() == before
+
+        # Administrative host updates remain visible without granting the
+        # virtual companion permission to make the update itself.
+        host_settings.update({"frequency": 868_000_000, "tx_power": 20})
+        current = bridge.get_self_info()
+        assert current.frequency_hz == 868_000_000
+        assert current.tx_power_dbm == 20
+
+    def test_radio_capability_getters_override_host_mapping(self):
+        host_settings = {
+            "frequency": 915_000_000,
+            "bandwidth": 250_000,
+            "spreading_factor": 10,
+            "coding_rate": 5,
+            "tx_power": 14,
+        }
+        bridge = CompanionBridge(
+            LocalIdentity(),
+            MockPacketInjector(),
+            radio_settings_getter=lambda: host_settings,
+            max_tx_power_getter=lambda: 19,
+        )
+
+        assert bridge.get_self_info().tx_power_dbm == 14
+        assert bridge.get_max_tx_power_dbm() == 19
+
+    def test_radio_capability_uses_generic_fallback_when_host_has_none(self):
+        bridge = CompanionBridge(LocalIdentity(), MockPacketInjector(), radio_config={})
+
+        assert bridge.get_max_tx_power_dbm() == 22
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +248,7 @@ class TestCompanionBridgeProcessReceivedPacket:
         await bridge.start()
 
         pkt = Packet()
-        pkt.header = (1 << 6) | (PAYLOAD_TYPE_RAW_CUSTOM << 2)
+        pkt.header = PAYLOAD_TYPE_RAW_CUSTOM << 2  # version 0
         pkt.payload = bytearray(b"\x01\x02\x03\x04")
         pkt.payload_len = 4
         pkt.path_len = 0
@@ -238,10 +304,60 @@ class TestCompanionBridgeSendAndShare:
         bridge = CompanionBridge(LocalIdentity(), injector)
         contact = _make_peer_contact("Alice")
         bridge.contacts.add(contact)
-        await bridge.send_text_message(contact.public_key, "Hello")
+        result = await bridge.send_text_message(contact.public_key, "Hello")
         assert len(injector.calls) >= 1
         pkt, _ = injector.calls[0]
         assert (pkt.header >> 2) & 0x0F == PAYLOAD_TYPE_TXT_MSG
+        assert injector.expected_crcs[0] == result.expected_ack
+
+    async def test_peer_with_matching_display_name_is_queued(self):
+        """Group traffic has no sender identity, so a matching name is still inbound."""
+        bridge = CompanionBridge(LocalIdentity(), MockPacketInjector(), node_name="Twin")
+        assert bridge.set_channel(0, "Public", b"\x11" * 16)
+        packet = PacketBuilder.create_group_datagram(
+            "Public",
+            LocalIdentity(),
+            "hello",
+            "Twin",
+            bridge.channels.get_channels(),
+            timestamp=1_700_000_000,
+        )
+
+        await bridge.process_received_packet(packet)
+
+        queued = bridge.sync_next_message()
+        assert queued is not None
+        assert queued.is_channel is True
+        assert queued.channel_idx == 0
+        assert queued.text == "Twin: hello"
+
+    async def test_outgoing_group_message_is_marked_before_injector_loopback(self):
+        """A bridge's locally injected packet must not reappear as an inbound message."""
+        bridge: CompanionBridge
+
+        async def loopback_injector(packet: Packet, **_kwargs) -> bool:
+            await bridge.process_received_packet(packet)
+            return True
+
+        bridge = CompanionBridge(LocalIdentity(), loopback_injector, node_name="Self")
+        assert bridge.set_channel(0, "Public", b"\x11" * 16)
+
+        assert await bridge.send_channel_message(0, "hello", timestamp=1_700_000_000)
+        assert bridge.message_queue.count == 0
+
+    async def test_outgoing_group_data_is_marked_before_injector_loopback(self):
+        """Binary channel data follows the same loopback suppression rule."""
+        bridge: CompanionBridge
+
+        async def loopback_injector(packet: Packet, **_kwargs) -> bool:
+            await bridge.process_received_packet(packet)
+            return True
+
+        bridge = CompanionBridge(LocalIdentity(), loopback_injector, node_name="Self")
+        assert bridge.set_channel(0, "Public", b"\x11" * 16)
+
+        assert await bridge.send_channel_data(0, 0x1234, b"\xaa\xbb")
+        assert bridge.message_queue.count == 0
 
     async def test_share_contact_not_found(self):
         injector = MockPacketInjector()
@@ -324,6 +440,18 @@ class TestCompanionBridgePathAndControl:
         bridge = CompanionBridge(LocalIdentity(), injector)
         result = await bridge.send_path_discovery_req(b"\x00" * 32)
         assert result.success is False
+        assert result.error == "not_found"
+
+    async def test_send_path_discovery_req_send_failure(self):
+        injector = AsyncMock(return_value=False)
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        contact = _make_peer_contact("Target")
+        bridge.contacts.add(contact)
+
+        result = await bridge.send_path_discovery_req(contact.public_key)
+
+        assert result.success is False
+        assert result.error == "send_failed"
 
     async def test_send_path_discovery_req_success(self):
         injector = MockPacketInjector()
@@ -335,12 +463,96 @@ class TestCompanionBridgePathAndControl:
         assert len(injector.calls) == 1
         assert result.timeout_ms == 10000
 
+    async def test_send_path_discovery_req_matches_wire_tag_and_response(self, monkeypatch):
+        injector = MockPacketInjector()
+        local_identity = LocalIdentity()
+        peer_identity = LocalIdentity()
+        bridge = CompanionBridge(local_identity, injector)
+        contact = Contact(public_key=peer_identity.get_public_key(), name="Target")
+        bridge.contacts.add(contact)
+        monkeypatch.setattr(
+            "openhop_core.companion.base_send.random.getrandbits",
+            lambda bits: 0xA1B2C3D4,
+        )
+
+        callbacks = []
+        bridge.on_path_discovery_response(lambda *args: callbacks.append(args))
+        result = await bridge.send_path_discovery_req(contact.public_key)
+
+        assert result.success is True
+        assert result.expected_ack is not None
+        packet, _ = injector.calls[0]
+        shared_secret = Identity(peer_identity.get_public_key()).calc_shared_secret(
+            local_identity.get_private_key()
+        )
+        plaintext = CryptoUtils.mac_then_decrypt(
+            shared_secret[:16], shared_secret, bytes(packet.payload[2:])
+        )
+        expected_request = (
+            result.expected_ack.to_bytes(4, "little")
+            + bytes([REQ_TYPE_GET_TELEMETRY_DATA, (~TELEM_PERM_BASE) & 0xFF, 0, 0, 0])
+            + bytes.fromhex("d4c3b2a1")
+        )
+        assert plaintext[: len(expected_request)] == expected_request
+
+        handled = await bridge._try_handle_path_discovery(
+            result.expected_ack.to_bytes(4, "little"),
+            (0x01, b"\x0a", 0x01, b"\x0b", contact.public_key),
+        )
+        assert handled is True
+        assert len(callbacks) == 1
+        # (tag_bytes, contact_pubkey, out_len_byte, out_path, in_len_byte, in_path)
+        assert callbacks[0][0] == result.expected_ack.to_bytes(4, "little")
+        assert callbacks[0][1] == contact.public_key
+        assert callbacks[0][2] == 0x01
+        assert callbacks[0][3] == b"\x0a"
+        assert callbacks[0][4] == 0x01
+        assert callbacks[0][5] == b"\x0b"
+
     async def test_send_trace_path_raw(self):
         injector = MockPacketInjector()
         bridge = CompanionBridge(LocalIdentity(), injector)
         result = await bridge.send_trace_path_raw(0x12345678, 0xABCD, 0, bytes([0x01, 0x02]))
-        assert result is True
+        assert result.success is True
         assert len(injector.calls) == 1
+        # Firmware reports the trace SENT frame as direct, tagged with the trace tag.
+        assert result.is_flood is False
+        assert result.expected_ack == 0x12345678
+
+    async def test_send_trace_path_raw_est_timeout_matches_firmware(self):
+        """est_timeout = calcDirectTimeoutMillisFor(airtime(raw_len), path_len >> path_sz).
+
+        Firmware appends the trace path to the payload and zeroes path_len
+        (Mesh.cpp sendDirect), so its ``payload_len + path_len + 2`` is exactly
+        this packet's raw on-air length.
+        """
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        # flags=0 -> 1-byte hashes, so a 2-byte path is 2 hops.
+        result = await bridge.send_trace_path_raw(0x12345678, 0xABCD, 0, bytes([0x01, 0x02]))
+        pkt, _ = injector.calls[0]
+        raw_len = pkt.get_raw_length()
+        assert raw_len == 2 + 9 + 2  # header + path_len byte, tag/auth/flags, trace path
+        airtime = estimate_airtime_ms(raw_len, 10, 250000, 5)
+        assert result.timeout_ms == int(500 + (6.0 * airtime + 250) * (2 + 1))
+
+    async def test_send_trace_path_raw_est_timeout_scales_with_hash_width(self):
+        """Hop count is path bytes // (1 << (flags & 3)), not the raw byte count."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        # flags=1 -> 2-byte hashes, so a 4-byte path is 2 hops (not 4).
+        result = await bridge.send_trace_path_raw(0x11, 0x22, 1, bytes([1, 2, 3, 4]))
+        pkt, _ = injector.calls[0]
+        airtime = estimate_airtime_ms(pkt.get_raw_length(), 10, 250000, 5)
+        assert result.timeout_ms == int(500 + (6.0 * airtime + 250) * (2 + 1))
+
+    async def test_send_trace_path_raw_send_failure(self):
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        with patch.object(bridge, "_send_packet", AsyncMock(return_value=False)):
+            result = await bridge.send_trace_path_raw(0x12345678, 0xABCD, 0, bytes([0x01]))
+        assert result.success is False
+        assert result.error == "send_failed"
 
     async def test_send_control_data_valid_payload(self):
         injector = MockPacketInjector()
@@ -359,6 +571,16 @@ class TestCompanionBridgePathAndControl:
         assert result is False
         assert len(injector.calls) == 0
 
+    async def test_send_control_data_rejects_oversized_payload(self):
+        from openhop_core.protocol.constants import MAX_PACKET_PAYLOAD
+
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        oversized = bytes([0x80]) + bytes(MAX_PACKET_PAYLOAD)  # 1 + 184 = 185
+        result = await bridge.send_control_data(oversized)
+        assert result is False
+        assert len(injector.calls) == 0
+
 
 # ---------------------------------------------------------------------------
 # Binary request
@@ -372,6 +594,18 @@ class TestCompanionBridgeBinaryReq:
         bridge = CompanionBridge(LocalIdentity(), injector)
         result = await bridge.send_binary_req(b"\x00" * 32, bytes([0x01]))
         assert result.success is False
+        assert result.error == "not_found"
+
+    async def test_send_binary_req_send_failure(self):
+        injector = AsyncMock(return_value=False)
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        contact = _make_peer_contact("Rpt")
+        bridge.contacts.add(contact)
+
+        result = await bridge.send_binary_req(contact.public_key, bytes([0x01]))
+
+        assert result.success is False
+        assert result.error == "send_failed"
 
     async def test_send_binary_req_with_contact(self):
         injector = MockPacketInjector()
@@ -476,6 +710,142 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         )
         assert (contact.flags & 0x01) == 0, "Contact must not be marked as favourite after auto-add"
 
+    @staticmethod
+    def _advert_event(peer, *, name, advert_timestamp, lat=0.0, lon=0.0):
+        return {
+            "public_key": peer.get_public_key().hex(),
+            "name": name,
+            "contact_type": ADV_TYPE_CHAT,
+            "lat": lat,
+            "lon": lon,
+            "advert_timestamp": advert_timestamp,
+            "timestamp": advert_timestamp,
+            "snr": 0.0,
+            "rssi": 0,
+        }
+
+    async def test_newer_advert_updates_existing_contact(self):
+        """An advert with a strictly newer timestamp updates the stored contact."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        peer = LocalIdentity()
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Original", advert_timestamp=1000),
+        )
+        advert_received_calls = []
+        bridge.on_advert_received(advert_received_calls.append)
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Renamed", advert_timestamp=2000),
+        )
+        contact = bridge.contacts.get_by_key(peer.get_public_key())
+        assert contact is not None
+        assert contact.name == "Renamed"
+        assert contact.last_advert_timestamp == 2000
+        assert len(advert_received_calls) == 1
+
+    async def test_equal_timestamp_advert_is_rejected_as_replay(self):
+        """An advert with a timestamp equal to the stored one is ignored (replay)."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        peer = LocalIdentity()
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Original", advert_timestamp=1000),
+        )
+        advert_received_calls = []
+        node_discovered_calls = []
+        bridge.on_advert_received(advert_received_calls.append)
+        bridge.on_node_discovered(node_discovered_calls.append)
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Replayed", advert_timestamp=1000),
+        )
+        contact = bridge.contacts.get_by_key(peer.get_public_key())
+        assert contact is not None
+        assert contact.name == "Original"
+        assert contact.last_advert_timestamp == 1000
+        assert advert_received_calls == []
+        assert node_discovered_calls == []
+
+    async def test_older_advert_is_rejected_as_replay(self):
+        """An advert with an older timestamp cannot overwrite a newer contact."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        peer = LocalIdentity()
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Newer", advert_timestamp=2000, lat=52.0),
+        )
+        advert_received_calls = []
+        bridge.on_advert_received(advert_received_calls.append)
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Stale", advert_timestamp=1000, lat=10.0),
+        )
+        contact = bridge.contacts.get_by_key(peer.get_public_key())
+        assert contact is not None
+        assert contact.name == "Newer"
+        assert contact.last_advert_timestamp == 2000
+        assert advert_received_calls == []
+
+    async def test_autoadd_max_hops_rejects_distant_new_contact(self):
+        """A new contact whose advert is at least autoadd_max_hops away is not
+        auto-added, but the client is still notified (firmware onAdvertRecv)."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        bridge.prefs.autoadd_max_hops = 2
+        peer = LocalIdentity()
+        node_discovered_calls = []
+        bridge.on_node_discovered(node_discovered_calls.append)
+        event = self._advert_event(peer, name="Faraway", advert_timestamp=1000)
+        event["path_len_encoded"] = PathUtils.encode_path_len(1, 2)  # 2 hops
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event)
+        assert bridge.contacts.get_by_key(peer.get_public_key()) is None
+        assert len(node_discovered_calls) == 1
+
+    async def test_autoadd_max_hops_allows_closer_new_contact(self):
+        """A new contact within the hop limit is auto-added."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        bridge.prefs.autoadd_max_hops = 2
+        peer = LocalIdentity()
+        event = self._advert_event(peer, name="Nearby", advert_timestamp=1000)
+        event["path_len_encoded"] = PathUtils.encode_path_len(1, 1)  # 1 hop
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event)
+        assert bridge.contacts.get_by_key(peer.get_public_key()) is not None
+
+    async def test_autoadd_max_hops_zero_means_no_limit(self):
+        """max_hops == 0 disables the distance test (default behavior)."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        bridge.prefs.autoadd_max_hops = 0
+        peer = LocalIdentity()
+        event = self._advert_event(peer, name="Distant", advert_timestamp=1000)
+        event["path_len_encoded"] = PathUtils.encode_path_len(1, 10)  # 10 hops
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event)
+        assert bridge.contacts.get_by_key(peer.get_public_key()) is not None
+
+    async def test_autoadd_max_hops_does_not_block_existing_contact_update(self):
+        """An existing contact is still updated even when the advert is beyond the
+        hop limit (the cap only gates new auto-adds)."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        peer = LocalIdentity()
+        # First advert (0 hops) adds the contact while the cap is off.
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(peer, name="Original", advert_timestamp=1000),
+        )
+        bridge.prefs.autoadd_max_hops = 1  # direct-only from now on
+        event = self._advert_event(peer, name="Renamed", advert_timestamp=2000)
+        event["path_len_encoded"] = PathUtils.encode_path_len(1, 5)  # 5 hops away
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event)
+        contact = bridge.contacts.get_by_key(peer.get_public_key())
+        assert contact is not None
+        assert contact.name == "Renamed"
+
     async def test_path_packet_updates_contact_path_and_fires_contact_path_updated_once(self):
         """PATH packet that decrypts updates contact out_path and fires contact_path_updated."""
         injector = MockPacketInjector()
@@ -511,8 +881,9 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
             path_updated_calls.append(contact)
 
         bridge.on_contact_path_updated(on_path_updated)
-        await bridge.process_received_packet(pkt)
+        result = await bridge.process_received_packet(pkt)
 
+        assert result.authenticated is True
         assert len(path_updated_calls) == 1
         assert path_updated_calls[0].public_key == peer_pubkey
         assert path_updated_calls[0].out_path_len == path_len_byte
@@ -556,7 +927,7 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
             return pkt
 
         send_confirmed_calls = []
-        bridge.on_send_confirmed(send_confirmed_calls.append)
+        bridge.on_send_confirmed(lambda crc, *a: send_confirmed_calls.append(crc))
         bridge._track_pending_ack(ack_crc_expected)
 
         # 2-byte path hash: 1 hop -> 2 path bytes (encoded 0x41)
@@ -590,6 +961,45 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         await bridge.process_received_packet(pkt3)
         assert len(send_confirmed_calls) == 1
         assert send_confirmed_calls[0] == ack_crc_3
+
+    async def test_pending_ack_table_evicts_oldest_when_full(self):
+        """When the pending-ACK table is full, the oldest entry is evicted so a
+        current send is always tracked (firmware circular expected_ack_table)."""
+        from openhop_core.companion.constants import MAX_PENDING_ACK_CRCS
+
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        for crc in range(MAX_PENDING_ACK_CRCS):
+            bridge._track_pending_ack(crc)
+        assert len(bridge._pending_ack_crcs) == MAX_PENDING_ACK_CRCS
+
+        # One more send evicts the oldest (crc 0), never the newest.
+        newest = MAX_PENDING_ACK_CRCS
+        bridge._track_pending_ack(newest)
+        assert len(bridge._pending_ack_crcs) == MAX_PENDING_ACK_CRCS
+        assert 0 not in bridge._pending_ack_crcs
+        assert newest in bridge._pending_ack_crcs
+
+        # The newest send can still be confirmed.
+        confirmed = []
+        bridge.on_send_confirmed(lambda crc, *a: confirmed.append(crc))
+        assert await bridge._try_confirm_send(newest) is True
+        assert confirmed == [newest]
+
+    async def test_send_confirmed_reports_trip_time(self):
+        """send_confirmed passes the round-trip time (now - send time) in ms."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        calls = []
+        bridge.on_send_confirmed(lambda crc, trip_ms=0: calls.append((crc, trip_ms)))
+        crc = 0x1234ABCD
+        bridge._track_pending_ack(crc)
+        # Backdate the recorded send time by ~50 ms so the trip is measurable.
+        bridge._pending_ack_crcs[crc] -= 0.05
+        assert await bridge._try_confirm_send(crc) is True
+        assert len(calls) == 1
+        assert calls[0][0] == crc
+        assert calls[0][1] >= 50
 
     async def test_node_discovered_fires_node_discovered_even_when_filtered(self):
         injector = MockPacketInjector()
@@ -654,8 +1064,10 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         assert bridge.contacts.get_count() == 1
         assert len(advert_received_calls) == 1
         assert advert_received_calls[0].name == "AdvertNode"
-        # Second event (same contact): update, still one contact, advert_received again
-        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event_data)
+        # Second event (same contact, newer timestamp): update, still one contact,
+        # advert_received again. A newer timestamp is required to pass replay protection.
+        newer_event = {**event_data, "advert_timestamp": 2000, "timestamp": 2000}
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, newer_event)
         assert bridge.contacts.get_count() == 1
         assert len(advert_received_calls) == 2
 
@@ -716,6 +1128,157 @@ class TestCompanionBridgeDeduplication:
         assert msg.text == "Hello"
         assert bridge.sync_next_message() is None
 
+    @pytest.mark.parametrize("path_len", [0xFF, 0x01, 0x42, 0x83])
+    async def test_message_path_len_reaches_queue_and_callback(self, path_len):
+        """The companion-format route byte survives event fan-out unchanged."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        key_hex = LocalIdentity().get_public_key().hex()
+        callback_metadata = []
+        bridge.on_message_received(lambda *args: callback_metadata.append(args[-2:]))
+
+        await bridge._handle_mesh_event(
+            MeshEvents.NEW_MESSAGE,
+            {
+                "contact_pubkey": key_hex,
+                "message_text": "direct",
+                "timestamp": 1000,
+                "txt_type": 0,
+                "packet_hash": "B1C2D3E4",
+                "path_len": path_len,
+            },
+        )
+
+        queued = bridge.sync_next_message()
+        assert queued is not None
+        assert queued.path_len == path_len
+        assert callback_metadata == [(path_len, True)]
+
+    async def test_rejected_message_is_reported_without_displacing_direct_message(self):
+        """Queue rejection is visible to persistence callbacks and callers."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector, offline_queue_size=1)
+        key_hex = LocalIdentity().get_public_key().hex()
+        queue_results = []
+        bridge.on_message_received(lambda *args: queue_results.append(args[-1]))
+
+        for packet_hash, text in (("A1B2C3D4", "first"), ("B1C2D3E4", "second")):
+            await bridge._handle_mesh_event(
+                MeshEvents.NEW_MESSAGE,
+                {
+                    "contact_pubkey": key_hex,
+                    "message_text": text,
+                    "timestamp": 1000,
+                    "txt_type": 0,
+                    "packet_hash": packet_hash,
+                    "path_len": 0xFF,
+                },
+            )
+
+        assert queue_results == [True, False]
+        retained = bridge.sync_next_message()
+        assert retained is not None
+        assert retained.text == "first"
+
+    async def test_message_event_callback_receives_single_event_object(self):
+        """New-style subscribers get one MessageEvent instead of positional args."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        key_hex = LocalIdentity().get_public_key().hex()
+        events = []
+        bridge.on_message_event(events.append)
+
+        await bridge._handle_mesh_event(
+            MeshEvents.NEW_MESSAGE,
+            {
+                "contact_pubkey": key_hex,
+                "message_text": "hello",
+                "timestamp": 1000,
+                "txt_type": 0,
+                "packet_hash": "C1D2E3F4",
+                "path_len": 0x42,
+            },
+        )
+
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, MessageEvent)
+        assert event.text == "hello"
+        assert event.timestamp == 1000
+        assert event.packet_hash == "C1D2E3F4"
+        assert event.path_len == 0x42
+        assert event.queued is True
+        # A queued push carries the exact in-memory queue entry by identity.
+        assert event.queue_entry is bridge.message_queue.peek()
+
+    async def test_message_event_queue_entry_none_when_push_rejected(self):
+        """A rejected protected-queue push carries queue_entry=None."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        # Fill the protected (all-direct) queue so the next direct push is rejected.
+        bridge.message_queue._max_size = 1
+        bridge.message_queue.push(QueuedMessage(sender_key=b"\x09" * 32, text="held"))
+        key_hex = LocalIdentity().get_public_key().hex()
+        events = []
+        bridge.on_message_event(events.append)
+
+        await bridge._handle_mesh_event(
+            MeshEvents.NEW_MESSAGE,
+            {
+                "contact_pubkey": key_hex,
+                "message_text": "rejected",
+                "timestamp": 2000,
+                "txt_type": 0,
+                "packet_hash": "DEADBEEF",
+            },
+        )
+
+        assert len(events) == 1
+        assert events[0].queued is False
+        assert events[0].queue_entry is None
+
+    async def test_legacy_async_message_callback_receives_positional_form(self):
+        """The deprecated on_message_received adapter preserves the positional
+        signature (sender_key, text, timestamp, txt_type, packet_hash, snr,
+        rssi, sender_prefix, path_len, queued) and awaits async callbacks."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        sender = LocalIdentity()
+        key_hex = sender.get_public_key().hex()
+        received = []
+
+        async def legacy_callback(*args):
+            received.append(args)
+
+        bridge.on_message_received(legacy_callback)
+
+        await bridge._handle_mesh_event(
+            MeshEvents.NEW_MESSAGE,
+            {
+                "contact_pubkey": key_hex,
+                "message_text": "legacy",
+                "timestamp": 2000,
+                "txt_type": 0,
+                "packet_hash": "D1E2F3A4",
+                "path_len": 0xFF,
+            },
+        )
+
+        assert received == [
+            (
+                sender.get_public_key(),
+                "legacy",
+                2000,
+                0,
+                "D1E2F3A4",
+                0.0,
+                0,
+                b"",
+                0xFF,
+                True,
+            )
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Request retry / total-timeout cap
@@ -758,6 +1321,35 @@ class TestRequestTimeoutCap:
         result = await bridge.send_telemetry_request(contact.public_key, timeout=0.08)
         assert result["success"] is False
         assert 1 <= len(injector.calls) <= 2
+
+    async def test_started_status_request_reports_meshcore_sent_metadata(self):
+        bridge, injector, contact = self._bridge_with_contact()
+        contact.out_path_len = 0
+        bridge.contacts.update(contact)
+        bridge._response_timeout_s = lambda pkt, proxy: 0.01
+
+        started = await bridge._start_status_request(contact.public_key)
+
+        assert started["success"] is True
+        sent = started["sent"]
+        assert sent.is_flood is False
+        assert sent.expected_ack is not None
+        assert sent.timeout_ms == 10
+        result = await started["task"]
+        assert result["success"] is False
+
+    async def test_started_status_request_reports_send_failure(self):
+        from unittest.mock import AsyncMock
+
+        injector = AsyncMock(return_value=False)
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        contact = _make_peer_contact("Repeater")
+        bridge.contacts.add(contact)
+
+        started = await bridge._start_status_request(contact.public_key)
+
+        assert started == {"success": False, "error": "send_failed", "reason": "Send failed"}
+        injector.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

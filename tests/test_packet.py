@@ -298,6 +298,19 @@ class TestPacketRoundTrip:
         with pytest.raises(ValueError, match="invalid path_len encoding"):
             pkt.read_from(raw)
 
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param(b"\x0A\x61", id="two-byte-33-hops-0x61"),
+            pytest.param(b"\x0A\x96", id="three-byte-22-hops-0x96"),
+        ],
+    )
+    def test_read_from_rejects_firmware_oversized_path_length(self, raw):
+        """MeshCore rejects encodings whose declared path needs more than 64 bytes."""
+        pkt = Packet()
+        with pytest.raises(ValueError, match="path_len too large"):
+            pkt.read_from(raw)
+
     def test_read_from_truncated_path_raises(self):
         """read_from rejects packet with insufficient path bytes."""
         # 2 hops × 2-byte hashes = 4 bytes expected, but only provide 2

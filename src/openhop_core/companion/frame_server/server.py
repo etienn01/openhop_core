@@ -33,6 +33,8 @@ from ..constants import (
     CMD_GET_DEFAULT_FLOOD_SCOPE,
     CMD_GET_DEVICE_TIME,
     CMD_GET_STATS,
+    CMD_GET_TUNING_PARAMS,
+    CMD_HAS_CONNECTION,
     CMD_IMPORT_CONTACT,
     CMD_IMPORT_PRIVATE_KEY,
     CMD_LOGOUT,
@@ -66,6 +68,9 @@ from ..constants import (
     CMD_SET_RADIO_TX_POWER,
     CMD_SET_TUNING_PARAMS,
     CMD_SHARE_CONTACT,
+    CMD_SIGN_DATA,
+    CMD_SIGN_FINISH,
+    CMD_SIGN_START,
     CMD_SYNC_NEXT_MESSAGE,
     ERR_CODE_ILLEGAL_ARG,
     ERR_CODE_UNSUPPORTED_CMD,
@@ -190,7 +195,12 @@ class CompanionFrameServer(
             CMD_EXPORT_CONTACT: self._cmd_export_contact,
             CMD_EXPORT_PRIVATE_KEY: self._cmd_export_private_key,
             CMD_IMPORT_PRIVATE_KEY: self._cmd_import_private_key,
+            CMD_SIGN_START: self._cmd_sign_start,
+            CMD_SIGN_DATA: self._cmd_sign_data,
+            CMD_SIGN_FINISH: self._cmd_sign_finish,
             CMD_SET_TUNING_PARAMS: self._cmd_set_tuning_params,
+            CMD_GET_TUNING_PARAMS: self._cmd_get_tuning_params,
+            CMD_HAS_CONNECTION: self._cmd_has_connection,
             CMD_LOGOUT: self._cmd_logout,
             CMD_GET_CUSTOM_VARS: self._cmd_get_custom_vars,
             CMD_SET_CUSTOM_VAR: self._cmd_set_custom_var,
@@ -207,9 +217,12 @@ class CompanionFrameServer(
     # Persistence hooks (override in subclasses for SQLite, etc.)
     # -------------------------------------------------------------------------
 
-    async def _persist_companion_message(self, msg_dict: dict) -> None:
+    async def _persist_companion_message(self, msg_dict: dict, queue_entry=None) -> None:
         """Hook: persist a received message.  Default is a no-op — the message
-        stays in the bridge's in-memory queue for ``sync_next_message``."""
+        stays in the bridge's in-memory queue for ``sync_next_message``.
+
+        ``queue_entry`` is the exact in-memory queue entry this message came from,
+        so an overriding persistence layer can remove it by identity."""
 
     def _sync_next_from_persistence(self) -> Optional[QueuedMessage]:
         """Hook: pop a persisted message when the bridge queue is empty.
@@ -245,6 +258,16 @@ class CompanionFrameServer(
         """Hook: return (millivolts, used_kb, total_kb).  Default: all zeros."""
         return (0, 0, 0)
 
+    def _get_self_telemetry_lpp(self) -> bytes:
+        """Hook: return local sensor telemetry as CayenneLPP bytes.
+
+        Mirrors the firmware self-telemetry `sensors.querySensors(0xFF, ...)`
+        (MyMesh.cpp:1646) with permission mask 0xFF. Concrete deployments with
+        a modem should override to return `KissModemWrapper.get_sensors(0xFF)`.
+        Default is no sensor data; the battery-voltage floor is still emitted.
+        """
+        return b""
+
     # -------------------------------------------------------------------------
     # Command dispatch
     # -------------------------------------------------------------------------
@@ -256,7 +279,7 @@ class CompanionFrameServer(
             return
         cmd = payload[0]
         data = payload[1:]
-        logger.info("Companion cmd 0x%02x (%s) len=%s", cmd, cmd, len(payload))
+        logger.debug("Companion cmd 0x%02x (%s) len=%s", cmd, cmd, len(payload))
         if cmd in (CMD_GET_CHANNEL, CMD_SET_CHANNEL):
             logger.debug(
                 "Companion cmd 0x%02x (%s), payload_len=%s",

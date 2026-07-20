@@ -94,13 +94,14 @@ class _FrameTransportMixin:
         if self._write_queue is None:
             return
         if len(data) > MAX_PAYLOAD_SIZE:
+            # Firmware writeFrame() refuses (returns 0) rather than truncating; a
+            # truncated frame would corrupt the response. Drop it instead.
             logger.warning(
-                "Outbound frame payload truncated from %s to %s (MAX_FRAME_SIZE=%s)",
+                "Outbound frame payload too large (%s > %s); dropping frame",
                 len(data),
                 MAX_PAYLOAD_SIZE,
-                MAX_FRAME_SIZE,
             )
-            data = data[:MAX_PAYLOAD_SIZE]
+            return
         frame = bytes([FRAME_OUTBOUND_PREFIX]) + struct.pack("<H", len(data)) + data
         try:
             self._write_queue.put_nowait(frame)
@@ -236,7 +237,9 @@ class _FrameTransportMixin:
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
                 except (AttributeError, OSError):
                     pass  # older macOS may lack KEEPINTVL/KEEPCNT
-        except OSError as e:
+        except (AttributeError, OSError) as e:
+            # AttributeError: some Python builds (observed: 3.9.6 on macOS)
+            # don't expose socket.TCP_KEEPALIVE at all.
             logger.debug("Could not set TCP keepalive: %s", e)
 
     async def _evict_existing_client(self) -> None:

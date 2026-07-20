@@ -4,8 +4,9 @@ Consolidates common operations between Packet and PacketBuilder classes.
 """
 
 import hashlib
+import math
 import struct
-from typing import Any, List, Optional, Union
+from typing import Any, List, NamedTuple, Optional, Union
 
 from .constants import (
     MAX_HASH_SIZE,
@@ -25,6 +26,139 @@ from .constants import (
     ROUTE_TYPE_TRANSPORT_DIRECT,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
+
+
+def coding_rate_denominator(cr: Union[int, float]) -> int:
+    """Return the LoRa coding-rate denominator (5..8) for rates 4/5..4/8.
+
+    Accepts either representation in use across configs and radio drivers:
+    the public denominator form (5..8) or the legacy index form (1..4,
+    meaning 4/5..4/8). Values outside both ranges are clamped to 5..8.
+    A value of 4 is unambiguous: it is not a valid denominator, so it
+    always means the legacy index for 4/8.
+    """
+    cr_val = int(cr)
+    if 1 <= cr_val <= 4:
+        return cr_val + 4
+    return max(5, min(8, cr_val))
+
+
+def calculate_lora_airtime_ms(
+    payload_len: int,
+    sf: int,
+    bw_hz: Union[int, float],
+    cr: Union[int, float],
+    preamble_symbols: int = 8,
+    crc_enabled: bool = True,
+    explicit_header: bool = True,
+    low_dr_opt: Optional[bool] = None,
+) -> float:
+    """LoRa time-on-air (ms), matching RadioLib's chip drivers.
+
+    MeshCore firmware airtime is RadioLib ``getTimeOnAir`` (the Semtech
+    AN1200.13 formula, with 6.25 sync symbols and a different numerator
+    constant for SF5/SF6). ``cr`` accepts either coding-rate representation;
+    see ``coding_rate_denominator``. ``payload_len`` is the full on-air byte
+    length (use ``Packet.get_raw_length()``).
+
+    When ``low_dr_opt`` is None it follows RadioLib's auto rule — enabled when
+    the symbol time is at least 16 ms — which is what firmware nodes use
+    (MeshCore never overrides the driver's LDRO auto-configuration). Note this
+    differs from the common "SF >= 11 and BW <= 125 kHz" shorthand at some
+    settings, e.g. SF12 @ 250 kHz and SF10 @ 62.5 kHz both have 16.384 ms
+    symbols and therefore use LDRO on real hardware.
+    """
+    sf = max(5, min(12, int(sf)))
+    bw_hz = float(bw_hz) or 250000.0
+    cr_denom = coding_rate_denominator(cr)
+
+    symbol_time_s = (1 << sf) / bw_hz
+    if low_dr_opt is None:
+        low_dr_opt = symbol_time_s * 1000.0 >= 16.0
+
+    sync_symbols = 6.25 if sf <= 6 else 4.25
+    sf_coeff2 = 0 if sf <= 6 else 8
+    bit_count = (
+        8 * payload_len
+        + (16 if crc_enabled else 0)
+        - 4 * sf
+        + sf_coeff2
+        + (20 if explicit_header else 0)
+    )
+    denom = 4 * (sf - 2) if low_dr_opt else 4 * sf
+    payload_symbols = 8 + math.ceil(max(bit_count, 0) / denom) * cr_denom
+
+    total_symbols = preamble_symbols + sync_symbols + payload_symbols
+    return total_symbols * symbol_time_s * 1000.0
+
+
+# Approximate SNR threshold per SF for successful reception (SF7..SF12),
+# from MeshCore's RadioLibWrappers (based on Semtech datasheets).
+_PACKET_SCORE_SNR_THRESHOLDS = (-7.5, -10.0, -12.5, -15.0, -17.5, -20.0)
+
+
+def packet_score(snr: float, sf: int, packet_len: int) -> float:
+    """Reception-quality score in [0, 1], matching MeshCore ``packetScoreInt``.
+
+    Grades how comfortably a packet was received: 0 when the SNR is at or
+    below the per-SF decode threshold, scaling up with SNR margin and down
+    with packet length (longer packets are likelier to collide). MeshCore
+    feeds this into the flood reception delay (``calcRxDelay``) and returns
+    0 for SF below 7. ``packet_len`` is the full on-air byte length.
+    """
+    if sf < 7:
+        return 0.0
+    threshold = _PACKET_SCORE_SNR_THRESHOLDS[min(sf, 12) - 7]
+    if snr < threshold:
+        return 0.0
+    snr_margin_rate = (snr - threshold) / 10.0
+    collision_penalty = 1.0 - (packet_len / 256.0)
+    return max(0.0, min(1.0, snr_margin_rate * collision_penalty))
+
+
+class FloodRxMetrics(NamedTuple):
+    score: float
+    air_time_ms: float
+    delay_ms: float
+
+
+def flood_rx_metrics(
+    frame_len: int,
+    snr: float,
+    sf: int,
+    bw_hz: Union[int, float],
+    cr: Union[int, float],
+    preamble_symbols: int = 8,
+    *,
+    rx_delay_base: float = 0.0,
+    min_delay_ms: float = 50.0,
+    max_delay_ms: float = 32000.0,
+) -> FloodRxMetrics:
+    """Shared flood RX scoring/airtime/delay metrics used by core and repeater.
+
+    Uses the MeshCore packet score and airtime formulas. Delay follows the
+    Dispatcher calcRxDelay behavior: disabled when rx_delay_base <= 0,
+    immediate below min_delay_ms, capped at max_delay_ms.
+    """
+    score = packet_score(snr, sf, frame_len)
+    air_time_ms = calculate_lora_airtime_ms(
+        frame_len,
+        sf,
+        bw_hz,
+        cr,
+        preamble_symbols,
+    )
+
+    if rx_delay_base <= 0.0:
+        return FloodRxMetrics(score=score, air_time_ms=air_time_ms, delay_ms=0.0)
+
+    delay_ms = (float(rx_delay_base) ** (0.85 - score) - 1.0) * air_time_ms
+    if delay_ms < min_delay_ms:
+        delay_ms = 0.0
+    else:
+        delay_ms = min(delay_ms, max_delay_ms)
+
+    return FloodRxMetrics(score=score, air_time_ms=air_time_ms, delay_ms=delay_ms)
 
 
 class PacketValidationUtils:
@@ -291,7 +425,9 @@ class PacketHashingUtils:
 
         Args:
             payload_type: Packet payload type
-            path_len: Path length (only used for TRACE packets)
+            path_len: Hashed ONLY for TRACE packets (which may revisit a node on
+                the return path); excluded for all other types so a rebroadcast
+                with a longer path dedups against the original.
             payload: Packet payload bytes
 
         Returns:
@@ -393,59 +529,8 @@ class PacketTimingUtils:
         if bw < 1000:
             bw = bw * 1000  # Convert kHz to Hz
 
-        symbol_time = (2**sf) / bw  # seconds per symbol
+        airtime_ms = calculate_lora_airtime_ms(packet_length_bytes, sf, bw, cr, preamble)
 
-        # Preamble time
-        preamble_time = preamble * symbol_time
-
-        # Payload symbols (simplified)
-        payload_symbols = 8 + max(0, (packet_length_bytes * 8 - 4 * sf + 28) // (4 * (sf - 2))) * (
-            cr + 4
-        )
-        payload_time = payload_symbols * symbol_time
-
-        total_time_ms = (preamble_time + payload_time) * 1000
-
-        # Add some overhead for processing and turnaround
-        return max(total_time_ms, 50.0)  # Minimum 50ms
-
-    @staticmethod
-    def calc_flood_timeout_ms(packet_airtime_ms: float) -> float:
-        """
-        Calculate timeout for flood packets.
-
-        Formula: 500ms + (16.0 × airtime)
-
-        Args:
-            packet_airtime_ms: Estimated packet airtime in milliseconds
-
-        Returns:
-            Timeout in milliseconds
-        """
-        SEND_TIMEOUT_BASE_MILLIS = 500
-        FLOOD_SEND_TIMEOUT_FACTOR = 16.0
-        return SEND_TIMEOUT_BASE_MILLIS + (FLOOD_SEND_TIMEOUT_FACTOR * packet_airtime_ms)
-
-    @staticmethod
-    def calc_direct_timeout_ms(packet_airtime_ms: float, path_hash_count: int) -> float:
-        """
-        Calculate timeout for direct packets.
-
-        Formula: 500ms + ((airtime × 6 + 250ms) × (path_hash_count + 1))
-
-        Args:
-            packet_airtime_ms: Estimated packet airtime in milliseconds
-            path_hash_count: Number of hops in the path (0 for direct).
-                Use ``PathUtils.get_path_hash_count(path_len)`` to extract
-                from an encoded path_len byte.
-
-        Returns:
-            Timeout in milliseconds
-        """
-        SEND_TIMEOUT_BASE_MILLIS = 500
-        DIRECT_SEND_PERHOP_FACTOR = 6.0
-        DIRECT_SEND_PERHOP_EXTRA_MILLIS = 250
-        return SEND_TIMEOUT_BASE_MILLIS + (
-            (packet_airtime_ms * DIRECT_SEND_PERHOP_FACTOR + DIRECT_SEND_PERHOP_EXTRA_MILLIS)
-            * (path_hash_count + 1)
-        )
+        # TODO: drop this legacy floor. Firmware reports true sub-50 ms
+        # airtimes; callers that need a wait margin already add their own.
+        return max(airtime_ms, 50.0)

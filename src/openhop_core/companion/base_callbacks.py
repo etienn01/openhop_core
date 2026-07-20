@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import time
 from typing import Any, Callable, Optional
 
+from ..util.callbacks import invoke_maybe_awaitable
 from .base_support import _fmt_path
 
 logger = logging.getLogger("CompanionBase")
@@ -29,14 +29,95 @@ class _CallbackMixin:
         for key in self._push_callbacks:
             self._push_callbacks[key].clear()
 
+    def on_message_event(self, callback: Callable) -> None:
+        """Register a direct-message callback receiving one ``MessageEvent``."""
+        self._push_callbacks["message_event"].append(callback)
+
+    def on_channel_message_event(self, callback: Callable) -> None:
+        """Register a channel-text callback receiving one ``ChannelMessageEvent``."""
+        self._push_callbacks["channel_message_event"].append(callback)
+
+    def on_channel_data_event(self, callback: Callable) -> None:
+        """Register a channel-data callback receiving one ``ChannelDataEvent``."""
+        self._push_callbacks["channel_data_event"].append(callback)
+
+    @staticmethod
+    async def _call_legacy(callback: Callable, *args: Any) -> None:
+        """Invoke a legacy positional callback, awaiting it when async."""
+        await invoke_maybe_awaitable(callback, *args)
+
     def on_message_received(self, callback: Callable) -> None:
-        self._push_callbacks["message_received"].append(callback)
+        """Deprecated: prefer :meth:`on_message_event`.
+
+        The legacy callback receives the ``MessageEvent`` fields exploded
+        positionally: ``(sender_key, text, timestamp, txt_type, packet_hash,
+        snr, rssi, sender_prefix, path_len, queued)``. The final ``queued``
+        flag is false when the protected offline queue could not retain the
+        message.
+        """
+
+        async def _legacy_adapter(event: Any) -> None:
+            await self._call_legacy(
+                callback,
+                event.sender_key,
+                event.text,
+                event.timestamp,
+                event.txt_type,
+                event.packet_hash,
+                event.snr,
+                event.rssi,
+                event.sender_prefix,
+                event.path_len,
+                event.queued,
+            )
+
+        self._push_callbacks["message_event"].append(_legacy_adapter)
 
     def on_channel_message_received(self, callback: Callable) -> None:
-        self._push_callbacks["channel_message_received"].append(callback)
+        """Deprecated: prefer :meth:`on_channel_message_event`.
+
+        The legacy callback receives ``(channel_name, sender_name, text,
+        timestamp, path_len, channel_idx, packet_hash, snr, rssi, queued)``.
+        """
+
+        async def _legacy_adapter(event: Any) -> None:
+            await self._call_legacy(
+                callback,
+                event.channel_name,
+                event.sender_name,
+                event.text,
+                event.timestamp,
+                event.path_len,
+                event.channel_idx,
+                event.packet_hash,
+                event.snr,
+                event.rssi,
+                event.queued,
+            )
+
+        self._push_callbacks["channel_message_event"].append(_legacy_adapter)
 
     def on_channel_data_received(self, callback: Callable) -> None:
-        self._push_callbacks["channel_data_received"].append(callback)
+        """Deprecated: prefer :meth:`on_channel_data_event`.
+
+        The legacy callback receives ``(channel_idx, path_len, data_type,
+        payload, packet_hash, snr, rssi, queued)``.
+        """
+
+        async def _legacy_adapter(event: Any) -> None:
+            await self._call_legacy(
+                callback,
+                event.channel_idx,
+                event.path_len,
+                event.data_type,
+                event.payload,
+                event.packet_hash,
+                event.snr,
+                event.rssi,
+                event.queued,
+            )
+
+        self._push_callbacks["channel_data_event"].append(_legacy_adapter)
 
     def on_advert_received(self, callback: Callable) -> None:
         self._push_callbacks["advert_received"].append(callback)
@@ -197,7 +278,7 @@ class _CallbackMixin:
 
     async def _try_handle_path_discovery(self, tag_bytes: bytes, path_info: tuple) -> bool:
         """If tag is pending path discovery, fire path_discovery_response and return True."""
-        out_path, in_path, contact_pubkey = path_info
+        out_len_byte, out_path, in_len_byte, in_path, contact_pubkey = path_info
         tag_int = int.from_bytes(tag_bytes, "little")
         if tag_int not in self._pending_discovery_tags:
             return False
@@ -206,7 +287,9 @@ class _CallbackMixin:
             "path_discovery_response",
             tag_bytes,
             contact_pubkey,
+            out_len_byte,
             out_path,
+            in_len_byte,
             in_path,
         )
         return True
@@ -214,10 +297,7 @@ class _CallbackMixin:
     async def _fire_callbacks(self, event_name: str, *args: Any) -> None:
         for callback in self._push_callbacks.get(event_name, []):
             try:
-                if inspect.iscoroutinefunction(callback):
-                    await callback(*args)
-                else:
-                    callback(*args)
+                await invoke_maybe_awaitable(callback, *args)
             except Exception as e:
                 logger.error("Error in %s callback: %s", event_name, e)
 

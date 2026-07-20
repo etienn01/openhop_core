@@ -10,6 +10,7 @@ import random
 import time
 from typing import Optional, Union
 
+from ..protocol.packet_utils import calculate_lora_airtime_ms, coding_rate_denominator
 from .base import LoRaRadio
 from .gpio_manager import GPIOPinManager
 from .lora.LoRaRF.SX126x import SX126x, set_gpio_manager
@@ -17,10 +18,20 @@ from .lora.LoRaRF.SX126x import SX126x, set_gpio_manager
 logger = logging.getLogger("SX1262_wrapper")
 TRACE_LEVEL = 5
 logging.addLevelName(TRACE_LEVEL, "TRACE")
+setattr(logging, "TRACE", TRACE_LEVEL)
+
+
+def _logger_trace(self, message, *args, **kwargs):
+    if self.isEnabledFor(TRACE_LEVEL):
+        self._log(TRACE_LEVEL, message, args, **kwargs)
+
+
+if not hasattr(logging.Logger, "trace"):
+    logging.Logger.trace = _logger_trace
 
 
 def _trace(message: str) -> None:
-    logger.log(TRACE_LEVEL, message)
+    logger.trace(message)
 
 
 class SX1262Radio(LoRaRadio):
@@ -28,6 +39,10 @@ class SX1262Radio(LoRaRadio):
 
     # Class variable to track the active instance (singleton-like behavior)
     _active_instance = None
+
+    # SX1262 PA hard limit in dBm; set_tx_power clamps any higher request down
+    # to this value (via SX126x.setTxPower) before writing it to the chip.
+    max_tx_power_dbm = 22
 
     # Common timing constants to avoid magic numbers
     RADIO_TIMING_DELAY = 0.01  # 10ms delay for standard radio operations
@@ -94,9 +109,7 @@ class SX1262Radio(LoRaRadio):
         """
         # Check if there's already an active instance and clean it up
         if SX1262Radio._active_instance is not None:
-            logger.warning(
-                "Another SX1262Radio instance is already active - cleaning it up first"
-            )
+            logger.warning("Another SX1262Radio instance is already active - cleaning it up first")
             try:
                 SX1262Radio._active_instance.cleanup()
             except Exception as e:
@@ -165,6 +178,7 @@ class SX1262Radio(LoRaRadio):
         self._tx_done_event = asyncio.Event()
         self._rx_done_event = asyncio.Event()
         self._cad_event = asyncio.Event()
+        self._pending_rx_irq_status = 0
 
         # Store last IRQ status for background task
         self._last_irq_status = 0
@@ -207,9 +221,7 @@ class SX1262Radio(LoRaRadio):
         self.rx_callback = None
 
     @staticmethod
-    def _normalize_en_pins(
-        en_pin: int = -1, en_pins: Optional[list[int]] = None
-    ) -> list[int]:
+    def _normalize_en_pins(en_pin: int = -1, en_pins: Optional[list[int]] = None) -> list[int]:
         normalized_pins = []
 
         if en_pins:
@@ -306,13 +318,19 @@ class SX1262Radio(LoRaRadio):
 
             irqStat = self.lora.getIrqStatus()
 
+            # Preserve packet-bearing RX terminal IRQs in software before the
+            # hardware IRQ status is cleared.
+            rx_packet_irq_mask = (
+                self.lora.IRQ_RX_DONE | self.lora.IRQ_CRC_ERR | self.lora.IRQ_HEADER_ERR
+            )
+            if irqStat & rx_packet_irq_mask:
+                self._pending_rx_irq_status |= irqStat & rx_packet_irq_mask
+
             if irqStat != 0:
                 self.lora.clearIrqStatus(0xFFFF)
                 self._last_irq_status = irqStat
             if irqStat & self.lora.IRQ_TX_DONE:
-                _trace(
-                    "[TX] TX_DONE interrupt (0x{:04X})".format(self.lora.IRQ_TX_DONE)
-                )
+                _trace("[TX] TX_DONE interrupt (0x{:04X})".format(self.lora.IRQ_TX_DONE))
                 self._tx_done_event.set()
 
             if irqStat & (self.lora.IRQ_CAD_DETECTED | self.lora.IRQ_CAD_DONE):
@@ -339,28 +357,14 @@ class SX1262Radio(LoRaRadio):
 
                 # Log all interrupt types for debugging
                 if irqStat & self.lora.IRQ_RX_DONE:
-                    _trace(
-                        "[RX] RX_DONE interrupt (0x{:04X})".format(
-                            self.lora.IRQ_RX_DONE
-                        )
-                    )
+                    _trace("[RX] RX_DONE interrupt (0x{:04X})".format(self.lora.IRQ_RX_DONE))
                 if irqStat & self.lora.IRQ_CRC_ERR:
-                    logger.debug(
-                        "[RX] CRC_ERR interrupt (0x{:04X})".format(
-                            self.lora.IRQ_CRC_ERR
-                        )
-                    )
+                    logger.debug("[RX] CRC_ERR interrupt (0x{:04X})".format(self.lora.IRQ_CRC_ERR))
                 if irqStat & self.lora.IRQ_TIMEOUT:
-                    logger.debug(
-                        "[RX] TIMEOUT interrupt (0x{:04X})".format(
-                            self.lora.IRQ_TIMEOUT
-                        )
-                    )
+                    logger.debug("[RX] TIMEOUT interrupt (0x{:04X})".format(self.lora.IRQ_TIMEOUT))
                 if irqStat & self.lora.IRQ_HEADER_ERR:
                     logger.debug(
-                        "[RX] HEADER_ERR interrupt (0x{:04X})".format(
-                            self.lora.IRQ_HEADER_ERR
-                        )
+                        "[RX] HEADER_ERR interrupt (0x{:04X})".format(self.lora.IRQ_HEADER_ERR)
                     )
                 if irqStat & self.lora.IRQ_PREAMBLE_DETECTED:
                     logger.debug(
@@ -376,9 +380,7 @@ class SX1262Radio(LoRaRadio):
                     )
                 if irqStat & self.lora.IRQ_HEADER_VALID:
                     logger.debug(
-                        "[RX] HEADER_VALID interrupt (0x{:04X})".format(
-                            self.lora.IRQ_HEADER_VALID
-                        )
+                        "[RX] HEADER_VALID interrupt (0x{:04X})".format(self.lora.IRQ_HEADER_VALID)
                     )
 
                 # Only wake the background task for TERMINAL interrupts
@@ -386,24 +388,60 @@ class SX1262Radio(LoRaRadio):
                 if irqStat & terminal_interrupts:
                     if not self._tx_lock.locked():
                         self._rx_done_event.set()
-                        _trace(
-                            f"[RX] Terminal interrupt 0x{irqStat:04X} - waking background task"
-                        )
+                        _trace(f"[RX] Terminal interrupt 0x{irqStat:04X} - waking background task")
                     else:
                         logger.debug(
                             f"[RX] Ignoring terminal interrupt 0x{irqStat:04X} during TX operation"
                         )
                 else:
                     # Non-terminal interrupt - just log it, don't wake background task
-                    logger.debug(
-                        f"[RX] Progress interrupt 0x{irqStat:04X} - packet still incoming"
-                    )
+                    logger.debug(f"[RX] Progress interrupt 0x{irqStat:04X} - packet still incoming")
 
         except Exception as e:
             logger.error(f"IRQ handler error: {e}")
             self._tx_done_event.set()
             if not self._tx_lock.locked():
                 self._rx_done_event.set()
+
+    async def _drain_pending_rx_irq_before_buffer_reuse(self) -> None:
+        """Drain latched packet-bearing RX IRQ state before CAD/TX buffer reuse."""
+        if not self._pending_rx_irq_status:
+            return
+
+        callback_packet_data = None
+        async with self._rx_lock:
+            pending_irq = self._pending_rx_irq_status
+            if not pending_irq:
+                return
+
+            try:
+                if pending_irq & self.lora.IRQ_CRC_ERR:
+                    self.crc_error_count += 1
+                elif pending_irq & self.lora.IRQ_RX_DONE:
+                    payloadLengthRx, rxStartBufferPointer = self.lora.getRxBufferStatus()
+                    if payloadLengthRx > 0:
+                        buffer = self.lora.readBuffer(rxStartBufferPointer, payloadLengthRx)
+                        callback_packet_data = bytes(buffer)
+                        _trace(
+                            f"[RX] Drained pending RX packet before TX/CAD: "
+                            f"{callback_packet_data.hex()[:32]}... "
+                            f"({len(callback_packet_data)} bytes)"
+                        )
+
+                if pending_irq & self.lora.IRQ_HEADER_ERR:
+                    logger.debug("[RX] Drained pending HEADER_ERR before TX/CAD")
+            finally:
+                # Clear only after the latched IRQ state has been consumed.
+                self._pending_rx_irq_status = 0
+
+        if callback_packet_data is not None:
+            if self.rx_callback:
+                try:
+                    self.rx_callback(callback_packet_data)
+                except Exception as cb_exc:
+                    logger.error(f"RX callback error: {cb_exc}")
+            else:
+                logger.warning("[RX] No RX callback registered!")
 
     def set_rx_callback(self, callback):
         """Set a callback to be called with each received packet (bytes)."""
@@ -427,9 +465,7 @@ class SX1262Radio(LoRaRadio):
             except RuntimeError:
                 logger.debug("No event loop available for RX task startup")
             except Exception as e:
-                logger.warning(
-                    f"Failed to start delayed RX IRQ background handler: {e}"
-                )
+                logger.warning(f"Failed to start delayed RX IRQ background handler: {e}")
 
     async def _rx_irq_background_task(self):
         """Background task: waits for RX_DONE IRQ and processes received packets automatically."""
@@ -451,136 +487,153 @@ class SX1262Radio(LoRaRadio):
                         self._is_receiving_packet = True
                         self._last_packet_activity = time.time()
 
+                        callback_packet_data = None
                         try:
-                            # Use the IRQ status stored by the interrupt handler
-                            irqStat = self._last_irq_status
+                            async with self._rx_lock:
+                                # Use the IRQ status stored by the interrupt handler
+                                irqStat = self._last_irq_status
 
-                            if irqStat & self.lora.IRQ_CRC_ERR:
-                                self.crc_error_count += 1
-
-                                try:
-                                    packet_rssi_dbm, snr_db, signal_rssi_dbm = (
-                                        self.lora.getSignalMetrics()
-                                    )
-                                    payloadLengthRx, rxStartBufferPointer = (
-                                        self.lora.getRxBufferStatus()
-                                    )
-                                    device_errors = self.lora.getDeviceErrors()
-                                    noise_floor = self.get_noise_floor()
-                                    raw_packet_hex = ""
-                                    if payloadLengthRx > 0 and payloadLengthRx < 256:
-                                        try:
-                                            buffer = self.lora.readBuffer(
-                                                rxStartBufferPointer, payloadLengthRx
-                                            )
-                                            raw_packet_hex = bytes(buffer).hex()
-                                        except Exception:
-                                            raw_packet_hex = "(read failed)"
-
-                                    logger.warning(
-                                        "[RX] CRC error #%d - RSSI=%ddBm, SNR=%.1fdB, SignalRSSI=%ddBm, "
-                                        "Length=%d, NoiseFloor=%.1fdBm, DeviceErrors=0x%04X, IRQ=0x%04X, "
-                                        "RawData=%s",
-                                        self.crc_error_count,
-                                        int(packet_rssi_dbm),
-                                        snr_db,
-                                        int(signal_rssi_dbm),
-                                        payloadLengthRx,
-                                        noise_floor,
-                                        device_errors,
-                                        irqStat,
-                                        raw_packet_hex,
-                                    )
-                                except Exception as diag_err:
-                                    # Fallback if diagnostic collection fails
-                                    logger.warning(
-                                        "[RX] CRC error #%d - Unable to collect diagnostics: %s",
-                                        self.crc_error_count,
-                                        diag_err,
-                                    )
-                            elif irqStat & self.lora.IRQ_RX_DONE:
-                                (
-                                    payloadLengthRx,
-                                    rxStartBufferPointer,
-                                ) = self.lora.getRxBufferStatus()
-                                (
-                                    packet_rssi_dbm,
-                                    snr_db,
-                                    signal_rssi_dbm,
-                                ) = self.lora.getSignalMetrics()
-                                self.last_rssi = int(packet_rssi_dbm)
-                                self.last_snr = snr_db
-                                self.last_signal_rssi = int(signal_rssi_dbm)
-
-                                logger.debug(
-                                    f"[RX] Packet received: length={payloadLengthRx}, "
-                                    f"RSSI={self.last_rssi}dBm, SNR={self.last_snr}dB"
+                                # Claim and clear the corresponding software latch bits here
+                                # so pre-TX/CAD drain cannot consume the same RX terminal event.
+                                consumed_latch_mask = irqStat & (
+                                    self.lora.IRQ_RX_DONE
+                                    | self.lora.IRQ_CRC_ERR
+                                    | self.lora.IRQ_HEADER_ERR
                                 )
+                                if consumed_latch_mask:
+                                    self._pending_rx_irq_status &= ~consumed_latch_mask
 
-                                # Trigger RX LED
-                                self._gpio_manager.blink_led(self.rxled_pin)
+                                if irqStat & self.lora.IRQ_CRC_ERR:
+                                    self.crc_error_count += 1
 
-                                if payloadLengthRx > 0:
-                                    buffer = self.lora.readBuffer(
-                                        rxStartBufferPointer, payloadLengthRx
-                                    )
-                                    packet_data = bytes(buffer)
-                                    _trace(
-                                        f"[RX] Packet data: {packet_data.hex()[:32]}... "
-                                        f"({len(packet_data)} bytes)"
-                                    )
+                                    try:
+                                        (
+                                            packet_rssi_dbm,
+                                            snr_db,
+                                            signal_rssi_dbm,
+                                        ) = self.lora.getSignalMetrics()
+                                        (
+                                            payloadLengthRx,
+                                            rxStartBufferPointer,
+                                        ) = self.lora.getRxBufferStatus()
+                                        device_errors = self.lora.getDeviceErrors()
+                                        noise_floor = self.get_noise_floor()
+                                        raw_packet_hex = ""
+                                        if payloadLengthRx > 0 and payloadLengthRx < 256:
+                                            try:
+                                                buffer = self.lora.readBuffer(
+                                                    rxStartBufferPointer,
+                                                    payloadLengthRx,
+                                                )
+                                                raw_packet_hex = bytes(buffer).hex()
+                                            except Exception:
+                                                raw_packet_hex = "(read failed)"
 
-                                    # Call user RX callback if set
-                                    if self.rx_callback:
-                                        try:
-                                            self.rx_callback(packet_data)
-                                        except Exception as cb_exc:
-                                            logger.error(f"RX callback error: {cb_exc}")
-                                    else:
                                         logger.warning(
-                                            "[RX] No RX callback registered!"
+                                            "[RX] CRC error #%d - RSSI=%ddBm, "
+                                            "SNR=%.1fdB, SignalRSSI=%ddBm, "
+                                            "Length=%d, NoiseFloor=%.1fdBm, "
+                                            "DeviceErrors=0x%04X, IRQ=0x%04X, "
+                                            "RawData=%s",
+                                            self.crc_error_count,
+                                            int(packet_rssi_dbm),
+                                            snr_db,
+                                            int(signal_rssi_dbm),
+                                            payloadLengthRx,
+                                            noise_floor,
+                                            device_errors,
+                                            irqStat,
+                                            raw_packet_hex,
                                         )
-                                else:
-                                    logger.warning("[RX] Empty packet received")
-                            elif irqStat & self.lora.IRQ_TIMEOUT:
-                                logger.warning("[RX] RX timeout detected")
-                            elif irqStat & self.lora.IRQ_HEADER_ERR:
-                                logger.warning(
-                                    f"[RX] Header error detected (0x{irqStat:04X}) - "
-                                    "corrupted header, restoring RX mode"
-                                )
-                            elif irqStat & self.lora.IRQ_PREAMBLE_DETECTED:
-                                logger.debug("[RX] Preamble detected - packet incoming")
-                            elif irqStat & self.lora.IRQ_SYNC_WORD_VALID:
-                                logger.debug(
-                                    "[RX] Sync word valid - receiving packet data"
-                                )
-                            elif irqStat & self.lora.IRQ_HEADER_VALID:
-                                logger.debug(
-                                    "[RX] Header valid - packet header received, payload coming"
-                                )
-                            else:
-                                logger.debug(f"[RX] Other interrupt: 0x{irqStat:04X}")
+                                    except Exception as diag_err:
+                                        # Fallback if diagnostic collection fails
+                                        logger.warning(
+                                            "[RX] CRC error #%d - "
+                                            "Unable to collect diagnostics: %s",
+                                            self.crc_error_count,
+                                            diag_err,
+                                        )
+                                elif irqStat & self.lora.IRQ_RX_DONE:
+                                    (
+                                        payloadLengthRx,
+                                        rxStartBufferPointer,
+                                    ) = self.lora.getRxBufferStatus()
+                                    (
+                                        packet_rssi_dbm,
+                                        snr_db,
+                                        signal_rssi_dbm,
+                                    ) = self.lora.getSignalMetrics()
+                                    self.last_rssi = int(packet_rssi_dbm)
+                                    self.last_snr = snr_db
+                                    self.last_signal_rssi = int(signal_rssi_dbm)
 
-                            if not self._tx_lock.locked():
-                                try:
-                                    self.lora.request(self.lora.RX_CONTINUOUS)
-                                    self.lora.clearIrqStatus(0xFFFF)
-                                    await asyncio.sleep(self.RADIO_TIMING_DELAY)
-                                    _trace(
-                                        f"[RX] Restored RX continuous mode after IRQ 0x{irqStat:04X}"
+                                    logger.debug(
+                                        f"[RX] Packet received: length={payloadLengthRx}, "
+                                        f"RSSI={self.last_rssi}dBm, SNR={self.last_snr}dB"
                                     )
-                                except Exception as e:
-                                    logger.error(f"Failed to restore RX mode: {e}")
-                            else:
-                                logger.debug(
-                                    f"[RX] Skipped RX restore after IRQ 0x{irqStat:04X}"
-                                    " — TX lock held, send() will restore RX on completion"
-                                )
+
+                                    # Trigger RX LED
+                                    self._gpio_manager.blink_led(self.rxled_pin)
+
+                                    if payloadLengthRx > 0:
+                                        buffer = self.lora.readBuffer(
+                                            rxStartBufferPointer, payloadLengthRx
+                                        )
+                                        callback_packet_data = bytes(buffer)
+                                        _trace(
+                                            f"[RX] Packet data: "
+                                            f"{callback_packet_data.hex()[:32]}... "
+                                            f"({len(callback_packet_data)} bytes)"
+                                        )
+                                    else:
+                                        logger.warning("[RX] Empty packet received")
+                                elif irqStat & self.lora.IRQ_TIMEOUT:
+                                    logger.warning("[RX] RX timeout detected")
+                                elif irqStat & self.lora.IRQ_HEADER_ERR:
+                                    logger.warning(
+                                        f"[RX] Header error detected (0x{irqStat:04X}) - "
+                                        "corrupted header, restoring RX mode"
+                                    )
+                                elif irqStat & self.lora.IRQ_PREAMBLE_DETECTED:
+                                    logger.debug("[RX] Preamble detected - packet incoming")
+                                elif irqStat & self.lora.IRQ_SYNC_WORD_VALID:
+                                    logger.debug("[RX] Sync word valid - receiving packet data")
+                                elif irqStat & self.lora.IRQ_HEADER_VALID:
+                                    logger.debug(
+                                        "[RX] Header valid - packet header received, payload coming"
+                                    )
+                                else:
+                                    logger.debug(f"[RX] Other interrupt: 0x{irqStat:04X}")
+
+                                if not self._tx_lock.locked():
+                                    try:
+                                        self.lora.request(self.lora.RX_CONTINUOUS)
+                                        self.lora.clearIrqStatus(0xFFFF)
+                                        await asyncio.sleep(self.RADIO_TIMING_DELAY)
+                                        _trace(
+                                            f"[RX] Restored RX continuous mode "
+                                            f"after IRQ 0x{irqStat:04X}"
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"Failed to restore RX mode: {e}")
+                                else:
+                                    logger.debug(
+                                        f"[RX] Skipped RX restore after IRQ 0x{irqStat:04X}"
+                                        " — TX lock held, send() will restore RX on completion"
+                                    )
+
+                            # Call callback outside _rx_lock so readers and
+                            # callback work don't serialize.
+                            if callback_packet_data is not None:
+                                if self.rx_callback:
+                                    try:
+                                        self.rx_callback(callback_packet_data)
+                                    except Exception as cb_exc:
+                                        logger.error(f"RX callback error: {cb_exc}")
+                                else:
+                                    logger.warning("[RX] No RX callback registered!")
                         except Exception as e:
-                            logger.error(
-                                f"[IRQ RX] Error processing received packet: {e}"
-                            )
+                            logger.error(f"[IRQ RX] Error processing received packet: {e}")
                         finally:
                             # Clear packet processing flag
                             self._is_receiving_packet = False
@@ -670,9 +723,7 @@ class SX1262Radio(LoRaRadio):
 
             # Setup TXEN pin if needed
             if self.txen_pin != -1 and not self._txen_pin_setup:
-                if self._gpio_manager.setup_output_pin(
-                    self.txen_pin, initial_value=False
-                ):
+                if self._gpio_manager.setup_output_pin(self.txen_pin, initial_value=False):
                     logger.debug(f"TXEN pin {self.txen_pin} configured")
                     self._txen_pin_setup = True
                 else:
@@ -680,9 +731,7 @@ class SX1262Radio(LoRaRadio):
 
             # Setup RXEN pin if needed
             if self.rxen_pin != -1:
-                if self._gpio_manager.setup_output_pin(
-                    self.rxen_pin, initial_value=False
-                ):
+                if self._gpio_manager.setup_output_pin(self.rxen_pin, initial_value=False):
                     logger.debug(f"RXEN pin {self.rxen_pin} configured")
                 else:
                     logger.warning(f"Could not setup RXEN pin {self.rxen_pin}")
@@ -694,18 +743,14 @@ class SX1262Radio(LoRaRadio):
 
             # Setup LED pins if specified
             if self.txled_pin != -1 and not self._txled_pin_setup:
-                if self._gpio_manager.setup_output_pin(
-                    self.txled_pin, initial_value=False
-                ):
+                if self._gpio_manager.setup_output_pin(self.txled_pin, initial_value=False):
                     self._txled_pin_setup = True
                     logger.debug(f"TX LED pin {self.txled_pin} configured")
                 else:
                     logger.warning(f"Could not setup TX LED pin {self.txled_pin}")
 
             if self.rxled_pin != -1 and not self._rxled_pin_setup:
-                if self._gpio_manager.setup_output_pin(
-                    self.rxled_pin, initial_value=False
-                ):
+                if self._gpio_manager.setup_output_pin(self.rxled_pin, initial_value=False):
                     self._rxled_pin_setup = True
                     logger.debug(f"RX LED pin {self.rxled_pin} configured")
                 else:
@@ -752,9 +797,7 @@ class SX1262Radio(LoRaRadio):
                         f"mapped to closest {closest_voltage}V"
                     )
                 else:
-                    logger.debug(
-                        f"DIO3 TCXO voltage {self.dio3_tcxo_voltage}V mapped exactly"
-                    )
+                    logger.debug(f"DIO3 TCXO voltage {self.dio3_tcxo_voltage}V mapped exactly")
 
                 # Set TCXO with 5ms delay (standard value)
                 self.lora.setDio3TcxoCtrl(voltage_constant, self.lora.TCXO_DELAY_5)
@@ -807,9 +850,7 @@ class SX1262Radio(LoRaRadio):
             self.lora.setBufferBaseAddress(0x00, 0x80)  # TX=0x00, RX=0x80
 
             # Set TX power
-            logger.info(
-                f"Setting TX power to {self.tx_power} dBm during initialization"
-            )
+            logger.info(f"Setting TX power to {self.tx_power} dBm during initialization")
             self.lora.setTxPower(self.tx_power, self.lora.TX_POWER_SX1262)
 
             # Configure modulation parameters
@@ -836,9 +877,7 @@ class SX1262Radio(LoRaRadio):
             # Configure RX interrupts and gain
             rx_mask = self._get_rx_irq_mask()
             self.lora.clearIrqStatus(0xFFFF)
-            self.lora.setDioIrqParams(
-                rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE
-            )
+            self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
             self.lora.setRxGain(self.lora.RX_GAIN_BOOSTED)
 
             # Program custom CAD thresholds to chip hardware if available
@@ -901,9 +940,7 @@ class SX1262Radio(LoRaRadio):
                             # when one is available
                             return True
 
-                        self._rx_irq_task = loop.create_task(
-                            self._rx_irq_background_task()
-                        )
+                        self._rx_irq_task = loop.create_task(self._rx_irq_background_task())
                         logger.debug("[RX] RX IRQ background task started")
                     else:
                         logger.debug("[RX] RX IRQ background task already running")
@@ -918,20 +955,12 @@ class SX1262Radio(LoRaRadio):
 
     def _calculate_tx_timeout(self, packet_length: int) -> tuple[int, int]:
         """
-        Calculate the LoRa packet airtime and transmission timeout using the standard
-        Semtech formula.
+        Calculate the LoRa packet airtime and transmission timeout.
 
-        This method implements the LoRa airtime calculation as described in the Semtech
-        LoRa Modem Designer's Guide (AN1200.13, section 4.1), taking into account the
-        following parameters:
-            - Spreading Factor (SF)
-            - Bandwidth (BW)
-            - Coding Rate (CR)
-            - Preamble length
-            - Explicit/implicit header mode (always explicit here)
-            - CRC enabled (always enabled here)
-            - Low Data Rate Optimization (enabled if SF >= 11 and BW <= 125 kHz)
-            - Payload length (packet_length)
+        Airtime comes from the shared ``calculate_lora_airtime_ms`` (the
+        RadioLib-matching Semtech formula; explicit header, CRC on, LDRO by
+        the driver's symbol-time auto rule) using this radio's configured SF,
+        bandwidth, coding rate, and preamble length.
 
         Returns:
             timeout_ms (int): Calculated packet transmission timeout in milliseconds
@@ -941,38 +970,17 @@ class SX1262Radio(LoRaRadio):
         """
         sf = self.spreading_factor
         bw_hz = int(self.bandwidth)  # your class already stores Hz
-        cr = self.coding_rate  # 1→4/5, 2→4/6, 3→4/7, 4→4/8
-        preamble = self.preamble_length
-        crc_on = True  # you always enable CRC
-        explicit_header = True  # you always use explicit header
-        low_dr_opt = 1 if (sf >= 11 and bw_hz <= 125000) else 0
-        symbol_time = (1 << sf) / float(bw_hz)
-        preamble_time = (preamble + 4.25) * symbol_time
-        ih = 0 if explicit_header else 1
-        crc = 1 if crc_on else 0
+        cr_denom = coding_rate_denominator(self.coding_rate)
 
-        tmp = 8 * packet_length - 4 * sf + 28 + 16 * crc - 20 * ih
-
-        denom = 4 * (sf - 2 * low_dr_opt)
-
-        if tmp > 0:
-            payload_symbols = 8 + max(math.ceil(tmp / denom) * (cr + 4), 0)
-        else:
-            payload_symbols = 8
-
-        payload_time = payload_symbols * symbol_time
-        air_time_ms = (preamble_time + payload_time) * 1000.0
+        air_time_ms = calculate_lora_airtime_ms(
+            packet_length, sf, bw_hz, cr_denom, self.preamble_length
+        )
         timeout_ms = math.ceil(air_time_ms) + 1000
         driver_timeout = timeout_ms * 64
 
         _trace(
             f"TX timing SF{sf}/{bw_hz / 1000:.1f}kHz "
-            f"CR4/{cr} {packet_length}B: "
-            f"symbol={symbol_time * 1000:.3f}ms, "
-            f"preamble={preamble_time * 1000:.1f}ms, "
-            f"tmp={tmp}, "
-            f"payload_syms={payload_symbols:.1f}, "
-            f"payload={payload_time * 1000:.1f}ms, "
+            f"CR4/{cr_denom} {packet_length}B: "
             f"air_time={air_time_ms:.1f}ms, "
             f"timeout={timeout_ms}ms, "
             f"driver_timeout={driver_timeout}"
@@ -988,17 +996,11 @@ class SX1262Radio(LoRaRadio):
         crcType = self.lora.CRC_ON
         invertIq = self.lora.IQ_STANDARD
 
-        self.lora.setPacketParamsLoRa(
-            preambleLength, headerType, length, crcType, invertIq
-        )
+        self.lora.setPacketParamsLoRa(preambleLength, headerType, length, crcType, invertIq)
 
     def _setup_tx_interrupts(self) -> None:
         """Configure interrupts for transmission - TX and CAD only, disable RX interrupts"""
-        mask = (
-            self._get_tx_irq_mask()
-            | self.lora.IRQ_CAD_DONE
-            | self.lora.IRQ_CAD_DETECTED
-        )
+        mask = self._get_tx_irq_mask() | self.lora.IRQ_CAD_DONE | self.lora.IRQ_CAD_DETECTED
         self.lora.setDioIrqParams(mask, mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
 
         existing_irq = self.lora.getIrqStatus()
@@ -1009,10 +1011,13 @@ class SX1262Radio(LoRaRadio):
         """Prepare radio hardware for transmission. Returns (success, lbt_backoff_delays_ms)."""
         self._tx_done_event.clear()
         self._rx_done_event.clear()
+
+        # Drain any packet-bearing RX IRQ that fired while TX was active and was
+        # latched in software before we begin CAD/TX buffer reuse.
+        await self._drain_pending_rx_irq_before_buffer_reuse()
+
         self.lora.setStandby(self.lora.STANDBY_RC)
-        await asyncio.sleep(
-            self.RADIO_TIMING_DELAY
-        )  # Give hardware time to enter standby
+        await asyncio.sleep(self.RADIO_TIMING_DELAY)  # Give hardware time to enter standby
         if self.lora.busyCheck():
             busy_wait = 0
             while self.lora.busyCheck() and busy_wait < 20:
@@ -1028,9 +1033,7 @@ class SX1262Radio(LoRaRadio):
             try:
                 channel_busy = await self.perform_cad(timeout=0.5, respect_tx_lock=False)
                 if not channel_busy:
-                    _trace(
-                        f"CAD check clear - channel available after {lbt_attempts + 1} attempts"
-                    )
+                    _trace(f"CAD check clear - channel available after {lbt_attempts + 1} attempts")
                     break
 
                 _trace("CAD check still busy - channel activity detected")
@@ -1131,9 +1134,7 @@ class SX1262Radio(LoRaRadio):
             busy_timeout += 1
 
         if self.lora.busyCheck():
-            logger.error(
-                "Radio stayed busy after TX command - transmission may not have started"
-            )
+            logger.error("Radio stayed busy after TX command - transmission may not have started")
             return False
 
         # Check initial interrupt status immediately after TX command
@@ -1161,9 +1162,7 @@ class SX1262Radio(LoRaRadio):
             self.lora.clearIrqStatus(initial_status)
             return False
         elif initial_status != 0:
-            logger.warning(
-                f"Unexpected initial interrupt status: 0x{initial_status:04X}"
-            )
+            logger.warning(f"Unexpected initial interrupt status: 0x{initial_status:04X}")
             # Clear any unexpected flags but continue
             self.lora.clearIrqStatus(initial_status)
 
@@ -1228,9 +1227,7 @@ class SX1262Radio(LoRaRadio):
                         pass
                     return False
 
-    async def _handle_transmission_timeout(
-        self, timeout_seconds: float, start_time: float
-    ) -> None:
+    async def _handle_transmission_timeout(self, timeout_seconds: float, start_time: float) -> None:
         """Handle transmission timeout and provide diagnostic information"""
         logger.error(
             f"Transmission wait timed out after {timeout_seconds:.1f} seconds - "
@@ -1243,9 +1240,7 @@ class SX1262Radio(LoRaRadio):
 
         # Check if this is a configuration issue
         if irqStat == 0x0200:  # Only timeout bit set
-            logger.error(
-                "Radio configuration issue: TX operation timed out without starting"
-            )
+            logger.error("Radio configuration issue: TX operation timed out without starting")
 
         self.lora.clearIrqStatus(irqStat)
 
@@ -1270,9 +1265,7 @@ class SX1262Radio(LoRaRadio):
             tx_time = self.lora.transmitTime()
             if tx_time > 0:
                 data_rate = self.lora.dataRate()
-                logger.debug(
-                    f"Packet transmitted: {tx_time:.2f}ms, {data_rate:.2f} bytes/s"
-                )
+                logger.debug(f"Packet transmitted: {tx_time:.2f}ms, {data_rate:.2f} bytes/s")
         except Exception as e:
             logger.debug(f"Transmission stats not available: {e}")
 
@@ -1310,9 +1303,7 @@ class SX1262Radio(LoRaRadio):
 
                 # Step 5: Restore RX interrupt configuration
                 rx_mask = self._get_rx_irq_mask()
-                self.lora.setDioIrqParams(
-                    rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE
-                )
+                self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
                 await asyncio.sleep(0.001)
 
                 # Step 6: Start RX mode
@@ -1346,8 +1337,6 @@ class SX1262Radio(LoRaRadio):
                 # Airtime is the timeout minus the 1000ms margin we add
                 airtime_ms = final_timeout_ms - 1000
 
-                self._prepare_packet_transmission(data_list, length)
-
                 _trace(
                     f"Setting TX timeout: {final_timeout_ms}ms "
                     f"(tOut={driver_timeout}) for {length} bytes"
@@ -1357,6 +1346,8 @@ class SX1262Radio(LoRaRadio):
                 tx_ready, lbt_backoff_delays = await self._prepare_radio_for_tx()
                 if not tx_ready:
                     raise RuntimeError("Radio not ready for TX")
+
+                self._prepare_packet_transmission(data_list, length)
 
                 # Setup TX interrupts AFTER CAD checks (CAD changes interrupt config)
                 self._setup_tx_interrupts()
@@ -1422,10 +1413,25 @@ class SX1262Radio(LoRaRadio):
         if not self._initialized or self.lora is None:
             return
 
+        # If enough samples are already buffered, finalize immediately.
+        if self._num_floor_samples >= self.NUM_NOISE_FLOOR_SAMPLES and self._floor_sample_sum != 0:
+            new_noise_floor = self._floor_sample_sum / self.NUM_NOISE_FLOOR_SAMPLES
+
+            # Clamp to reasonable bounds (-150 to -50 dBm)
+            if new_noise_floor < -150:
+                new_noise_floor = -150
+            elif new_noise_floor > -50:
+                new_noise_floor = -50
+
+            self._noise_floor = new_noise_floor
+            self._floor_sample_sum = 0.0
+            self._num_floor_samples = 0
+            return
+
         # Rate-limit sampling checks to every 100ms (not every 10ms timeout)
         # This reduces CPU waste from 100 function calls/sec to ~10/sec
         now = time.time()
-        if now - self._last_sample_check < 0.1:
+        if self._num_floor_samples == 0 and now - self._last_sample_check < 0.1:
             return
         self._last_sample_check = now
 
@@ -1455,9 +1461,7 @@ class SX1262Radio(LoRaRadio):
                         accept_sample = -150 < current_rssi < -30
                     else:
                         # Normal: only accept samples near current noise floor
-                        accept_sample = current_rssi < (
-                            self._noise_floor + self.SAMPLING_THRESHOLD
-                        )
+                        accept_sample = current_rssi < (self._noise_floor + self.SAMPLING_THRESHOLD)
 
                     if accept_sample:
                         self._num_floor_samples += 1
@@ -1465,23 +1469,6 @@ class SX1262Radio(LoRaRadio):
 
             except Exception as e:
                 logger.debug(f"Failed to sample noise floor: {e}")
-
-        elif (
-            self._num_floor_samples >= self.NUM_NOISE_FLOOR_SAMPLES
-            and self._floor_sample_sum != 0
-        ):
-            # Calculate new noise floor average
-            new_noise_floor = self._floor_sample_sum / self.NUM_NOISE_FLOOR_SAMPLES
-
-            # Clamp to reasonable bounds (-150 to -50 dBm)
-            if new_noise_floor < -150:
-                new_noise_floor = -150
-            elif new_noise_floor > -50:
-                new_noise_floor = -50
-
-            self._noise_floor = new_noise_floor
-            self._floor_sample_sum = 0.0
-            self._num_floor_samples = 0
 
     def get_noise_floor(self) -> Optional[float]:
         """
@@ -1516,9 +1503,7 @@ class SX1262Radio(LoRaRadio):
             self.tx_power = power
             self.lora.setTxPower(power, self.lora.TX_POWER_SX1262)
 
-        return self._safe_radio_operation(
-            "set TX power", set_power, f"TX power set to {power} dBm"
-        )
+        return self._safe_radio_operation("set TX power", set_power, f"TX power set to {power} dBm")
 
     def set_spreading_factor(self, sf: int) -> bool:
         """Set spreading factor (6-12)"""
@@ -1587,9 +1572,7 @@ class SX1262Radio(LoRaRadio):
             self._floor_sample_sum = 0.0
             rx_mask = self._get_rx_irq_mask()
             self.lora.clearIrqStatus(0xFFFF)
-            self.lora.setDioIrqParams(
-                rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE
-            )
+            self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
             self.lora.request(self.lora.RX_CONTINUOUS)
             time.sleep(self._RADIO_TIMING_DELAY)
             self.lora.clearIrqStatus(0xFFFF)
@@ -1723,9 +1706,10 @@ class SX1262Radio(LoRaRadio):
         if cad_symbol_num is None:
             cad_symbol_num = self._custom_cad_symbol_num or 2
         cad_symbol_num = int(cad_symbol_num)
-        cad_symbol_constant = self._resolve_cad_symbol_constant(cad_symbol_num)
         acquired_tx_lock = False
         try:
+            cad_symbol_constant = self._resolve_cad_symbol_constant(cad_symbol_num)
+
             if respect_tx_lock:
                 try:
                     await asyncio.wait_for(
@@ -1748,13 +1732,13 @@ class SX1262Radio(LoRaRadio):
                             "error": "cad_waited_for_tx_lock_timeout",
                         }
                     return False
+
+            await self._drain_pending_rx_irq_before_buffer_reuse()
             # Critical sequence to prevent interrupt race conditions during CAD
 
             # Step 1: Put radio in standby mode before CAD configuration
             self.lora.setStandby(self.lora.STANDBY_RC)
-            await asyncio.sleep(
-                self.RADIO_TIMING_DELAY
-            )  # Give hardware time to enter standby
+            await asyncio.sleep(self.RADIO_TIMING_DELAY)  # Give hardware time to enter standby
 
             # Step 2: Clear any existing interrupt flags
             existing_irq = self.lora.getIrqStatus()
@@ -1783,9 +1767,7 @@ class SX1262Radio(LoRaRadio):
 
             # Step 4: Configure CAD interrupts
             cad_mask = self.lora.IRQ_CAD_DONE | self.lora.IRQ_CAD_DETECTED
-            self.lora.setDioIrqParams(
-                cad_mask, cad_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE
-            )
+            self.lora.setDioIrqParams(cad_mask, cad_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
             await asyncio.sleep(0.001)  # Let interrupt config settle
 
             # Step 5: Configure CAD parameters
@@ -1905,9 +1887,7 @@ class SX1262Radio(LoRaRadio):
                 self.lora.clearIrqStatus(0xFFFF)
 
                 self.lora.setStandby(self.lora.STANDBY_RC)
-                await asyncio.sleep(
-                    self.RADIO_TIMING_DELAY
-                )  # Give hardware time to enter standby
+                await asyncio.sleep(self.RADIO_TIMING_DELAY)  # Give hardware time to enter standby
 
                 self.lora.setDioIrqParams(
                     self.lora.IRQ_NONE,
@@ -1919,9 +1899,7 @@ class SX1262Radio(LoRaRadio):
 
                 self.lora.clearIrqStatus(0xFFFF)
                 rx_mask = self._get_rx_irq_mask()
-                self.lora.setDioIrqParams(
-                    rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE
-                )
+                self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
                 await asyncio.sleep(0.001)
                 if acquired_tx_lock or not self._tx_lock.locked():
                     self.lora.request(self.lora.RX_CONTINUOUS)

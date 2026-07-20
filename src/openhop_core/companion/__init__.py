@@ -41,7 +41,18 @@ from .constants import (
 from .contact_store import ContactStore
 from .frame_server import CompanionFrameServer
 from .message_queue import MessageQueue
-from .models import AdvertPath, Channel, Contact, NodePrefs, PacketStats, QueuedMessage, SentResult
+from .models import (
+    AdvertPath,
+    Channel,
+    ChannelDataEvent,
+    ChannelMessageEvent,
+    Contact,
+    MessageEvent,
+    NodePrefs,
+    PacketStats,
+    QueuedMessage,
+    SentResult,
+)
 from .path_cache import PathCache
 from .stats_collector import StatsCollector
 
@@ -64,6 +75,9 @@ __all__ = [
     "PacketStats",
     "AdvertPath",
     "QueuedMessage",
+    "MessageEvent",
+    "ChannelMessageEvent",
+    "ChannelDataEvent",
     # ADV Types
     "ADV_TYPE_CHAT",
     "ADV_TYPE_REPEATER",

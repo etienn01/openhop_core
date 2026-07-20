@@ -93,6 +93,7 @@ if _HAS_BASE:
 
     class _RadioBase(LoRaRadio):
         pass
+
 else:
 
     class _RadioBase:
@@ -598,9 +599,7 @@ class USBLoRaRadio(_RadioBase):
             }
         or None on timeout.
         """
-        resp = await self._send_command(
-            CMD_GET_WIFI, b"", expect_cmd=CMD_WIFI_STATUS, timeout=2.0
-        )
+        resp = await self._send_command(CMD_GET_WIFI, b"", expect_cmd=CMD_WIFI_STATUS, timeout=2.0)
         if resp is None:
             return None
         return self._parse_wifi_status(resp)
@@ -627,9 +626,7 @@ class USBLoRaRadio(_RadioBase):
         Device will reboot and drop the serial link. USB OTA/provisioning
         remains possible via `set_wifi_credentials()` after re-connecting.
         """
-        resp = await self._send_command(
-            CMD_WIFI_RESET, b"", expect_cmd=CMD_WIFI_RESET, timeout=2.0
-        )
+        resp = await self._send_command(CMD_WIFI_RESET, b"", expect_cmd=CMD_WIFI_RESET, timeout=2.0)
         return resp is not None
 
     @staticmethod
@@ -897,9 +894,7 @@ class USBLoRaRadio(_RadioBase):
             self.last_signal_rssi = signal_rssi
             self._rx_count += 1
 
-            logger.debug(
-                f"RX: {len(lora_data)}B RSSI={rssi}dBm SNR={snr_x10 / 10:.1f}dB"
-            )
+            logger.debug(f"RX: {len(lora_data)}B RSSI={rssi}dBm SNR={snr_x10 / 10:.1f}dB")
 
             # Invoke RX callback on the event loop thread.
             # pymc_core dispatcher._on_packet_received calls asyncio.get_running_loop()
@@ -980,9 +975,7 @@ class USBLoRaRadio(_RadioBase):
             try:
                 await asyncio.wait_for(evt.wait(), timeout=timeout)
             except asyncio.TimeoutError:
-                logger.warning(
-                    f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}"
-                )
+                logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
                 return None
 
             return self._response_data.get(expect_cmd)

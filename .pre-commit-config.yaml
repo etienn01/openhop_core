@@ -10,10 +10,11 @@ repos:
 
   # Python formatting (Black) - apply to all Python files
   - repo: https://github.com/psf/black
-    rev: 23.3.0
+    rev: 26.5.1
     hooks:
       - id: black
         language_version: python3
+        exclude: '^(tests/|examples/|src/openhop_core/hardware/lora/)'
 
   # Python import sorting (isort) - apply to all Python files
   - repo: https://github.com/pycqa/isort
@@ -21,10 +22,11 @@ repos:
     hooks:
       - id: isort
         args: ["--profile", "black", "--line-length", "100"]
+        exclude: '^(tests/|src/openhop_core/hardware/lora/)'
 
   # Python linting (flake8) - strict settings for code quality
   - repo: https://github.com/pycqa/flake8
-    rev: 6.0.0
+    rev: 7.1.1
     hooks:
       - id: flake8
         # Strict but reasonable settings
@@ -33,7 +35,7 @@ repos:
           "--extend-ignore=E203,E231,W503"
         ]
         # Exclude third-party code but check our core code
-        exclude: '^(src/openhop_core/hardware/lora/|examples/)'
+        exclude: '^(src/openhop_core/hardware/lora/|examples/|scripts/test_modem_crypto\.py$)'
 
   # Run pytest to ensure all tests pass
   # - repo: local
