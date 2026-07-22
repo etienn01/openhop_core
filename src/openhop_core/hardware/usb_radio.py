@@ -73,6 +73,7 @@ from .protocol_constants import (
     WIFI_MODE_OFFLINE,
     WIFI_MODE_STA_CONNECTED,
     WIFI_MODE_STA_CONNECTING,
+    build_cad_params_payload,
     build_frame,
     crc16_ccitt,
 )
@@ -165,6 +166,7 @@ class USBLoRaRadio(_RadioBase):
         # AttributeError before the first call.
         self._custom_cad_peak: Optional[int] = None
         self._custom_cad_min: Optional[int] = None
+        self._custom_cad_symbol_num: Optional[int] = None
 
         # TX lock to serialize transmissions (matches SX1262Radio)
         self._tx_lock = asyncio.Lock()
@@ -499,27 +501,28 @@ class USBLoRaRadio(_RadioBase):
         det_min: Optional[int] = None,
         timeout: float = 1.0,
         calibration: bool = False,
+        cad_symbol_num: Optional[int] = None,
     ) -> bool:
         """Public CAD interface matching SX1262Radio.perform_cad().
 
         When det_peak/det_min are supplied (used by the repeater CAD
-        calibration tool to sweep different thresholds), program the chip
-        with those values via CMD_SET_CAD_PARAMS before running the scan.
+        calibration tool), program the thresholds and requested symbol count
+        via CMD_SET_CAD_PARAMS before running the scan.
         """
+        if cad_symbol_num is None:
+            cad_symbol_num = self._custom_cad_symbol_num or 2
+        cad_symbol_num = int(cad_symbol_num)
+
         if det_peak is not None and det_min is not None:
             new_peak = int(det_peak)
             new_min = int(det_min)
-            # Same caching rationale as tcp_radio: avoid re-sending unchanged
-            # thresholds during the per-sample inner loop of calibration.
-            if new_peak != self._custom_cad_peak or new_min != self._custom_cad_min:
-                payload = bytes(
-                    [
-                        0x01,
-                        new_peak & 0xFF,
-                        new_min & 0xFF,
-                        0x00,
-                    ]
-                )
+            # Avoid re-sending only when thresholds and symbol count all match.
+            if (
+                new_peak != self._custom_cad_peak
+                or new_min != self._custom_cad_min
+                or cad_symbol_num != self._custom_cad_symbol_num
+            ):
+                payload = build_cad_params_payload(cad_symbol_num, new_peak, new_min)
                 await self._send_command(
                     CMD_SET_CAD_PARAMS,
                     payload,
@@ -528,11 +531,18 @@ class USBLoRaRadio(_RadioBase):
                 )
                 self._custom_cad_peak = new_peak
                 self._custom_cad_min = new_min
+                self._custom_cad_symbol_num = cad_symbol_num
 
         # Calibration tool sends timeout=0.3 which is tight for our stack;
         # raise the floor so we don't lose samples to "no response".
         effective = max(timeout, 0.6)
         return await self._perform_cad(effective)
+
+    def set_custom_cad_symbol_num(self, cad_symbol_num: int) -> bool:
+        """Store a validated CAD symbol count for calls that omit an override."""
+        build_cad_params_payload(cad_symbol_num, 0, 0)
+        self._custom_cad_symbol_num = int(cad_symbol_num)
+        return True
 
     # ── Wi-Fi / OTA provisioning (v0.5) ───────────────────────
 

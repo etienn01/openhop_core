@@ -86,6 +86,18 @@ RADIO_CONFIG_SIZE = struct.calcsize(RADIO_CONFIG_FMT)
 STATUS_RESP_FMT = "<IIIIhhhbB"
 STATUS_RESP_SIZE = struct.calcsize(STATUS_RESP_FMT)
 
+# RadioLib CAD symbol-count encoding used by CMD_SET_CAD_PARAMS.
+CAD_SYMBOL_CODES = {1: 0x00, 2: 0x01, 4: 0x02, 8: 0x03, 16: 0x04}
+
+
+def build_cad_params_payload(cad_symbol_num: int, peak: int, min_val: int) -> bytes:
+    """Build the firmware CAD-parameter payload for a supported symbol count."""
+    try:
+        symbol_code = CAD_SYMBOL_CODES[int(cad_symbol_num)]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("cad_symbol_num must be one of: 1, 2, 4, 8, 16") from exc
+    return bytes([symbol_code, int(peak) & 0xFF, int(min_val) & 0xFF, 0x00])
+
 
 # ─── Framing helpers ─────────────────────────────────────────────────
 
@@ -176,7 +188,9 @@ __all__ = [
     "RADIO_CONFIG_SIZE",
     "STATUS_RESP_FMT",
     "STATUS_RESP_SIZE",
+    "CAD_SYMBOL_CODES",
     # Framing
     "crc16_ccitt",
     "build_frame",
+    "build_cad_params_payload",
 ]
