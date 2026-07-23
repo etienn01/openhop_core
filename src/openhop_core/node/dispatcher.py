@@ -546,10 +546,18 @@ class Dispatcher:
 
         # When disabled, packet_filter still tracks hashes for stats/visibility.
         packet_hash = pkt.calculate_packet_hash().hex()[:16]
-        if self.dedupe_enabled and self.packet_filter.is_duplicate(packet_hash):
-            self._log(f"Duplicate packet ignored (hash: {packet_hash})")
-            return
-        self.packet_filter.track_packet(packet_hash)
+        # MeshCore records a routed-direct packet in its seen table only when
+        # this node is the next hop (Mesh::onRecvPacket). A node that overhears
+        # an earlier route variant must not mark the path-independent hash seen,
+        # or it would later drop the self-stripped copy it is asked to relay.
+        # Flood, zero-hop direct and direct TRACE keep unconditional dedup: the
+        # first two match firmware's up-front markSeen, and the TRACE hash folds
+        # in path_len so its per-hop copies never collide.
+        if not self._is_transit_direct_not_next_hop(pkt):
+            if self.dedupe_enabled and self.packet_filter.is_duplicate(packet_hash):
+                self._log(f"Duplicate packet ignored (hash: {packet_hash})")
+                return
+            self.packet_filter.track_packet(packet_hash)
 
         # Client-repeat: build the retransmit from the just-received packet
         # BEFORE handlers run, so a copy is taken while path/payload are intact
@@ -762,6 +770,29 @@ class Dispatcher:
         fwd._flood_scope_applied = True
         fwd._path_hash_mode_applied = True
         return fwd
+
+    def _is_transit_direct_not_next_hop(self, pkt: Packet) -> bool:
+        """True for a routed-direct packet this node is not the next hop for.
+
+        Mirrors MeshCore ``Mesh::onRecvPacket``, which records a routed-direct
+        packet in the seen table only inside the
+        ``isHashMatch(path) && allowPacketForward`` branch. Such packets must be
+        left out of dedup so an overheard longer-path variant does not suppress
+        the self-stripped copy this node is later the next hop for. Direct TRACE
+        is excluded (its hash folds in ``path_len``, so per-hop copies never
+        collide) as are flood and zero-hop-direct packets.
+        """
+        if not pkt.is_route_direct() or pkt.get_path_hash_count() <= 0:
+            return False
+        if pkt.get_payload_type() == PAYLOAD_TYPE_TRACE:
+            return False
+        if self.local_identity is None:
+            return False
+        self_key = self.local_identity.get_public_key()
+        hash_size = pkt.get_path_hash_size()
+        if len(pkt.path) < hash_size:
+            return False
+        return bytes(pkt.path[:hash_size]) != self_key[:hash_size]
 
     def _build_client_repeat_forward(self, pkt: Packet) -> Optional[Packet]:
         """Build the retransmit packet for a received packet, or None to drop.
