@@ -693,6 +693,7 @@ class _SendOpsMixin:
         log_label: str,
         cleanup: Optional[Callable[[], None]],
         response_tag_registered: Optional[Callable[[int], None]],
+        contact_pubkey: Optional[bytes] = None,
     ) -> dict:
         """Finish a request after its first packet has already been sent."""
         try:
@@ -701,6 +702,8 @@ class _SendOpsMixin:
                 return result
 
             for attempt in range(1, DEFAULT_MAX_ATTEMPTS):
+                if contact_pubkey is not None:
+                    await self._teach_return_path_before_retry(contact_pubkey, log_label)
                 pkt, packet_tag = build_packet()
                 if response_tag_registered is not None and packet_tag is not None:
                     response_tag_registered(packet_tag)
@@ -744,6 +747,7 @@ class _SendOpsMixin:
         sent_tag: Optional[int] = None,
         cleanup: Optional[Callable[[], None]] = None,
         response_tag_registered: Optional[Callable[[int], None]] = None,
+        contact_pubkey: Optional[bytes] = None,
     ) -> dict:
         """Send the first packet and return its metadata plus a waiter task."""
         deadline = time.monotonic() + total_timeout_s if total_timeout_s is not None else None
@@ -783,6 +787,7 @@ class _SendOpsMixin:
                     log_label=log_label,
                     cleanup=cleanup,
                     response_tag_registered=response_tag_registered,
+                    contact_pubkey=contact_pubkey,
                 ),
                 f"{log_label} response",
             )
@@ -1006,6 +1011,7 @@ class _SendOpsMixin:
         total_timeout_s: Optional[float] = None,
         log_label: str = "request",
         response_tag_registered: Optional[Callable[[int], None]] = None,
+        contact_pubkey: Optional[bytes] = None,
     ) -> dict:
         """Send a request up to DEFAULT_MAX_ATTEMPTS times until a response lands.
 
@@ -1016,10 +1022,15 @@ class _SendOpsMixin:
         ``total_timeout_s`` caps the cumulative wait across attempts: the final
         attempt's wait is clipped to the remaining budget and no new attempt
         starts once the budget is spent.
+
+        A timed-out attempt also re-teaches our return path when ``contact_pubkey``
+        is known; see :meth:`_teach_return_path_before_retry`.
         """
         result: dict = {"timeout": True}
         deadline = time.monotonic() + total_timeout_s if total_timeout_s else None
         for attempt in range(DEFAULT_MAX_ATTEMPTS):
+            if attempt > 0 and contact_pubkey is not None:
+                await self._teach_return_path_before_retry(contact_pubkey, log_label)
             pkt, packet_tag = build_packet()
             if response_tag_registered is not None and packet_tag is not None:
                 response_tag_registered(packet_tag)
@@ -1045,14 +1056,39 @@ class _SendOpsMixin:
                 break
         return result
 
+    async def _teach_return_path_before_retry(self, contact_pubkey: bytes, log_label: str) -> None:
+        """Re-teach our return path after a request attempt timed out.
+
+        openHop hardening with no firmware equivalent. When a server answers
+        DIRECT down a route that no longer reaches us, *nothing* arrives — there
+        is no flood reply to trigger the normal re-teach and no inbound path to
+        embed. A timeout against a contact we hold an ``out_path`` for is the
+        only evidence available, so the teacher falls back to reversing our own
+        ``out_path`` (see ``maybe_teach_reverse_of_out_path``). Best-effort: any
+        failure just leaves the retry to proceed as before.
+        """
+        try:
+            proto_handler = self._get_protocol_response_handler()
+            teacher = getattr(proto_handler, "return_path_teacher", None)
+            if teacher is None:
+                return
+            await teacher.maybe_teach_reverse_of_out_path(
+                contact_pubkey, reason=f"{log_label} retry after timeout"
+            )
+        except Exception as e:
+            logger.debug("[PATHDIAG] return-path teach before retry failed: %s", e)
+
     async def _wait_for_path_propagation(self, proxy: Any, request_type: str) -> None:
         """Log the pre-send path; no longer sleeps.
 
-        Firmware sends the request immediately and relies on the reciprocal PATH
-        (which openHop already sends at login time, see ProtocolResponseHandler).
-        The previous 0.5s/hop sleep added up to ~1.5s+ of latency per request for
-        multi-hop contacts with no reliability benefit and has been removed; the
-        adaptive timeout + internal resend now handle a lost first attempt.
+        Firmware sends the request immediately and relies on the peer already
+        holding a route back to us. openHop teaches that route from the flood
+        PATH a flood login returns, and — since a DIRECT (forced-path) login is
+        answered with a plain flood RESPONSE instead — also from that RESPONSE;
+        see :mod:`openhop_core.node.handlers.return_path`. The previous
+        0.5s/hop sleep added up to ~1.5s+ of latency per request for multi-hop
+        contacts with no reliability benefit and has been removed; the adaptive
+        timeout + internal resend now handle a lost first attempt.
         """
         out_path_len = getattr(proxy, "out_path_len", -1)
         out_path = getattr(proxy, "out_path", b"") or b""
@@ -1115,6 +1151,7 @@ class _SendOpsMixin:
                 log_label=log_label,
                 cleanup=_clear_response_tags,
                 response_tag_registered=_register_response_tag,
+                contact_pubkey=pub_key,
             )
             if not started.get("success"):
                 return started
@@ -1263,6 +1300,7 @@ class _SendOpsMixin:
                 proxy,
                 log_label=f"protocol REQ 0x{protocol_code:02X}",
                 response_tag_registered=_register_response_tag,
+                contact_pubkey=pub_key,
             )
             return {
                 "success": result.get("success", False),

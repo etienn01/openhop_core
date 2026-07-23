@@ -7,6 +7,7 @@ from ...protocol.packet_utils import PathUtils
 from ...util.callbacks import invoke_maybe_awaitable
 from .base import BaseHandler
 from .result import HandlerResult
+from .return_path import ReturnPathTeacher
 
 # Response codes from C++ server
 RESP_SERVER_LOGIN_OK = 0x80
@@ -32,10 +33,15 @@ class LoginResponseHandler(BaseHandler):
     def payload_type() -> int:
         return PAYLOAD_TYPE_RESPONSE
 
-    def __init__(self, local_identity, contacts, log_fn):
+    def __init__(self, local_identity, contacts, log_fn, *, return_path_teacher=None):
         self.local_identity = local_identity
         self.contacts = contacts
         self.log = log_fn
+        # Shared with ProtocolResponseHandler by the factory; constructed here
+        # when absent so standalone use still works (see :mod:`.return_path`).
+        self.return_path_teacher = return_path_teacher or ReturnPathTeacher(
+            log_fn, local_identity, contacts
+        )
         # Pending login completions keyed by the target contact's full public key
         # (32 bytes). A response is dispatched only to the waiter whose target
         # matches the authenticated sender, mirroring the firmware sender gate
@@ -46,6 +52,16 @@ class LoginResponseHandler(BaseHandler):
         self._active_login_passwords = {}  # dest_hash -> password
         # Protocol response handler for forwarding telemetry responses
         self._protocol_response_handler = None
+
+    def set_packet_injector(self, injector) -> None:
+        """Wire the transmit path used for return-path teaching.
+
+        Companion layers normally reach the shared teacher through
+        ``ProtocolResponseHandler.set_packet_injector``; this exists so a
+        standalone ``LoginResponseHandler`` can teach too, instead of silently
+        no-opping.
+        """
+        self.return_path_teacher.set_injector(injector)
 
     def set_protocol_response_handler(self, protocol_response_handler):
         """Set protocol response handler for forwarding telemetry responses."""
@@ -177,6 +193,22 @@ class LoginResponseHandler(BaseHandler):
                 # pending_login pubkey mismatch falls through to the status/
                 # telemetry matchers instead of being treated as a login.
                 return await self._forward_to_protocol_handler(packet)
+            # Firmware parity (BaseChatMesh::onPeerDataRecv RESPONSE branch):
+            # a login sent DIRECT down a forced path is answered by the server
+            # with a *flood* RESPONSE (simple_repeater MyMesh::onAnonDataRecv,
+            # the reply_path_len < 0 branch). That is the tell that the server
+            # holds no usable out_path for us, and it is the only signal we get
+            # before the first CLI request goes out — so teach the route back
+            # now, or every subsequent REQ is answered down a dead route.
+            # PATH-shaped responses are excluded: the reciprocal for those is
+            # already sent by ProtocolResponseHandler.
+            if packet.get_payload_type() == PAYLOAD_TYPE_RESPONSE:
+                await self.return_path_teacher.maybe_teach_from_flood_reply(
+                    packet,
+                    self._pubkey_bytes(matched_contact),
+                    lookup_hash,
+                    reason="flood login RESPONSE",
+                )
             if response_data is None:
                 self.log("Authenticated login response had invalid or incomplete contents")
                 return HandlerResult.consumed()

@@ -15,6 +15,7 @@ from ...protocol.packet_builder import PacketBuilder
 from ...protocol.packet_utils import PathUtils
 from .crypto_helpers import iter_decrypt_by_src_hash
 from .result import HandlerResult
+from .return_path import ReturnPathTeacher
 
 # ---------------------------------------------------------------------------
 # Built-in CayenneLPP decoder (no external dependency)
@@ -151,10 +152,24 @@ class ProtocolResponseHandler:
     - etc.
     """
 
-    def __init__(self, log_fn: Callable[[str], None], local_identity, contact_book):
+    def __init__(
+        self,
+        log_fn: Callable[[str], None],
+        local_identity,
+        contact_book,
+        *,
+        return_path_teacher: Optional["ReturnPathTeacher"] = None,
+    ):
         self._log = log_fn
         self._local_identity = local_identity
         self._contact_book = contact_book
+        # Re-teaches a peer its route back to us when a reply arrives flooded
+        # despite us holding a direct out_path. Constructed here when the caller
+        # supplies none so standalone use of this handler still works; the
+        # factory passes a shared instance (see registry.create_core_handlers).
+        self.return_path_teacher = return_path_teacher or ReturnPathTeacher(
+            log_fn, local_identity, contact_book
+        )
 
         # A response is correlated only after the MAC identifies the complete
         # contact and the peer reflects the request tag. The one-byte source
@@ -195,8 +210,13 @@ class ProtocolResponseHandler:
         repeater has no out_path for us and must fall back to plain FLOOD for
         responses — which intermediate repeaters may drop due to transport-code
         region filtering.
+
+        The same transmit path is handed to the return-path teacher, which
+        covers the flood-RESPONSE case this handler's PATH-only reciprocal
+        misses (see :mod:`.return_path`).
         """
         self._packet_injector = injector
+        self.return_path_teacher.set_injector(injector)
 
     @staticmethod
     def payload_type() -> int:
@@ -555,6 +575,26 @@ class ProtocolResponseHandler:
                         decrypted,
                         path_len_byte,
                     )
+                    # This reciprocal *is* an evidence-derived teach. Report it,
+                    # or the teacher would think the contact was never taught
+                    # and let its reverse-of-out_path guess overwrite a route
+                    # that is known good.
+                    self.return_path_teacher.note_evidence_teach(contact_pubkey)
+            elif pkt_type == PAYLOAD_TYPE_RESPONSE:
+                # Plain RESPONSE (0x01). Firmware parity with
+                # BaseChatMesh::onPeerDataRecv's RESPONSE branch: a flood-routed
+                # reply from a peer we already hold a direct out_path for means
+                # the peer has no usable route back to us, so re-teach it. This
+                # is the path a DIRECT (user-forced) login takes — the server
+                # answers it with a flood RESPONSE, not the flood PATH that
+                # carries the reciprocal above, so nothing else teaches it.
+                await self.return_path_teacher.maybe_teach_from_flood_reply(
+                    pkt,
+                    contact_pubkey,
+                    src_hash,
+                    reason="flood RESPONSE",
+                    shared_secret=shared_secret,
+                )
 
             success, text, parsed = self._parse_protocol_response(response_data)
             return success, text, parsed, decrypted, contact_pubkey, response_payload
