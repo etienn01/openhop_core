@@ -113,11 +113,39 @@ class _Injector:
 
 
 def _teacher(contacts=None, injector=None, **kwargs):
+    # Default the settle window off so tests do not sleep; the settle behaviour
+    # itself is covered explicitly by overriding _settle.
+    kwargs.setdefault("settle_s", 0.0)
     teacher = ReturnPathTeacher(
         lambda _m: None, LOCAL_IDENTITY, contacts if contacts is not None else _contacts(), **kwargs
     )
     teacher.set_injector(injector if injector is not None else _Injector())
     return teacher
+
+
+def _copy_of(pkt: Packet, *, in_path: bytes, rssi: int, len_byte: int = None) -> Packet:
+    """Another flood copy of the SAME reply: identical payload (hence identical
+    packet hash), differing only in the accumulated path and last-hop RSSI —
+    exactly how one flooded reply reaches us over several routes. ``len_byte``
+    overrides the path_len encoding when the copy has a different hop count."""
+    copy = Packet()
+    copy.header = pkt.header
+    copy.path = bytearray(in_path)
+    copy.path_len = pkt.path_len if len_byte is None else len_byte
+    copy.payload = bytearray(pkt.payload)
+    copy.payload_len = pkt.payload_len
+    copy._rssi = rssi
+    return copy
+
+
+# Two-byte-hash routes of differing length, sharing no bytes so a test can tell
+# which one was taught. SHORT is 2 hops, LONG is that route plus a strong final
+# hop (the "desk repeater adds a hop" case).
+# encode_path_len(hash_size, hash_count): both routes use 2-byte hashes.
+SHORT_2HOP = bytes([0x11, 0x22, 0x33, 0x44])
+SHORT_2HOP_LEN = PathUtils.encode_path_len(2, 2)  # 2 hops
+LONG_3HOP = bytes([0x11, 0x22, 0x33, 0x44, 0xEC, 0xF4])
+LONG_3HOP_LEN = PathUtils.encode_path_len(2, 3)  # 3 hops
 
 
 async def _teach_flood(teacher, **kwargs):
@@ -270,6 +298,165 @@ async def test_no_injector_is_a_no_op():
     teacher = ReturnPathTeacher(lambda _m: None, LOCAL_IDENTITY, _contacts())
     assert teacher.enabled is False
     assert await _teach_flood(teacher) is False
+
+
+# --------------------------------------------------------------------------- #
+# Best-copy selection by last-hop RSSI (openHop, no firmware equivalent)
+# --------------------------------------------------------------------------- #
+
+# A second route the same reply can arrive on, distinct from IN_PATH so a test
+# can tell which copy was taught. 2-byte hash, one hop — matches IN_PATH_LEN.
+STRONG_PATH = bytes([0xEE, 0xFF])
+
+
+@pytest.mark.asyncio
+async def test_teaches_from_best_rssi_copy_not_the_first_arrived():
+    """The bug this fixes: dedup hands the handler the first-arrived copy, which
+    on a real mesh is often the weakest route. A stronger copy seen pre-dedup by
+    note_flood_copy must win."""
+    injector = _Injector()
+    teacher = _teacher(injector=injector)
+
+    base = _response_packet(flood=True, in_path=IN_PATH)
+    strong = _copy_of(base, in_path=STRONG_PATH, rssi=-20)
+    weak = _copy_of(base, in_path=IN_PATH, rssi=-100)
+
+    # The strong copy arrives (pre-dedup) before the weak one triggers the teach.
+    teacher.note_flood_copy(strong)
+    assert await teacher.maybe_teach_from_flood_reply(weak, PEER_KEY, PEER_HASH, reason="test")
+    await teacher.wait_for_pending()
+
+    assert len(injector.packets) == 1
+    _, embedded = _decode_teach(injector.packets[0])
+    assert embedded == STRONG_PATH, "taught the marginal first-arrived route, not the best one"
+
+
+@pytest.mark.asyncio
+async def test_first_copy_wins_when_no_better_copy_is_seen():
+    """With nothing better recorded, the teach falls back to the triggering
+    (first-arrived) copy — preserving behaviour where no subscriber is wired."""
+    injector = _Injector()
+    teacher = _teacher(injector=injector)
+
+    assert await _teach_flood(teacher) is True
+    _, embedded = _decode_teach(injector.packets[0])
+    assert embedded == IN_PATH
+
+
+@pytest.mark.asyncio
+async def test_settle_window_lets_a_later_stronger_copy_win():
+    """Firmware's sendDirect(...,3000) is a settle window; a stronger copy that
+    lands during it must be the one taught."""
+    injector = _Injector()
+    teacher = _teacher(injector=injector)
+
+    base = _response_packet(flood=True, in_path=IN_PATH)
+    weak = _copy_of(base, in_path=IN_PATH, rssi=-100)
+    strong = _copy_of(base, in_path=STRONG_PATH, rssi=-20)
+
+    async def fake_settle(_seconds):
+        # A stronger copy arrives while we are holding for the settle window.
+        teacher.note_flood_copy(strong)
+
+    teacher._settle_s = 3.0
+    teacher._settle = fake_settle
+
+    assert await teacher.maybe_teach_from_flood_reply(weak, PEER_KEY, PEER_HASH, reason="t")
+    await teacher.wait_for_pending()
+
+    _, embedded = _decode_teach(injector.packets[0])
+    assert embedded == STRONG_PATH
+
+
+@pytest.mark.asyncio
+async def test_note_flood_copy_ignores_direct_and_misaddressed_and_nonresponse():
+    injector = _Injector()
+    teacher = _teacher(injector=injector)
+
+    direct = _response_packet(flood=False)
+    direct._rssi = -10
+    teacher.note_flood_copy(direct)  # direct is never a teach trigger
+
+    other = _response_packet(flood=True, in_path=STRONG_PATH)
+    other.payload[0] = (LOCAL_IDENTITY.get_public_key()[0] + 1) & 0xFF  # addressed elsewhere
+    other._rssi = -10
+    teacher.note_flood_copy(other)
+
+    assert not teacher._recent_copies
+
+
+def test_note_flood_copy_is_a_noop_without_injector():
+    teacher = ReturnPathTeacher(lambda _m: None, LOCAL_IDENTITY, _contacts(), settle_s=0.0)
+    pkt = _response_packet(flood=True)
+    pkt._rssi = -10
+    teacher.note_flood_copy(pkt)
+    assert not teacher._recent_copies
+
+
+def test_recorded_copies_are_pruned_by_ttl():
+    clock = {"t": 0.0}
+    teacher = _teacher(time_fn=lambda: clock["t"])
+    teacher._copy_ttl_s = 8.0
+
+    a = _response_packet(flood=True, in_path=IN_PATH)
+    teacher.note_flood_copy(_copy_of(a, in_path=IN_PATH, rssi=-40))
+    assert len(teacher._recent_copies) == 1
+
+    clock["t"] += 100.0  # well past the TTL
+    b = _response_packet(flood=True, in_path=STRONG_PATH)
+    teacher.note_flood_copy(_copy_of(b, in_path=STRONG_PATH, rssi=-40))
+    assert len(teacher._recent_copies) == 1  # the stale entry was dropped
+
+
+# --------------------------------------------------------------------------- #
+# Hop-penalized selection (a strong nearby repeater must not add a needless hop)
+# --------------------------------------------------------------------------- #
+
+
+async def _teach_choosing_between(teacher, short_rssi, long_rssi):
+    """Record a 2-hop and a 3-hop copy of one reply, trigger the teach, and
+    return the embedded path the teacher chose."""
+    injector = teacher._injector
+    base = _response_packet(flood=True)
+    teacher.note_flood_copy(
+        _copy_of(base, in_path=SHORT_2HOP, rssi=short_rssi, len_byte=SHORT_2HOP_LEN)
+    )
+    teacher.note_flood_copy(
+        _copy_of(base, in_path=LONG_3HOP, rssi=long_rssi, len_byte=LONG_3HOP_LEN)
+    )
+    # Trigger with a weak first-arrived copy; selection must come from the table.
+    trigger = _copy_of(base, in_path=SHORT_2HOP, rssi=-120, len_byte=SHORT_2HOP_LEN)
+    assert await teacher.maybe_teach_from_flood_reply(trigger, PEER_KEY, PEER_HASH, reason="t")
+    await teacher.wait_for_pending()
+    _, embedded = _decode_teach(injector.packets[-1])
+    return embedded
+
+
+@pytest.mark.asyncio
+async def test_shorter_route_wins_when_extra_hop_buys_little_signal():
+    """The ECF4-on-the-desk case: a 3-hop copy at -13 must NOT beat a 2-hop copy
+    at -15 — 2 dB is not worth an extra hop (10 dB/hop default)."""
+    teacher = _teacher(injector=_Injector())
+    embedded = await _teach_choosing_between(teacher, short_rssi=-15, long_rssi=-13)
+    assert embedded == SHORT_2HOP
+
+
+@pytest.mark.asyncio
+async def test_longer_route_wins_when_it_is_materially_stronger():
+    """When the shorter route's final hop is genuinely weak, the extra hop is
+    earned: a 3-hop copy at -13 beats a 2-hop copy at -60."""
+    teacher = _teacher(injector=_Injector())
+    embedded = await _teach_choosing_between(teacher, short_rssi=-60, long_rssi=-13)
+    assert embedded == LONG_3HOP
+
+
+@pytest.mark.asyncio
+async def test_zero_penalty_restores_pure_best_rssi():
+    """With the penalty disabled, selection is pure last-hop RSSI again, so the
+    stronger 3-hop copy wins even for a 2 dB edge."""
+    teacher = _teacher(injector=_Injector(), hop_penalty_db=0.0)
+    embedded = await _teach_choosing_between(teacher, short_rssi=-15, long_rssi=-13)
+    assert embedded == LONG_3HOP
 
 
 # --------------------------------------------------------------------------- #
@@ -467,6 +654,7 @@ async def test_protocol_response_handler_teaches_on_flood_response():
     injector = _Injector()
     handler = ProtocolResponseHandler(lambda _m: None, LOCAL_IDENTITY, _contacts())
     handler.set_packet_injector(injector)
+    handler.return_path_teacher._settle_s = 0.0  # don't sleep the real settle window
 
     await handler(_response_packet(flood=True))
     await handler.return_path_teacher.wait_for_pending()
@@ -517,6 +705,7 @@ async def test_login_response_handler_teaches_on_flood_login_response():
     injector = _Injector()
     handler = LoginResponseHandler(LOCAL_IDENTITY, _contacts(), lambda _m: None)
     handler.set_packet_injector(injector)
+    handler.return_path_teacher._settle_s = 0.0  # don't sleep the real settle window
 
     completions = []
     handler.register_login_callback(PEER_KEY, lambda success, data: completions.append(success))
