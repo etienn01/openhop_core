@@ -725,11 +725,21 @@ class KissModemWrapper(LoRaRadio):
                 self._last_failure_log_ts = now
                 logger.warning("Marking KISS serial link degraded: %s", reason)
 
-        with self._connection_lock:
-            self._degraded = True
-            self._degraded_reason = reason
-            self.is_connected = False
-            self._close_serial_connection()
+        # Do not wait for the connection lock here. A failed SetHardware write can
+        # hold _command_lock (or _serial_write_lock), while the reconnect worker
+        # holds _connection_lock and needs that lock for its handshake. Waiting
+        # would form an ABBA deadlock and leave the wrapper permanently degraded.
+        # Defer closing the port while that lifecycle transition is in progress.
+        self._degraded = True
+        self._degraded_reason = reason
+        self.is_connected = False
+        if self._connection_lock.acquire(blocking=False):
+            try:
+                self._close_serial_connection()
+            finally:
+                self._connection_lock.release()
+        else:
+            logger.debug("Connection lock busy; deferring serial close to its owner")
 
         # Wake any in-flight DATA sender so it fails fast instead of waiting out the
         # full TX_DONE timeout on a link that is already gone (cleanup() does the same).
@@ -746,6 +756,15 @@ class KissModemWrapper(LoRaRadio):
         self.reconnect_thread.start()
 
     def _reconnect_worker(self) -> None:
+        """Run the reconnect loop and release its gate when the worker exits."""
+        try:
+            self._reconnect_loop()
+        except Exception:
+            logger.exception("KISS modem reconnect worker died unexpectedly")
+        finally:
+            self._reconnecting_event.clear()
+
+    def _reconnect_loop(self) -> None:
         """Reconnect with exponential backoff and re-run modem handshake."""
         attempts = 0
         while not self.stop_event.is_set():
@@ -781,10 +800,7 @@ class KissModemWrapper(LoRaRadio):
                 self._degraded = False
                 self._degraded_reason = None
                 logger.info("KISS modem serial reconnect successful on attempt %s", attempts)
-                self._reconnecting_event.clear()
                 return
-
-        self._reconnecting_event.clear()
 
     def _set_kiss_tx_delay(self, delay_ms: int) -> None:
         """
