@@ -38,6 +38,7 @@ from ...protocol.constants import (
     PAYLOAD_TYPE_RESPONSE,
 )
 from ...protocol.packet_utils import PathUtils
+from ...protocol.region_map import apply_reply_scope
 from .base import BaseHandler
 from .login_server import LoginServerHandler
 from .result import HandlerResult
@@ -325,6 +326,10 @@ class AnonRequestHandler(BaseHandler):
                 if reply_path_len > 0 and path_bytes:
                     encoded = PathUtils.encode_path_len(hash_size, reply_path_len)
                     response_pkt.set_path(path_bytes, encoded)
+
+            # Scope the flood path-return reply to the region the request arrived
+            # under (OH-026); a direct reply captures no region and stays plain.
+            apply_reply_scope(response_pkt, packet)
 
             self._send_packet_callback(response_pkt, SERVER_RESPONSE_DELAY_MS)
             route = "flood" if packet.is_route_flood() else "direct"

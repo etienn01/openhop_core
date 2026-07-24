@@ -32,6 +32,7 @@ from ..protocol.constants import (
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
 from ..protocol.packet_utils import PathUtils
+from ..protocol.region_map import RegionMap, capture_recv_region
 from .companion_base import CompanionBase
 from .constants import (
     ADV_TYPE_CHAT,
@@ -205,6 +206,12 @@ class CompanionBridge(CompanionBase):
             initial_contacts=initial_contacts,
         )
         self._packet_injector = packet_injector
+
+        # Region registry for reply-region capture (OH-026). None by default so a
+        # standalone bridge captures nothing (replies fall through to plain). The
+        # host repeater points this at its dispatcher's region_map so incoming
+        # request regions are captured and mirrored onto replies.
+        self.region_map: Optional[RegionMap] = None
 
         async def _handler_send_packet(pkt: Packet, wait_for_ack: bool = False) -> bool:
             return await self._packet_injector(pkt, wait_for_ack=wait_for_ack)
@@ -420,6 +427,11 @@ class CompanionBridge(CompanionBase):
         route_type = packet.get_route_type()
         is_flood = route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD)
         self.stats.record_rx(is_flood=is_flood)
+
+        # Capture the region this request arrived under (OH-026) before the handler
+        # builds any reply, so a flood reply is scoped to that region (or plain).
+        # No-op when no RegionMap is configured (standalone bridge).
+        capture_recv_region(self.region_map, packet)
 
         handler = self._handlers.get(ptype)
         if handler:

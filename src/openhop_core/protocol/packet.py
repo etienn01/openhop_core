@@ -117,6 +117,8 @@ class Packet:
         "_path_hash_mode_applied",
         "_flood_scope_applied",
         "_injected_for_tx",
+        "_recv_region_captured",
+        "_recv_region_key",
     )
 
     def __init__(self):
@@ -144,6 +146,13 @@ class Packet:
         # (scoped or deliberately plain); the dispatcher must not re-scope it.
         self._flood_scope_applied = False
         self._injected_for_tx = False  # Set by repeater inject path; skip engine on route
+        # Region captured from this packet on receive (OH-026). Only set True when
+        # a RegionMap was actually consulted; the matched region key (or None =>
+        # reply plain) is read by region_map.apply_reply_scope when a handler
+        # builds a flood reply. Lives on the Packet, never a shared dispatcher
+        # member, because replies are sent from background tasks that would race.
+        self._recv_region_captured: bool = False
+        self._recv_region_key: Optional[bytes] = None
 
     def get_route_type(self) -> int:
         """

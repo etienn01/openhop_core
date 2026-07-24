@@ -147,6 +147,13 @@ class CompanionRadio(CompanionBase):
         self._running = True
         self.node.dispatcher.set_default_path_hash_mode(self.prefs.path_hash_mode)
         self.node.dispatcher.rx_delay_base = self.prefs.rx_delay_base
+        # Seed the flood-scope mirrors from persisted prefs at boot (OH-022): the
+        # default, the transient override and the sticky unscoped flag. Without
+        # this, a companion booted with only a persisted default would send every
+        # dispatcher-scoped packet as plain flood until the first set_* call.
+        self.node.dispatcher.default_flood_transport_key = self._default_scope_key()
+        self.node.dispatcher.flood_transport_key = self._flood_transport_key
+        self.node.dispatcher.flood_unscoped = self._flood_unscoped
         # Sync the airtime budget factor before arming the bucket so the initial
         # duty cycle is correct when client-repeat starts enabled.
         self.node.dispatcher.airtime_budget_factor = self.prefs.airtime_factor
@@ -210,24 +217,50 @@ class CompanionRadio(CompanionBase):
     # -------------------------------------------------------------------------
 
     def set_flood_scope(self, transport_key: Optional[bytes] = None) -> None:
-        """Set or clear flood scope and propagate to the dispatcher."""
+        """Set or clear the transient flood scope and propagate to the dispatcher.
+
+        Clears the dispatcher's explicit-unscoped mirror too (base
+        ``set_flood_scope`` clears ``_flood_unscoped``), re-enabling the
+        override/default scope path.
+        """
         super().set_flood_scope(transport_key)
         self.node.dispatcher.flood_transport_key = self._flood_transport_key
+        self.node.dispatcher.flood_unscoped = False
 
     def set_flood_region(self, region_name: Optional[str] = None) -> None:
-        """Set flood region and propagate to the dispatcher."""
+        """Set flood region and propagate to the dispatcher (clears unscoped)."""
         super().set_flood_region(region_name)
         self.node.dispatcher.flood_transport_key = self._flood_transport_key
+        self.node.dispatcher.flood_unscoped = False
 
     def set_flood_unscoped(self) -> None:
-        """Force unscoped floods; clear the dispatcher's scope mirror too.
+        """Force unscoped floods and mirror the sticky flag to the dispatcher.
 
         Firmware's send_unscoped flag suppresses scoping on every flood send,
-        so the node-level mirror must not keep applying a stale override key.
-        The next set_flood_scope()/set_flood_region() re-syncs the mirror.
+        so the dispatcher must stop applying both the transient override and the
+        persisted default. The override mirror is cleared and the flag set; the
+        default mirror is deliberately NOT nulled (the flag suppresses it, and a
+        later set_flood_scope()/set_flood_region() clears the flag to re-enable
+        the default path).
         """
         super().set_flood_unscoped()
         self.node.dispatcher.flood_transport_key = None
+        self.node.dispatcher.flood_unscoped = True
+
+    def set_default_flood_scope(
+        self,
+        scope_name: Optional[str],
+        transport_key: Optional[bytes],
+    ) -> bool:
+        """Persist the default flood scope and mirror it to the dispatcher.
+
+        The mirror is the resolved key (``_default_scope_key`` maps an all-zero
+        or short key to None => plain flood), so sends that rely on the
+        dispatcher to scope at TX time carry the default too (OH-022).
+        """
+        result = super().set_default_flood_scope(scope_name, transport_key)
+        self.node.dispatcher.default_flood_transport_key = self._default_scope_key()
+        return result
 
     def set_path_hash_mode(self, mode: int) -> None:
         """Set path hash mode and sync to dispatcher default."""

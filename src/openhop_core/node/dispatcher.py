@@ -18,7 +18,8 @@ from ..protocol.constants import (  # Payload types
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
 from ..protocol.packet_utils import PathUtils, calculate_lora_airtime_ms, flood_rx_metrics
-from ..protocol.transport_keys import calc_transport_code
+from ..protocol.region_map import RegionMap, capture_recv_region
+from ..protocol.transport_keys import scope_packet
 from ..protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES
 from ..util.callbacks import invoke_maybe_awaitable
 
@@ -128,7 +129,25 @@ class Dispatcher:
         # Flood scope: 16-byte transport key for region-scoped flooding.
         # When set, flood packets are tagged with a transport code and sent
         # as ROUTE_TYPE_TRANSPORT_FLOOD.  Set via companion set_flood_scope().
+        # This is the transient send-scope OVERRIDE mirror.
         self.flood_transport_key: Optional[bytes] = None
+        # Persisted default flood scope mirror (OH-022). Firmware
+        # sendFloodScoped(recipient) falls back to prefs.default_scope_key when
+        # no transient override is set; the companion applies that at its layer,
+        # but several sends build the packet and rely on the dispatcher to scope
+        # it at TX time. Mirror the default here so those sends carry it too.
+        # A null/short default resolves to None (=> plain flood).
+        self.default_flood_transport_key: Optional[bytes] = None
+        # Explicit-unscoped flag mirror (firmware send_unscoped, FW #2492). When
+        # True it suppresses BOTH the override and the default at TX time; it is
+        # not nulled by the default mirror, only cleared by a later
+        # set_flood_scope()/set_flood_region().
+        self.flood_unscoped: bool = False
+
+        # Optional region registry for reply-region capture (OH-026). Standalone
+        # nodes/companions leave this None (no capture); the repeater populates
+        # it so replies carry the incoming request's region.
+        self.region_map: Optional[RegionMap] = None
 
         # Default path hash mode for flood packets with 0 hops that have not
         # had path hash mode set by the companion. 0=1-byte, 1=2-byte, 2=3-byte.
@@ -514,6 +533,11 @@ class Dispatcher:
         pkt._rssi = rssi if rssi is not None else self.radio.get_last_rssi()
         pkt._snr = snr if snr is not None else self.radio.get_last_snr()
 
+        # Capture the region this packet arrived under (OH-026) before any handler
+        # runs, so a reply builder can scope its reply to that region. No-op when
+        # no RegionMap is configured (standalone node/companion).
+        capture_recv_region(self.region_map, pkt)
+
         # Let the node know about this packet for analysis (statistics, caching, etc.)
         if self.packet_analysis_callback:
             try:
@@ -585,28 +609,46 @@ class Dispatcher:
     # Public interface - sending and receiving packets
     # ------------------------------------------------------------------
 
-    def _apply_flood_scope(self, pkt: Packet) -> None:
-        """Apply flood scope transport codes to a packet in-place.
+    def _scope_packet(self, pkt: Packet, key: bytes) -> None:
+        """Attach transport codes for ``key`` and switch FLOOD -> TRANSPORT_FLOOD.
 
-        If ``flood_transport_key`` is set and the packet uses flood routing,
-        calculates the transport code, attaches it to the packet, and
-        switches the route type to ``ROUTE_TYPE_TRANSPORT_FLOOD``.
+        Delegates to the shared :func:`scope_packet` primitive so the dispatcher
+        and companion resolvers compute the wire format identically.
+        """
+        scope_packet(pkt, key)
+
+    def _apply_flood_scope(self, pkt: Packet) -> None:
+        """Apply flood scope transport codes to a packet in-place at TX time.
+
+        Mirrors firmware ``sendFloodScoped(recipient)`` precedence
+        (companion_radio/MyMesh.cpp): a packet the companion/reply layer already
+        decided is left untouched; explicit-unscoped wins first; otherwise the
+        transient override is used, else the persisted default. A null default
+        (None) leaves the packet a plain flood.
 
         Packets the companion layer already scoped (or deliberately left as
-        plain flood, e.g. explicit-unscoped mode or default-scoped adverts)
-        are marked ``_flood_scope_applied`` and skipped here.
+        plain flood, e.g. explicit-unscoped mode or default-scoped adverts) —
+        and replies whose region the reply helper already decided — are marked
+        ``_flood_scope_applied`` and skipped here.
         """
-        if self.flood_transport_key is None:
-            return
+        # Checked FIRST: a companion/reply decision is authoritative and must
+        # never be re-scoped, even when the node has an override/default set.
         if getattr(pkt, "_flood_scope_applied", False):
             return
-        route_type = pkt.get_route_type()
-        if route_type != ROUTE_TYPE_FLOOD:
+        if pkt.get_route_type() != ROUTE_TYPE_FLOOD:
             return
-        code = calc_transport_code(self.flood_transport_key, pkt)
-        pkt.transport_codes[0] = code
-        pkt.transport_codes[1] = 0  # reserved for home region
-        pkt.header = (pkt.header & ~0x03) | ROUTE_TYPE_TRANSPORT_FLOOD
+        # Explicit-unscoped wins (firmware checks send_unscoped before scope).
+        if self.flood_unscoped:
+            return
+        # Transient override else persisted default (override else DEFAULT).
+        key = (
+            self.flood_transport_key
+            if self.flood_transport_key is not None
+            else self.default_flood_transport_key
+        )
+        if key is None:
+            return
+        self._scope_packet(pkt, key)
 
     def set_default_path_hash_mode(self, mode: Optional[int]) -> None:
         """Set or clear the default path hash mode for flood packets with 0 hops.

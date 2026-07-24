@@ -17,6 +17,7 @@ from typing import Callable, Optional
 
 from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder
 from ...protocol.constants import PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_RESPONSE
+from ...protocol.region_map import apply_reply_scope
 from .base import BaseHandler
 from .result import HandlerResult
 
@@ -324,6 +325,12 @@ class LoginServerHandler(BaseHandler):
                 f"path_len={response_pkt.path_len}, "
                 f"payload[0:2]={bytes(response_pkt.payload[:2]).hex()}"
             )
+
+            # Scope the flood reply (PATH-return for a flood login, or the flood
+            # RESPONSE datagram for a direct login) to the region the request
+            # arrived under (OH-026). Both branches build a flood reply; a
+            # direct request captures no region and stays plain.
+            apply_reply_scope(response_pkt, original_packet)
 
             # Send with delay (matches C++ SERVER_RESPONSE_DELAY)
             delay_ms = 300

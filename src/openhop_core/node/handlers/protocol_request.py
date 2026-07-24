@@ -12,6 +12,7 @@ from openhop_core.protocol import PacketBuilder
 from openhop_core.protocol.constants import MAX_PATH_SIZE, PAYLOAD_TYPE_REQ, PAYLOAD_TYPE_RESPONSE
 from openhop_core.protocol.crypto import CryptoUtils
 from openhop_core.protocol.packet_utils import PathUtils
+from openhop_core.protocol.region_map import apply_reply_scope
 
 from .result import HandlerResult
 
@@ -337,6 +338,10 @@ class ProtocolRequestHandler:
                     else 1
                 )
                 reply_packet.apply_path_hash_mode(hash_size - 1)
+                # Scope the flood PATH-return to the region the REQ arrived under
+                # (OH-026): TRANSPORT_FLOOD with the code re-hashed over this
+                # reply's payload, or plain when the request was unscoped/direct.
+                apply_reply_scope(reply_packet, original_packet)
                 self.log(f"PATH (path-return) built for 0x{client_hash:02X} via FLOOD")
                 return reply_packet
 
