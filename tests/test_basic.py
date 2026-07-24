@@ -2,7 +2,7 @@ from openhop_core import CryptoUtils, LocalIdentity, MeshNode, Packet, __version
 
 
 def test_version():
-    assert __version__ == "1.1.3.dev11"
+    assert __version__ == "1.1.3.dev12"
 
 
 def test_import():
