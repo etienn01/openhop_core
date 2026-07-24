@@ -442,6 +442,65 @@ async def test_shorter_route_wins_when_extra_hop_buys_little_signal():
 
 
 @pytest.mark.asyncio
+async def test_zero_hop_copy_beats_materially_stronger_one_hop_copy():
+    """A healthy direct route must not be replaced by a nearby relay.
+
+    Captured regression: HOWL Repeater's flood reply arrived zero-hop at
+    -46 dBm, then through B5B5 at -12 dBm. The routed-dependency plus per-hop
+    penalties preserve the direct route.
+    """
+    injector = _Injector()
+    teacher = _teacher(injector=injector)
+    direct_len = PathUtils.encode_path_len(2, 0)
+    relayed_len = PathUtils.encode_path_len(2, 1)
+    base = _response_packet(flood=True)
+    direct = _copy_of(base, in_path=b"", rssi=-46, len_byte=direct_len)
+    relayed = _copy_of(base, in_path=b"\xb5\xb5", rssi=-12, len_byte=relayed_len)
+
+    async def fake_settle(_seconds):
+        teacher.note_flood_copy(relayed)
+
+    teacher._settle_s = 3.0
+    teacher._settle = fake_settle
+
+    assert await teacher.maybe_teach_from_flood_reply(direct, PEER_KEY, PEER_HASH, reason="test")
+    await teacher.wait_for_pending()
+
+    embedded_len, embedded = _decode_teach(injector.packets[-1])
+    assert embedded_len == direct_len
+    assert embedded == b""
+
+
+@pytest.mark.asyncio
+async def test_materially_stronger_one_hop_copy_beats_tenuous_zero_hop_copy():
+    """The direct preference is finite, not an absolute zero-hop rule.
+
+    A direct copy near -120 dBm is tenuous enough that a one-hop copy at
+    -60 dBm pays both routing penalties and still wins.
+    """
+    injector = _Injector()
+    teacher = _teacher(injector=injector)
+    direct_len = PathUtils.encode_path_len(2, 0)
+    relayed_len = PathUtils.encode_path_len(2, 1)
+    base = _response_packet(flood=True)
+    direct = _copy_of(base, in_path=b"", rssi=-120, len_byte=direct_len)
+    relayed = _copy_of(base, in_path=b"\xb5\xb5", rssi=-60, len_byte=relayed_len)
+
+    async def fake_settle(_seconds):
+        teacher.note_flood_copy(relayed)
+
+    teacher._settle_s = 3.0
+    teacher._settle = fake_settle
+
+    assert await teacher.maybe_teach_from_flood_reply(direct, PEER_KEY, PEER_HASH, reason="test")
+    await teacher.wait_for_pending()
+
+    embedded_len, embedded = _decode_teach(injector.packets[-1])
+    assert embedded_len == relayed_len
+    assert embedded == b"\xb5\xb5"
+
+
+@pytest.mark.asyncio
 async def test_longer_route_wins_when_it_is_materially_stronger():
     """When the shorter route's final hop is genuinely weak, the extra hop is
     earned: a 3-hop copy at -13 beats a 2-hop copy at -60."""

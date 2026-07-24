@@ -53,9 +53,11 @@ Deliberate deviations from firmware, each documented at its definition:
   embeds whichever copy it processed first, and only its (SNR-scored,
   ships-disabled) reception hold makes that the best one; neither firmware mode
   weighs hop count, so a strong nearby repeater can append itself as an extra
-  hop. openHop does not lean on the hold and discounts extra hops. See
-  ``RETURN_PATH_SETTLE_S`` and ``RETURN_PATH_HOP_PENALTY_DB``. There is
-  deliberately no cross-reply downgrade guard:
+  hop. openHop does not lean on the hold; it applies a fixed dependency penalty
+  before considering any routed copy, then discounts each hop. See
+  ``RETURN_PATH_SETTLE_S``, ``RETURN_PATH_ROUTED_DEPENDENCY_PENALTY_DB``, and
+  ``RETURN_PATH_HOP_PENALTY_DB``. There is deliberately no cross-reply downgrade
+  guard:
   firmware has none, and a flood reply from a peer we hold an ``out_path`` for is
   by this module's own premise a broken return route, so refusing to re-teach it
   because a newer copy is weaker than a previous (non-working) one would prolong
@@ -123,9 +125,26 @@ RETURN_PATH_COOLDOWN_S = 5.0
 # firmware when the hold is off and no worse when it is on.
 RETURN_PATH_SETTLE_S = 3.0
 
-# Cost, in dB of last-hop RSSI, charged per hop when choosing between copies of a
-# flood reply. Copies are ranked by ``rssi - HOP_PENALTY_DB * hop_count`` so a
-# longer route only wins when it is *materially* stronger, not merely a couple dB.
+# Deliberate firmware divergence: fixed cost, in dB of last-hop RSSI, charged
+# once to every routed copy. Firmware embeds whichever flood copy it processes;
+# it does not give direct reception an explicit preference.
+#
+# This penalty represents the new forwarding dependency introduced by replacing
+# a proven zero-hop route with any routed route. It is intentionally finite:
+# HOWL Repeater's observed zero-hop -46 dBm copy should beat its one-hop B5B5
+# copy at -12 dBm, but a tenuous zero-hop copy around -120 dBm should still lose
+# to a materially stronger routed copy. Applying the same fixed cost to every
+# non-zero-hop candidate leaves comparisons among routed paths unchanged.
+RETURN_PATH_ROUTED_DEPENDENCY_PENALTY_DB = 30.0
+
+# Additional cost, in dB of last-hop RSSI, charged per hop when choosing between
+# copies of a flood reply. Together with the fixed dependency penalty above,
+# copies are ranked by:
+#
+#   rssi - ROUTED_DEPENDENCY_PENALTY_DB - HOP_PENALTY_DB * hop_count
+#
+# (The fixed term is omitted for zero-hop copies.) A longer route therefore only
+# wins when it is materially stronger, not merely a couple dB.
 #
 # Neither firmware mode weighs hop count: the default embeds the first-arrived
 # copy (Mesh.cpp notes the path "may not be the best in terms of hops"), and the
@@ -172,8 +191,7 @@ class _FloodCopy:
     ``rssi`` is the last-hop RSSI of the copy (higher is stronger); ``path`` /
     ``len_byte`` are the flood accumulation path that copy arrived on — the route
     the peer should be taught to use back to us. ``score`` is the hop-penalized
-    rank (``rssi - HOP_PENALTY_DB * hop_count``) copies are compared on, so a
-    shorter route is preferred unless a longer one is materially stronger.
+    rank, including the fixed routed-dependency penalty documented above.
     ``ts`` is the monotonic time the entry was last improved, for TTL pruning.
     """
 
@@ -515,16 +533,18 @@ class ReturnPathTeacher:
     # ---- best-copy collection (hop-penalized RSSI selection) ---------------
 
     def _copy_score(self, rssi: int, len_byte: int) -> float:
-        """Rank a flood copy: last-hop RSSI minus a per-hop penalty.
+        """Rank a flood copy by last-hop RSSI and routing dependency.
 
-        Prefers a shorter return route unless a longer one is materially
-        stronger. See :data:`RETURN_PATH_HOP_PENALTY_DB`.
+        A routed copy pays one fixed dependency penalty plus the per-hop
+        penalty. A zero-hop copy pays neither. Both costs are finite, so a
+        materially stronger routed copy can still beat a tenuous direct link.
         """
         try:
             hops = PathUtils.get_path_hash_count(len_byte)
         except Exception:
             hops = 0
-        return rssi - self._hop_penalty_db * hops
+        dependency_penalty = RETURN_PATH_ROUTED_DEPENDENCY_PENALTY_DB if hops else 0.0
+        return rssi - dependency_penalty - self._hop_penalty_db * hops
 
     def _addressed_to_us(self, dest_hash: int) -> bool:
         """True when ``dest_hash`` is our own hash (or our hash is unknown).
@@ -557,9 +577,10 @@ class ReturnPathTeacher:
     def _record_copy(self, packet_hash: bytes, path: bytes, len_byte: int, rssi: int) -> None:
         """Keep the highest-scoring copy of a flood reply, keyed by packet hash.
 
-        Copies are ranked by :meth:`_copy_score` (hop-penalized RSSI), so a
-        stronger-but-longer route only displaces a shorter one when it wins on
-        score, not on raw RSSI alone.
+        Copies are ranked by :meth:`_copy_score`, including the finite
+        routed-dependency and per-hop penalties. A routed copy can displace a
+        direct or shorter copy only when its last-hop RSSI advantage is large
+        enough to pay those costs.
         """
         now = self._time()
         self._prune_copies(now)
