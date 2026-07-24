@@ -369,6 +369,16 @@ class ProtocolRequestHandler:
             )
             if path_bytes is not None and path_len_encoded is not None:
                 reply_packet.set_path(path_bytes, path_len_encoded)
+            if route_type == "flood":
+                # No out_path, so this RESPONSE floods. Firmware sends it via
+                # sendFloodReply (simple_repeater onPeerDataRecv, the
+                # OUT_PATH_UNKNOWN branch), which for a DIRECT request means
+                # recv_pkt_region is NULL => plain, unscoped flood. Decide it
+                # here so the dispatcher's node default/override cannot stamp a
+                # region firmware would never put on this reply. On a node with
+                # no RegionMap this is inert and the reply falls through to the
+                # node default, matching BaseChatMesh's sendFloodScoped(from).
+                apply_reply_scope(reply_packet, original_packet)
 
             self.log(f"RESPONSE built for 0x{client_hash:02X} via {route_type.upper()}")
             return reply_packet

@@ -24,6 +24,10 @@ from openhop_core.companion import CompanionBridge, CompanionRadio
 from openhop_core.companion.models import Contact
 from openhop_core.node.dispatcher import Dispatcher
 from openhop_core.node.handlers.login_server import LoginServerHandler
+from openhop_core.node.handlers.protocol_request import (
+    REQ_TYPE_GET_STATUS,
+    ProtocolRequestHandler,
+)
 from openhop_core.protocol import (
     CryptoUtils,
     Identity,
@@ -34,7 +38,9 @@ from openhop_core.protocol import (
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ANON_REQ,
     PAYLOAD_TYPE_PATH,
+    PAYLOAD_TYPE_REQ,
     PAYLOAD_TYPE_TXT_MSG,
+    ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
     TXT_TYPE_PLAIN,
@@ -82,9 +88,7 @@ def _make_companion(node_name: str = "test") -> CompanionRadio:
 
 def _make_flood_packet() -> Packet:
     """A minimal flood-routed advert packet (for dispatcher-level unit tests)."""
-    return PacketBuilder.create_advert(
-        local_identity=LocalIdentity(), name="x", route_type="flood"
-    )
+    return PacketBuilder.create_advert(local_identity=LocalIdentity(), name="x", route_type="flood")
 
 
 def _build_login_req(
@@ -258,9 +262,9 @@ class TestSetASendsCarryDefault:
 
     def _assert_scoped_with_default(self, pkt: Packet, default_key: bytes, label: str):
         assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD, f"{label} not TRANSPORT_FLOOD"
-        assert pkt.transport_codes[0] == calc_transport_code(default_key, pkt), (
-            f"{label} transport code does not match the default key"
-        )
+        assert pkt.transport_codes[0] == calc_transport_code(
+            default_key, pkt
+        ), f"{label} transport code does not match the default key"
 
     @pytest.mark.asyncio
     async def test_flood_sends_carry_default(self):
@@ -493,6 +497,172 @@ class TestRepeaterReplyCarriesRegion:
         # Cross-check: each reply matches only its own region.
         assert reply_a.transport_codes[0] != calc_transport_code(b_key, reply_a)
         assert reply_b.transport_codes[0] != calc_transport_code(a_key, reply_b)
+
+
+class TestRepeaterReqReplyScope:
+    """Both REQ reply shapes in ``ProtocolRequestHandler._build_response``.
+
+    Firmware ``simple_repeater::onPeerDataRecv`` (PAYLOAD_TYPE_REQ) has two
+    flood reply branches, and both go through ``sendFloodReply``::
+
+        if (packet->isRouteFlood()) {
+          path = createPathReturn(...);  sendFloodReply(path, ...);          // (a)
+        } else {
+          reply = createDatagram(PAYLOAD_TYPE_RESPONSE, ...);
+          if (client->out_path_len != OUT_PATH_UNKNOWN) sendDirect(...);
+          else                                          sendFloodReply(reply, ...);  // (b)
+        }
+
+    ``sendFloodReply`` scopes to ``recv_pkt_region`` — which is NULL for a DIRECT
+    request — so branch (b) is a plain, unscoped flood. Branch (b) used to be the
+    one reply builder that never marked its decision, so the dispatcher's node
+    default/override stamped a region onto it that firmware would never use. It
+    is the reply that carries a status/telemetry/neighbours response whenever the
+    ACL holds no out_path for the client.
+    """
+
+    def _req_handler(self, server: LocalIdentity, client_info):
+        handler = ProtocolRequestHandler(
+            local_identity=server,
+            contacts=None,
+            get_clients_fn=lambda src_hash: [client_info],
+            request_handlers={REQ_TYPE_GET_STATUS: lambda c, ts, data: b"\x01\x02\x03\x04"},
+            log_fn=lambda *_: None,
+        )
+        return handler
+
+    def _client_info(self, client: LocalIdentity, *, out_path_len: int = -1, out_path=b""):
+        class _Client:
+            def __init__(self):
+                self.id = Identity(client.get_public_key())
+                self.public_key = client.get_public_key()
+                self.out_path = bytearray(out_path)
+                self.out_path_len = out_path_len
+                self.last_timestamp = 0
+
+        return _Client()
+
+    def _build_req(
+        self,
+        server: LocalIdentity,
+        client: LocalIdentity,
+        *,
+        route_type: int,
+        region_key: bytes = None,
+    ) -> Packet:
+        server_pub = server.get_public_key()
+        client_pub = client.get_public_key()
+        shared = Identity(server_pub).calc_shared_secret(client.get_private_key())
+        plaintext = struct.pack("<I", int(time.time())) + bytes([REQ_TYPE_GET_STATUS])
+        enc = CryptoUtils.encrypt_then_mac(shared[:16], shared, plaintext)
+        payload = bytes([server_pub[0], client_pub[0]]) + enc
+
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_REQ << 2) | route_type
+        pkt.payload = bytearray(payload)
+        pkt.payload_len = len(payload)
+        pkt.path = bytearray()
+        pkt.path_len = 0
+        if region_key is not None:
+            scope_packet(pkt, region_key)
+        return pkt
+
+    @pytest.mark.asyncio
+    async def test_direct_req_without_out_path_replies_plain_flood(self):
+        """Branch (b): the node default must not reach this reply.
+
+        A DIRECT request captures no region (firmware ``recv_pkt_region`` is
+        NULL), so the flood RESPONSE stays plain and is marked applied.
+        """
+        region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
+        server, client = LocalIdentity(), LocalIdentity()
+        handler = self._req_handler(server, self._client_info(client))  # no out_path
+
+        req = self._build_req(server, client, route_type=ROUTE_TYPE_DIRECT)
+        capture_recv_region(region_map, req)
+        assert req._recv_region_captured is True
+        assert req._recv_region_key is None
+
+        result = await handler(req)
+        assert result.authenticated is True
+        reply = result.response
+        assert reply is not None
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
+        assert reply._flood_scope_applied is True
+
+        # The gate has to actually hold at TX time against a configured default.
+        dispatcher = Dispatcher(MockRadio())
+        dispatcher.default_flood_transport_key = get_auto_key_for("#region-a")
+        dispatcher._apply_flood_scope(reply)
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
+        assert reply.transport_codes == [0, 0]
+
+    @pytest.mark.asyncio
+    async def test_flood_req_path_return_carries_request_region(self):
+        """Branch (a) keeps carrying the region the REQ arrived under."""
+        a_key = get_auto_key_for("#region-a")
+        region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
+        server, client = LocalIdentity(), LocalIdentity()
+        handler = self._req_handler(server, self._client_info(client))
+
+        req = self._build_req(
+            server, client, route_type=ROUTE_TYPE_TRANSPORT_FLOOD, region_key=a_key
+        )
+        capture_recv_region(region_map, req)
+        assert req._recv_region_key == a_key
+
+        result = await handler(req)
+        reply = result.response
+        assert reply is not None
+        assert reply.get_payload_type() == PAYLOAD_TYPE_PATH
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert reply.transport_codes[0] == calc_transport_code(a_key, reply)
+        assert reply._flood_scope_applied is True
+
+    @pytest.mark.asyncio
+    async def test_direct_req_with_out_path_replies_direct_unscoped(self):
+        """A known out_path is a sendDirect: no flood scope decision at all."""
+        region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
+        server, client = LocalIdentity(), LocalIdentity()
+        client_info = self._client_info(client, out_path_len=1, out_path=b"\x5a")
+        handler = self._req_handler(server, client_info)
+
+        req = self._build_req(server, client, route_type=ROUTE_TYPE_DIRECT)
+        capture_recv_region(region_map, req)
+
+        result = await handler(req)
+        reply = result.response
+        assert reply is not None
+        assert reply.get_route_type() == ROUTE_TYPE_DIRECT
+        assert reply.transport_codes == [0, 0]
+
+    @pytest.mark.asyncio
+    async def test_standalone_node_flood_reply_still_takes_the_default(self):
+        """Without a RegionMap the reply falls through to the node default.
+
+        Companion parity: ``BaseChatMesh::onPeerDataRecv`` answers this branch
+        with ``sendFloodScoped(from, ...)``, which does fall back to
+        ``prefs.default_scope_key``. The mark must not be applied when nothing
+        was captured, or that fallback would be suppressed.
+        """
+        server, client = LocalIdentity(), LocalIdentity()
+        handler = self._req_handler(server, self._client_info(client))
+
+        req = self._build_req(server, client, route_type=ROUTE_TYPE_DIRECT)
+        # No capture_recv_region(): region_map is None on a standalone node.
+        assert req._recv_region_captured is False
+
+        result = await handler(req)
+        reply = result.response
+        assert reply is not None
+        assert reply._flood_scope_applied is False
+
+        default_key = get_auto_key_for("#default-region")
+        dispatcher = Dispatcher(MockRadio())
+        dispatcher.default_flood_transport_key = default_key
+        dispatcher._apply_flood_scope(reply)
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
 
 
 class TestRegionCaptureBothEntrypoints:
