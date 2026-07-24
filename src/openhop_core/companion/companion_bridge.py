@@ -473,6 +473,11 @@ class CompanionBridge(CompanionBase):
 
     async def stop(self) -> None:
         self._running = False
+        self._clear_pending_frame_logins()
+        protocol_handler = self._get_protocol_response_handler()
+        if protocol_handler is not None:
+            protocol_handler.cancel_pending_reciprocals()
+            await protocol_handler.wait_for_pending_reciprocals()
         logger.info("CompanionBridge stopped")
 
     @property

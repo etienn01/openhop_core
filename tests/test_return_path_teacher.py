@@ -630,6 +630,7 @@ async def test_flood_path_reciprocal_reports_itself_and_blocks_the_reverse_guess
     handler.set_packet_injector(injector)
 
     await handler(_flood_path_packet())
+    await handler.wait_for_pending_reciprocals()
     await handler.return_path_teacher.wait_for_pending()
 
     # Exactly one packet: the reciprocal. The RESPONSE-branch teach must not

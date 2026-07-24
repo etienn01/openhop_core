@@ -110,6 +110,10 @@ class CompanionBase(
         # note_login_connection / has_login_connection / clear_login_connection
         # methods in base_send.py for the lifecycle.
         self._login_connections: dict[bytes, float] = {}
+        # Frame-server login commands expose a per-send timeout and are retried
+        # by the companion app. Keep one logical response session per full
+        # contact key so those retries do not replace each other's callbacks.
+        self._pending_frame_logins: dict[bytes, Any] = {}
         self._sign_buffer: Optional[bytearray] = None
         self._flood_transport_key: Optional[bytes] = None
         # Sticky "force unscoped flood" flag (FW PR #2492 / FIRMWARE_VER_CODE 12+):

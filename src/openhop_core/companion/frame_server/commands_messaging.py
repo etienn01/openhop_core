@@ -432,11 +432,15 @@ class _MessagingCommandsMixin:
             if len(data) > PUB_KEY_SIZE
             else ""
         )
-        started = await self.bridge._start_login_request(pubkey, password)
+        started = await self.bridge._start_frame_login_request(pubkey, password)
         if not started.get("success"):
             self._write_request_start_error(started)
             return
         self._write_sent_result(started["sent"], default_timeout_ms=LOGIN_TIMEOUT_HINT_MS)
+        if not started.get("session_owner", True):
+            # A previous command already owns the one completion writer for this
+            # logical login session. This retry only sends another radio packet.
+            return
 
         async def _write_login_result() -> None:
             result = await started["task"]

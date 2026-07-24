@@ -221,6 +221,11 @@ class ReturnPathTeacher:
         # here, the reverse-of-out_path guess is permanently disabled for it —
         # see maybe_teach_reverse_of_out_path.
         self._taught_from_evidence: Set[bytes] = set()
+        # Reciprocal PATH sends are now queued so response delivery is never
+        # blocked by TX. Count queued evidence teaches per contact so a request
+        # timeout cannot launch a speculative reverse-path teach while a real
+        # observed-path teach is still in flight.
+        self._pending_evidence_teaches: dict[bytes, int] = {}
         # In-flight teach tasks, so callers (and tests) can await completion.
         self._pending_teaches: Set[asyncio.Task] = set()
         # packet hash -> best-received copy, populated pre-dedup by
@@ -248,8 +253,25 @@ class ReturnPathTeacher:
         let the reverse-of-out_path guess overwrite a route that is known good.
         """
         key = bytes(contact_pubkey)
+        self._finish_pending_evidence_teach(key)
         self._taught_from_evidence.add(key)
         self._last_taught[key] = self._time()
+
+    def begin_evidence_teach(self, contact_pubkey: bytes) -> None:
+        """Record one observed-path teach queued by another handler."""
+        key = bytes(contact_pubkey)
+        self._pending_evidence_teaches[key] = self._pending_evidence_teaches.get(key, 0) + 1
+
+    def fail_evidence_teach(self, contact_pubkey: bytes) -> None:
+        """Release one queued evidence teach that failed before transmission."""
+        self._finish_pending_evidence_teach(bytes(contact_pubkey))
+
+    def _finish_pending_evidence_teach(self, key: bytes) -> None:
+        count = self._pending_evidence_teaches.get(key, 0)
+        if count <= 1:
+            self._pending_evidence_teaches.pop(key, None)
+        else:
+            self._pending_evidence_teaches[key] = count - 1
 
     def note_flood_copy(self, pkt: Packet, data: Any = None, analysis: Any = None) -> None:
         """Record a flood reply copy for best-route selection (raw RX subscriber).
@@ -407,10 +429,10 @@ class ReturnPathTeacher:
             return False
 
         key = bytes(contact_pubkey)
-        if key in self._taught_from_evidence:
+        if key in self._taught_from_evidence or key in self._pending_evidence_teaches:
             self._log(
                 f"[ReturnPath] Skip reverse teach to 0x{key[0]:02X} ({reason}): "
-                "already taught from an observed inbound path"
+                "already taught, or being taught, from an observed inbound path"
             )
             return False
 

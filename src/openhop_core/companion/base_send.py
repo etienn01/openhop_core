@@ -8,6 +8,7 @@ import logging
 import random
 import struct
 import time
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
 from ..protocol import Packet, PacketBuilder
@@ -50,6 +51,26 @@ from .timing import (
 )
 
 logger = logging.getLogger("CompanionBase")
+
+# Frame-server clients own login retry timing from the timeout in RESP_CODE_SENT.
+# Keep one authenticated-response waiter alive across those retries so a slow
+# flood reply can still complete login. This is deliberately longer than one
+# adaptive send timeout; observed multi-hop replies can take over a minute.
+FRAME_LOGIN_PENDING_TTL_S = 120.0
+
+
+@dataclass
+class _PendingFrameLogin:
+    """One logical frame-server login session, reused across client retries."""
+
+    target_key: bytes
+    dest_hash: int
+    contact_name: str
+    event: asyncio.Event
+    result: dict
+    callback: Callable[[bool, dict], None]
+    expires_at: float
+    task: Optional[asyncio.Task] = None
 
 
 class _SendOpsMixin:
@@ -884,28 +905,183 @@ class _SendOpsMixin:
                     "timeout": True,
                     "reason": "Login response timeout",
                 }
-            data = login_result["data"]
-            if login_result["success"]:
-                # Mirror firmware onContactResponse (MyMesh.cpp:686-690):
-                # open a connection on a successful login response. This is the
-                # single point every login response (frame server or direct API)
-                # flows through, matching the firmware's onContactResponse.
-                self.note_login_connection(pub_key, data.get("keep_alive_interval", 0))
-            return {
-                "success": login_result["success"],
-                "repeater": contact.name,
-                "is_admin": data.get("is_admin", False),
-                "keep_alive_interval": data.get("keep_alive_interval", 0),
-                "tag": data.get("timestamp", 0),
-                "acl_permissions": data.get("reserved", data.get("permissions", 0)),
-                "firmware_ver_level": data.get("firmware_ver_level"),
-                "reason": ("Login successful" if login_result["success"] else "Login failed"),
-            }
+            return self._build_login_result(
+                pub_key,
+                contact.name,
+                login_result["success"],
+                login_result["data"],
+            )
 
         started["task"] = self._spawn_background_task(
             _format_login_result(), "login result formatting"
         )
         return started
+
+    def _build_login_result(
+        self,
+        pub_key: bytes,
+        contact_name: str,
+        success: bool,
+        data: dict,
+    ) -> dict:
+        """Build the common login result returned by API and frame-server paths."""
+        if success:
+            self.note_login_connection(pub_key, data.get("keep_alive_interval", 0))
+        return {
+            "success": success,
+            "repeater": contact_name,
+            "is_admin": data.get("is_admin", False),
+            "keep_alive_interval": data.get("keep_alive_interval", 0),
+            "tag": data.get("timestamp", 0),
+            "acl_permissions": data.get("reserved", data.get("permissions", 0)),
+            "firmware_ver_level": data.get("firmware_ver_level"),
+            "reason": "Login successful" if success else "Login failed",
+        }
+
+    async def _start_frame_login_request(self, pub_key: bytes, password: str) -> dict:
+        """Send one frame-server login attempt and reuse its pending response session.
+
+        MeshCore companion clients own retries: each command gets one transmission
+        and one per-send timeout hint. Repeated commands for the same full public
+        key refresh this logical session instead of replacing its callback, so a
+        late authenticated reply completes whichever retry is currently pending.
+
+        The public :meth:`send_login` API intentionally keeps its existing
+        three-attempt behaviour; this method is the frame-server compatibility
+        boundary.
+        """
+        contact = self.contacts.get_by_key(pub_key)
+        if not contact:
+            return {"success": False, "error": "not_found", "reason": "Contact not found"}
+        proxy = self.contacts.get_proxy_by_key(pub_key)
+        if not proxy:
+            return {"success": False, "error": "not_found", "reason": "Contact not found"}
+        login_handler = self._get_login_response_handler()
+        if not login_handler:
+            return {
+                "success": False,
+                "error": "bad_state",
+                "reason": "Login handler not available",
+            }
+
+        target_key = proxy.public_key_bytes
+        sessions = self._pending_frame_logins
+        session = sessions.get(target_key)
+        if session is not None and (
+            session.event.is_set() or (session.task is not None and session.task.done())
+        ):
+            sessions.pop(target_key, None)
+            login_handler.remove_login_callback(target_key, session.callback)
+            session = None
+
+        session_owner = session is None
+        if session is None:
+            event = asyncio.Event()
+            result: dict = {"success": False, "data": {}}
+            session_ref: Optional[_PendingFrameLogin] = None
+
+            def _login_cb(success: bool, data: dict) -> None:
+                current = session_ref
+                if current is None or current.event.is_set():
+                    return
+                current.result["success"] = success
+                current.result["data"] = data
+                current.event.set()
+
+            session = _PendingFrameLogin(
+                target_key=target_key,
+                dest_hash=proxy.dest_hash,
+                contact_name=contact.name,
+                event=event,
+                result=result,
+                callback=_login_cb,
+                expires_at=time.monotonic() + FRAME_LOGIN_PENDING_TTL_S,
+            )
+            session_ref = session
+            sessions[target_key] = session
+            login_handler.register_login_callback(target_key, session.callback)
+
+        login_handler.store_login_password(proxy.dest_hash, password)
+        pkt = PacketBuilder.create_login_packet(
+            contact=proxy, local_identity=self._identity, password=password
+        )
+        self._apply_path_hash_mode(pkt)
+        timeout_s = self._response_timeout_s(pkt, proxy)
+        logger.debug(
+            "[PATHDIAG] frame login -> 0x%02X (%s): route=%s attempt=1/1 "
+            "timeout=%.1fs out_path_len=%s",
+            proxy.dest_hash,
+            contact.name,
+            "FLOOD" if pkt.is_route_flood() else "DIRECT",
+            timeout_s,
+            _fmt_path_len(getattr(proxy, "out_path_len", -1)),
+        )
+        if not await self._send_packet(pkt, wait_for_ack=False):
+            if session_owner and sessions.get(target_key) is session:
+                sessions.pop(target_key, None)
+                login_handler.remove_login_callback(target_key, session.callback)
+                login_handler.clear_login_password(proxy.dest_hash)
+            return {"success": False, "error": "send_failed", "reason": "Send failed"}
+
+        session.expires_at = time.monotonic() + FRAME_LOGIN_PENDING_TTL_S
+
+        if session.task is None:
+
+            async def _wait_for_frame_login() -> dict:
+                try:
+                    while not session.event.is_set():
+                        remaining = session.expires_at - time.monotonic()
+                        if remaining <= 0:
+                            return {
+                                "success": False,
+                                "timeout": True,
+                                "reason": "Login response timeout",
+                            }
+                        try:
+                            await asyncio.wait_for(session.event.wait(), timeout=remaining)
+                        except asyncio.TimeoutError:
+                            # A repeated command may have refreshed expires_at while
+                            # this wait used the previous deadline.
+                            continue
+                    return self._build_login_result(
+                        target_key,
+                        session.contact_name,
+                        session.result["success"],
+                        session.result["data"],
+                    )
+                finally:
+                    if sessions.get(target_key) is session:
+                        sessions.pop(target_key, None)
+                        login_handler.remove_login_callback(target_key, session.callback)
+                        login_handler.clear_login_password(session.dest_hash)
+
+            session.task = self._spawn_background_task(
+                _wait_for_frame_login(), "frame login response"
+            )
+
+        return {
+            "success": True,
+            "sent": SentResult(
+                success=True,
+                is_flood=pkt.is_route_flood(),
+                expected_ack=int.from_bytes(target_key[:4], "little"),
+                timeout_ms=int(timeout_s * 1000),
+            ),
+            "task": session.task,
+            "session_owner": session_owner,
+        }
+
+    def _clear_pending_frame_logins(self) -> None:
+        """Cancel frame-login sessions and detach their response callbacks."""
+        sessions = tuple(self._pending_frame_logins.values())
+        self._pending_frame_logins.clear()
+        login_handler = self._get_login_response_handler()
+        for session in sessions:
+            if login_handler is not None:
+                login_handler.remove_login_callback(session.target_key, session.callback)
+                login_handler.clear_login_password(session.dest_hash)
+            if session.task is not None and not session.task.done():
+                session.task.cancel()
 
     async def send_login(self, pub_key: bytes, password: str) -> dict:
         """Send a login request to a repeater and wait for the response."""

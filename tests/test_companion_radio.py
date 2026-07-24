@@ -590,6 +590,70 @@ class TestCompanionLoginRetry:
         result = await started["task"]
         assert result["success"] is False
 
+    async def test_frame_login_retries_reuse_one_pending_session(self, monkeypatch):
+        """Each frame command sends once while late replies share one completion."""
+        radio = MockRadio()
+        comp = CompanionRadio(radio, LocalIdentity())
+        contact = _make_peer_contact("Rpt")
+        comp.contacts.add(contact)
+        monkeypatch.setattr(comp, "_response_timeout_s", lambda pkt, proxy: 0.01)
+
+        first = await comp._start_frame_login_request(contact.public_key, "pw")
+        second = await comp._start_frame_login_request(contact.public_key, "pw")
+
+        assert len(radio.sent) == 2
+        assert first["session_owner"] is True
+        assert second["session_owner"] is False
+        assert second["task"] is first["task"]
+        assert first["sent"].timeout_ms == 10
+
+        # The per-send timeout is only a client retry hint. The shared response
+        # session remains live and accepts a later authenticated response.
+        await asyncio.sleep(0.02)
+        callback = comp._get_login_response_handler()._pending_logins[contact.public_key]
+        callback(
+            True,
+            {
+                "timestamp": 123,
+                "is_admin": True,
+                "keep_alive_interval": 4,
+                "reserved": 3,
+                "firmware_ver_level": 2,
+            },
+        )
+        result = await first["task"]
+
+        assert result["success"] is True
+        assert result["tag"] == 123
+        assert result["is_admin"] is True
+        assert contact.public_key not in comp._pending_frame_logins
+        assert contact.public_key not in comp._get_login_response_handler()._pending_logins
+
+    async def test_frame_login_session_expires_and_cleans_up(self, monkeypatch):
+        """An abandoned frame login retains no callback after its bounded grace."""
+        monkeypatch.setattr(
+            "openhop_core.companion.base_send.FRAME_LOGIN_PENDING_TTL_S",
+            0.02,
+        )
+        radio = MockRadio()
+        comp = CompanionRadio(radio, LocalIdentity())
+        contact = _make_peer_contact("Rpt")
+        comp.contacts.add(contact)
+
+        started = await comp._start_frame_login_request(contact.public_key, "pw")
+        result = await started["task"]
+
+        assert result["timeout"] is True
+        assert len(radio.sent) == 1
+        assert contact.public_key not in comp._pending_frame_logins
+        assert contact.public_key not in comp._get_login_response_handler()._pending_logins
+
+        retried = await comp._start_frame_login_request(contact.public_key, "pw")
+        assert retried["session_owner"] is True
+        assert retried["task"] is not started["task"]
+        comp._clear_pending_frame_logins()
+        await asyncio.sleep(0)
+
 
 # ---------------------------------------------------------------------------
 # Repeater-command response correlation (drives the real text handler)
@@ -768,7 +832,7 @@ class TestRepeaterCommandCorrelation:
         """CLI_DATA from a contact with no pending command is a normal message
         (firmware queues it to the client rather than dropping it)."""
         radio, identity, comp, peers = self._setup(["Rpt"])
-        (rpt_identity, _) = peers[0]
+        rpt_identity, _ = peers[0]
         handler = comp._get_text_handler()
         recorder = _EventRecorder()
         monkeypatch.setattr(handler, "event_service", recorder)
@@ -785,7 +849,7 @@ class TestRepeaterCommandCorrelation:
     async def test_single_command_happy_path(self, monkeypatch):
         """A single command resolves with its target's CLI_DATA reply."""
         radio, identity, comp, peers = self._setup(["Rpt"])
-        (rpt_identity, rpt_contact) = peers[0]
+        rpt_identity, rpt_contact = peers[0]
         handler = comp._get_text_handler()
         _shorten_command_timeout(monkeypatch, [1.0])
 
@@ -945,7 +1009,7 @@ class TestLoginResponseCorrelation:
         """A single login resolves success from an OK response and failure from a
         rejection response (both via the real handler)."""
         radio, identity, comp, peers = self._setup(["Rpt"])
-        (rpt_identity, rpt_contact) = peers[0]
+        rpt_identity, rpt_contact = peers[0]
         monkeypatch.setattr(comp, "_response_timeout_s", lambda pkt, proxy: 0.5)
         handler = comp._get_login_response_handler()
 
@@ -1015,7 +1079,7 @@ class TestLoginResponseHashCollisions:
         radio = MockRadio()
         identity = LocalIdentity()
         comp = CompanionRadio(radio, identity)
-        (a_identity, a_contact) = _distinct_peers(["RptA"], avoid={identity.get_public_key()[0]})[0]
+        a_identity, a_contact = _distinct_peers(["RptA"], avoid={identity.get_public_key()[0]})[0]
         b_identity, b_contact = _colliding_peer(
             "RptB", a_contact.public_key[0], avoid_keys={a_contact.public_key}
         )

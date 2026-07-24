@@ -180,13 +180,16 @@ class CompanionRadio(CompanionBase):
 
     async def stop(self) -> None:
         self._running = False
+        self._clear_pending_frame_logins()
         try:
             self.node.dispatcher.remove_raw_packet_subscriber(self._on_raw_packet_rx_log)
-            teacher = getattr(
-                self.node.dispatcher.protocol_response_handler, "return_path_teacher", None
-            )
+            protocol_handler = self.node.dispatcher.protocol_response_handler
+            teacher = getattr(protocol_handler, "return_path_teacher", None)
             if teacher is not None:
                 self.node.dispatcher.remove_raw_packet_subscriber(teacher.note_flood_copy)
+            if protocol_handler is not None:
+                protocol_handler.cancel_pending_reciprocals()
+                await protocol_handler.wait_for_pending_reciprocals()
         except Exception:
             logger.debug("Remove raw packet subscriber during stop failed", exc_info=True)
         await self.node.stop()
