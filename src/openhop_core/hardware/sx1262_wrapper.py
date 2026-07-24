@@ -46,6 +46,12 @@ class SX1262Radio(LoRaRadio):
 
     # Common timing constants to avoid magic numbers
     RADIO_TIMING_DELAY = 0.01  # 10ms delay for standard radio operations
+    FRONTEND_SETTLE_DELAY_S = 0.100
+
+    # SX1262 receiver-sensitivity workaround used by other SX126x implementations:
+    # set bit 0 at register 0x08B5 while preserving all other bits.
+    REG_RX_SENSITIVITY = 0x08B5
+    REG_RX_SENSITIVITY_BIT0 = 0x01
 
     def __init__(
         self,
@@ -307,6 +313,23 @@ class SX1262Radio(LoRaRadio):
 
         self.lora.setPacketType(self.lora.LORA_MODEM)
         return True
+
+    def _apply_rx_sensitivity_fix(self) -> None:
+        """Apply SX1262 RX sensitivity workaround (register 0x08B5 bit 0)."""
+        reg_value = self.lora.readRegister(self.REG_RX_SENSITIVITY, 1)
+        if not reg_value:
+            logger.warning("Failed to read RX sensitivity register 0x%04X", self.REG_RX_SENSITIVITY)
+            return
+
+        current_value = int(reg_value[0])
+        updated_value = current_value | self.REG_RX_SENSITIVITY_BIT0
+        self.lora.writeRegister(self.REG_RX_SENSITIVITY, (updated_value,), 1)
+        logger.debug(
+            "Applied SX1262 RX sensitivity fix at 0x%04X: 0x%02X -> 0x%02X",
+            self.REG_RX_SENSITIVITY,
+            current_value,
+            updated_value,
+        )
 
     def _handle_interrupt(self):
         """instance method interrupt handler"""
@@ -767,6 +790,10 @@ class SX1262Radio(LoRaRadio):
                         logger.warning(f"Could not setup EN pin {en_pin}")
                 self._en_pins_setup = all_en_pins_configured
 
+            if self.en_pins and self._en_pins_setup:
+                logger.debug("Waiting 100 ms for external radio front end to settle")
+                time.sleep(self.FRONTEND_SETTLE_DELAY_S)
+
             # Basic radio setup
             if not self._basic_radio_setup(use_busy_check=True):
                 return False
@@ -879,6 +906,8 @@ class SX1262Radio(LoRaRadio):
             self.lora.clearIrqStatus(0xFFFF)
             self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
             self.lora.setRxGain(self.lora.RX_GAIN_BOOSTED)
+
+            self._apply_rx_sensitivity_fix()
 
             # Program custom CAD thresholds to chip hardware if available
             if self._custom_cad_peak is not None and self._custom_cad_min is not None:
