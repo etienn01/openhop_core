@@ -328,7 +328,7 @@ class AnonRequestHandler(BaseHandler):
                     response_pkt.set_path(path_bytes, encoded)
 
             # Scope the flood path-return reply to the region the request arrived
-            # under (OH-026); a direct reply captures no region and stays plain.
+            # under; a direct reply captures no region and stays plain.
             apply_reply_scope(response_pkt, packet)
 
             self._send_packet_callback(response_pkt, SERVER_RESPONSE_DELAY_MS)

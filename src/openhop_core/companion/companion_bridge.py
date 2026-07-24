@@ -207,7 +207,7 @@ class CompanionBridge(CompanionBase):
         )
         self._packet_injector = packet_injector
 
-        # Region registry for reply-region capture (OH-026). None by default so a
+        # Region registry for reply-region capture. None by default so a
         # standalone bridge captures nothing (replies fall through to plain). The
         # host repeater points this at its dispatcher's region_map so incoming
         # request regions are captured and mirrored onto replies.
@@ -428,7 +428,7 @@ class CompanionBridge(CompanionBase):
         is_flood = route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD)
         self.stats.record_rx(is_flood=is_flood)
 
-        # Capture the region this request arrived under (OH-026) before the handler
+        # Capture the region this request arrived under before the handler
         # builds any reply, so a flood reply is scoped to that region (or plain).
         # No-op when no RegionMap is configured (standalone bridge).
         capture_recv_region(self.region_map, packet)

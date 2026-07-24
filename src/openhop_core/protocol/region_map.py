@@ -134,7 +134,7 @@ class RegionMap:
 
 
 def capture_recv_region(region_map: Optional[RegionMap], pkt: Packet) -> None:
-    """Record the region a received packet arrived under, onto the packet (OH-026).
+    """Record the region a received packet arrived under, onto the packet.
 
     Shared by both RX entrypoints (``Dispatcher._process_received_packet`` and
     ``CompanionBridge.process_received_packet``) so capture is identical.
@@ -146,7 +146,7 @@ def capture_recv_region(region_map: Optional[RegionMap], pkt: Packet) -> None:
       never the node default.
 
     A ``None`` region_map (standalone companion) is a no-op: ``_recv_region_captured``
-    stays False, so a reply falls through to the dispatcher default (OH-022).
+    stays False, so a reply falls through to the dispatcher default.
     """
     if region_map is None:
         return
@@ -161,12 +161,12 @@ def capture_recv_region(region_map: Optional[RegionMap], pkt: Packet) -> None:
 def apply_reply_scope(reply_pkt: Packet, request_pkt: Optional[Packet]) -> None:
     """Scope a freshly-built flood reply to the region its request arrived under.
 
-    OH-026: a repeater/room-server reply carries the request's region (or plain
-    when the request was unscoped/direct), re-hashing the transport code over
-    the reply's own payload — never the request's code, never the node default.
+    A repeater/room-server reply carries the request's region (or plain when
+    the request was unscoped/direct), re-hashing the transport code over the
+    reply's own payload — never the request's code, never the node default.
 
     - Not captured (standalone companion, ``region_map`` None): return without
-      marking, so the reply falls through to the dispatcher default (OH-022).
+      marking, so the reply falls through to the dispatcher default.
     - Captured with a key and the reply is a plain FLOOD: scope it
       (=> TRANSPORT_FLOOD).
     - Captured with no key (plain-flood/direct request, or unknown region):

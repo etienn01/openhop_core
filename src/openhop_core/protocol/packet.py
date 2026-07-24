@@ -146,7 +146,7 @@ class Packet:
         # (scoped or deliberately plain); the dispatcher must not re-scope it.
         self._flood_scope_applied = False
         self._injected_for_tx = False  # Set by repeater inject path; skip engine on route
-        # Region captured from this packet on receive (OH-026). Only set True when
+        # Region captured from this packet on receive. Only set True when
         # a RegionMap was actually consulted; the matched region key (or None =>
         # reply plain) is read by region_map.apply_reply_scope when a handler
         # builds a flood reply. Lives on the Packet, never a shared dispatcher

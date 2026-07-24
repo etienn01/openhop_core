@@ -147,7 +147,7 @@ class CompanionRadio(CompanionBase):
         self._running = True
         self.node.dispatcher.set_default_path_hash_mode(self.prefs.path_hash_mode)
         self.node.dispatcher.rx_delay_base = self.prefs.rx_delay_base
-        # Seed the flood-scope mirrors from persisted prefs at boot (OH-022): the
+        # Seed the flood-scope mirrors from persisted prefs at boot: the
         # default, the transient override and the sticky unscoped flag. Without
         # this, a companion booted with only a persisted default would send every
         # dispatcher-scoped packet as plain flood until the first set_* call.
@@ -256,7 +256,7 @@ class CompanionRadio(CompanionBase):
 
         The mirror is the resolved key (``_default_scope_key`` maps an all-zero
         or short key to None => plain flood), so sends that rely on the
-        dispatcher to scope at TX time carry the default too (OH-022).
+        dispatcher to scope at TX time carry the default too.
         """
         result = super().set_default_flood_scope(scope_name, transport_key)
         self.node.dispatcher.default_flood_transport_key = self._default_scope_key()

@@ -131,7 +131,7 @@ class Dispatcher:
         # as ROUTE_TYPE_TRANSPORT_FLOOD.  Set via companion set_flood_scope().
         # This is the transient send-scope OVERRIDE mirror.
         self.flood_transport_key: Optional[bytes] = None
-        # Persisted default flood scope mirror (OH-022). Firmware
+        # Persisted default flood scope mirror. Firmware
         # sendFloodScoped(recipient) falls back to prefs.default_scope_key when
         # no transient override is set; the companion applies that at its layer,
         # but several sends build the packet and rely on the dispatcher to scope
@@ -144,7 +144,7 @@ class Dispatcher:
         # set_flood_scope()/set_flood_region().
         self.flood_unscoped: bool = False
 
-        # Optional region registry for reply-region capture (OH-026). Standalone
+        # Optional region registry for reply-region capture. Standalone
         # nodes/companions leave this None (no capture); the repeater populates
         # it so replies carry the incoming request's region.
         self.region_map: Optional[RegionMap] = None
@@ -533,7 +533,7 @@ class Dispatcher:
         pkt._rssi = rssi if rssi is not None else self.radio.get_last_rssi()
         pkt._snr = snr if snr is not None else self.radio.get_last_snr()
 
-        # Capture the region this packet arrived under (OH-026) before any handler
+        # Capture the region this packet arrived under before any handler
         # runs, so a reply builder can scope its reply to that region. No-op when
         # no RegionMap is configured (standalone node/companion).
         capture_recv_region(self.region_map, pkt)

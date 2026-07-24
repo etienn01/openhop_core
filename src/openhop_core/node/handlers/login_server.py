@@ -328,8 +328,8 @@ class LoginServerHandler(BaseHandler):
 
             # Scope the flood reply (PATH-return for a flood login, or the flood
             # RESPONSE datagram for a direct login) to the region the request
-            # arrived under (OH-026). Both branches build a flood reply; a
-            # direct request captures no region and stays plain.
+            # arrived under. Both branches build a flood reply; a direct request
+            # captures no region and stays plain.
             apply_reply_scope(response_pkt, original_packet)
 
             # Send with delay (matches C++ SERVER_RESPONSE_DELAY)
