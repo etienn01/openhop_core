@@ -868,7 +868,7 @@ class SX1262Radio(LoRaRadio):
                 logger.info("DIO2 RF switch control enabled")
 
             # Common configuration for all board types
-            # self.lora._fixResistanceAntenna()
+            self.lora._fixResistanceAntenna()
 
             # Set frequency
             rfFreq = int(self.frequency * 33554432 / 32000000)
@@ -1482,7 +1482,6 @@ class SX1262Radio(LoRaRadio):
 
         # Give 500ms quiet time after any packet activity
         if now - self._last_packet_activity < 0.5:
-            logger.debug("[Noise] Sample skipped: recent packet activity")
             return
 
         self._last_sample_check = now

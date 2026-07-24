@@ -1,4 +1,5 @@
 import time
+import logging
 
 # Optional import - spidev is only needed for hardware SPI (Raspberry Pi)
 # When using USB adapters like CH341, a custom transport is provided instead
@@ -13,6 +14,7 @@ from ...signal_utils import snr_register_to_db
 from .base import BaseLoRa
 
 _gpio_manager = None
+logger = logging.getLogger("SX126x")
 
 
 def set_gpio_manager(gpio_manager):
@@ -194,6 +196,45 @@ class SX126x(BaseLoRa):
     PA_RAMP_800U = 0x05  #            800 us
     PA_RAMP_1700U = 0x06  #            1700 us
     PA_RAMP_3400U = 0x07  #            3400 us
+
+    # Optimized SX1262 PA settings derived from current RadioLib table:
+    # jgromes/RadioLib src/modules/SX126x/SX1262.cpp (paOptimizedTable)
+    # Indexing is requested dBm + 9 for requested range [-9, 22].
+    # Each tuple is (paDutyCycle, hpMax, paVal[SetTxParams power byte]).
+    SX1262_PA_TABLE = (
+        (2, 2, -5),
+        (2, 1, 0),
+        (1, 1, 3),
+        (1, 2, 0),
+        (1, 1, 6),
+        (1, 2, 3),
+        (2, 2, 2),
+        (4, 1, 6),
+        (1, 1, 11),
+        (2, 1, 11),
+        (1, 1, 14),
+        (2, 1, 14),
+        (1, 1, 20),
+        (1, 1, 22),
+        (2, 2, 11),
+        (3, 1, 21),
+        (1, 2, 17),
+        (4, 2, 13),
+        (1, 2, 20),
+        (1, 2, 22),
+        (2, 2, 21),
+        (3, 2, 21),
+        (1, 4, 19),
+        (1, 4, 20),
+        (3, 3, 20),
+        (2, 5, 19),
+        (1, 6, 22),
+        (2, 5, 22),
+        (3, 5, 22),
+        (3, 6, 22),
+        (4, 6, 22),
+        (4, 7, 22),
+    )
 
     # SetModulationParams
     BW_7800 = 0x00  # LoRa bandwidth: 7.8 kHz
@@ -578,16 +619,30 @@ class SX126x(BaseLoRa):
         rfFreq = int(frequency * 33554432 / 32000000)
         self.setRfFrequency(rfFreq)
 
+    def _get_sx1262_pa_config(self, requested_dbm: int):
+        """Resolve SX1262 optimized PA settings for requested output dBm."""
+        index = requested_dbm + 9
+        return self.SX1262_PA_TABLE[index]
+
     def setTxPower(self, txPower: int, version=TX_POWER_SX1262):
         # -----------------------------
         # Chipset-specific hard limits
         # -----------------------------
-        if txPower > 22:
-            txPower = 22
-        if version == self.TX_POWER_SX1261 and txPower > 15:
-            txPower = 15
-        if txPower < -17:
-            txPower = -17
+        if version == self.TX_POWER_SX1261:
+            if txPower > 15:
+                txPower = 15
+            if txPower < -17:
+                txPower = -17
+        elif version == self.TX_POWER_SX1262:
+            if txPower > 22:
+                txPower = 22
+            if txPower < -9:
+                txPower = -9
+        else:
+            if txPower > 22:
+                txPower = 22
+            if txPower < -17:
+                txPower = -17
 
         # Default configuration
         paDutyCycle = 0x00
@@ -599,22 +654,23 @@ class SX126x(BaseLoRa):
         # SX1262 (E22 modules)
         # =============================
         if version == self.TX_POWER_SX1262:
-            # Per datasheet 13.4.4: power parameter is in dBm directly
-            powerReg = txPower
+            requested_dbm = txPower
+            paDutyCycle, hpMax, paVal = self._get_sx1262_pa_config(requested_dbm)
 
-            # Configure OCP (Over Current Protection) for high power only
-            # For high power (≥20 dBm), need 140 mA current limit
-            # For lower power, leave chip default (matches RadioLib behavior)
-            if txPower >= 20:
-                # High power: Set OCP to 140 mA
-                # Formula: I_max = 2.5 * (OCP + 1) mA
-                # 0x38 = 56 decimal → (56 + 1) * 2.5 = 142.5 mA
-                self.setCurrentProtection(0x38)  # 140 mA
+            # Keep SX1262 OCP fixed at 140 mA (0x38) independent of requested
+            # output dBm. This avoids OCP changing as a side effect of power
+            # selection while preserving high-power SX1262 operation.
+            self.setCurrentProtection(0x38)
 
-            # Matches RadioLib's SX1262::setOutputPower() implementation
             deviceSel = 0x00  # SX1262 PA (0x00 for SX1262, 0x01 for SX1261)
-            paDutyCycle = 0x04  # Optimal duty cycle for high power
-            hpMax = 0x07  # Maximum clamping level (allows full +22 dBm)
+            powerReg = paVal
+            logger.debug(
+                "SX1262 TX power: requested=%ddBm, duty=%d, hpMax=%d, paVal=%d",
+                requested_dbm,
+                paDutyCycle,
+                hpMax,
+                paVal,
+            )
 
             # Note: For E22-900M30S modules, 22 dBm from SX1262 chip
             #       → ~30 dBm (1W) output via external YP2233W PA
