@@ -216,6 +216,34 @@ class _CallbackMixin:
             "context": context or {},
         }
 
+    def has_pending_request_tag(self, tag: int, contact_pubkey: bytes) -> bool:
+        """True when ``tag`` is the reflected tag of a request we are waiting on.
+
+        Wired into :meth:`LoginResponseHandler.set_foreign_request_probe` so a
+        status/telemetry/neighbours reply is never mistaken for a login reply
+        while a login to the same contact is still pending. Covers both places a
+        pending tag can live:
+
+        * ``_pending_binary_requests`` — ``send_binary_req`` (neighbours, owner
+          info, ACL, MMA), keyed by the little-endian tag hex;
+        * the protocol handler's per-(contact, tag) waiters — ``send_status`` /
+          ``send_telemetry`` via ``_start_protocol_request``.
+
+        Expired entries are pruned first, so a long-dead request cannot keep
+        diverting replies away from a genuine login.
+        """
+        try:
+            self.cleanup_expired_binary_requests()
+            if (int(tag) & 0xFFFFFFFF).to_bytes(4, "little").hex() in self._pending_binary_requests:
+                return True
+            handler = self._get_protocol_response_handler()
+            waiters = getattr(handler, "_response_waiters", None)
+            if waiters and (bytes(contact_pubkey), int(tag) & 0xFFFFFFFF) in waiters:
+                return True
+        except Exception as e:
+            logger.debug("has_pending_request_tag failed: %s", e)
+        return False
+
     def cleanup_expired_binary_requests(self) -> None:
         """Remove expired entries from _pending_binary_requests."""
         now = time.time()

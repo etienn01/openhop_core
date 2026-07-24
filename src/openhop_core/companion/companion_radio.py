@@ -404,6 +404,11 @@ class CompanionRadio(CompanionBase):
         dispatcher.set_ack_received_listener(self._on_ack_received)
         dispatcher.add_raw_packet_subscriber(self._on_raw_packet_rx_log)
         dispatcher.raw_data_received_callback = self._on_raw_custom_received
+        login_handler = getattr(dispatcher, "login_response_handler", None)
+        if login_handler is not None:
+            # See CompanionBridge: keep a pending login from swallowing an
+            # unrelated reply from the same contact.
+            login_handler.set_foreign_request_probe(self.has_pending_request_tag)
         if dispatcher.protocol_response_handler:
             dispatcher.protocol_response_handler.set_binary_response_callback(
                 self._on_binary_response

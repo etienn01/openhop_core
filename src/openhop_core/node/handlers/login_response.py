@@ -52,6 +52,9 @@ class LoginResponseHandler(BaseHandler):
         self._active_login_passwords = {}  # dest_hash -> password
         # Protocol response handler for forwarding telemetry responses
         self._protocol_response_handler = None
+        # See set_foreign_request_probe: distinguishes a login reply from any
+        # other reply that happens to arrive while a login is pending.
+        self._foreign_request_probe: Optional[Callable[[int, bytes], bool]] = None
 
     def set_packet_injector(self, injector) -> None:
         """Wire the transmit path used for return-path teaching.
@@ -91,6 +94,30 @@ class LoginResponseHandler(BaseHandler):
         pk = contact.public_key
         return pk if isinstance(pk, bytes) else bytes.fromhex(pk)
 
+    def _is_foreign_request_reply(self, response_data: Optional[dict], contact) -> bool:
+        """True when this reply answers some *other* pending request, not a login.
+
+        Best-effort: with no probe wired, or no decodable tag, behaviour is
+        unchanged (the login branch decides), so a standalone handler keeps
+        working exactly as before.
+        """
+        if self._foreign_request_probe is None or not response_data:
+            return False
+        tag = response_data.get("timestamp")
+        if tag is None:
+            return False
+        try:
+            if not self._foreign_request_probe(int(tag) & 0xFFFFFFFF, self._pubkey_bytes(contact)):
+                return False
+        except Exception as e:
+            self.log(f"Foreign-request probe failed: {e}")
+            return False
+        self.log(
+            f"Response from '{getattr(contact, 'name', '?')}' reflects tag "
+            f"0x{int(tag) & 0xFFFFFFFF:08X} of a pending request, not a login; forwarding"
+        )
+        return True
+
     def _has_pending_login_for_hash(self, lookup_hash: int) -> bool:
         """True when any pending login (or stored password) targets this hash."""
         if lookup_hash in self._active_login_passwords:
@@ -122,6 +149,31 @@ class LoginResponseHandler(BaseHandler):
         """Clear stored password for destination hash."""
         if dest_hash in self._active_login_passwords:
             del self._active_login_passwords[dest_hash]
+
+    def set_foreign_request_probe(self, probe: Optional[Callable[[int, bytes], bool]]) -> None:
+        """Wire a check for "this reflected tag belongs to some other request".
+
+        ``probe(tag, contact_pubkey)`` returns True when the tag matches a pending
+        binary/protocol request rather than a login. Without it, a pending login
+        makes this handler claim *every* authenticated RESPONSE from that contact,
+        because a login reply and a status/telemetry/neighbours reply are
+        indistinguishable by contact alone.
+
+        Firmware has the same ambiguity but a one-response window — MyMesh
+        ``onContactResponse`` clears ``pending_login`` on the first response from
+        the contact, so at most one packet can be misread. openHop deliberately
+        keeps a login waiter alive far longer (``FRAME_LOGIN_PENDING_TTL_S``, so a
+        late flood login reply still completes), which without this probe turns
+        that one-packet window into a two-minute one: observed live, a 148-byte
+        neighbours reply was consumed here and reported as ``Login failed (code:
+        0x2F)`` — 0x2F being the low byte of its ``neighbours_count`` of 47.
+
+        The reflected request tag is the discriminator firmware itself points at
+        (``// FUTURE: tag == pending_status``): every protocol/binary request
+        reflects its timestamp in the response's first four bytes, and the sender
+        registered that tag when it sent the request.
+        """
+        self._foreign_request_probe = probe
 
     async def __call__(self, packet: Packet) -> HandlerResult:
         """Handle RESPONSE/ANON_REQ packets and report MAC ownership."""
@@ -187,6 +239,15 @@ class LoginResponseHandler(BaseHandler):
                 break
 
         if authenticated and matched_contact:
+            # A reply whose reflected tag belongs to a pending binary/protocol
+            # request is not a login reply, even though a login is pending for
+            # this contact. Checked before the login branch so the payload is
+            # never parsed with the login layout — doing so reads a foreign field
+            # as a response code and reports a bogus login failure, and the real
+            # request's data is lost. Forwarding also leaves the return-path teach
+            # to the protocol handler, which does it for its own responses.
+            if self._is_foreign_request_reply(response_data, matched_contact):
+                return await self._forward_to_protocol_handler(packet)
             if self._pubkey_bytes(matched_contact) not in self._pending_logins:
                 # Authenticated, but this contact has no login pending: not a
                 # login response. Mirrors firmware onContactResponse, where a

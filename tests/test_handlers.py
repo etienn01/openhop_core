@@ -977,6 +977,130 @@ class TestGroupTextHandler:
         assert parsed["content"] == "Bob: hey"
 
 
+class TestPendingLoginDoesNotSwallowOtherReplies:
+    """A pending login must not claim an unrelated reply from the same contact.
+
+    Observed live: three login attempts to a repeater timed out at the client,
+    leaving a login waiter alive (openHop keeps one for
+    ``FRAME_LOGIN_PENDING_TTL_S`` so a late flood login reply can still
+    complete). A neighbours fetch to that repeater then answered normally — and
+    the 148-byte reply was consumed here and logged as ``Login failed to
+    'Hillcrest' (code: 0x2F)``. 0x2F is 47, the low byte of that response's
+    ``neighbours_count``: the login parser had read a neighbour count as a
+    response code, and the fetch reported failure with the data discarded.
+
+    Firmware has the same contact-based ambiguity but a one-response window
+    (``MyMesh::onContactResponse`` clears ``pending_login`` on the first reply),
+    so at most one packet can be misread. The discriminator is the reflected
+    request tag, which firmware's own source points at:
+    ``// FUTURE: tag == pending_status``.
+    """
+
+    def setup_method(self):
+        self.contacts = MockContactBook()
+        self.local_identity = LocalIdentity()
+        self.server = LocalIdentity()
+        self.server_key = self.server.get_public_key()
+        # LoginResponseHandler iterates ``contacts.contacts`` looking for a
+        # pubkey whose first byte matches the responding hash.
+        server_contact = type("_C", (), {"public_key": self.server_key, "name": "FarRepeater"})()
+        self.contacts.contacts.append(server_contact)
+        self.handler = LoginResponseHandler(self.local_identity, self.contacts, MagicMock())
+        self.forwarded = []
+
+        class _Proto:
+            _response_waiters: dict = {}
+
+            async def __call__(_self, pkt):
+                self.forwarded.append(pkt)
+                return HandlerResult.consumed()
+
+        self.proto = _Proto()
+        self.handler.set_protocol_response_handler(self.proto)
+
+    def _reply(self, plaintext: bytes) -> Packet:
+        """A RESPONSE datagram from the server to us carrying ``plaintext``."""
+        shared = Identity(self.server_key).calc_shared_secret(self.local_identity.get_private_key())
+        enc = CryptoUtils.encrypt_then_mac(shared[:16], shared, plaintext)
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_RESPONSE << 2) | ROUTE_TYPE_DIRECT
+        pkt.payload = bytearray(
+            [self.local_identity.get_public_key()[0], self.server_key[0]]
+        ) + bytearray(enc)
+        pkt.payload_len = len(pkt.payload)
+        pkt.path = bytearray()
+        pkt.path_len = 0
+        return pkt
+
+    def _neighbours_reply(self, tag: int) -> Packet:
+        """tag(4) + neighbours_count(2)=47 + results_count(2) + entries."""
+        body = struct.pack("<IHH", tag, 47, 2) + bytes(range(18))
+        return self._reply(body)
+
+    def _login_reply(self, tag: int) -> Packet:
+        """tag(4) + code(1)=OK + keep_alive(1) + is_admin(1) + perms(1) + rand(4) + ver(1)."""
+        return self._reply(struct.pack("<IBBBB", tag, 0, 0, 1, 0x03) + b"\x00\x00\x00\x00\x07")
+
+    @pytest.mark.asyncio
+    async def test_neighbours_reply_is_forwarded_not_read_as_a_login(self):
+        tag = 0x11223344
+        login_cb = MagicMock()
+        self.handler.register_login_callback(self.server_key, login_cb)
+        self.handler.set_foreign_request_probe(lambda t, key: t == tag and key == self.server_key)
+
+        result = await self.handler(self._neighbours_reply(tag))
+
+        assert self.forwarded, "the neighbours reply must reach the protocol handler"
+        assert result.authenticated is True
+        login_cb.assert_not_called()  # and must NOT be reported as a login result
+
+    @pytest.mark.asyncio
+    async def test_a_real_login_reply_still_completes_while_a_request_is_pending(self):
+        """The probe must not divert the login reply it was meant to protect."""
+        login_cb = MagicMock()
+        self.handler.register_login_callback(self.server_key, login_cb)
+        # Some *other* tag is pending; this reply reflects the login's own tag.
+        self.handler.set_foreign_request_probe(lambda t, key: t == 0xAAAAAAAA)
+
+        await self.handler(self._login_reply(0x55667788))
+
+        assert self.forwarded == []
+        login_cb.assert_called_once()
+        assert login_cb.call_args[0][0] is True
+
+    @pytest.mark.asyncio
+    async def test_without_a_probe_behaviour_is_unchanged(self):
+        """A standalone handler (no companion wiring) keeps its old behaviour."""
+        login_cb = MagicMock()
+        self.handler.register_login_callback(self.server_key, login_cb)
+
+        await self.handler(self._neighbours_reply(0x11223344))
+
+        assert self.forwarded == []
+        login_cb.assert_called_once()  # the pre-fix misread, still reachable
+
+    @pytest.mark.asyncio
+    async def test_probe_covers_pending_binary_requests_via_the_companion(self):
+        """End-to-end wiring: CompanionBase.has_pending_request_tag is the probe."""
+        from openhop_core.companion.companion_bridge import CompanionBridge
+
+        async def _injector(pkt, wait_for_ack=False, expected_crc=None):
+            return True
+
+        bridge = CompanionBridge(LocalIdentity(), _injector, node_name="b")
+        tag = 0x0BADF00D
+        assert bridge.has_pending_request_tag(tag, self.server_key) is False
+        bridge.register_binary_request(
+            tag.to_bytes(4, "little").hex(), request_type=0x06, timeout_seconds=30
+        )
+        assert bridge.has_pending_request_tag(tag, self.server_key) is True
+        # An expired registration must stop diverting replies.
+        bridge.register_binary_request(
+            tag.to_bytes(4, "little").hex(), request_type=0x06, timeout_seconds=-1
+        )
+        assert bridge.has_pending_request_tag(tag, self.server_key) is False
+
+
 # Login Response Handler Tests
 class TestLoginResponseHandler:
     def setup_method(self):

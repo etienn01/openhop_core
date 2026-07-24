@@ -270,6 +270,9 @@ class CompanionBridge(CompanionBase):
         self._protocol_response_handler = core.protocol_response_handler
         self._login_response_handler = core.login_response_handler
         self._text_handler_ref = core.text_handler
+        # A pending login must not let the login handler claim an unrelated
+        # status/telemetry/neighbours reply from the same contact.
+        core.login_response_handler.set_foreign_request_probe(self.has_pending_request_tag)
         core.protocol_response_handler.set_binary_response_callback(self._on_binary_response)
         core.protocol_response_handler.set_packet_injector(self._packet_injector)
         core.protocol_response_handler.set_contact_path_updated_callback(
