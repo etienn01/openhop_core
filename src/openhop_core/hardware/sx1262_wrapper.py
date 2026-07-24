@@ -1450,18 +1450,12 @@ class SX1262Radio(LoRaRadio):
 
         # Don't sample during TX operations.
         if self._tx_lock.locked():
-            logger.debug("[Noise] Sample skipped: TX in progress")
             return
 
         # Don't sample if packet processing is active or RX terminal IRQs are pending.
         if self._is_receiving_packet:
-            logger.debug("[Noise] Sample skipped: active receive processing")
             return
         if self._pending_rx_irq_status:
-            logger.debug(
-                "[Noise] Sample skipped: pending RX IRQ status 0x%04X",
-                self._pending_rx_irq_status,
-            )
             return
 
         # Skip during in-flight RX activity indicated by hardware IRQ flags.
@@ -1474,10 +1468,6 @@ class SX1262Radio(LoRaRadio):
         )
         irq_status = self.lora.getIrqStatus()
         if irq_status & rx_activity_mask:
-            logger.debug(
-                "[Noise] Sample skipped: active RX preamble/header (irq=0x%04X)",
-                irq_status,
-            )
             return
 
         # Give 500ms quiet time after any packet activity
