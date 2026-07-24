@@ -3,7 +3,6 @@
 from unittest.mock import MagicMock
 
 import pytest
-
 from openhop_core.hardware.lora.LoRaRF.SX126x import SX126x
 
 

@@ -1,5 +1,5 @@
-import time
 import logging
+import time
 
 # Optional import - spidev is only needed for hardware SPI (Raspberry Pi)
 # When using USB adapters like CH341, a custom transport is provided instead
