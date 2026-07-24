@@ -208,6 +208,58 @@ class TestCompanionBridgeChannelUpdated:
 
 
 @pytest.mark.asyncio
+class TestCompanionBridgeFloodCopyFeed:
+    """The host-wired pre-dedup feed that lets the teacher pick the best route.
+
+    A bridge owns no dispatcher, and the host delivers only the *first* copy of a
+    flood reply to ``process_received_packet`` — later copies die in the host's
+    seen-table. Observed on a live mesh: four copies of one login reply over
+    ~1.8 s, the teach going out 0.4 s in on the marginal first route, and the
+    peer's later direct replies then failing while flood replies kept working.
+    So the host wires ``dispatcher.add_raw_packet_subscriber(bridge.note_flood_copy)``
+    and this method has to reach the teacher.
+    """
+
+    def _flood_response_to(self, bridge, *, in_path: bytes, rssi: int) -> Packet:
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_RESPONSE << 2) | ROUTE_TYPE_FLOOD
+        # payload[0] must be OUR dest hash for the teacher to record the copy.
+        pkt.payload = bytearray([bridge._identity.get_public_key()[0], 0x5A]) + bytearray(
+            b"\xcc" * 12
+        )
+        pkt.payload_len = len(pkt.payload)
+        pkt.path = bytearray(in_path)
+        pkt.path_len = PathUtils.encode_path_len(1, len(in_path))
+        pkt._rssi = rssi
+        return pkt
+
+    async def test_note_flood_copy_reaches_the_return_path_teacher(self):
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        teacher = bridge._get_protocol_response_handler().return_path_teacher
+        # The teacher ignores copies until a transmit path is wired.
+        teacher.set_injector(injector)
+
+        first = self._flood_response_to(bridge, in_path=b"\xaa\xbb\xcc", rssi=-100)
+        better = self._flood_response_to(bridge, in_path=b"\xdd", rssi=-40)
+        bridge.note_flood_copy(first)
+        bridge.note_flood_copy(better)
+
+        # Both copies of the same reply share a packet hash; the stronger,
+        # shorter route must be the one retained.
+        assert len(teacher._recent_copies) == 1
+        kept = next(iter(teacher._recent_copies.values()))
+        assert kept.path == b"\xdd"
+        assert kept.rssi == -40
+
+    async def test_note_flood_copy_is_safe_without_a_teacher(self):
+        """It runs on the host's hot RX path; a missing handler must not raise."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        bridge._protocol_response_handler = None
+        bridge.note_flood_copy(self._flood_response_to(bridge, in_path=b"\xaa", rssi=-50))
+
+
 class TestCompanionBridgeProcessReceivedPacket:
     async def test_process_packet_records_rx_stats(self):
         injector = MockPacketInjector()

@@ -1378,13 +1378,8 @@ class TestProtocolResponseHandler:
             "len": PathUtils.encode_path_len(1, 1),
             "path": b"\xa1",
         }
+        # The reciprocal is genuinely in flight (queued, not awaited inline).
         await asyncio.wait_for(injector_started.wait(), timeout=0.1)
-        assert (
-            await protocol_handler.return_path_teacher.maybe_teach_reverse_of_out_path(
-                server_pubkey, reason="login retry"
-            )
-            is False
-        )
         release_injector.set()
         await protocol_handler.wait_for_pending_reciprocals()
 

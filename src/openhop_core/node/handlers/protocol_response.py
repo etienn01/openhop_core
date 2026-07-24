@@ -464,6 +464,10 @@ class ProtocolResponseHandler:
             # The inbound flood path (pkt.path) tells the remote repeater
             # "to reach me, go through these intermediate hops".
             in_path = list(pkt.path) if pkt.path else []
+            # Key for the pre-dedup copy table, so the re-teach below can look up
+            # the best-received copy of *this* reply. Path-independent, so every
+            # copy hashes alike.
+            reciprocal_hash_key = bytes(pkt.calculate_packet_hash())
 
             # Build the reciprocal PATH packet.  create_path_return produces a
             # FLOOD PATH by default; we convert it to DIRECT below.
@@ -484,16 +488,14 @@ class ProtocolResponseHandler:
             reciprocal.header = (reciprocal.header & ~0x03) | ROUTE_TYPE_DIRECT
             reciprocal.set_path(out_path_bytes, path_len_byte)
 
-            evidence_resolved = False
-
             async def _dispatch_reciprocal() -> None:
-                nonlocal evidence_resolved
                 try:
                     sent = await injector(reciprocal)
                     if sent is False:
                         raise RuntimeError("packet injector rejected reciprocal PATH")
+                    # Claims the teacher's cooldown so it does not immediately
+                    # re-teach this contact the same route.
                     self.return_path_teacher.note_evidence_teach(contact_pubkey)
-                    evidence_resolved = True
                     self._log(
                         f"[ProtocolResponse] Sending reciprocal PATH to 0x{src_hash:02X} "
                         f"via DIRECT (out_path_len={path_len_byte}, "
@@ -505,33 +507,32 @@ class ProtocolResponseHandler:
                         f"embedded_in_path={bytes(in_path).hex() or '(empty)'} "
                         f"path_len_byte=0x{path_len_byte:02X}"
                     )
+                    # The teach above had to go out now, on the first-arrived
+                    # copy, so the peer has a usable route immediately. Copies of
+                    # this same reply keep landing for a second or two, and the
+                    # first is routinely the worst route; correct ourselves once
+                    # the window closes. Scheduled, not awaited, so this send task
+                    # ends with the wire write. Teaching twice is safe — see
+                    # ReturnPathTeacher.maybe_reteach_better_copy.
+                    self.return_path_teacher.schedule_reteach_better_copy(
+                        contact_pubkey=contact_pubkey,
+                        dest_hash=src_hash,
+                        taught_path=bytes(in_path),
+                        taught_len_byte=pkt.path_len,
+                        out_path=out_path_bytes,
+                        out_path_len=path_len_byte,
+                        shared_secret=shared_secret,
+                        hash_key=reciprocal_hash_key,
+                        reason="reciprocal PATH",
+                    )
                 except asyncio.CancelledError:
-                    if not evidence_resolved:
-                        self.return_path_teacher.fail_evidence_teach(contact_pubkey)
-                        evidence_resolved = True
                     raise
                 except Exception as e:
-                    if not evidence_resolved:
-                        self.return_path_teacher.fail_evidence_teach(contact_pubkey)
-                        evidence_resolved = True
                     self._log(f"[ProtocolResponse] Failed to send reciprocal PATH: {e}")
 
-            self.return_path_teacher.begin_evidence_teach(contact_pubkey)
-            try:
-                task = asyncio.create_task(_dispatch_reciprocal())
-                self._pending_reciprocals.add(task)
-
-                def _reciprocal_done(done: asyncio.Task) -> None:
-                    nonlocal evidence_resolved
-                    self._pending_reciprocals.discard(done)
-                    if done.cancelled() and not evidence_resolved:
-                        self.return_path_teacher.fail_evidence_teach(contact_pubkey)
-                        evidence_resolved = True
-
-                task.add_done_callback(_reciprocal_done)
-            except Exception:
-                self.return_path_teacher.fail_evidence_teach(contact_pubkey)
-                raise
+            task = asyncio.create_task(_dispatch_reciprocal())
+            self._pending_reciprocals.add(task)
+            task.add_done_callback(self._pending_reciprocals.discard)
         except Exception as e:
             self._log(f"[ProtocolResponse] Failed to queue reciprocal PATH: {e}")
 
