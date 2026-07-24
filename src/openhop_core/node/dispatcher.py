@@ -110,6 +110,11 @@ class Dispatcher:
         self._handler_instances: dict[int, Any] = (
             {}
         )  # Store actual handler objects for method access
+        # Payload types whose handler consumes the payload for this node (as
+        # opposed to routing or observing it). Populated via
+        # register_handler(..., local_delivery=True); read by
+        # _is_transit_direct_delivery.
+        self._local_delivery_types: set[int] = set()
 
         # Handler references for companion-layer access; populated by
         # register_default_handlers(). Declared here so callers can rely on
@@ -248,10 +253,26 @@ class Dispatcher:
     # Public interface - registering handlers and callbacks
     # ------------------------------------------------------------------
 
-    def register_handler(self, payload_type: int, handler_instance) -> None:
-        """Register a handler for a specific type of packet."""
+    def register_handler(
+        self, payload_type: int, handler_instance, *, local_delivery: bool = False
+    ) -> None:
+        """Register a handler for a specific type of packet.
+
+        ``local_delivery`` marks a handler that *consumes* the payload for this
+        node (decrypt, ACK, display) as opposed to one that routes or observes
+        it. Only those are gated by the firmware rule in
+        :meth:`_is_transit_direct_delivery`: MeshCore never hands a routed-direct
+        packet with hops still on its path to payload processing. It defaults to
+        False so an application handler — a repeater's router, which must see
+        exactly those transit packets — keeps receiving everything, and so an
+        application override of a core payload type takes over that decision.
+        """
         # Keep the handler instance around so we can call methods on it
         self._handler_instances[payload_type] = handler_instance
+        if local_delivery:
+            self._local_delivery_types.add(payload_type)
+        else:
+            self._local_delivery_types.discard(payload_type)
 
         # Figure out what function to call when we get this packet type
         if hasattr(handler_instance, "handle_packet"):
@@ -292,11 +313,16 @@ class Dispatcher:
         self.local_identity = local_identity
 
         # --- ACK handler (dispatcher-specific wiring) ---
+        # Deliberately NOT local_delivery: firmware peeks at a routed-direct ACK
+        # while it is still in transit ("early received ACK", Mesh::onRecvPacket)
+        # before the next-hop check, and CRC correlation is idempotent.
         ack_handler = AckHandler(self._log, self)
         ack_handler.set_ack_received_callback(self._register_ack_received)
         self.register_handler(AckHandler.payload_type(), ack_handler)
 
         # --- Multi-ack handler: extract the embedded ACK from MULTIPART packets ---
+        # Also left un-gated: it only correlates an embedded ACK CRC, the same
+        # idempotent peek as the ACK handler above.
         multipart_ack_handler = MultipartAckHandler(self._log)
         multipart_ack_handler.set_ack_received_callback(self._register_ack_received)
         self.register_handler(MultipartAckHandler.payload_type(), multipart_ack_handler)
@@ -329,24 +355,32 @@ class Dispatcher:
         from .handlers import PathHandler as _Path
         from .handlers import TextMessageHandler as _Txt
 
-        self.register_handler(_Adv.payload_type(), core.advert_handler)
-        self.register_handler(_Txt.payload_type(), core.text_handler)
-        self.register_handler(_Grp.payload_type(), core.group_text_handler)
-        self.register_handler(_Path.payload_type(), core.path_handler)
-        self.register_handler(_Login.payload_type(), core.login_response_handler)
+        # These consume the payload for this node, so they are gated by the
+        # firmware transit rule (see _is_transit_direct_delivery).
+        self.register_handler(_Adv.payload_type(), core.advert_handler, local_delivery=True)
+        self.register_handler(_Txt.payload_type(), core.text_handler, local_delivery=True)
+        self.register_handler(_Grp.payload_type(), core.group_text_handler, local_delivery=True)
+        self.register_handler(_Path.payload_type(), core.path_handler, local_delivery=True)
+        self.register_handler(
+            _Login.payload_type(), core.login_response_handler, local_delivery=True
+        )
 
         # --- Dispatcher-only handlers ---
         self.register_handler(
             AnonReqResponseHandler.payload_type(),
             AnonReqResponseHandler(local_identity, contacts, self._log),
+            local_delivery=True,
         )
 
+        # TRACE is not gated: firmware handles a direct TRACE in its own branch
+        # ahead of the routed-direct block, and this handler owns the path bytes
+        # (they carry per-hop SNR, not routing hashes).
         trace_handler = TraceHandler(self._log, core.protocol_response_handler)
         self.register_handler(TraceHandler.payload_type(), trace_handler)
         self.trace_handler = trace_handler
 
         control_handler = ControlHandler(self._log)
-        self.register_handler(ControlHandler.payload_type(), control_handler)
+        self.register_handler(ControlHandler.payload_type(), control_handler, local_delivery=True)
         self.control_handler = control_handler
 
         # --- RAW_CUSTOM handler: deliver to companion if direct and callback set ---
@@ -358,7 +392,7 @@ class Dispatcher:
             if self.raw_data_received_callback:
                 await self._invoke_callback(self.raw_data_received_callback, pkt)
 
-        self.register_handler(PAYLOAD_TYPE_RAW_CUSTOM, raw_custom_handler)
+        self.register_handler(PAYLOAD_TYPE_RAW_CUSTOM, raw_custom_handler, local_delivery=True)
 
         self._logger.info("Default handlers registered.")
 
@@ -1183,19 +1217,50 @@ class Dispatcher:
             return
 
         try:
-            result = await handler(pkt)
-            # Mirror firmware Mesh::onRecvPacket markDoNotRetransmit: a data or
-            # anon packet genuinely decrypted for this identity is consumed and
-            # must not be re-flooded. HandlerResult.authenticated is that
-            # verdict (False on a bare dest-hash collision), so the client-repeat
-            # flood forward is suppressed only on real consumption. ACK marking
-            # is done inside AckHandler (it does not return a HandlerResult).
-            if isinstance(result, HandlerResult) and result.authenticated:
-                pkt.mark_do_not_retransmit()
+            if self._is_transit_direct_delivery(pkt, payload_type):
+                # Firmware releases this packet without payload processing; the
+                # forwarding decision is made independently (see
+                # _build_client_repeat_forward / an application router).
+                self._log(
+                    f"Transit {type_name}: routed-direct with "
+                    f"{pkt.get_path_hash_count()} hop(s) left, not delivered locally"
+                )
+            else:
+                result = await handler(pkt)
+                # Mirror firmware Mesh::onRecvPacket markDoNotRetransmit: a data or
+                # anon packet genuinely decrypted for this identity is consumed and
+                # must not be re-flooded. HandlerResult.authenticated is that
+                # verdict (False on a bare dest-hash collision), so the client-repeat
+                # flood forward is suppressed only on real consumption. ACK marking
+                # is done inside AckHandler (it does not return a HandlerResult).
+                if isinstance(result, HandlerResult) and result.authenticated:
+                    pkt.mark_do_not_retransmit()
             if self.packet_received_callback:
                 await self._invoke_callback(self.packet_received_callback, pkt)
         except Exception as err:
             self._log(f"Handler error for {type_name}: {err}")
+
+    def _is_transit_direct_delivery(self, pkt: Packet, payload_type: int) -> bool:
+        """True when a local-delivery handler must be skipped for a transit packet.
+
+        MeshCore ``Mesh::onRecvPacket`` never runs payload processing for a
+        routed-direct packet that still has hops on its path: it peeks at an
+        early ACK, forwards the packet if this node is the next hop (stripping
+        itself first, so delivery only ever happens at hop count 0), and
+        otherwise releases it. Payload delivery for a direct packet therefore
+        only happens once the path is exhausted.
+
+        openHop's ``_dispatch`` serves both local delivery and, for applications
+        like the repeater, routing — so the rule is applied only to handlers
+        registered with ``local_delivery=True``. Without it a node that hears
+        both a peer's pre-relay transmission and the relay's retransmission
+        delivers the same DM twice: the copies share a path-independent packet
+        hash, and dedup no longer suppresses the un-stripped one (it must not,
+        or an overheard route variant would suppress a copy this node owns).
+        """
+        if payload_type not in self._local_delivery_types:
+            return False
+        return pkt.is_route_direct() and pkt.get_path_hash_count() > 0
 
     # ------------------------------------------------------------------
     # ACK registration system
