@@ -30,7 +30,9 @@ def set_spi_transport(spi_transport):
 def _get_output(pin):
     """Get output pin via centralized GPIO manager (setup only if needed)"""
     if _gpio_manager is None:
-        raise RuntimeError("GPIO manager not initialized. Call set_gpio_manager() first.")
+        raise RuntimeError(
+            "GPIO manager not initialized. Call set_gpio_manager() first."
+        )
     # Only setup if pin doesn't exist yet
     if pin not in _gpio_manager._pins:
         _gpio_manager.setup_output_pin(pin, initial_value=True)
@@ -40,7 +42,9 @@ def _get_output(pin):
 def _get_input(pin):
     """Get input pin via centralized GPIO manager (setup only if needed)"""
     if _gpio_manager is None:
-        raise RuntimeError("GPIO manager not initialized. Call set_gpio_manager() first.")
+        raise RuntimeError(
+            "GPIO manager not initialized. Call set_gpio_manager() first."
+        )
     # Only setup if pin doesn't exist yet
     if pin not in _gpio_manager._pins:
         _gpio_manager.setup_input_pin(pin)
@@ -135,8 +139,12 @@ class SX126x(BaseLoRa):
 
     # SetRxTxFallbackMode
     FALLBACK_FS = 0x40  # after Rx/Tx go to: FS mode
-    FALLBACK_STDBY_XOSC = 0x30  #                    standby mode with crystal oscillator
-    FALLBACK_STDBY_RC = 0x20  #                    standby mode with RC oscillator (default)
+    FALLBACK_STDBY_XOSC = (
+        0x30  #                    standby mode with crystal oscillator
+    )
+    FALLBACK_STDBY_RC = (
+        0x20  #                    standby mode with RC oscillator (default)
+    )
 
     # SetDioIrqParams
     IRQ_TX_DONE = 0x0001  # packet transmission completed
@@ -250,7 +258,9 @@ class SX126x(BaseLoRa):
     PREAMBLE_DET_LEN_32 = 0x07  #                               32-bit
     ADDR_COMP_OFF = 0x00  # FSK address filtering: off
     ADDR_COMP_NODE = 0x01  #                        filtering on node address
-    ADDR_COMP_ALL = 0x02  #                        filtering on node and broadcast address
+    ADDR_COMP_ALL = (
+        0x02  #                        filtering on node and broadcast address
+    )
     PACKET_KNOWN = 0x00  # FSK packet type: the packet length known on both side
     PACKET_VARIABLE = 0x01  #                  the packet length on variable size
     CRC_0 = 0x01  # FSK CRC type: no CRC
@@ -271,7 +281,9 @@ class SX126x(BaseLoRa):
     CAD_EXIT_RX = 0x01  # after CAD is done, exit to Rx mode if activity is detected
 
     # GetStatus
-    STATUS_DATA_AVAILABLE = 0x04  # command status: packet received and data can be retrieved
+    STATUS_DATA_AVAILABLE = (
+        0x04  # command status: packet received and data can be retrieved
+    )
     STATUS_CMD_TIMEOUT = 0x06  #                 SPI command timed out
     STATUS_CMD_ERROR = 0x08  #                 invalid SPI command
     STATUS_CMD_FAILED = 0x0A  #                 SPI command failed to execute
@@ -323,7 +335,9 @@ class SX126x(BaseLoRa):
     _cs = 0
     _reset = 22
     _busy = 23
-    _cs_define = -1  # -1 = use automatic CS from SPI driver, or set via setManualCsPin()
+    _cs_define = (
+        -1
+    )  # -1 = use automatic CS from SPI driver, or set via setManualCsPin()
     _irq = -1
     _txen = -1
     _rxen = -1
@@ -674,7 +688,7 @@ class SX126x(BaseLoRa):
         # APPLY FINAL CONFIG
         # =============================
         self.setPaConfig(paDutyCycle, hpMax, deviceSel, paLut)
-        self.setTxParams(powerReg, self.PA_RAMP_40U)
+        self.setTxParams(powerReg, self.PA_RAMP_200U)
 
     def setRxGain(self, rxGain):
         # set power saving or boosted gain in register
@@ -759,7 +773,9 @@ class SX126x(BaseLoRa):
         else:
             invertIq = self.IQ_STANDARD
 
-        self.setPacketParamsLoRa(preambleLength, headerType, payloadLength, crcType, invertIq)
+        self.setPacketParamsLoRa(
+            preambleLength, headerType, payloadLength, crcType, invertIq
+        )
         self._fixInvertedIq(invertIq)
 
     def setSpreadingFactor(self, sf: int):
@@ -939,7 +955,9 @@ class SX126x(BaseLoRa):
         # if self.getMode() == self.STATUS_MODE_RX:
         #     return False
         # clear previous interrupt and set RX done, RX timeout, header error, and CRC error as interrupt source
-        self._irqSetup(self.IRQ_RX_DONE | self.IRQ_TIMEOUT | self.IRQ_HEADER_ERR | self.IRQ_CRC_ERR)
+        self._irqSetup(
+            self.IRQ_RX_DONE | self.IRQ_TIMEOUT | self.IRQ_HEADER_ERR | self.IRQ_CRC_ERR
+        )
         # set status to RX wait or RX continuous wait
         self._statusWait = self.STATUS_RX_WAIT
         self._statusIrq = 0x0000
@@ -966,7 +984,9 @@ class SX126x(BaseLoRa):
         if self.getMode() == self.STATUS_MODE_RX:
             return False
         # clear previous interrupt and set RX done, RX timeout, header error, and CRC error as interrupt source
-        self._irqSetup(self.IRQ_RX_DONE | self.IRQ_TIMEOUT | self.IRQ_HEADER_ERR | self.IRQ_CRC_ERR)
+        self._irqSetup(
+            self.IRQ_RX_DONE | self.IRQ_TIMEOUT | self.IRQ_HEADER_ERR | self.IRQ_CRC_ERR
+        )
         # set status to RX wait or RX continuous wait
         self._statusWait = self.STATUS_RX_WAIT
         self._statusIrq = 0x0000
@@ -1270,7 +1290,9 @@ class SX126x(BaseLoRa):
 
     ### SX126X API: DIO AND IRQ CONTROL ###
 
-    def setDioIrqParams(self, irqMask: int, dio1Mask: int, dio2Mask: int, dio3Mask: int):
+    def setDioIrqParams(
+        self, irqMask: int, dio1Mask: int, dio2Mask: int, dio3Mask: int
+    ):
         buf = (
             (irqMask >> 8) & 0xFF,
             irqMask & 0xFF,
@@ -1329,7 +1351,9 @@ class SX126x(BaseLoRa):
         buf = (sf, bw, cr, ldro, 0, 0, 0, 0)
         self._writeBytes(0x8B, buf, 8)
 
-    def setModulationParamsFsk(self, br: int, pulseShape: int, bandwidth: int, Fdev: int):
+    def setModulationParamsFsk(
+        self, br: int, pulseShape: int, bandwidth: int, Fdev: int
+    ):
         buf = (
             (br >> 16) & 0xFF,
             (br >> 8) & 0xFF,
@@ -1494,7 +1518,9 @@ class SX126x(BaseLoRa):
             # Let SPI driver handle CS automatically
             spi.xfer2(buf)
 
-    def _readBytes(self, opCode: int, nBytes: int, address: tuple = (), nAddress: int = 0) -> tuple:
+    def _readBytes(
+        self, opCode: int, nBytes: int, address: tuple = (), nAddress: int = 0
+    ) -> tuple:
         if self.busyCheck():
             return ()
 
