@@ -203,14 +203,15 @@ class SX1262Radio(LoRaRadio):
         self._custom_cad_symbol_num = None
 
         # Noise floor sampling
-        self._noise_floor = -99.0
+        self._noise_floor = -120.0
         self._num_floor_samples = 0
         self._floor_sample_sum = 0.0
+        self._noise_floor_samples: list[float] = []
         self._last_packet_activity = 0.0
         self._is_receiving_packet = False
-        self._last_sample_check = 0.0  # Rate-limit sampling checks to 100ms intervals
+        self._last_sample_check = 0.0
         self.NUM_NOISE_FLOOR_SAMPLES = 20
-        self.SAMPLING_THRESHOLD = 10  # Only sample if RSSI < noise_floor + threshold
+        self.NOISE_FLOOR_UPDATE_INTERVAL = 5.0
 
         # Radio metrics
         self.crc_error_count = 0
@@ -1442,62 +1443,77 @@ class SX1262Radio(LoRaRadio):
         if not self._initialized or self.lora is None:
             return
 
-        # If enough samples are already buffered, finalize immediately.
-        if self._num_floor_samples >= self.NUM_NOISE_FLOOR_SAMPLES and self._floor_sample_sum != 0:
-            new_noise_floor = self._floor_sample_sum / self.NUM_NOISE_FLOOR_SAMPLES
-
-            # Clamp to reasonable bounds (-150 to -50 dBm)
-            if new_noise_floor < -150:
-                new_noise_floor = -150
-            elif new_noise_floor > -50:
-                new_noise_floor = -50
-
-            self._noise_floor = new_noise_floor
-            self._floor_sample_sum = 0.0
-            self._num_floor_samples = 0
-            return
-
-        # Rate-limit sampling checks to every 100ms (not every 10ms timeout)
-        # This reduces CPU waste from 100 function calls/sec to ~10/sec
+        # Take one instantaneous RSSI sample every 5 seconds during idle periods.
         now = time.time()
-        if self._num_floor_samples == 0 and now - self._last_sample_check < 0.1:
+        if now - self._last_sample_check < self.NOISE_FLOOR_UPDATE_INTERVAL:
             return
-        self._last_sample_check = now
 
-        # Don't sample during TX operations or if recently received packet
+        # Don't sample during TX operations.
         if self._tx_lock.locked():
+            logger.debug("[Noise] Sample skipped: TX in progress")
+            return
+
+        # Don't sample if packet processing is active or RX terminal IRQs are pending.
+        if self._is_receiving_packet:
+            logger.debug("[Noise] Sample skipped: active receive processing")
+            return
+        if self._pending_rx_irq_status:
+            logger.debug(
+                "[Noise] Sample skipped: pending RX IRQ status 0x%04X",
+                self._pending_rx_irq_status,
+            )
+            return
+
+        # Skip during in-flight RX activity indicated by hardware IRQ flags.
+        rx_activity_mask = (
+            self.lora.IRQ_PREAMBLE_DETECTED
+            | self.lora.IRQ_HEADER_VALID
+            | self.lora.IRQ_RX_DONE
+            | self.lora.IRQ_CRC_ERR
+            | self.lora.IRQ_HEADER_ERR
+        )
+        irq_status = self.lora.getIrqStatus()
+        if irq_status & rx_activity_mask:
+            logger.debug(
+                "[Noise] Sample skipped: active RX preamble/header (irq=0x%04X)",
+                irq_status,
+            )
             return
 
         # Give 500ms quiet time after any packet activity
-        if time.time() - self._last_packet_activity < 0.5:
+        if now - self._last_packet_activity < 0.5:
+            logger.debug("[Noise] Sample skipped: recent packet activity")
             return
 
-        # Don't sample if currently receiving a packet
-        if self._is_receiving_packet:
-            return
+        self._last_sample_check = now
 
-        # Sample RSSI during quiet periods only
-        if self._num_floor_samples < self.NUM_NOISE_FLOOR_SAMPLES:
-            try:
-                raw_rssi = self.lora.getRssiInst()
-                if raw_rssi is not None:
-                    current_rssi = -(float(raw_rssi) / 2)
+        try:
+            raw_rssi = self.lora.getRssiInst()
+            if raw_rssi is None:
+                logger.debug("[Noise] Sample rejected: RSSI read returned None")
+                return
 
-                    # For initial sampling (bootstrap), accept any reasonable RSSI
-                    # After that, only accept values near current noise floor
-                    if self._noise_floor == -99.0:
-                        # Bootstrap: accept any RSSI in valid range (-150 to -30 dBm)
-                        accept_sample = -150 < current_rssi < -30
-                    else:
-                        # Normal: only accept samples near current noise floor
-                        accept_sample = current_rssi < (self._noise_floor + self.SAMPLING_THRESHOLD)
+            current_rssi = -(float(raw_rssi) / 2.0)
+            if not (-127.5 <= current_rssi < 0.0):
+                logger.debug("[Noise] Sample rejected: out-of-range RSSI %.1f dBm", current_rssi)
+                return
 
-                    if accept_sample:
-                        self._num_floor_samples += 1
-                        self._floor_sample_sum += current_rssi
+            self._noise_floor_samples.append(current_rssi)
+            if len(self._noise_floor_samples) > self.NUM_NOISE_FLOOR_SAMPLES:
+                self._noise_floor_samples.pop(0)
 
-            except Exception as e:
-                logger.debug(f"Failed to sample noise floor: {e}")
+            self._num_floor_samples = len(self._noise_floor_samples)
+            self._floor_sample_sum = sum(self._noise_floor_samples)
+            self._noise_floor = self._floor_sample_sum / self._num_floor_samples
+
+            logger.debug(
+                "[Noise] Sample accepted: %.1f dBm, floor=%.1f dBm, samples=%d",
+                current_rssi,
+                self._noise_floor,
+                self._num_floor_samples,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to sample noise floor: {e}")
 
     def get_noise_floor(self) -> Optional[float]:
         """
@@ -1596,9 +1612,10 @@ class SX1262Radio(LoRaRadio):
             self.bandwidth = bw
             self.spreading_factor = sf
             self.coding_rate = cr
-            self._noise_floor = -99.0
+            self._noise_floor = -120.0
             self._num_floor_samples = 0
             self._floor_sample_sum = 0.0
+            self._noise_floor_samples = []
             rx_mask = self._get_rx_irq_mask()
             self.lora.clearIrqStatus(0xFFFF)
             self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
@@ -1940,9 +1957,10 @@ class SX1262Radio(LoRaRadio):
                 self.lora.clearIrqStatus(0xFFFF)
                 if acquired_tx_lock:
                     self._control_tx_rx_pins(tx_mode=False)
-                    self._noise_floor = -99.0
+                    self._noise_floor = -120.0
                     self._num_floor_samples = 0
                     self._floor_sample_sum = 0.0
+                    self._noise_floor_samples = []
             except Exception as e:
                 logger.warning(f"Failed to restore RX mode after CAD: {e}")
             finally:

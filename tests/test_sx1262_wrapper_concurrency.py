@@ -1049,64 +1049,99 @@ class TestNoiseFloorSampling:
     def test_no_sample_when_tx_lock_held(self, radio):
         radio._tx_lock = MagicMock()
         radio._tx_lock.locked.return_value = True
-        initial = radio._num_floor_samples
-        radio._sample_noise_floor()
-        assert radio._num_floor_samples == initial
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=10.0):
+            radio._sample_noise_floor()
+        radio.lora.getRssiInst.assert_not_called()
 
     def test_no_sample_during_packet_reception(self, radio):
         radio._is_receiving_packet = True
-        initial = radio._num_floor_samples
-        radio._sample_noise_floor()
-        assert radio._num_floor_samples == initial
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=20.0):
+            radio._sample_noise_floor()
+        radio.lora.getRssiInst.assert_not_called()
+
+    def test_no_sample_with_pending_rx_irq_status(self, radio):
+        radio._pending_rx_irq_status = IRQ_RX_DONE
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=30.0):
+            radio._sample_noise_floor()
+        radio.lora.getRssiInst.assert_not_called()
+
+    def test_no_sample_during_active_rx_irq_flags(self, radio, mock_lora):
+        mock_lora.getIrqStatus.return_value = IRQ_PREAMBLE_DETECTED | IRQ_HEADER_VALID
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=40.0):
+            radio._sample_noise_floor()
+        mock_lora.getRssiInst.assert_not_called()
 
     def test_no_sample_within_500ms_of_last_packet(self, radio):
-        radio._last_packet_activity = time.time()
-        initial = radio._num_floor_samples
-        radio._sample_noise_floor()
-        assert radio._num_floor_samples == initial
+        radio._last_packet_activity = 50.0
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=50.3):
+            radio._sample_noise_floor()
+        radio.lora.getRssiInst.assert_not_called()
 
-    def test_sample_accumulated_during_quiet_period(self, radio, mock_lora):
+    def test_rate_limit_enforced_at_5_seconds(self, radio, mock_lora):
+        radio._last_sample_check = 100.0
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=104.9):
+            radio._sample_noise_floor()
+        mock_lora.getRssiInst.assert_not_called()
+
+    def test_sample_accepted_during_quiet_period(self, radio, mock_lora):
         mock_lora.getRssiInst.return_value = 160  # -80 dBm
         radio._last_packet_activity = 0.0
         radio._is_receiving_packet = False
-        radio._noise_floor = -99.0  # bootstrap mode
-        radio._sample_noise_floor()
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=200.0):
+            radio._sample_noise_floor()
+        assert radio._num_floor_samples == 1
+        assert radio._noise_floor == pytest.approx(-80.0)
+
+    def test_rolling_window_averages_latest_20_samples(self, radio, mock_lora):
+        radio._last_packet_activity = 0.0
+        radio._is_receiving_packet = False
+        samples_dbm = [(-120.0 + i) for i in range(21)]
+        mock_lora.getRssiInst.side_effect = [int(-(sample * 2)) for sample in samples_dbm]
+
+        base_ts = 1000.0
+        for idx in range(21):
+            with patch(
+                "openhop_core.hardware.sx1262_wrapper.time.time",
+                return_value=base_ts + (idx * 6.0),
+            ):
+                radio._sample_noise_floor()
+
+        expected_floor = sum(samples_dbm[1:]) / 20.0
+        assert radio._num_floor_samples == 20
+        assert radio._noise_floor == pytest.approx(expected_floor)
+        assert len(radio._noise_floor_samples) == 20
+
+    def test_raw_rssi_conversion_divide_by_two(self, radio, mock_lora):
+        mock_lora.getRssiInst.return_value = 237  # -(237/2) = -118.5 dBm
+        radio._last_packet_activity = 0.0
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=300.0):
+            radio._sample_noise_floor()
+        assert radio._noise_floor == pytest.approx(-118.5)
+
+    def test_out_of_range_rssi_is_rejected(self, radio, mock_lora):
+        mock_lora.getRssiInst.return_value = 255  # -127.5 dBm edge is valid
+        radio._last_packet_activity = 0.0
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=310.0):
+            radio._sample_noise_floor()
         assert radio._num_floor_samples == 1
 
-    def test_floor_calculated_after_n_samples(self, radio, mock_lora):
-        mock_lora.getRssiInst.return_value = 160  # -80 dBm
-        radio._last_packet_activity = 0.0
-        radio._is_receiving_packet = False
-        radio._noise_floor = -99.0
+        mock_lora.getRssiInst.return_value = 256  # -128.0 dBm -> reject
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=316.0):
+            radio._sample_noise_floor()
+        assert radio._num_floor_samples == 1
 
-        for _ in range(radio.NUM_NOISE_FLOOR_SAMPLES):
+    def test_old_noise_floor_plus_10_filter_removed(self, radio, mock_lora):
+        radio._noise_floor = -120.0
+        radio._noise_floor_samples = []
+        radio._num_floor_samples = 0
+        radio._floor_sample_sum = 0.0
+        radio._last_packet_activity = 0.0
+        mock_lora.getRssiInst.return_value = 200  # -100 dBm
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=400.0):
             radio._sample_noise_floor()
 
-        # One more call triggers the calculation branch
-        radio._sample_noise_floor()
-
-        assert radio._noise_floor != -99.0
-        assert radio._num_floor_samples == 0  # reset post-calculation
-
-    def test_noise_floor_clamped_at_lower_bound(self, radio):
-        n = radio.NUM_NOISE_FLOOR_SAMPLES
-        radio._floor_sample_sum = -200.0 * n  # impossible low
-        radio._num_floor_samples = n
-        radio._last_packet_activity = 0.0
-        radio._is_receiving_packet = False
-        radio._noise_floor = -60.0
-        radio._sample_noise_floor()
-        assert radio._noise_floor >= -150.0
-
-    def test_noise_floor_clamped_at_upper_bound(self, radio):
-        n = radio.NUM_NOISE_FLOOR_SAMPLES
-        radio._floor_sample_sum = -20.0 * n  # unrealistically high
-        radio._num_floor_samples = n
-        radio._last_packet_activity = 0.0
-        radio._is_receiving_packet = False
-        radio._noise_floor = -60.0
-        radio._sample_noise_floor()
-        assert radio._noise_floor <= -50.0
+        assert radio._num_floor_samples == 1
+        assert radio._noise_floor == pytest.approx(-100.0)
 
     def test_get_noise_floor_returns_0_when_uninitialized(self, radio):
         radio._initialized = False
@@ -2997,15 +3032,20 @@ class TestCoverageSecondPass:
         with pytest.raises(RuntimeError, match="Radio failed to start TX"):
             await radio.send(b"data")
 
-    def test_noise_floor_rejects_sample_above_threshold(self, radio, mock_lora):
-        radio._noise_floor = -100.0
+    def test_noise_floor_accepts_valid_sample_without_adaptive_threshold(self, radio, mock_lora):
+        radio._noise_floor = -120.0
+        radio._noise_floor_samples = []
+        radio._num_floor_samples = 0
+        radio._floor_sample_sum = 0.0
         radio._last_packet_activity = 0.0
         radio._is_receiving_packet = False
-        before = radio._num_floor_samples
-        # -50 dBm is above threshold (-90), should be rejected.
-        mock_lora.getRssiInst.return_value = 100
-        radio._sample_noise_floor()
-        assert radio._num_floor_samples == before
+        mock_lora.getRssiInst.return_value = 100  # -50 dBm, valid range
+
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=500.0):
+            radio._sample_noise_floor()
+
+        assert radio._num_floor_samples == 1
+        assert radio._noise_floor == pytest.approx(-50.0)
 
     def test_cleanup_cancels_not_done_rx_task(self, radio):
         task = MagicMock()
