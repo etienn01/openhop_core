@@ -539,6 +539,15 @@ class KissModemWrapper(LoRaRadio):
                 logger.warning("KISS modem did not become ready after reconnect")
                 return False
 
+            # Postcondition: this function's whole job is a live link, and the
+            # workers were started before readiness ran. An RX failure in that
+            # window used to leave a dead reader behind while the caller reported
+            # a successful (re)connect, so the node went permanently deaf with
+            # nothing left to re-arm a reconnect.
+            if self.rx_thread is None or not self.rx_thread.is_alive():
+                logger.warning("RX worker did not survive startup on %s", self.port)
+                return False
+
             return True
         except Exception as e:
             logger.error("Failed to connect to %s: %s", self.port, e)
@@ -586,13 +595,38 @@ class KissModemWrapper(LoRaRadio):
             except Exception:
                 pass
 
+    def _is_stopping(self) -> bool:
+        """True when the workers are meant to be winding down."""
+        return self._shutting_down or self.stop_event.is_set()
+
     def _stop_io_threads(self, join_timeout: float = 2.0) -> None:
-        """Join RX/TX threads, skipping current thread to avoid deadlock."""
+        """Stop RX/TX threads, skipping current thread to avoid deadlock.
+
+        Closes the port first: the workers' loop conditions key off it being
+        open, so that is what actually ends them. Joining alone — the previous
+        behaviour — meant a worker blocked in ``read()`` on a port whose close
+        had been deferred (see _mark_serial_failure) simply outlived the join
+        timeout and kept running against the old handle, while the next
+        generation started on the new one. Two RX threads then shared a single
+        KISS decoder buffer.
+        """
+        conn = self.serial_conn
+        if conn is not None:
+            try:
+                if getattr(conn, "is_open", False):
+                    conn.close()
+            except Exception as e:
+                logger.debug("Closing serial port while stopping workers: %s", e)
         current = threading.current_thread()
-        if self.rx_thread and self.rx_thread.is_alive() and self.rx_thread is not current:
-            self.rx_thread.join(timeout=join_timeout)
-        if self.tx_thread and self.tx_thread.is_alive() and self.tx_thread is not current:
-            self.tx_thread.join(timeout=join_timeout)
+        for label, thread in (("RX", self.rx_thread), ("TX", self.tx_thread)):
+            if thread and thread.is_alive() and thread is not current:
+                thread.join(timeout=join_timeout)
+                if thread.is_alive():
+                    logger.warning(
+                        "%s worker still running after %.1fs; it will be replaced",
+                        label,
+                        join_timeout,
+                    )
 
     def _stop_reconnect_thread(self, join_timeout: float = 2.0) -> None:
         """Join reconnect thread if it is running."""
@@ -2152,7 +2186,15 @@ class KissModemWrapper(LoRaRadio):
                 self._decode_kiss(chunk)
 
             except Exception as e:
-                if self.is_connected:
+                # Gate on deliberate shutdown, NOT on is_connected. The reconnect
+                # path starts these workers with is_connected still False and only
+                # sets it True after readiness plus the SetHardware handshake, so
+                # the old gate silenced exactly the window a freshly reopened
+                # device is most likely to fail in: the thread died with no log
+                # and no failure marked, nothing re-armed a reconnect, and the
+                # node went permanently deaf while the log read "reconnect
+                # successful". Observed in the field, and reproduced.
+                if not self._is_stopping():
                     logger.error(f"RX worker error: {e}")
                     self._mark_serial_failure(f"RX worker error: {e}")
                 break
@@ -2181,7 +2223,8 @@ class KissModemWrapper(LoRaRadio):
                     threading.Event().wait(0.01)
 
             except Exception as e:
-                if self.is_connected:
+                # See _rx_worker: gated on deliberate shutdown, not is_connected.
+                if not self._is_stopping():
                     logger.error(f"TX worker error: {e}")
                     self._mark_serial_failure(f"TX worker error: {e}")
                 break
