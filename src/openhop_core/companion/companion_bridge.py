@@ -61,9 +61,12 @@ class _BridgeAckHandler:
         return PAYLOAD_TYPE_ACK
 
     async def __call__(self, packet: Packet) -> None:
-        if not packet.payload or len(packet.payload) != 4:
+        # Firmware emits 6-byte ACKs for plain DMs (4-byte hash + ext-attempt +
+        # random byte); accept >= 4 and correlate on the first 4 bytes only,
+        # matching the shared AckHandler.
+        if not packet.payload or len(packet.payload) < 4:
             return
-        crc = int.from_bytes(packet.payload, "little")
+        crc = int.from_bytes(packet.payload[:4], "little")
         await self._apply_ack(crc)
 
     async def _apply_ack(self, crc: int) -> None:
@@ -470,6 +473,11 @@ class CompanionBridge(CompanionBase):
 
     async def stop(self) -> None:
         self._running = False
+        self._clear_pending_frame_logins()
+        protocol_handler = self._get_protocol_response_handler()
+        if protocol_handler is not None:
+            protocol_handler.cancel_pending_reciprocals()
+            await protocol_handler.wait_for_pending_reciprocals()
         logger.info("CompanionBridge stopped")
 
     @property

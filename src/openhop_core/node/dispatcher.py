@@ -546,10 +546,18 @@ class Dispatcher:
 
         # When disabled, packet_filter still tracks hashes for stats/visibility.
         packet_hash = pkt.calculate_packet_hash().hex()[:16]
-        if self.dedupe_enabled and self.packet_filter.is_duplicate(packet_hash):
-            self._log(f"Duplicate packet ignored (hash: {packet_hash})")
-            return
-        self.packet_filter.track_packet(packet_hash)
+        # MeshCore records a routed-direct packet in its seen table only when
+        # this node is the next hop (Mesh::onRecvPacket). A node that overhears
+        # an earlier route variant must not mark the path-independent hash seen,
+        # or it would later drop the self-stripped copy it is asked to relay.
+        # Flood, zero-hop direct and direct TRACE keep unconditional dedup: the
+        # first two match firmware's up-front markSeen, and the TRACE hash folds
+        # in path_len so its per-hop copies never collide.
+        if not self._is_transit_direct_not_next_hop(pkt):
+            if self.dedupe_enabled and self.packet_filter.is_duplicate(packet_hash):
+                self._log(f"Duplicate packet ignored (hash: {packet_hash})")
+                return
+            self.packet_filter.track_packet(packet_hash)
 
         # Client-repeat: build the retransmit from the just-received packet
         # BEFORE handlers run, so a copy is taken while path/payload are intact
@@ -763,6 +771,29 @@ class Dispatcher:
         fwd._path_hash_mode_applied = True
         return fwd
 
+    def _is_transit_direct_not_next_hop(self, pkt: Packet) -> bool:
+        """True for a routed-direct packet this node is not the next hop for.
+
+        Mirrors MeshCore ``Mesh::onRecvPacket``, which records a routed-direct
+        packet in the seen table only inside the
+        ``isHashMatch(path) && allowPacketForward`` branch. Such packets must be
+        left out of dedup so an overheard longer-path variant does not suppress
+        the self-stripped copy this node is later the next hop for. Direct TRACE
+        is excluded (its hash folds in ``path_len``, so per-hop copies never
+        collide) as are flood and zero-hop-direct packets.
+        """
+        if not pkt.is_route_direct() or pkt.get_path_hash_count() <= 0:
+            return False
+        if pkt.get_payload_type() == PAYLOAD_TYPE_TRACE:
+            return False
+        if self.local_identity is None:
+            return False
+        self_key = self.local_identity.get_public_key()
+        hash_size = pkt.get_path_hash_size()
+        if len(pkt.path) < hash_size:
+            return False
+        return bytes(pkt.path[:hash_size]) != self_key[:hash_size]
+
     def _build_client_repeat_forward(self, pkt: Packet) -> Optional[Packet]:
         """Build the retransmit packet for a received packet, or None to drop.
 
@@ -913,28 +944,76 @@ class Dispatcher:
         # disabled the send path is unchanged (a recorded deliberate deferral).
         if not self._client_repeat_enabled:
             async with self._tx_lock:  # Wait our turn
-                return await self._send_packet_immediate(packet, wait_for_ack, expected_crc)
-        # Throttle off-lock, then re-decide admission under the lock so a
-        # snapshot taken before queueing cannot transmit past a debit another
-        # task committed under _tx_lock. _debit_tx_budget runs only under the
-        # lock and the sole out-of-lock mutation (_refill_tx_budget) only
-        # increases the budget, so an under-lock pass holds until radio.send.
-        # Livelock is bounded: every debit sets _tx_next_time pacing that all
-        # later admissions honour (firmware's next_tx_time property). Never
-        # sleep under the lock -- fall out of the async with to wait again.
-        while True:
-            await self._await_tx_budget(packet)
-            async with self._tx_lock:  # Wait our turn
-                if not self._client_repeat_enabled or self._tx_budget_wait_s() <= 0.0:
-                    return await self._send_packet_immediate(packet, wait_for_ack, expected_crc)
+                tx_ok, ack_event, ack_crc = await self._transmit_locked(
+                    packet, wait_for_ack, expected_crc
+                )
+        else:
+            # Throttle off-lock, then re-decide admission under the lock so a
+            # snapshot taken before queueing cannot transmit past a debit another
+            # task committed under _tx_lock. _debit_tx_budget runs only under the
+            # lock and the sole out-of-lock mutation (_refill_tx_budget) only
+            # increases the budget, so an under-lock pass holds until radio.send.
+            # Livelock is bounded: every debit sets _tx_next_time pacing that all
+            # later admissions honour (firmware's next_tx_time property). Never
+            # sleep under the lock -- fall out of the async with to wait again.
+            while True:
+                await self._await_tx_budget(packet)
+                async with self._tx_lock:  # Wait our turn
+                    if not self._client_repeat_enabled or self._tx_budget_wait_s() <= 0.0:
+                        tx_ok, ack_event, ack_crc = await self._transmit_locked(
+                            packet, wait_for_ack, expected_crc
+                        )
+                        break
 
-    async def _send_packet_immediate(
+        # Wait for the ACK OUTSIDE _tx_lock so relay traffic and other sends can
+        # use the funnel during the up-to-ACK_TIMEOUT window. Firmware's
+        # Dispatcher::loop frees the radio when the physical send completes and
+        # services its outbound queue independently of ACK correlation; holding
+        # the funnel through the ACK wait was the divergence. The waiter was
+        # registered under the lock (and _register_ack_received also caches into
+        # _recent_acks), so an ACK arriving the instant the lock frees is caught.
+        if not tx_ok:
+            return False
+        if ack_event is None:
+            return True
+        try:
+            # Unchanged from the pre-shrink path except that it no longer runs
+            # under _tx_lock: the waiter is already registered, so an ACK landing
+            # during this pause is matched rather than raced.
+            await asyncio.sleep(self.tx_delay)
+            ack_received = await self._await_ack_event(ack_event, ack_crc, ACK_TIMEOUT)
+            if ack_received:
+                self._log(f"[>>acK] received for CRC {ack_crc:08X}")
+            else:
+                self._log(f"ACK timeout for CRC {ack_crc:08X}")
+            return ack_received
+        finally:
+            self.state = DispatcherState.IDLE
+            self._current_expected_crc = None
+            # Registration now happens under _tx_lock, one await earlier than the
+            # wait that owns its cleanup, so this scope -- not _await_ack_event --
+            # is the one that spans every exit path. Without this, a cancel during
+            # the tx_delay pause would strand the CRC in _waiting_acks forever
+            # (nothing prunes it, unlike _recent_acks), leaving relayed ACKs for
+            # that CRC permanently marked do-not-retransmit. Identity-guarded and
+            # idempotent: a no-op once the ACK path or _await_ack_event removed it.
+            if self._waiting_acks.get(ack_crc) is ack_event:
+                del self._waiting_acks[ack_crc]
+
+    async def _transmit_locked(
         self,
         packet: Packet,
         wait_for_ack: bool = True,
         expected_crc: Optional[int] = None,
-    ) -> bool:
-        """Send a packet immediately (assumes lock is held)."""
+    ) -> tuple[bool, Optional[asyncio.Event], Optional[int]]:
+        """Transmit the packet; assumes ``_tx_lock`` is held.
+
+        Returns ``(tx_ok, ack_event, ack_crc)``. When an ACK wait is needed the
+        waiter is registered here — before the caller releases ``_tx_lock`` — and
+        the event is returned so the caller can await it OUTSIDE the lock, freeing
+        the send funnel during the wait. ``ack_event`` is ``None`` when no wait is
+        needed (ADVERT/ACK, ``wait_for_ack`` False, or a transmit failure).
+        """
         payload_type = packet.get_payload_type()
 
         # Mark this packet seen before transmitting, matching firmware's
@@ -957,11 +1036,11 @@ class Dispatcher:
         except Exception as e:
             self._log(f"Radio transmit error: {e}")
             self.state = DispatcherState.IDLE
-            return False
+            return (False, None, None)
         if tx_metadata is None:
             self._log("Radio transmit returned no confirmation metadata")
             self.state = DispatcherState.IDLE
-            return False
+            return (False, None, None)
         # Spend the airtime budget on the completed transmit (client-repeat only).
         if self._client_repeat_enabled:
             self._debit_tx_budget(packet)
@@ -980,40 +1059,31 @@ class Dispatcher:
         # Skip waiting for ACK if not needed
         if payload_type in {PAYLOAD_TYPE_ADVERT, PAYLOAD_TYPE_ACK} or not wait_for_ack:
             self.state = DispatcherState.IDLE
-            return True
+            return (True, None, None)
 
-        # ------------------------------------------------------------------ #
-        #  Wait for ACK using the callback system
-        # ------------------------------------------------------------------ #
-        await asyncio.sleep(self.tx_delay)
+        # ACK wait needed. Register the waiter now, while _tx_lock is still held,
+        # so an ACK arriving the instant the caller releases the lock is not
+        # missed; the caller awaits the event off-lock (see send_packet).
+        crc = expected_crc if expected_crc is not None else packet.get_crc()
+        self._current_expected_crc = crc
+        ack_event = self.expect_ack(crc)
         self.state = DispatcherState.WAIT
-
-        # Set the expected CRC for ACK matching
-        if expected_crc is not None:
-            self._current_expected_crc = expected_crc
-        else:
-            self._current_expected_crc = packet.get_crc()
-
-        self._log(
-            f"Waiting for ACK with CRC {self._current_expected_crc:08X} (timeout: {ACK_TIMEOUT}s)"
-        )
-
-        try:
-            # Wait for the ACK using the event-based system
-            ack_received = await self.wait_for_ack(self._current_expected_crc, ACK_TIMEOUT)
-            if ack_received:
-                self._log(f"[>>acK] received for CRC {self._current_expected_crc:08X}")
-                return True
-            else:
-                self._log(f"ACK timeout for CRC {self._current_expected_crc:08X}")
-                return False
-        finally:
-            self.state = DispatcherState.IDLE
-            self._current_expected_crc = None
+        self._log(f"Waiting for ACK with CRC {crc:08X} (timeout: {ACK_TIMEOUT}s)")
+        return (True, ack_event, crc)
 
     async def wait_for_ack(self, crc: int, timeout: float = ACK_TIMEOUT) -> bool:
         """Wait for a specific ACK CRC for up to `timeout` seconds."""
         event = self.expect_ack(crc)
+        return await self._await_ack_event(event, crc, timeout)
+
+    async def _await_ack_event(
+        self, event: asyncio.Event, crc: int, timeout: float = ACK_TIMEOUT
+    ) -> bool:
+        """Await an already-registered ACK event, cleaning up on every exit.
+
+        Split out of :meth:`wait_for_ack` so :meth:`send_packet` can register the
+        waiter under ``_tx_lock`` and await it after releasing the lock.
+        """
         try:
             await asyncio.wait_for(event.wait(), timeout)
             return True

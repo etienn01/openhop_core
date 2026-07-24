@@ -15,6 +15,7 @@ from ...protocol.packet_builder import PacketBuilder
 from ...protocol.packet_utils import PathUtils
 from .crypto_helpers import iter_decrypt_by_src_hash
 from .result import HandlerResult
+from .return_path import ReturnPathTeacher
 
 # ---------------------------------------------------------------------------
 # Built-in CayenneLPP decoder (no external dependency)
@@ -151,10 +152,24 @@ class ProtocolResponseHandler:
     - etc.
     """
 
-    def __init__(self, log_fn: Callable[[str], None], local_identity, contact_book):
+    def __init__(
+        self,
+        log_fn: Callable[[str], None],
+        local_identity,
+        contact_book,
+        *,
+        return_path_teacher: Optional["ReturnPathTeacher"] = None,
+    ):
         self._log = log_fn
         self._local_identity = local_identity
         self._contact_book = contact_book
+        # Re-teaches a peer its route back to us when a reply arrives flooded
+        # despite us holding a direct out_path. Constructed here when the caller
+        # supplies none so standalone use of this handler still works; the
+        # factory passes a shared instance (see registry.create_core_handlers).
+        self.return_path_teacher = return_path_teacher or ReturnPathTeacher(
+            log_fn, local_identity, contact_book
+        )
 
         # A response is correlated only after the MAC identifies the complete
         # contact and the peer reflects the request tag. The one-byte source
@@ -169,6 +184,9 @@ class ProtocolResponseHandler:
         self._login_response_handler: Optional[Any] = None
         # Packet injector for sending reciprocal PATH packets (mirrors C++ Mesh.cpp:168-169)
         self._packet_injector: Optional[Callable] = None
+        # Reciprocal sends are queued so login/ACK delivery cannot block behind
+        # radio TX, duty-cycle, or LBT waits. Keep strong references until done.
+        self._pending_reciprocals: set[asyncio.Task] = set()
         # Optional: notify when contact out_path is updated from decrypted PATH
         # (e.g. companion persist).
         self._contact_path_updated_callback: Optional[Callable[..., Any]] = None
@@ -195,8 +213,25 @@ class ProtocolResponseHandler:
         repeater has no out_path for us and must fall back to plain FLOOD for
         responses — which intermediate repeaters may drop due to transport-code
         region filtering.
+
+        The same transmit path is handed to the return-path teacher, which
+        covers the flood-RESPONSE case this handler's PATH-only reciprocal
+        misses (see :mod:`.return_path`).
         """
         self._packet_injector = injector
+        self.return_path_teacher.set_injector(injector)
+
+    async def wait_for_pending_reciprocals(self) -> None:
+        """Await queued reciprocal PATH transmissions (shutdown/tests)."""
+        while self._pending_reciprocals:
+            pending = tuple(self._pending_reciprocals)
+            await asyncio.gather(*pending, return_exceptions=True)
+            self._pending_reciprocals.difference_update(pending)
+
+    def cancel_pending_reciprocals(self) -> None:
+        """Cancel reciprocal PATH transmissions that have not completed."""
+        for task in tuple(self._pending_reciprocals):
+            task.cancel()
 
     @staticmethod
     def payload_type() -> int:
@@ -396,6 +431,7 @@ class ProtocolResponseHandler:
     async def _send_reciprocal_path(
         self,
         src_hash: int,
+        contact_pubkey: bytes,
         shared_secret: bytes,
         pkt: Packet,
         decrypted: bytes,
@@ -416,10 +452,14 @@ class ProtocolResponseHandler:
         - The reciprocal is sent **DIRECT** using the inner ``out_path``
           extracted from the decrypted data (e.g. [hash_B, hash_X]), which
           routes through the mesh to reach the remote repeater.
+        - Transmission is queued rather than awaited inline. Firmware invokes
+          ``onContactResponse`` before queueing this reciprocal; doing the same
+          prevents a valid login reply from expiring behind the local TX path.
         """
         if self._packet_injector is None:
             return
         try:
+            injector = self._packet_injector
             our_hash = self._local_identity.get_public_key()[0]
             # The inbound flood path (pkt.path) tells the remote repeater
             # "to reach me, go through these intermediate hops".
@@ -444,24 +484,56 @@ class ProtocolResponseHandler:
             reciprocal.header = (reciprocal.header & ~0x03) | ROUTE_TYPE_DIRECT
             reciprocal.set_path(out_path_bytes, path_len_byte)
 
-            # Await injection so the reciprocal PATH is serialized through the
-            # radio TX pipeline before this method returns.  This ensures the
-            # login callback doesn't fire until the reciprocal PATH is in flight,
-            # preventing the app's first stats REQ from racing ahead of it.
-            await self._packet_injector(reciprocal)
+            evidence_resolved = False
 
-            self._log(
-                f"[ProtocolResponse] Sending reciprocal PATH to 0x{src_hash:02X} "
-                f"via DIRECT (out_path_len={path_len_byte}, in_path_len={len(in_path)})"
-            )
-            self._log(
-                f"[PATHDIAG] reciprocal -> 0x{src_hash:02X} route=DIRECT "
-                f"routing_path={out_path_bytes.hex() or '(empty)'} "
-                f"embedded_in_path={bytes(in_path).hex() or '(empty)'} "
-                f"path_len_byte=0x{path_len_byte:02X}"
-            )
+            async def _dispatch_reciprocal() -> None:
+                nonlocal evidence_resolved
+                try:
+                    sent = await injector(reciprocal)
+                    if sent is False:
+                        raise RuntimeError("packet injector rejected reciprocal PATH")
+                    self.return_path_teacher.note_evidence_teach(contact_pubkey)
+                    evidence_resolved = True
+                    self._log(
+                        f"[ProtocolResponse] Sending reciprocal PATH to 0x{src_hash:02X} "
+                        f"via DIRECT (out_path_len={path_len_byte}, "
+                        f"in_path_len={len(in_path)})"
+                    )
+                    self._log(
+                        f"[PATHDIAG] reciprocal -> 0x{src_hash:02X} route=DIRECT "
+                        f"routing_path={out_path_bytes.hex() or '(empty)'} "
+                        f"embedded_in_path={bytes(in_path).hex() or '(empty)'} "
+                        f"path_len_byte=0x{path_len_byte:02X}"
+                    )
+                except asyncio.CancelledError:
+                    if not evidence_resolved:
+                        self.return_path_teacher.fail_evidence_teach(contact_pubkey)
+                        evidence_resolved = True
+                    raise
+                except Exception as e:
+                    if not evidence_resolved:
+                        self.return_path_teacher.fail_evidence_teach(contact_pubkey)
+                        evidence_resolved = True
+                    self._log(f"[ProtocolResponse] Failed to send reciprocal PATH: {e}")
+
+            self.return_path_teacher.begin_evidence_teach(contact_pubkey)
+            try:
+                task = asyncio.create_task(_dispatch_reciprocal())
+                self._pending_reciprocals.add(task)
+
+                def _reciprocal_done(done: asyncio.Task) -> None:
+                    nonlocal evidence_resolved
+                    self._pending_reciprocals.discard(done)
+                    if done.cancelled() and not evidence_resolved:
+                        self.return_path_teacher.fail_evidence_teach(contact_pubkey)
+                        evidence_resolved = True
+
+                task.add_done_callback(_reciprocal_done)
+            except Exception:
+                self.return_path_teacher.fail_evidence_teach(contact_pubkey)
+                raise
         except Exception as e:
-            self._log(f"[ProtocolResponse] Failed to send reciprocal PATH: {e}")
+            self._log(f"[ProtocolResponse] Failed to queue reciprocal PATH: {e}")
 
     async def _decrypt_protocol_response(
         self, pkt: Packet, src_hash: int
@@ -550,11 +622,27 @@ class ProtocolResponseHandler:
                 if pkt.is_route_flood():
                     await self._send_reciprocal_path(
                         src_hash,
+                        contact_pubkey,
                         shared_secret,
                         pkt,
                         decrypted,
                         path_len_byte,
                     )
+            elif pkt_type == PAYLOAD_TYPE_RESPONSE:
+                # Plain RESPONSE (0x01). Firmware parity with
+                # BaseChatMesh::onPeerDataRecv's RESPONSE branch: a flood-routed
+                # reply from a peer we already hold a direct out_path for means
+                # the peer has no usable route back to us, so re-teach it. This
+                # is the path a DIRECT (user-forced) login takes — the server
+                # answers it with a flood RESPONSE, not the flood PATH that
+                # carries the reciprocal above, so nothing else teaches it.
+                await self.return_path_teacher.maybe_teach_from_flood_reply(
+                    pkt,
+                    contact_pubkey,
+                    src_hash,
+                    reason="flood RESPONSE",
+                    shared_secret=shared_secret,
+                )
 
             success, text, parsed = self._parse_protocol_response(response_data)
             return success, text, parsed, decrypted, contact_pubkey, response_payload

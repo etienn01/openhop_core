@@ -1,3 +1,4 @@
+import asyncio
 import struct
 import time
 from unittest.mock import AsyncMock, MagicMock
@@ -496,16 +497,16 @@ class TestTextMessageHandler:
         ("route", "path", "path_len"),
         [
             pytest.param("direct", b"", 0xFF, id="direct-out-path-unknown-ff"),
-            pytest.param("flood", b"\xAA", 0x01, id="flood-one-byte-hash-01"),
+            pytest.param("flood", b"\xaa", 0x01, id="flood-one-byte-hash-01"),
             pytest.param(
                 "flood",
-                b"\xAA\xBB\xCC\xDD",
+                b"\xaa\xbb\xcc\xdd",
                 0x42,
                 id="flood-two-byte-hashes-42",
             ),
             pytest.param(
                 "transport_flood",
-                b"\xAA\xBB\xCC\xDD\xEE\xFF\x10\x20\x30",
+                b"\xaa\xbb\xcc\xdd\xee\xff\x10\x20\x30",
                 0x83,
                 id="transport-flood-three-byte-hashes-83",
             ),
@@ -1110,6 +1111,7 @@ class TestProtocolResponseHandler:
         handler.set_contact_path_updated_callback(on_path_updated)
 
         await handler(pkt)
+        await handler.wait_for_pending_reciprocals()
 
         assert len(callback_calls) == 1
         assert callback_calls[0][0] == peer_pubkey
@@ -1302,6 +1304,7 @@ class TestProtocolResponseHandler:
         assert pkt.is_route_flood()
 
         await handler(pkt)
+        await handler.wait_for_pending_reciprocals()
 
         # Path learned as zero-hop direct (out_path_len == 0).
         assert len(path_updates) == 1
@@ -1311,6 +1314,79 @@ class TestProtocolResponseHandler:
         assert learned.out_path_len == 0
         # Reciprocal PATH sent back so the repeater learns its route to us.
         injector.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_login_path_completes_before_blocked_reciprocal_tx(self):
+        """A valid PATH login response must not wait behind the radio TX path."""
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.companion.models import Contact
+
+        local_identity = LocalIdentity()
+        server_identity = LocalIdentity()
+        server_pubkey = server_identity.get_public_key()
+        contacts = ContactStore(5)
+        contacts.add(Contact(public_key=server_pubkey, name="Repeater"))
+        protocol_handler = ProtocolResponseHandler(MagicMock(), local_identity, contacts)
+        login_handler = LoginResponseHandler(local_identity, contacts, MagicMock())
+
+        injector_started = asyncio.Event()
+        release_injector = asyncio.Event()
+
+        async def blocked_injector(_packet):
+            injector_started.set()
+            await release_injector.wait()
+
+        protocol_handler.set_packet_injector(blocked_injector)
+        login_completed = asyncio.Event()
+        path_seen_by_callback = {}
+
+        def on_login(_success, _data):
+            contact = contacts.get_by_key(server_pubkey)
+            path_seen_by_callback["len"] = contact.out_path_len
+            path_seen_by_callback["path"] = contact.out_path
+            login_completed.set()
+
+        login_handler.register_login_callback(server_pubkey, on_login)
+
+        reply = bytearray(13)
+        struct.pack_into("<I", reply, 0, 1234)
+        reply[4] = 0x00
+        reply[12] = 2
+        secret = Identity(server_pubkey).calc_shared_secret(local_identity.get_private_key())
+        packet = PacketBuilder.create_path_return(
+            dest_hash=local_identity.get_public_key()[0],
+            src_hash=server_pubkey[0],
+            secret=secret,
+            path=[0xA1],
+            extra_type=PAYLOAD_TYPE_RESPONSE,
+            extra=bytes(reply),
+        )
+        packet.set_path(b"\xb2", PathUtils.encode_path_len(1, 1))
+
+        result = await asyncio.wait_for(
+            PathHandler(
+                MagicMock(),
+                protocol_response_handler=protocol_handler,
+                login_response_handler=login_handler,
+            )(packet),
+            timeout=0.1,
+        )
+
+        assert result.authenticated is True
+        assert login_completed.is_set()
+        assert path_seen_by_callback == {
+            "len": PathUtils.encode_path_len(1, 1),
+            "path": b"\xa1",
+        }
+        await asyncio.wait_for(injector_started.wait(), timeout=0.1)
+        assert (
+            await protocol_handler.return_path_teacher.maybe_teach_reverse_of_out_path(
+                server_pubkey, reason="login retry"
+            )
+            is False
+        )
+        release_injector.set()
+        await protocol_handler.wait_for_pending_reciprocals()
 
 
 class TestProtocolRequestHandler:

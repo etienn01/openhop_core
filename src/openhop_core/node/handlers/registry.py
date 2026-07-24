@@ -15,6 +15,7 @@ from .group_text import GroupTextHandler
 from .login_response import LoginResponseHandler
 from .path import PathHandler
 from .protocol_response import ProtocolResponseHandler
+from .return_path import ReturnPathTeacher
 from .text import TextMessageHandler
 
 
@@ -28,6 +29,7 @@ class CoreHandlers:
     protocol_response_handler: ProtocolResponseHandler
     login_response_handler: LoginResponseHandler
     path_handler: PathHandler
+    return_path_teacher: ReturnPathTeacher
 
 
 def create_core_handlers(
@@ -64,9 +66,18 @@ def create_core_handlers(
         group_packet_seen_callback: Optional shared full-hash cache callback
             for companion group text/data loopback suppression.
     """
-    protocol_response_handler = ProtocolResponseHandler(log_fn, identity, contacts)
+    # Shared by both response handlers so the per-contact re-teach cooldown is
+    # accounted once, not once per handler. Its transmit path is wired later,
+    # via ProtocolResponseHandler.set_packet_injector.
+    return_path_teacher = ReturnPathTeacher(log_fn, identity, contacts)
 
-    login_response_handler = LoginResponseHandler(identity, contacts, log_fn)
+    protocol_response_handler = ProtocolResponseHandler(
+        log_fn, identity, contacts, return_path_teacher=return_path_teacher
+    )
+
+    login_response_handler = LoginResponseHandler(
+        identity, contacts, log_fn, return_path_teacher=return_path_teacher
+    )
     login_response_handler.set_protocol_response_handler(protocol_response_handler)
     protocol_response_handler.set_login_response_handler(login_response_handler)
 
@@ -105,4 +116,5 @@ def create_core_handlers(
         protocol_response_handler=protocol_response_handler,
         login_response_handler=login_response_handler,
         path_handler=path_handler,
+        return_path_teacher=return_path_teacher,
     )

@@ -8,6 +8,7 @@ import logging
 import random
 import struct
 import time
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
 from ..protocol import Packet, PacketBuilder
@@ -50,6 +51,26 @@ from .timing import (
 )
 
 logger = logging.getLogger("CompanionBase")
+
+# Frame-server clients own login retry timing from the timeout in RESP_CODE_SENT.
+# Keep one authenticated-response waiter alive across those retries so a slow
+# flood reply can still complete login. This is deliberately longer than one
+# adaptive send timeout; observed multi-hop replies can take over a minute.
+FRAME_LOGIN_PENDING_TTL_S = 120.0
+
+
+@dataclass
+class _PendingFrameLogin:
+    """One logical frame-server login session, reused across client retries."""
+
+    target_key: bytes
+    dest_hash: int
+    contact_name: str
+    event: asyncio.Event
+    result: dict
+    callback: Callable[[bool, dict], None]
+    expires_at: float
+    task: Optional[asyncio.Task] = None
 
 
 class _SendOpsMixin:
@@ -693,6 +714,7 @@ class _SendOpsMixin:
         log_label: str,
         cleanup: Optional[Callable[[], None]],
         response_tag_registered: Optional[Callable[[int], None]],
+        contact_pubkey: Optional[bytes] = None,
     ) -> dict:
         """Finish a request after its first packet has already been sent."""
         try:
@@ -701,6 +723,8 @@ class _SendOpsMixin:
                 return result
 
             for attempt in range(1, DEFAULT_MAX_ATTEMPTS):
+                if contact_pubkey is not None:
+                    await self._teach_return_path_before_retry(contact_pubkey, log_label)
                 pkt, packet_tag = build_packet()
                 if response_tag_registered is not None and packet_tag is not None:
                     response_tag_registered(packet_tag)
@@ -744,6 +768,7 @@ class _SendOpsMixin:
         sent_tag: Optional[int] = None,
         cleanup: Optional[Callable[[], None]] = None,
         response_tag_registered: Optional[Callable[[int], None]] = None,
+        contact_pubkey: Optional[bytes] = None,
     ) -> dict:
         """Send the first packet and return its metadata plus a waiter task."""
         deadline = time.monotonic() + total_timeout_s if total_timeout_s is not None else None
@@ -783,6 +808,7 @@ class _SendOpsMixin:
                     log_label=log_label,
                     cleanup=cleanup,
                     response_tag_registered=response_tag_registered,
+                    contact_pubkey=contact_pubkey,
                 ),
                 f"{log_label} response",
             )
@@ -879,28 +905,183 @@ class _SendOpsMixin:
                     "timeout": True,
                     "reason": "Login response timeout",
                 }
-            data = login_result["data"]
-            if login_result["success"]:
-                # Mirror firmware onContactResponse (MyMesh.cpp:686-690):
-                # open a connection on a successful login response. This is the
-                # single point every login response (frame server or direct API)
-                # flows through, matching the firmware's onContactResponse.
-                self.note_login_connection(pub_key, data.get("keep_alive_interval", 0))
-            return {
-                "success": login_result["success"],
-                "repeater": contact.name,
-                "is_admin": data.get("is_admin", False),
-                "keep_alive_interval": data.get("keep_alive_interval", 0),
-                "tag": data.get("timestamp", 0),
-                "acl_permissions": data.get("reserved", data.get("permissions", 0)),
-                "firmware_ver_level": data.get("firmware_ver_level"),
-                "reason": ("Login successful" if login_result["success"] else "Login failed"),
-            }
+            return self._build_login_result(
+                pub_key,
+                contact.name,
+                login_result["success"],
+                login_result["data"],
+            )
 
         started["task"] = self._spawn_background_task(
             _format_login_result(), "login result formatting"
         )
         return started
+
+    def _build_login_result(
+        self,
+        pub_key: bytes,
+        contact_name: str,
+        success: bool,
+        data: dict,
+    ) -> dict:
+        """Build the common login result returned by API and frame-server paths."""
+        if success:
+            self.note_login_connection(pub_key, data.get("keep_alive_interval", 0))
+        return {
+            "success": success,
+            "repeater": contact_name,
+            "is_admin": data.get("is_admin", False),
+            "keep_alive_interval": data.get("keep_alive_interval", 0),
+            "tag": data.get("timestamp", 0),
+            "acl_permissions": data.get("reserved", data.get("permissions", 0)),
+            "firmware_ver_level": data.get("firmware_ver_level"),
+            "reason": "Login successful" if success else "Login failed",
+        }
+
+    async def _start_frame_login_request(self, pub_key: bytes, password: str) -> dict:
+        """Send one frame-server login attempt and reuse its pending response session.
+
+        MeshCore companion clients own retries: each command gets one transmission
+        and one per-send timeout hint. Repeated commands for the same full public
+        key refresh this logical session instead of replacing its callback, so a
+        late authenticated reply completes whichever retry is currently pending.
+
+        The public :meth:`send_login` API intentionally keeps its existing
+        three-attempt behaviour; this method is the frame-server compatibility
+        boundary.
+        """
+        contact = self.contacts.get_by_key(pub_key)
+        if not contact:
+            return {"success": False, "error": "not_found", "reason": "Contact not found"}
+        proxy = self.contacts.get_proxy_by_key(pub_key)
+        if not proxy:
+            return {"success": False, "error": "not_found", "reason": "Contact not found"}
+        login_handler = self._get_login_response_handler()
+        if not login_handler:
+            return {
+                "success": False,
+                "error": "bad_state",
+                "reason": "Login handler not available",
+            }
+
+        target_key = proxy.public_key_bytes
+        sessions = self._pending_frame_logins
+        session = sessions.get(target_key)
+        if session is not None and (
+            session.event.is_set() or (session.task is not None and session.task.done())
+        ):
+            sessions.pop(target_key, None)
+            login_handler.remove_login_callback(target_key, session.callback)
+            session = None
+
+        session_owner = session is None
+        if session is None:
+            event = asyncio.Event()
+            result: dict = {"success": False, "data": {}}
+            session_ref: Optional[_PendingFrameLogin] = None
+
+            def _login_cb(success: bool, data: dict) -> None:
+                current = session_ref
+                if current is None or current.event.is_set():
+                    return
+                current.result["success"] = success
+                current.result["data"] = data
+                current.event.set()
+
+            session = _PendingFrameLogin(
+                target_key=target_key,
+                dest_hash=proxy.dest_hash,
+                contact_name=contact.name,
+                event=event,
+                result=result,
+                callback=_login_cb,
+                expires_at=time.monotonic() + FRAME_LOGIN_PENDING_TTL_S,
+            )
+            session_ref = session
+            sessions[target_key] = session
+            login_handler.register_login_callback(target_key, session.callback)
+
+        login_handler.store_login_password(proxy.dest_hash, password)
+        pkt = PacketBuilder.create_login_packet(
+            contact=proxy, local_identity=self._identity, password=password
+        )
+        self._apply_path_hash_mode(pkt)
+        timeout_s = self._response_timeout_s(pkt, proxy)
+        logger.debug(
+            "[PATHDIAG] frame login -> 0x%02X (%s): route=%s attempt=1/1 "
+            "timeout=%.1fs out_path_len=%s",
+            proxy.dest_hash,
+            contact.name,
+            "FLOOD" if pkt.is_route_flood() else "DIRECT",
+            timeout_s,
+            _fmt_path_len(getattr(proxy, "out_path_len", -1)),
+        )
+        if not await self._send_packet(pkt, wait_for_ack=False):
+            if session_owner and sessions.get(target_key) is session:
+                sessions.pop(target_key, None)
+                login_handler.remove_login_callback(target_key, session.callback)
+                login_handler.clear_login_password(proxy.dest_hash)
+            return {"success": False, "error": "send_failed", "reason": "Send failed"}
+
+        session.expires_at = time.monotonic() + FRAME_LOGIN_PENDING_TTL_S
+
+        if session.task is None:
+
+            async def _wait_for_frame_login() -> dict:
+                try:
+                    while not session.event.is_set():
+                        remaining = session.expires_at - time.monotonic()
+                        if remaining <= 0:
+                            return {
+                                "success": False,
+                                "timeout": True,
+                                "reason": "Login response timeout",
+                            }
+                        try:
+                            await asyncio.wait_for(session.event.wait(), timeout=remaining)
+                        except asyncio.TimeoutError:
+                            # A repeated command may have refreshed expires_at while
+                            # this wait used the previous deadline.
+                            continue
+                    return self._build_login_result(
+                        target_key,
+                        session.contact_name,
+                        session.result["success"],
+                        session.result["data"],
+                    )
+                finally:
+                    if sessions.get(target_key) is session:
+                        sessions.pop(target_key, None)
+                        login_handler.remove_login_callback(target_key, session.callback)
+                        login_handler.clear_login_password(session.dest_hash)
+
+            session.task = self._spawn_background_task(
+                _wait_for_frame_login(), "frame login response"
+            )
+
+        return {
+            "success": True,
+            "sent": SentResult(
+                success=True,
+                is_flood=pkt.is_route_flood(),
+                expected_ack=int.from_bytes(target_key[:4], "little"),
+                timeout_ms=int(timeout_s * 1000),
+            ),
+            "task": session.task,
+            "session_owner": session_owner,
+        }
+
+    def _clear_pending_frame_logins(self) -> None:
+        """Cancel frame-login sessions and detach their response callbacks."""
+        sessions = tuple(self._pending_frame_logins.values())
+        self._pending_frame_logins.clear()
+        login_handler = self._get_login_response_handler()
+        for session in sessions:
+            if login_handler is not None:
+                login_handler.remove_login_callback(session.target_key, session.callback)
+                login_handler.clear_login_password(session.dest_hash)
+            if session.task is not None and not session.task.done():
+                session.task.cancel()
 
     async def send_login(self, pub_key: bytes, password: str) -> dict:
         """Send a login request to a repeater and wait for the response."""
@@ -1006,6 +1187,7 @@ class _SendOpsMixin:
         total_timeout_s: Optional[float] = None,
         log_label: str = "request",
         response_tag_registered: Optional[Callable[[int], None]] = None,
+        contact_pubkey: Optional[bytes] = None,
     ) -> dict:
         """Send a request up to DEFAULT_MAX_ATTEMPTS times until a response lands.
 
@@ -1016,10 +1198,15 @@ class _SendOpsMixin:
         ``total_timeout_s`` caps the cumulative wait across attempts: the final
         attempt's wait is clipped to the remaining budget and no new attempt
         starts once the budget is spent.
+
+        A timed-out attempt also re-teaches our return path when ``contact_pubkey``
+        is known; see :meth:`_teach_return_path_before_retry`.
         """
         result: dict = {"timeout": True}
         deadline = time.monotonic() + total_timeout_s if total_timeout_s else None
         for attempt in range(DEFAULT_MAX_ATTEMPTS):
+            if attempt > 0 and contact_pubkey is not None:
+                await self._teach_return_path_before_retry(contact_pubkey, log_label)
             pkt, packet_tag = build_packet()
             if response_tag_registered is not None and packet_tag is not None:
                 response_tag_registered(packet_tag)
@@ -1045,14 +1232,39 @@ class _SendOpsMixin:
                 break
         return result
 
+    async def _teach_return_path_before_retry(self, contact_pubkey: bytes, log_label: str) -> None:
+        """Re-teach our return path after a request attempt timed out.
+
+        openHop hardening with no firmware equivalent. When a server answers
+        DIRECT down a route that no longer reaches us, *nothing* arrives — there
+        is no flood reply to trigger the normal re-teach and no inbound path to
+        embed. A timeout against a contact we hold an ``out_path`` for is the
+        only evidence available, so the teacher falls back to reversing our own
+        ``out_path`` (see ``maybe_teach_reverse_of_out_path``). Best-effort: any
+        failure just leaves the retry to proceed as before.
+        """
+        try:
+            proto_handler = self._get_protocol_response_handler()
+            teacher = getattr(proto_handler, "return_path_teacher", None)
+            if teacher is None:
+                return
+            await teacher.maybe_teach_reverse_of_out_path(
+                contact_pubkey, reason=f"{log_label} retry after timeout"
+            )
+        except Exception as e:
+            logger.debug("[PATHDIAG] return-path teach before retry failed: %s", e)
+
     async def _wait_for_path_propagation(self, proxy: Any, request_type: str) -> None:
         """Log the pre-send path; no longer sleeps.
 
-        Firmware sends the request immediately and relies on the reciprocal PATH
-        (which openHop already sends at login time, see ProtocolResponseHandler).
-        The previous 0.5s/hop sleep added up to ~1.5s+ of latency per request for
-        multi-hop contacts with no reliability benefit and has been removed; the
-        adaptive timeout + internal resend now handle a lost first attempt.
+        Firmware sends the request immediately and relies on the peer already
+        holding a route back to us. openHop teaches that route from the flood
+        PATH a flood login returns, and — since a DIRECT (forced-path) login is
+        answered with a plain flood RESPONSE instead — also from that RESPONSE;
+        see :mod:`openhop_core.node.handlers.return_path`. The previous
+        0.5s/hop sleep added up to ~1.5s+ of latency per request for multi-hop
+        contacts with no reliability benefit and has been removed; the adaptive
+        timeout + internal resend now handle a lost first attempt.
         """
         out_path_len = getattr(proxy, "out_path_len", -1)
         out_path = getattr(proxy, "out_path", b"") or b""
@@ -1115,6 +1327,7 @@ class _SendOpsMixin:
                 log_label=log_label,
                 cleanup=_clear_response_tags,
                 response_tag_registered=_register_response_tag,
+                contact_pubkey=pub_key,
             )
             if not started.get("success"):
                 return started
@@ -1263,6 +1476,7 @@ class _SendOpsMixin:
                 proxy,
                 log_label=f"protocol REQ 0x{protocol_code:02X}",
                 response_tag_registered=_register_response_tag,
+                contact_pubkey=pub_key,
             )
             return {
                 "success": result.get("success", False),

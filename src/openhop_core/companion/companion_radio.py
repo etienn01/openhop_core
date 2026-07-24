@@ -180,8 +180,16 @@ class CompanionRadio(CompanionBase):
 
     async def stop(self) -> None:
         self._running = False
+        self._clear_pending_frame_logins()
         try:
             self.node.dispatcher.remove_raw_packet_subscriber(self._on_raw_packet_rx_log)
+            protocol_handler = self.node.dispatcher.protocol_response_handler
+            teacher = getattr(protocol_handler, "return_path_teacher", None)
+            if teacher is not None:
+                self.node.dispatcher.remove_raw_packet_subscriber(teacher.note_flood_copy)
+            if protocol_handler is not None:
+                protocol_handler.cancel_pending_reciprocals()
+                await protocol_handler.wait_for_pending_reciprocals()
         except Exception:
             logger.debug("Remove raw packet subscriber during stop failed", exc_info=True)
         await self.node.stop()
@@ -374,6 +382,13 @@ class CompanionRadio(CompanionBase):
             # (firmware onContactPathRecv behaviour). Without this the remote
             # repeater never learns its route back to us and floods every reply.
             dispatcher.protocol_response_handler.set_packet_injector(self._send_packet)
+            # Feed the return-path teacher every flood reply copy pre-dedup so it
+            # teaches from the best-received route, not the first-arrived one (see
+            # ReturnPathTeacher.note_flood_copy). Dedup below would otherwise hide
+            # every copy but the first from the handlers.
+            teacher = getattr(dispatcher.protocol_response_handler, "return_path_teacher", None)
+            if teacher is not None:
+                dispatcher.add_raw_packet_subscriber(teacher.note_flood_copy)
         # When a direct trace reaches the end of its path, push completion data
         # to connected clients (firmware onTraceRecv -> PUSH_CODE_TRACE_DATA).
         if getattr(dispatcher, "trace_handler", None):

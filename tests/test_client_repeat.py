@@ -76,6 +76,18 @@ def _flood_txt(dest_hash, path=b"", path_len=0):
     return p
 
 
+def _direct_txt(path, path_len, dest_hash=0x77):
+    p = Packet()
+    p.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_DIRECT
+    # payload: dest_hash, src_hash, MAC + ciphertext (opaque here). The hash is
+    # path-independent, so every route variant of this payload hashes alike.
+    p.payload = bytearray([dest_hash, 0x99]) + bytearray(b"\xAA" * 12)
+    p.payload_len = len(p.payload)
+    p.path = bytearray(path)
+    p.path_len = path_len
+    return p
+
+
 # --------------------------------------------------------------------------- #
 # Pure forward-builder behaviour
 # --------------------------------------------------------------------------- #
@@ -275,6 +287,56 @@ async def test_own_retransmit_echo_is_suppressed():
     # Hearing our own retransmit back over RF must not forward again: the send
     # funnel tracked the (path-excluded) hash before TX, so RX dedupe drops it.
     await d._process_received_packet(echoed, -70, 8.0)
+    await _drain_tasks()
+    assert radio.send_count == 1
+
+
+@pytest.mark.asyncio
+async def test_overheard_direct_variant_does_not_suppress_owned_relay():
+    """Overhearing a longer route variant must not poison the seen table so
+    that the self-stripped copy this node is the next hop for is dropped as a
+    duplicate (MeshCore marks a routed-direct packet seen only when it is the
+    next hop)."""
+    d, radio = _make_dispatcher(enabled=True)
+    d._client_repeat_delay_ms = lambda pkt: 0.0
+
+    # Overheard earlier variant: first hop is another node, so we are not the
+    # next hop. Same payload as the copy we will later own -> identical hash.
+    overheard = _direct_txt(
+        path=bytes([0xEE, SELF_HASH, 0xBB]),
+        path_len=PathUtils.encode_path_len(1, 3),
+    )
+    await d._process_received_packet(overheard.write_to(), -70, 8.0)
+    await _drain_tasks()
+    assert radio.send_count == 0  # not ours to relay, and not tracked as seen
+
+    # The upstream hop strips itself; now we are the next hop for the same
+    # payload. It must be forwarded, not dropped as a duplicate.
+    owned = _direct_txt(
+        path=bytes([SELF_HASH, 0xBB]),
+        path_len=PathUtils.encode_path_len(1, 2),
+    )
+    await d._process_received_packet(owned.write_to(), -70, 8.0)
+    await _drain_tasks()
+    assert radio.send_count == 1
+
+
+@pytest.mark.asyncio
+async def test_owned_direct_relay_still_deduplicates_second_copy():
+    """A genuine duplicate of the copy this node is the next hop for is still
+    suppressed: dedup is only bypassed for packets we do not own."""
+    d, radio = _make_dispatcher(enabled=True)
+    d._client_repeat_delay_ms = lambda pkt: 0.0
+    owned = _direct_txt(
+        path=bytes([SELF_HASH, 0xBB]),
+        path_len=PathUtils.encode_path_len(1, 2),
+    )
+
+    await d._process_received_packet(owned.write_to(), -70, 8.0)
+    await _drain_tasks()
+    assert radio.send_count == 1
+
+    await d._process_received_packet(owned.write_to(), -70, 8.0)
     await _drain_tasks()
     assert radio.send_count == 1
 

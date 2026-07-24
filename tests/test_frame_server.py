@@ -395,7 +395,7 @@ async def test_cmd_add_update_contact_writes_single_ok_response():
 @pytest.mark.parametrize(
     ("encoded_path_len", "path"),
     [
-        (PathUtils.encode_path_len(1, 2), b"\xA1\x00"),
+        (PathUtils.encode_path_len(1, 2), b"\xa1\x00"),
         (PathUtils.encode_path_len(2, 2), b"\x10\x00\x20\x00"),
         (PathUtils.encode_path_len(3, 2), b"\x30\x00\x32\x40\x41\x00"),
         (0, b""),
@@ -918,7 +918,7 @@ async def test_cmd_send_login_timeout_does_not_emit_failure_push():
 
     pubkey = bytes(range(32))
     bridge = Mock()
-    bridge._start_login_request = AsyncMock(
+    bridge._start_frame_login_request = AsyncMock(
         return_value={
             "success": True,
             "sent": SentResult(success=True, is_flood=True, expected_ack=0x1122, timeout_ms=9000),
@@ -938,6 +938,53 @@ async def test_cmd_send_login_timeout_does_not_emit_failure_push():
 
     assert frames == [bytes([RESP_CODE_SENT, 1]) + struct.pack("<II", 0x1122, 9000)]
     assert not any(frame[0] == PUSH_CODE_LOGIN_FAIL for frame in frames)
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_login_retry_has_one_completion_writer():
+    """Repeated commands each get SENT, but one logical session emits one push."""
+    from openhop_core.companion.constants import PUSH_CODE_LOGIN_SUCCESS
+
+    pubkey = bytes(range(32))
+    result_task = asyncio.create_task(
+        _return_result(
+            {
+                "success": True,
+                "is_admin": True,
+                "tag": 123,
+                "acl_permissions": 3,
+                "firmware_ver_level": 2,
+            }
+        )
+    )
+    sent = SentResult(success=True, is_flood=True, expected_ack=0x1122, timeout_ms=9000)
+    bridge = Mock()
+    bridge._start_frame_login_request = AsyncMock(
+        side_effect=[
+            {
+                "success": True,
+                "sent": sent,
+                "task": result_task,
+                "session_owner": True,
+            },
+            {
+                "success": True,
+                "sent": sent,
+                "task": result_task,
+                "session_owner": False,
+            },
+        ]
+    )
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    frames: list[bytes] = []
+    server._write_frame = lambda frame: frames.append(frame)
+
+    await server._cmd_send_login(pubkey + b"pw")
+    await server._cmd_send_login(pubkey + b"pw")
+    await asyncio.sleep(0)
+
+    assert sum(frame[0] == RESP_CODE_SENT for frame in frames) == 2
+    assert sum(frame[0] == PUSH_CODE_LOGIN_SUCCESS for frame in frames) == 1
 
 
 @pytest.mark.asyncio
@@ -1801,7 +1848,7 @@ async def test_import_private_key_reports_disabled_without_changing_identity():
     server, frames = _make_capture_server(bridge)
     original_public_key = bridge.get_public_key()
 
-    await server._handle_cmd(bytes([CMD_IMPORT_PRIVATE_KEY]) + b"\xA5" * 64)
+    await server._handle_cmd(bytes([CMD_IMPORT_PRIVATE_KEY]) + b"\xa5" * 64)
 
     assert frames == [bytes([RESP_CODE_DISABLED])]
     assert bridge.get_public_key() == original_public_key
@@ -1811,7 +1858,7 @@ async def test_import_private_key_reports_disabled_without_changing_identity():
 async def test_short_private_key_import_is_unsupported():
     server, frames = _make_capture_server(Mock())
 
-    await server._handle_cmd(bytes([CMD_IMPORT_PRIVATE_KEY]) + b"\xA5" * 63)
+    await server._handle_cmd(bytes([CMD_IMPORT_PRIVATE_KEY]) + b"\xa5" * 63)
 
     assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD])]
 

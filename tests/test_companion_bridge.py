@@ -20,6 +20,7 @@ from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_RESPONSE,
     PAYLOAD_TYPE_TXT_MSG,
     REQ_TYPE_GET_TELEMETRY_DATA,
+    ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
     TELEM_PERM_BASE,
 )
@@ -1000,6 +1001,54 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         assert len(calls) == 1
         assert calls[0][0] == crc
         assert calls[0][1] >= 50
+
+    async def test_discrete_six_byte_ack_fires_send_confirmed(self):
+        """A direct-route plain-DM ACK is 6 bytes (4-byte hash + ext-attempt +
+        random byte). The bridge must accept it and correlate on the first 4
+        bytes; folding all 6 bytes or requiring exactly 4 would never match the
+        4-byte expected CRC and send_confirmed would silently never fire."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        confirmed = []
+        bridge.on_send_confirmed(lambda crc, *a: confirmed.append(crc))
+
+        ack_crc = 0x1A2B3C4D
+        bridge._track_pending_ack(ack_crc)
+
+        payload = ack_crc.to_bytes(4, "little") + bytes([0x07, 0xF3])
+        pkt = Packet()
+        pkt.header = ROUTE_TYPE_DIRECT | (PAYLOAD_TYPE_ACK << 2)
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(payload)
+        pkt.payload_len = len(payload)
+
+        await bridge.process_received_packet(pkt)
+
+        assert confirmed == [ack_crc]
+
+    async def test_discrete_ack_does_not_confirm_unpending_crc(self):
+        """The extended tail bytes are not part of correlation and must not be
+        able to produce a false confirm: a 6-byte ACK whose first 4 bytes are
+        not a pending CRC leaves send_confirmed unfired."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        confirmed = []
+        bridge.on_send_confirmed(lambda crc, *a: confirmed.append(crc))
+
+        bridge._track_pending_ack(0x1A2B3C4D)
+
+        payload = (0xDEADBEEF).to_bytes(4, "little") + bytes([0x01, 0x02])
+        pkt = Packet()
+        pkt.header = ROUTE_TYPE_DIRECT | (PAYLOAD_TYPE_ACK << 2)
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(payload)
+        pkt.payload_len = len(payload)
+
+        await bridge.process_received_packet(pkt)
+
+        assert confirmed == []
 
     async def test_node_discovered_fires_node_discovered_even_when_filtered(self):
         injector = MockPacketInjector()

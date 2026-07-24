@@ -298,7 +298,7 @@ async def test_path_handler_updates_matched_contact_sends_reciprocal_and_resolve
         extra=ack_crc.to_bytes(4, "little") + b"\x02\xa5",
         path_len_encoded=encoded_out_path_len,
     )
-    packet.set_path(b"\xC3", PathUtils.encode_path_len(1, 1))
+    packet.set_path(b"\xc3", PathUtils.encode_path_len(1, 1))
 
     dispatcher = Dispatcher(_CallbackRadio())
     dispatcher.local_identity = LOCAL_IDENTITY
@@ -320,6 +320,7 @@ async def test_path_handler_updates_matched_contact_sends_reciprocal_and_resolve
         ack_handler=ack_handler,
         protocol_response_handler=response_handler,
     )(packet)
+    await response_handler.wait_for_pending_reciprocals()
 
     assert result.authenticated is True
     assert waiting.is_set()

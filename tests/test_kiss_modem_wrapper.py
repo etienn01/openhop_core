@@ -1962,6 +1962,107 @@ class TestSerialRecovery:
         modem._start_reconnect_worker()
         assert modem.reconnect_thread is None
 
+    def test_mark_serial_failure_does_not_deadlock_with_reconnect_lock_order(self):
+        """A failed command must not wait for a reconnect handshake's lock.
+
+        An ordinary SetHardware caller holds _command_lock when its UART write
+        fails. A reconnect worker holds _connection_lock while it starts its
+        handshake and then needs _command_lock. Blocking failure handling creates
+        an ABBA deadlock; the failure transition must return promptly instead.
+        """
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        # Prevent the failure path from starting a real background reconnect.
+        modem._reconnecting_event.set()
+
+        command_held = threading.Event()
+        connection_held = threading.Event()
+        reconnect_waiting_on_command = threading.Event()
+        failure_returned = threading.Event()
+        reconnect_acquired_command = threading.Event()
+
+        def failed_command():
+            with modem._command_lock:
+                command_held.set()
+                assert connection_held.wait(1.0)
+                modem._mark_serial_failure("simulated overlapping write failure")
+                failure_returned.set()
+
+        def reconnect_handshake():
+            assert command_held.wait(1.0)
+            with modem._connection_lock:
+                connection_held.set()
+                reconnect_waiting_on_command.set()
+                with modem._command_lock:
+                    reconnect_acquired_command.set()
+
+        command_thread = threading.Thread(target=failed_command, daemon=True)
+        reconnect_thread = threading.Thread(target=reconnect_handshake, daemon=True)
+        command_thread.start()
+        reconnect_thread.start()
+
+        assert reconnect_waiting_on_command.wait(1.0)
+        assert failure_returned.wait(0.5)
+        assert reconnect_acquired_command.wait(0.5)
+        command_thread.join(timeout=0.5)
+        reconnect_thread.join(timeout=0.5)
+        assert not command_thread.is_alive()
+        assert not reconnect_thread.is_alive()
+
+    def test_mark_serial_failure_does_not_deadlock_with_reconnect_write(self):
+        """A failed UART write must not wait for a reconnect UART write.
+
+        _write_frame holds _serial_write_lock while it invokes failure handling.
+        A reconnect handshake holds _connection_lock while it waits to write its
+        PING. Waiting for _connection_lock in the failure path would deadlock the
+        two workers just as it does for SetHardware's _command_lock.
+        """
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._reconnecting_event.set()
+        serial_conn = MagicMock()
+        serial_conn.is_open = True
+        serial_conn.write.side_effect = lambda data: len(data)
+        modem.serial_conn = serial_conn
+
+        connection_held = threading.Event()
+        serial_write_held = threading.Event()
+        failure_returned = threading.Event()
+        reconnect_wrote = threading.Event()
+
+        def failed_write():
+            with modem._serial_write_lock:
+                serial_write_held.set()
+                assert connection_held.wait(1.0)
+                modem._mark_serial_failure("simulated overlapping write failure")
+                failure_returned.set()
+
+        def reconnect_handshake():
+            with modem._connection_lock:
+                connection_held.set()
+                assert serial_write_held.wait(1.0)
+                assert modem._write_frame(b"reconnect ping") is True
+                reconnect_wrote.set()
+
+        failed_thread = threading.Thread(target=failed_write, daemon=True)
+        reconnect_thread = threading.Thread(target=reconnect_handshake, daemon=True)
+        failed_thread.start()
+        reconnect_thread.start()
+
+        assert failure_returned.wait(0.5)
+        assert reconnect_wrote.wait(0.5)
+        failed_thread.join(timeout=0.5)
+        reconnect_thread.join(timeout=0.5)
+        assert not failed_thread.is_alive()
+        assert not reconnect_thread.is_alive()
+
+    def test_reconnect_worker_clears_gate_after_unexpected_exception(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._reconnecting_event.set()
+        modem._reconnect_loop = MagicMock(side_effect=RuntimeError("simulated reconnect error"))
+
+        modem._reconnect_worker()
+
+        assert modem._reconnecting_event.is_set() is False
+
     def test_connect_clears_reconnecting_gate_after_success(self):
         modem = KissModemWrapper(port="/dev/null", auto_configure=False)
         modem._reconnecting_event.set()
