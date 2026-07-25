@@ -463,6 +463,58 @@ class TestTextMessageHandler:
         assert len(res) == 1
         assert res[0][1] == TXT_ACK_DELAY_MS / 1000.0
 
+    def _flood_ack_inner(self, pkt, sender, shared):
+        """Decrypt the inner payload of the PATH-return ACK built for ``pkt``."""
+        res = self.handler._build_ack_responses(
+            packet=pkt,
+            matched_contact=MockContact(public_key=sender.get_public_key().hex()),
+            shared_secret=shared,
+            pubkey=sender.get_public_key(),
+            ack_hash=bytes(range(6)),
+            is_flood=True,
+        )
+        return CryptoUtils.mac_then_decrypt(shared[:16], shared, bytes(res[0][0].payload[2:]))
+
+    def test_flood_ack_path_return_preserves_multibyte_hash_width(self):
+        """The taught path keeps the DM's declared width and is trimmed to it.
+
+        The path bytes and the path_len declaring their width are one decision:
+        taking the whole buffer while declaring only the first two hops makes
+        create_path_return reject the pair.
+        """
+        sender = LocalIdentity()
+        shared = Identity(sender.get_public_key()).calc_shared_secret(
+            self.local_identity.get_private_key()
+        )
+        pkt = Packet()
+        # 2 hops of 2-byte hashes, plus slack the declared length excludes.
+        pkt.path = bytearray([0xA1, 0xA2, 0xB1, 0xB2, 0xFF, 0xFF])
+        pkt.path_len = PathUtils.encode_path_len(2, 2)
+
+        plaintext = self._flood_ack_inner(pkt, sender, shared)
+        assert plaintext[0] == PathUtils.encode_path_len(2, 2)
+        assert plaintext[1:5] == bytes([0xA1, 0xA2, 0xB1, 0xB2])
+        assert plaintext[5] == PAYLOAD_TYPE_ACK  # extra_type
+
+    def test_flood_ack_path_return_drops_a_path_of_undecodable_width(self):
+        """An undecodable path_len teaches no path rather than guessing a width.
+
+        Unreachable from the wire — Packet.from_bytes rejects an invalid
+        path_len — but the two halves must stay consistent regardless of how the
+        packet was constructed.
+        """
+        sender = LocalIdentity()
+        shared = Identity(sender.get_public_key()).calc_shared_secret(
+            self.local_identity.get_private_key()
+        )
+        pkt = Packet()
+        pkt.path = bytearray([0x01, 0x02, 0x03, 0x04])
+        pkt.path_len = 0xFF  # hash_size 4 is reserved: no decodable width
+
+        plaintext = self._flood_ack_inner(pkt, sender, shared)
+        assert plaintext[0] == 0  # zero hops, nothing taught
+        assert plaintext[1] == PAYLOAD_TYPE_ACK
+
     @pytest.mark.asyncio
     async def test_received_text_stops_at_first_nul(self):
         """The delivered message text ends at the first NUL: AES zero padding and the
@@ -1659,6 +1711,48 @@ class TestProtocolRequestHandler:
         assert r.response is not None
         assert client.last_timestamp == 500
 
+    @pytest.mark.asyncio
+    async def test_direct_req_flood_fallback_accumulates_at_request_hash_width(self):
+        """With no out_path the RESPONSE floods at the REQ's hash width.
+
+        Firmware: sendFloodReply(reply, SERVER_RESPONSE_DELAY,
+        packet->getPathHashSize()) (simple_repeater onPeerDataRecv, the
+        OUT_PATH_UNKNOWN branch). A DIRECT request that reached us has had its
+        hops consumed, but removeSelfFromPath only decrements the count, so
+        path_len bits 6-7 still carry the width it was routed at.
+        """
+        handler, client, build_req = self._req_handler_with_client()
+        assert client.out_path_len == -1  # no known route: forces the flood fallback
+
+        pkt = build_req(1000)
+        pkt.path_len = PathUtils.encode_path_len(3, 0)  # 3-byte hashes, hops consumed
+
+        reply = (await handler(pkt)).response
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
+        assert PathUtils.get_path_hash_size(reply.path_len) == 3
+        assert PathUtils.get_path_hash_count(reply.path_len) == 0
+        # Marked so the dispatcher's node default cannot stamp over the mirror
+        # (see test_dispatcher.py: applied marker is not overwritten).
+        assert getattr(reply, "_path_hash_mode_applied", False) is True
+
+    @pytest.mark.asyncio
+    async def test_direct_req_reply_keeps_the_out_path_hash_width(self):
+        """A routed reply keeps its out_path's width; the mirror is flood-only.
+
+        The out_path here is zero-hop, so nothing but the branch guard stops the
+        mirror from rewriting a path_len that belongs to the stored route.
+        """
+        handler, client, build_req = self._req_handler_with_client()
+        client.out_path = b""
+        client.out_path_len = PathUtils.encode_path_len(2, 0)  # zero-hop, 2-byte hashes
+
+        pkt = build_req(1000)
+        pkt.path_len = PathUtils.encode_path_len(3, 0)  # request used a different width
+
+        reply = (await handler(pkt)).response
+        assert reply.get_route_type() == ROUTE_TYPE_DIRECT
+        assert reply.path_len == PathUtils.encode_path_len(2, 0)
+
     def test_advance_client_watermark_is_monotonic(self):
         """The watermark never moves backwards: if another accepted request
         advanced it between the replay check and the write, an older (but
@@ -2188,6 +2282,60 @@ class TestLoginServerHandler:
         assert plaintext[1] == 0xAA
         assert plaintext[2] == 0xBB
         assert plaintext[3] == PAYLOAD_TYPE_RESPONSE  # extra_type
+
+    @pytest.mark.asyncio
+    async def test_flood_login_reply_accumulates_at_request_hash_width(self):
+        """The PATH-return accumulates hops at the *request's* hash width.
+
+        Firmware: sendFloodReply(path, SERVER_RESPONSE_DELAY,
+        packet->getPathHashSize()) (simple_repeater onAnonDataRecv). The reply's
+        own path_len declares the width repeaters use on the way back, which is
+        separate from the width declared for the path carried inside it.
+        """
+        pkt = self._build_login_packet(
+            password="admin123", route_type="flood", path=[0xAA, 0xBB, 0xCC, 0xDD]
+        )
+        pkt.path_len = PathUtils.encode_path_len(2, 2)  # 2 hops of 2-byte hashes
+
+        await self.handler(pkt)
+
+        response_pkt, _ = self.sent_packets[0]
+        assert response_pkt.get_payload_type() == PAYLOAD_TYPE_PATH
+        # Outer: reply starts at zero hops but declares the inbound width.
+        assert PathUtils.get_path_hash_size(response_pkt.path_len) == 2
+        assert PathUtils.get_path_hash_count(response_pkt.path_len) == 0
+        # Marked so the dispatcher's node default cannot stamp over the mirror
+        # (see test_dispatcher.py: applied marker is not overwritten).
+        assert getattr(response_pkt, "_path_hash_mode_applied", False) is True
+
+        # Inner: the taught path keeps its own 2-byte declaration and bytes.
+        client_id = Identity(self.client_identity_local.get_public_key())
+        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
+        plaintext = CryptoUtils.mac_then_decrypt(
+            shared_secret[:16], shared_secret, bytes(response_pkt.payload[2:])
+        )
+        assert plaintext[0] == PathUtils.encode_path_len(2, 2)
+        assert plaintext[1:5] == bytes([0xAA, 0xBB, 0xCC, 0xDD])
+
+    @pytest.mark.asyncio
+    async def test_direct_login_flood_reply_accumulates_at_request_hash_width(self):
+        """The direct-login flood RESPONSE mirrors the width too.
+
+        Firmware runs this branch through the same sendFloodReply(...,
+        packet->getPathHashSize()) call (simple_repeater onAnonDataRecv, the
+        ``reply_path_len < 0`` case). A direct request that reached us has had
+        its hops consumed but still carries the width in path_len bits 6-7.
+        """
+        pkt = self._build_login_packet(password="admin123", route_type="direct")
+        pkt.path_len = PathUtils.encode_path_len(3, 0)  # 3-byte hashes, hops consumed
+
+        await self.handler(pkt)
+
+        response_pkt, _ = self.sent_packets[0]
+        assert response_pkt.get_payload_type() == PAYLOAD_TYPE_RESPONSE
+        assert PathUtils.get_path_hash_size(response_pkt.path_len) == 3
+        assert PathUtils.get_path_hash_count(response_pkt.path_len) == 0
+        assert getattr(response_pkt, "_path_hash_mode_applied", False) is True
 
 
 # ---------------------------------------------------------------------------

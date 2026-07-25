@@ -337,7 +337,13 @@ class ProtocolRequestHandler:
                     if PathUtils.is_valid_path_len(path_len_byte)
                     else 1
                 )
-                reply_packet.apply_path_hash_mode(hash_size - 1)
+                # mark_applied: without it the dispatcher's node-default
+                # path_hash_mode (_apply_default_path_hash_mode, called from
+                # send_packet) overwrites this mirror on the way out, and the
+                # reply accumulates at the node's own width instead of the
+                # request's — which is what firmware's sendFloodReply(...,
+                # packet->getPathHashSize()) exists to avoid.
+                reply_packet.apply_path_hash_mode(hash_size - 1, mark_applied=True)
                 # Scope the flood PATH-return to the region the REQ arrived
                 # under: TRANSPORT_FLOOD with the code re-hashed over this
                 # reply's payload, or plain when the request was unscoped/direct.
@@ -379,6 +385,20 @@ class ProtocolRequestHandler:
                 # no RegionMap this is inert and the reply falls through to the
                 # node default, matching BaseChatMesh's sendFloodScoped(from).
                 apply_reply_scope(reply_packet, original_packet)
+                # Same sendFloodReply call, same third argument: accumulate at
+                # the REQ's hash width, not this node's own preference. A DIRECT
+                # request that reached us has had its hops consumed, but
+                # removeSelfFromPath only decrements the count — path_len bits
+                # 6-7 still carry the width it was routed at. Only the flood
+                # branch: the direct branch's path_len comes from the client's
+                # out_path above and must not be stamped over.
+                in_path_len = getattr(original_packet, "path_len", 0) or 0
+                in_hash_size = (
+                    PathUtils.get_path_hash_size(in_path_len)
+                    if PathUtils.is_valid_path_len(in_path_len)
+                    else 1
+                )
+                reply_packet.apply_path_hash_mode(in_hash_size - 1, mark_applied=True)
 
             self.log(f"RESPONSE built for 0x{client_hash:02X} via {route_type.upper()}")
             return reply_packet

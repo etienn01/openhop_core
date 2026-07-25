@@ -133,12 +133,21 @@ class TextMessageHandler(BaseHandler):
         """
 
         if is_flood:
-            incoming_path = list(packet.path if hasattr(packet, "path") else [])
-            path_len_encoded = (
-                getattr(packet, "path_len", None)
-                if PathUtils.is_valid_path_len(getattr(packet, "path_len", -1))
-                else None
-            )
+            # One decision for both halves: the path bytes and the path_len byte
+            # declaring their hash width have to agree, or create_path_return
+            # rejects the pair. Deriving them from separate guards let an invalid
+            # path_len yield a non-empty path with no declared width. That cannot
+            # reach here from the wire (Packet.from_bytes rejects an invalid
+            # path_len), but the correct handling is to teach no path rather than
+            # one whose hash width we would be guessing.
+            in_path_len = getattr(packet, "path_len", 0) or 0
+            if PathUtils.is_valid_path_len(in_path_len):
+                path_len_encoded = in_path_len
+                raw_path = bytes(getattr(packet, "path", b"") or b"")
+                incoming_path = list(raw_path[: PathUtils.get_path_byte_len(in_path_len)])
+            else:
+                path_len_encoded = None
+                incoming_path = []
             ack_packet = PacketBuilder.create_path_return(
                 dest_hash=PacketBuilder._hash_byte(pubkey),
                 src_hash=PacketBuilder._hash_byte(self.local_identity.get_public_key()),
