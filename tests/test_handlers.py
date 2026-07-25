@@ -1484,6 +1484,7 @@ class TestProtocolResponseHandler:
             path=[0xA1],
             extra_type=PAYLOAD_TYPE_RESPONSE,
             extra=bytes(reply),
+            path_len_encoded=PathUtils.encode_path_len(1, 1),
         )
         packet.set_path(b"\xb2", PathUtils.encode_path_len(1, 1))
 

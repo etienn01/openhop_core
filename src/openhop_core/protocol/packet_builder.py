@@ -894,10 +894,20 @@ class PacketBuilder:
         two-way communication, with optional additional data.
 
         The inner payload first byte is the encoded path_len (bits 6-7 = hash
-        size - 1, bits 0-5 = hop count). When path_len_encoded is provided
-        and valid, it is used so 2- and 3-byte path hashes match firmware.
-        When path_len_encoded is None, the first byte is len(path) (1-byte
-        hash semantics).
+        size - 1, bits 0-5 = hop count), so ``path_len_encoded`` is required
+        for a non-empty path: ``path`` is a flat byte sequence and its length
+        alone cannot distinguish N 1-byte hashes from one N-byte hash.
+
+        Guessing 1-byte semantics here is unrecoverable in the field.  Firmware
+        stores a taught path verbatim (``simple_repeater`` ``onPeerPathRecv``:
+        ``client->out_path_len = copyPath(...)``), persists it to flash, and
+        never re-derives it — ``onPeerPathRecv`` is its only writer.  A path
+        taught with the wrong hash size therefore makes the peer answer down a
+        route that resolves to nobody, for every subsequent DIRECT exchange,
+        until something re-teaches it or a *flood* login resets it
+        (``handleLoginReq``: ``if (is_flood) client->out_path_len =
+        OUT_PATH_UNKNOWN;``).  Failing loudly at build time is the only place
+        the mistake is still cheap.
 
         Args:
             dest_hash: Destination node hash (1 byte).
@@ -906,20 +916,36 @@ class PacketBuilder:
             path: Sequence of node hashes for the return path.
             extra_type: Type identifier for extra data (default: 0xFF).
             extra: Additional binary data to include.
-            path_len_encoded: Encoded path_len byte from the original packet.
-                If None, first byte of inner payload is len(path) (1-byte hashes).
+            path_len_encoded: Encoded path_len byte, normally the ``path_len``
+                of the packet the path was observed on.  Required whenever
+                ``path`` is non-empty; for a 1-byte-hash path pass
+                ``PathUtils.encode_path_len(1, hop_count)``.  May be None only
+                for an empty path.
 
         Returns:
             Packet: Encrypted return path packet.
 
         Raises:
             ValueError: If combined path and extra data exceed packet limits,
-                or if path_len_encoded is provided but path length does not match.
+                if path_len_encoded is omitted for a non-empty path, if it is
+                not a valid encoded path_len, or if it disagrees with the
+                actual path length.
         """
         if len(path) + len(extra) + 5 > (MAX_PACKET_PAYLOAD - 2 - CIPHER_BLOCK_SIZE):
             raise ValueError("Combined path/extra too long")
 
-        if path_len_encoded is not None and PathUtils.is_valid_path_len(path_len_encoded):
+        if path_len_encoded is None:
+            if len(path) > 0:
+                raise ValueError(
+                    f"path_len_encoded is required for a non-empty path "
+                    f"({len(path)} bytes): the byte count cannot distinguish "
+                    f"N 1-byte hashes from one N-byte hash. Pass the observed "
+                    f"packet's path_len, or PathUtils.encode_path_len(hash_size, hops)."
+                )
+            first_byte = 0
+        else:
+            if not PathUtils.is_valid_path_len(path_len_encoded):
+                raise ValueError(f"invalid path_len_encoded 0x{path_len_encoded:02X}")
             expected_len = PathUtils.get_path_byte_len(path_len_encoded)
             if len(path) != expected_len:
                 raise ValueError(
@@ -927,8 +953,6 @@ class PacketBuilder:
                     f"(expected {expected_len} bytes)"
                 )
             first_byte = path_len_encoded
-        else:
-            first_byte = len(path)
 
         if extra:
             inner = bytes([first_byte]) + bytes(path) + bytes([extra_type]) + extra

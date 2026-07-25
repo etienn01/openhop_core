@@ -203,9 +203,28 @@ def test_packet_builder_create_path_return_encoded_path_len():
     assert decrypted[5] == 0xFF  # extra_type
 
 
-def test_packet_builder_create_path_return_no_encoded_uses_len_path():
-    """When path_len_encoded is None, first byte is len(path) (1-byte hash semantics)."""
-    path = [0x11, 0x22, 0x33]  # 3 bytes
+def test_packet_builder_create_path_return_requires_encoded_len_for_nonempty_path():
+    """A non-empty path without path_len_encoded is ambiguous, so it must raise.
+
+    3 bytes is either three 1-byte hashes or one 3-byte hash, and guessing
+    wrong teaches the peer a route that resolves to nobody until a flood login
+    resets it (firmware onPeerPathRecv stores the taught path verbatim).
+    """
+    with pytest.raises(ValueError, match="path_len_encoded is required"):
+        PacketBuilder.create_path_return(
+            dest_hash=0x01,
+            src_hash=0x02,
+            secret=bytes(32),
+            path=[0x11, 0x22, 0x33],
+            extra_type=0xFF,
+            extra=b"",
+            path_len_encoded=None,
+        )
+
+
+def test_packet_builder_create_path_return_one_byte_hashes_declared_explicitly():
+    """1-byte hashes still work; the caller just has to say so."""
+    path = [0x11, 0x22, 0x33]  # three 1-byte hashes
     secret = bytes(32)
     pkt = PacketBuilder.create_path_return(
         dest_hash=0x01,
@@ -214,15 +233,45 @@ def test_packet_builder_create_path_return_no_encoded_uses_len_path():
         path=path,
         extra_type=0xFF,
         extra=b"",
-        path_len_encoded=None,
+        path_len_encoded=PathUtils.encode_path_len(1, 3),
     )
     aes_key = secret[:16]
     decrypted = CryptoUtils.mac_then_decrypt(aes_key, secret, bytes(pkt.payload[2:]))
-    assert decrypted[0] == 3
+    assert PathUtils.get_path_hash_size(decrypted[0]) == 1
+    assert PathUtils.get_path_hash_count(decrypted[0]) == 3
     assert decrypted[1:4] == bytes(path)
     # No extra payload: 0xFF dummy type followed by 4 random uniqueness bytes.
     assert decrypted[4] == 0xFF
     assert len(decrypted) >= 4 + 1 + 4
+
+
+def test_packet_builder_create_path_return_empty_path_needs_no_encoded_len():
+    """An empty path is unambiguous, so path_len_encoded stays optional."""
+    secret = bytes(32)
+    pkt = PacketBuilder.create_path_return(
+        dest_hash=0x01,
+        src_hash=0x02,
+        secret=secret,
+        path=[],
+        extra_type=0xFF,
+        extra=b"",
+    )
+    decrypted = CryptoUtils.mac_then_decrypt(secret[:16], secret, bytes(pkt.payload[2:]))
+    assert decrypted[0] == 0
+
+
+def test_packet_builder_create_path_return_rejects_invalid_encoded_len():
+    """An invalid encoded path_len must raise, not fall back to a byte count."""
+    with pytest.raises(ValueError, match="invalid path_len_encoded"):
+        PacketBuilder.create_path_return(
+            dest_hash=0x01,
+            src_hash=0x02,
+            secret=bytes(32),
+            path=[0x11] * 4,
+            extra_type=0xFF,
+            extra=b"",
+            path_len_encoded=0xFF,  # hash_size 4 is reserved
+        )
 
 
 def test_packet_builder_create_path_return_empty_extra_is_unique():
@@ -230,7 +279,14 @@ def test_packet_builder_create_path_return_empty_extra_is_unique():
     matching MeshCore Mesh::createPathReturn."""
     path = [0x11, 0x22, 0x33]
     secret = bytes(32)
-    kwargs = dict(dest_hash=0x01, src_hash=0x02, secret=secret, path=path, extra=b"")
+    kwargs = dict(
+        dest_hash=0x01,
+        src_hash=0x02,
+        secret=secret,
+        path=path,
+        extra=b"",
+        path_len_encoded=PathUtils.encode_path_len(1, 3),
+    )
     a = PacketBuilder.create_path_return(**kwargs)
     b = PacketBuilder.create_path_return(**kwargs)
     assert bytes(a.payload) != bytes(b.payload)
