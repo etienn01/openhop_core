@@ -376,6 +376,20 @@ class ProtocolRequestHandler:
             if path_bytes is not None and path_len_encoded is not None:
                 reply_packet.set_path(path_bytes, path_len_encoded)
             if route_type == "flood":
+                # Same sendFloodReply call as the PATH-return above, same third
+                # argument: accumulate at the REQ's hash width, not this node's
+                # own preference. A DIRECT request that reached us has had its
+                # hops consumed, but removeSelfFromPath only decrements the
+                # count — path_len bits 6-7 still carry the width it was routed
+                # at. Only the flood branch: the direct branch's path_len comes
+                # from the client's out_path above and must not be stamped over.
+                in_path_len = getattr(original_packet, "path_len", 0) or 0
+                in_hash_size = (
+                    PathUtils.get_path_hash_size(in_path_len)
+                    if PathUtils.is_valid_path_len(in_path_len)
+                    else 1
+                )
+                reply_packet.apply_path_hash_mode(in_hash_size - 1, mark_applied=True)
                 # No out_path, so this RESPONSE floods. Firmware sends it via
                 # sendFloodReply (simple_repeater onPeerDataRecv, the
                 # OUT_PATH_UNKNOWN branch), which for a DIRECT request means
@@ -385,20 +399,6 @@ class ProtocolRequestHandler:
                 # no RegionMap this is inert and the reply falls through to the
                 # node default, matching BaseChatMesh's sendFloodScoped(from).
                 apply_reply_scope(reply_packet, original_packet)
-                # Same sendFloodReply call, same third argument: accumulate at
-                # the REQ's hash width, not this node's own preference. A DIRECT
-                # request that reached us has had its hops consumed, but
-                # removeSelfFromPath only decrements the count — path_len bits
-                # 6-7 still carry the width it was routed at. Only the flood
-                # branch: the direct branch's path_len comes from the client's
-                # out_path above and must not be stamped over.
-                in_path_len = getattr(original_packet, "path_len", 0) or 0
-                in_hash_size = (
-                    PathUtils.get_path_hash_size(in_path_len)
-                    if PathUtils.is_valid_path_len(in_path_len)
-                    else 1
-                )
-                reply_packet.apply_path_hash_mode(in_hash_size - 1, mark_applied=True)
 
             self.log(f"RESPONSE built for 0x{client_hash:02X} via {route_type.upper()}")
             return reply_packet
