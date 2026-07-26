@@ -108,7 +108,7 @@ def create_core_handlers(
         radio_config,
     )
 
-    advert_handler = AdvertHandler(log_fn, event_service=event_service)
+    advert_handler = AdvertHandler(log_fn, event_service=event_service, local_identity=identity)
 
     group_text_handler = GroupTextHandler(
         identity,

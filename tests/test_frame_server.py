@@ -233,6 +233,33 @@ async def test_node_discovered_pushes_short_advert_for_stored_contact():
     assert len(data) == 1 + PUB_KEY_SIZE
 
 
+@pytest.mark.asyncio
+async def test_self_advert_pushes_no_frame_to_client():
+    """Our own advert, heard back off a repeater, is dropped like Mesh::onRecvPacket
+    does (Mesh.cpp:263): the client sees neither ADVERT nor NEW_ADVERT."""
+    from unittest.mock import AsyncMock
+
+    from openhop_core.companion.companion_bridge import CompanionBridge
+    from openhop_core.protocol import LocalIdentity, PacketBuilder
+
+    injector = AsyncMock(return_value=True)
+    identity = LocalIdentity()
+    bridge = CompanionBridge(identity, injector)
+
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=256)
+    server._setup_push_callbacks()
+
+    await bridge.process_received_packet(PacketBuilder.create_advert(identity, "Me"))
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    push_codes = [server._write_queue.get_nowait()[3] for _ in range(server._write_queue.qsize())]
+    assert PUSH_CODE_ADVERT not in push_codes
+    assert PUSH_CODE_NEW_ADVERT not in push_codes
+    assert bridge.contacts.get_count() == 0
+
+
 def test_build_advert_push_frames_name_truncated_to_32_bytes():
     """Long name is truncated to 32 bytes in full frame."""
     pubkey = bytes(range(32))

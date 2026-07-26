@@ -17,7 +17,7 @@ from openhop_core.companion.constants import (
 )
 from openhop_core.companion.frame_server import CompanionFrameServer
 from openhop_core.companion.models import Contact
-from openhop_core.protocol import Identity, LocalIdentity, Packet
+from openhop_core.protocol import Identity, LocalIdentity, Packet, PacketBuilder
 from openhop_core.protocol.constants import PAYLOAD_TYPE_ADVERT, ROUTE_TYPE_FLOOD
 
 # Literal MeshCore Packet::writeTo layout: header | path_len | pubkey |
@@ -120,6 +120,22 @@ async def test_import_uses_normal_autoadd_policy_instead_of_direct_store_mutatio
     assert bridge.import_contact(MESHCORE_ADVERT_WIRE) is True
     await _drain_loopback()
     assert bridge.get_contact_by_key(MESHCORE_ADVERT_PUBKEY) is None
+
+
+@pytest.mark.asyncio
+async def test_import_contact_of_own_advert_is_still_ignored():
+    """Importing our own advert reports success (the packet parsed) but never
+    reaches the advert handler, matching Mesh::onRecvPacket (Mesh.cpp:263)."""
+    identity = LocalIdentity()
+    bridge = CompanionBridge(identity, AsyncMock(return_value=True))
+    handler = AsyncMock()
+    bridge._get_advert_handler = lambda: handler
+
+    assert bridge.import_contact(PacketBuilder.create_advert(identity, "Me").write_to()) is True
+    await _drain_loopback()
+
+    handler.assert_not_awaited()
+    assert bridge.get_contact_by_key(identity.get_public_key()) is None
 
 
 def test_legacy_export_record_and_non_advert_are_rejected_before_loopback():

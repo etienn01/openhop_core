@@ -6,7 +6,7 @@ import logging
 import time
 from typing import Optional
 
-from ..protocol import Packet, PacketBuilder
+from ..protocol import Packet, PacketBuilder, is_self_advert
 from ..protocol.constants import (
     ADVERT_FLAG_HAS_LOCATION,
     ADVERT_FLAG_HAS_NAME,
@@ -145,7 +145,7 @@ class _ContactChannelMixin:
     async def _loopback_imported_advert(self, packet: Packet) -> None:
         """Deliver an imported ADVERT through the normal verified handler."""
         payload = packet.get_payload()
-        if len(payload) >= 32 and payload[:32] == self._identity.get_public_key():
+        if is_self_advert(payload, self._identity.get_public_key()):
             # Mesh::onRecvPacket ignores a self ADVERT after import, while the
             # command itself has already succeeded because its packet parsed.
             return

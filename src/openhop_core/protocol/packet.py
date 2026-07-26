@@ -117,6 +117,7 @@ class Packet:
         "_path_hash_mode_applied",
         "_flood_scope_applied",
         "_injected_for_tx",
+        "_injected_origin_hash",
         "_recv_region_captured",
         "_recv_region_key",
     )
@@ -146,6 +147,11 @@ class Packet:
         # (scoped or deliberately plain); the dispatcher must not re-scope it.
         self._flood_scope_applied = False
         self._injected_for_tx = False  # Set by repeater inject path; skip engine on route
+        # Companion that originated this injected TX, as the "0xHH" hash string the
+        # host keys its frame servers by (None for host-originated injects). Set by
+        # the repeater inject path so the companion fan-out can withhold the packet
+        # from its own sender -- a node never hears its own transmission.
+        self._injected_origin_hash: Optional[str] = None
         # Region captured from this packet on receive. Only set True when
         # a RegionMap was actually consulted; the matched region key (or None =>
         # reply plain) is read by region_map.apply_reply_scope when a handler

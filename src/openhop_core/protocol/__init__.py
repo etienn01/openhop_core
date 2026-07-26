@@ -84,7 +84,7 @@ from .region_map import (
     capture_recv_region,
 )
 from .transport_keys import calc_transport_code, get_auto_key_for, scope_packet
-from .utils import decode_appdata, parse_advert_payload
+from .utils import decode_appdata, is_self_advert, parse_advert_payload
 
 __all__ = [
     # Core classes
@@ -106,6 +106,7 @@ __all__ = [
     "parse_advert_payload",
     "decode_appdata",
     "describe_advert_flags",
+    "is_self_advert",
     "get_auto_key_for",
     "calc_transport_code",
     "scope_packet",

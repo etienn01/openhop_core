@@ -2,7 +2,7 @@ import struct
 import time
 from typing import Any, Dict, Optional
 
-from ...protocol import Identity, Packet, decode_appdata, parse_advert_payload
+from ...protocol import Identity, Packet, decode_appdata, is_self_advert, parse_advert_payload
 from ...protocol.constants import (
     MAX_ADVERT_DATA_SIZE,
     PAYLOAD_TYPE_ADVERT,
@@ -21,9 +21,10 @@ class AdvertHandler(BaseHandler):
     def payload_type() -> int:
         return PAYLOAD_TYPE_ADVERT
 
-    def __init__(self, log_fn, event_service=None):
+    def __init__(self, log_fn, event_service=None, local_identity=None):
         self.log = log_fn
         self.event_service = event_service
+        self.local_identity = local_identity
 
     def _verify_advert_signature(
         self, pubkey: bytes, timestamp: bytes, appdata: bytes, signature: bytes
@@ -84,6 +85,20 @@ class AdvertHandler(BaseHandler):
                     f"truncating to {MAX_ADVERT_DATA_SIZE}"
                 )
                 appdata = appdata[:MAX_ADVERT_DATA_SIZE]
+
+            # Drop our own advert before anything reads it, matching the
+            # self_id.matches(id.pub_key) test at the top of Mesh::onRecvPacket's
+            # ADVERT branch (Mesh.cpp:263) — ahead of signature verification, which
+            # a self-signed advert would pass.  Firmware also gets in ahead of
+            # wasSeen(); openHop's equivalent dedupe has already run by here, in
+            # Dispatcher.handle_packet, which is a harmless divergence. A software node
+            # hears its own advert routinely: a neighbouring repeater re-floods it,
+            # or a host loops our own TX back.  Read-side only: the packet is left
+            # exactly as it arrived so the forwarding decision is unchanged.
+            self_key = self.local_identity.get_public_key() if self.local_identity else b""
+            if is_self_advert(payload, self_key):
+                self.log(f"Ignoring self advert (pubkey={pubkey_hex[:8]}...)")
+                return None
 
             # Verify cryptographic signature
             if not self._verify_advert_signature(

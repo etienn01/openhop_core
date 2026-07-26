@@ -46,6 +46,12 @@ class _RxEventsMixin:
                 # -> one store update and at most one advert_received (Bridge and Radio).
                 now = int(time.time())
                 contact = Contact.from_dict(data, now=now)
+                if contact.public_key == self.get_public_key():
+                    # Backstop: the ADVERT handler already drops a self advert the way
+                    # Mesh::onRecvPacket does (Mesh.cpp:263).  This event is a public
+                    # seam, and a node must never contact-book or path-cache itself
+                    # however the event was produced.
+                    return
                 # Wire advert flags (ADVERT_FLAG_IS_CHAT_NODE=0x01, etc.) must not
                 # be stored as local contact flags (bit 0 = favourite).  For new
                 # contacts the flags start at 0; for existing contacts

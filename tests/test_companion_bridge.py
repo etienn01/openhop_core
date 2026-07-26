@@ -33,6 +33,12 @@ def _make_peer_contact(name: str) -> Contact:
     return Contact(public_key=peer.get_public_key(), name=name)
 
 
+async def _drain_events() -> None:
+    """Allow the EventService task a handler published to run to completion."""
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
 class MockPacketInjector:
     """Records injected packets and returns True by default."""
 
@@ -316,6 +322,37 @@ class TestCompanionBridgeProcessReceivedPacket:
         assert payload_bytes == b"\x01\x02\x03\x04"
         assert snr == 6.0
         assert rssi == -75
+
+    async def test_bridge_receiving_own_advert_adds_no_contact(self):
+        """A repeater re-flooding our advert delivers it straight back; the handler
+        drops it the way Mesh::onRecvPacket does (Mesh.cpp:263), so we never become
+        a contact of ourselves."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        await bridge.start()
+
+        await bridge.process_received_packet(PacketBuilder.create_advert(bridge._identity, "Me"))
+        await _drain_events()
+        await bridge.stop()
+
+        assert bridge.contacts.get_count() == 0
+
+    async def test_peer_advert_still_stored_after_self_guard(self):
+        """Control for the self-advert guard: a peer's advert through the same
+        entrypoint is still discovered and stored exactly once."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        await bridge.start()
+        discovered_calls = []
+        bridge.on_node_discovered(discovered_calls.append)
+
+        peer = LocalIdentity()
+        await bridge.process_received_packet(PacketBuilder.create_advert(peer, "Peer"))
+        await _drain_events()
+        await bridge.stop()
+
+        assert len(discovered_calls) == 1
+        assert bridge.contacts.get_by_key(peer.get_public_key()) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -708,6 +745,32 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
         assert len(advert_received_calls) == 1
         assert advert_received_calls[0].name == "DiscoveredNode"
         assert advert_received_calls[0].public_key == peer.get_public_key()
+
+    async def test_node_discovered_for_own_public_key_is_ignored(self):
+        """The event seam is public: however a NODE_DISCOVERED carrying our own key
+        was produced, we must never contact-book or path-cache ourselves."""
+        injector = MockPacketInjector()
+        identity = LocalIdentity()
+        bridge = CompanionBridge(identity, injector)
+        advert_received_calls = []
+        discovered_calls = []
+        bridge.on_advert_received(advert_received_calls.append)
+        bridge.on_node_discovered(discovered_calls.append)
+        event_data = {
+            "public_key": identity.get_public_key().hex(),
+            "name": "Myself",
+            "contact_type": ADV_TYPE_CHAT,
+            "lat": 0.0,
+            "lon": 0.0,
+            "advert_timestamp": 1000,
+            "timestamp": 1000,
+            "snr": 0.0,
+            "rssi": 0,
+        }
+        await bridge._handle_mesh_event(MeshEvents.NODE_DISCOVERED, event_data)
+        assert advert_received_calls == []
+        assert discovered_calls == []
+        assert bridge.contacts.get_count() == 0
 
     async def test_one_node_discovered_event_produces_exactly_one_advert_received(self):
         """Single-path guarantee: one NODE_DISCOVERED event yields exactly one

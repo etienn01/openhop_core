@@ -867,7 +867,9 @@ class TestAdvertHandler:
 
     @pytest.mark.asyncio
     async def test_advert_handler_ignores_self_advert(self):
-        """Test that handler processes self-advert (dispatcher handles filtering)."""
+        """Without a local identity the handler cannot know an advert is its own,
+        so it parses normally (the registry always supplies one — see
+        test_advert_handler_drops_self_advert_when_identity_known)."""
         local_identity = LocalIdentity()
         packet = PacketBuilder.create_advert(local_identity, "SelfNode")
 
@@ -876,6 +878,57 @@ class TestAdvertHandler:
         # Handler should still return parsed data; dispatcher filters self-adverts
         assert result is not None
         assert result["name"] == "SelfNode"
+
+    @pytest.mark.asyncio
+    async def test_advert_handler_drops_self_advert_when_identity_known(self):
+        """Mesh::onRecvPacket (Mesh.cpp:263) never reads our own advert back in."""
+        local_identity = LocalIdentity()
+        event_service = MockEventService()
+        handler = AdvertHandler(
+            self.log_fn, event_service=event_service, local_identity=local_identity
+        )
+        packet = PacketBuilder.create_advert(local_identity, "SelfNode")
+
+        result = await handler(packet)
+
+        assert result is None
+        event_service.publish_sync.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_self_advert_is_still_retransmittable(self):
+        """The self-advert guard is read-side only: it never marks the packet, so
+        the forwarding decision stays what it is for a freshly parsed copy."""
+        local_identity = LocalIdentity()
+        handler = AdvertHandler(self.log_fn, local_identity=local_identity)
+        packet = PacketBuilder.create_advert(local_identity, "SelfNode")
+        fresh = Packet()
+        assert fresh.read_from(packet.write_to())
+
+        assert await handler(packet) is None
+
+        assert packet.is_marked_do_not_retransmit() == fresh.is_marked_do_not_retransmit()
+        assert packet.is_marked_do_not_retransmit() is False
+
+    def test_registry_wires_local_identity_into_the_advert_handler(self):
+        """The factory is the only place production code supplies the identity, so
+        if this kwarg is ever dropped the self-advert guard goes inert everywhere
+        (Dispatcher, CompanionBridge, CompanionRadio) with the suite still green."""
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.node.handlers.registry import create_core_handlers
+
+        identity = LocalIdentity()
+
+        handlers = create_core_handlers(
+            identity=identity,
+            contacts=ContactStore(5),
+            channels=None,
+            event_service=None,
+            send_packet_fn=lambda *a, **k: None,
+            log_fn=self.log_fn,
+            node_name="test",
+        )
+
+        assert handlers.advert_handler.local_identity is identity
 
     def test_decode_appdata_rejects_truncated_optional_fields(self):
         with pytest.raises(ValueError, match="truncated"):
