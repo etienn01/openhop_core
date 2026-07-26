@@ -1510,11 +1510,15 @@ class SX1262Radio(LoRaRadio):
         Returns properly sampled noise floor from background measurements.
         """
         if not self._initialized or self.lora is None:
-            return 0.0
+            return None
 
-        # If currently transmitting, return 0 (clear indicator)
+        # Unavailable while TX is active; callers should treat None as "no sample".
         if hasattr(self, "_tx_lock") and self._tx_lock.locked():
-            return 0.0
+            return None
+
+        # No accepted background sample yet; internal -120.0 is a reset sentinel.
+        if self._num_floor_samples <= 0:
+            return None
 
         # Return the properly sampled and averaged noise floor
         return self._noise_floor

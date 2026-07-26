@@ -1157,13 +1157,38 @@ class TestNoiseFloorSampling:
         assert radio._num_floor_samples == 1
         assert radio._noise_floor == pytest.approx(-100.0)
 
-    def test_get_noise_floor_returns_0_when_uninitialized(self, radio):
+    def test_get_noise_floor_returns_none_when_uninitialized(self, radio):
         radio._initialized = False
-        assert radio.get_noise_floor() == 0.0
+        assert radio.get_noise_floor() is None
 
-    def test_get_noise_floor_returns_0_when_lora_none(self, radio):
+    def test_get_noise_floor_returns_none_when_lora_none(self, radio):
         radio.lora = None
-        assert radio.get_noise_floor() == 0.0
+        assert radio.get_noise_floor() is None
+
+    def test_get_noise_floor_returns_none_while_tx_lock_held(self, radio):
+        radio._num_floor_samples = 1
+        radio._noise_floor = -101.5
+        radio._tx_lock = MagicMock()
+        radio._tx_lock.locked.return_value = True
+        assert radio.get_noise_floor() is None
+
+    def test_get_noise_floor_returns_none_for_uninitialized_internal_sentinel(
+        self, radio
+    ):
+        radio._noise_floor = -120.0
+        radio._num_floor_samples = 0
+        radio._noise_floor_samples = []
+        assert radio.get_noise_floor() is None
+
+    def test_get_noise_floor_returns_valid_negative_measurements(self, radio):
+        radio._noise_floor = -101.5
+        radio._num_floor_samples = 3
+        assert radio.get_noise_floor() == pytest.approx(-101.5)
+
+    def test_get_noise_floor_preserves_measured_minus_120(self, radio):
+        radio._noise_floor = -120.0
+        radio._num_floor_samples = 1
+        assert radio.get_noise_floor() == pytest.approx(-120.0)
 
 
 # ===========================================================================
@@ -2383,10 +2408,10 @@ class TestCoverageGapBranches:
         mock_lora.sleep.side_effect = RuntimeError("sleep failed")
         radio.sleep()  # must not raise
 
-    def test_get_noise_floor_returns_zero_while_tx_lock_held(self, radio):
+    def test_get_noise_floor_returns_none_while_tx_lock_held(self, radio):
         radio._tx_lock = MagicMock()
         radio._tx_lock.locked.return_value = True
-        assert radio.get_noise_floor() == 0.0
+        assert radio.get_noise_floor() is None
 
     def test_noise_floor_sampling_handles_rssi_read_exception(self, radio, mock_lora):
         radio._last_packet_activity = 0.0
