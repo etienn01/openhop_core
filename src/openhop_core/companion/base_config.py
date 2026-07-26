@@ -8,8 +8,8 @@ import time
 from typing import Optional
 
 from ..protocol import Packet
-from ..protocol.constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
-from ..protocol.transport_keys import calc_transport_code, get_auto_key_for
+from ..protocol.constants import ROUTE_TYPE_FLOOD
+from ..protocol.transport_keys import get_auto_key_for, scope_packet
 from .constants import (
     DEFAULT_ALLOWED_REPEAT_FREQ_RANGES,
     DEFAULT_MAX_TX_POWER_DBM,
@@ -324,10 +324,12 @@ class _DeviceConfigMixin:
         return self._default_scope_key()
 
     def _scope_packet(self, pkt: Packet, key: bytes) -> None:
-        """Attach transport codes for ``key`` and switch FLOOD -> TRANSPORT_FLOOD."""
-        pkt.transport_codes[0] = calc_transport_code(key, pkt)
-        pkt.transport_codes[1] = 0  # reserved for home region (firmware TODO)
-        pkt.header = (pkt.header & ~0x03) | ROUTE_TYPE_TRANSPORT_FLOOD
+        """Attach transport codes for ``key`` and switch FLOOD -> TRANSPORT_FLOOD.
+
+        Delegates to the shared :func:`scope_packet` primitive so the companion
+        and dispatcher resolvers compute the wire format identically.
+        """
+        scope_packet(pkt, key)
 
     def _apply_flood_scope(self, pkt: Packet) -> None:
         """Apply flood scope transport codes to a packet in-place.

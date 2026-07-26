@@ -714,7 +714,6 @@ class _SendOpsMixin:
         log_label: str,
         cleanup: Optional[Callable[[], None]],
         response_tag_registered: Optional[Callable[[int], None]],
-        contact_pubkey: Optional[bytes] = None,
     ) -> dict:
         """Finish a request after its first packet has already been sent."""
         try:
@@ -723,9 +722,9 @@ class _SendOpsMixin:
                 return result
 
             for attempt in range(1, DEFAULT_MAX_ATTEMPTS):
-                if contact_pubkey is not None:
-                    await self._teach_return_path_before_retry(contact_pubkey, log_label)
-                pkt, packet_tag = build_packet()
+                # Every retry floods, whatever route the contact holds; the first
+                # attempt already went out before this method was called.
+                pkt, packet_tag = self._build_retry_packet(build_packet, proxy, log_label)
                 if response_tag_registered is not None and packet_tag is not None:
                     response_tag_registered(packet_tag)
                 self._apply_path_hash_mode(pkt)
@@ -768,7 +767,6 @@ class _SendOpsMixin:
         sent_tag: Optional[int] = None,
         cleanup: Optional[Callable[[], None]] = None,
         response_tag_registered: Optional[Callable[[int], None]] = None,
-        contact_pubkey: Optional[bytes] = None,
     ) -> dict:
         """Send the first packet and return its metadata plus a waiter task."""
         deadline = time.monotonic() + total_timeout_s if total_timeout_s is not None else None
@@ -808,7 +806,6 @@ class _SendOpsMixin:
                     log_label=log_label,
                     cleanup=cleanup,
                     response_tag_registered=response_tag_registered,
-                    contact_pubkey=contact_pubkey,
                 ),
                 f"{log_label} response",
             )
@@ -1187,7 +1184,6 @@ class _SendOpsMixin:
         total_timeout_s: Optional[float] = None,
         log_label: str = "request",
         response_tag_registered: Optional[Callable[[int], None]] = None,
-        contact_pubkey: Optional[bytes] = None,
     ) -> dict:
         """Send a request up to DEFAULT_MAX_ATTEMPTS times until a response lands.
 
@@ -1199,15 +1195,16 @@ class _SendOpsMixin:
         attempt's wait is clipped to the remaining budget and no new attempt
         starts once the budget is spent.
 
-        A timed-out attempt also re-teaches our return path when ``contact_pubkey``
-        is known; see :meth:`_teach_return_path_before_retry`.
+        Every attempt after the first floods, whatever route the contact holds;
+        see :meth:`_build_retry_packet`.
         """
         result: dict = {"timeout": True}
         deadline = time.monotonic() + total_timeout_s if total_timeout_s else None
         for attempt in range(DEFAULT_MAX_ATTEMPTS):
-            if attempt > 0 and contact_pubkey is not None:
-                await self._teach_return_path_before_retry(contact_pubkey, log_label)
-            pkt, packet_tag = build_packet()
+            if attempt == 0:
+                pkt, packet_tag = build_packet()
+            else:
+                pkt, packet_tag = self._build_retry_packet(build_packet, proxy, log_label)
             if response_tag_registered is not None and packet_tag is not None:
                 response_tag_registered(packet_tag)
             self._apply_path_hash_mode(pkt)
@@ -1232,27 +1229,64 @@ class _SendOpsMixin:
                 break
         return result
 
-    async def _teach_return_path_before_retry(self, contact_pubkey: bytes, log_label: str) -> None:
-        """Re-teach our return path after a request attempt timed out.
+    def _build_retry_packet(
+        self,
+        build_packet: Callable[[], tuple[Packet, Optional[int]]],
+        proxy: Any,
+        log_label: str,
+    ) -> tuple[Packet, Optional[int]]:
+        """Build a retry attempt as a FLOOD request, whatever route the contact holds.
 
-        openHop hardening with no firmware equivalent. When a server answers
-        DIRECT down a route that no longer reaches us, *nothing* arrives — there
-        is no flood reply to trigger the normal re-teach and no inbound path to
-        embed. A timeout against a contact we hold an ``out_path`` for is the
-        only evidence available, so the teacher falls back to reversing our own
-        ``out_path`` (see ``maybe_teach_reverse_of_out_path``). Best-effort: any
-        failure just leaves the retry to proceed as before.
+        A first attempt that timed out leaves the stored ``out_path`` suspect in
+        both directions: either the request never reached the peer, or the peer
+        answered DIRECT down a route back to us that no longer works. Flooding
+        the retry addresses both — it reaches the peer without depending on the
+        stored path, and a peer answers a *flood* request with a PATH-return
+        (``simple_repeater``/``BaseChatMesh`` ``onPeerDataRecv``), which is a real
+        observed inbound path for the return-path teacher to teach from. The
+        alternative — assuming the route is symmetric and teaching its reverse —
+        is wrong whenever it is not, and a peer taught a wrong route answers into
+        a void with no flood reply left to correct it.
+
+        Mirrors how firmware forces a single request to flood
+        (``companion_radio/MyMesh.cpp``)::
+
+            auto save = recipient->out_path_len;  // temporarily force sendRequest() to flood
+            recipient->out_path_len = OUT_PATH_UNKNOWN;
+            int result = sendRequest(*recipient, req_data, sizeof(req_data), tag, est_timeout);
+            recipient->out_path_len = save;
+
+        The stored path is only masked, never cleared: a contact stays direct for
+        every other caller, and a successful flood round-trip re-teaches the route
+        rather than discarding it. ``build_packet`` is synchronous, so no other
+        task can observe the mask, and it is restored on every exit path.
+
+        The forced flood is sent **unscoped**, marked ``_flood_scope_applied`` so
+        neither the companion nor the dispatcher resolver stamps a region on it.
+        A region-scoped retry is worse than no retry at all on a mixed mesh: a
+        repeater that has no regions configured cannot match the transport code,
+        so ``allowPacketForward`` refuses it (``simple_repeater/MyMesh.cpp``:
+        ``recv_pkt_region == NULL`` for a flood packet) and the retry dies at the
+        first hop — while the direct attempt it replaces at least had a route. The
+        trade-off is a mesh whose repeaters deny unscoped floods outright, where
+        the reverse holds; reach in the common case wins.
         """
+        saved = getattr(proxy, "out_path_len", None)
+        if saved is None or saved < 0:
+            return build_packet()  # already floods; nothing to force
         try:
-            proto_handler = self._get_protocol_response_handler()
-            teacher = getattr(proto_handler, "return_path_teacher", None)
-            if teacher is None:
-                return
-            await teacher.maybe_teach_reverse_of_out_path(
-                contact_pubkey, reason=f"{log_label} retry after timeout"
-            )
-        except Exception as e:
-            logger.debug("[PATHDIAG] return-path teach before retry failed: %s", e)
+            proxy.out_path_len = -1
+        except Exception as e:  # not a settable proxy: fall back to its own route
+            logger.debug("[PATHDIAG] %s: cannot force flood retry: %s", log_label, e)
+            return build_packet()
+        try:
+            pkt, tag = build_packet()
+        finally:
+            proxy.out_path_len = saved
+        if pkt is not None and pkt.is_route_flood():
+            pkt._flood_scope_applied = True
+            logger.debug("[PATHDIAG] %s: retry forced to unscoped FLOOD", log_label)
+        return pkt, tag
 
     async def _wait_for_path_propagation(self, proxy: Any, request_type: str) -> None:
         """Log the pre-send path; no longer sleeps.
@@ -1327,7 +1361,6 @@ class _SendOpsMixin:
                 log_label=log_label,
                 cleanup=_clear_response_tags,
                 response_tag_registered=_register_response_tag,
-                contact_pubkey=pub_key,
             )
             if not started.get("success"):
                 return started
@@ -1476,7 +1509,6 @@ class _SendOpsMixin:
                 proxy,
                 log_label=f"protocol REQ 0x{protocol_code:02X}",
                 response_tag_registered=_register_response_tag,
-                contact_pubkey=pub_key,
             )
             return {
                 "success": result.get("success", False),

@@ -15,8 +15,9 @@ import struct
 import time
 from typing import Callable, Optional
 
-from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder
+from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder, PathUtils
 from ...protocol.constants import PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_RESPONSE
+from ...protocol.region_map import apply_reply_scope
 from .base import BaseHandler
 from .result import HandlerResult
 
@@ -316,6 +317,22 @@ class LoginServerHandler(BaseHandler):
                 packet_type_name = "RESPONSE(flood)"
                 self.log("[LoginServer] Creating RESPONSE datagram (direct login, flood reply)")
 
+            # Accumulate the reply's path at the *request's* hash width, not this
+            # node's own preference. Firmware sends both branches through
+            # sendFloodReply(..., packet->getPathHashSize()) (simple_repeater
+            # onAnonDataRecv); the node's path_hash_mode governs only packets it
+            # originates itself (sendFloodScoped(default_scope, ..., _prefs
+            # .path_hash_mode + 1)). Marked applied so the dispatcher's node
+            # default cannot stamp over the mirror, the same way apply_reply_scope
+            # protects the region decision below.
+            in_path_len = getattr(original_packet, "path_len", 0) if original_packet else 0
+            in_hash_size = (
+                PathUtils.get_path_hash_size(in_path_len)
+                if PathUtils.is_valid_path_len(in_path_len)
+                else 1
+            )
+            response_pkt.apply_path_hash_mode(in_hash_size - 1, mark_applied=True)
+
             # Debug: Log packet details
             self.log(
                 f"[LoginServer] RESPONSE packet details: "
@@ -324,6 +341,12 @@ class LoginServerHandler(BaseHandler):
                 f"path_len={response_pkt.path_len}, "
                 f"payload[0:2]={bytes(response_pkt.payload[:2]).hex()}"
             )
+
+            # Scope the flood reply (PATH-return for a flood login, or the flood
+            # RESPONSE datagram for a direct login) to the region the request
+            # arrived under. Both branches build a flood reply; a direct request
+            # captures no region and stays plain.
+            apply_reply_scope(response_pkt, original_packet)
 
             # Send with delay (matches C++ SERVER_RESPONSE_DELAY)
             delay_ms = 300

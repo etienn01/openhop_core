@@ -8,6 +8,7 @@ from ...protocol.constants import (
     TXT_TYPE_PLAIN,
     TXT_TYPE_SIGNED_PLAIN,
 )
+from ...protocol.region_map import apply_reply_scope
 from .base import BaseHandler
 from .result import HandlerResult
 
@@ -132,12 +133,21 @@ class TextMessageHandler(BaseHandler):
         """
 
         if is_flood:
-            incoming_path = list(packet.path if hasattr(packet, "path") else [])
-            path_len_encoded = (
-                getattr(packet, "path_len", None)
-                if PathUtils.is_valid_path_len(getattr(packet, "path_len", -1))
-                else None
-            )
+            # One decision for both halves: the path bytes and the path_len byte
+            # declaring their hash width have to agree, or create_path_return
+            # rejects the pair. Deriving them from separate guards let an invalid
+            # path_len yield a non-empty path with no declared width. That cannot
+            # reach here from the wire (Packet.from_bytes rejects an invalid
+            # path_len), but the correct handling is to teach no path rather than
+            # one whose hash width we would be guessing.
+            in_path_len = getattr(packet, "path_len", 0) or 0
+            if PathUtils.is_valid_path_len(in_path_len):
+                path_len_encoded = in_path_len
+                raw_path = bytes(getattr(packet, "path", b"") or b"")
+                incoming_path = list(raw_path[: PathUtils.get_path_byte_len(in_path_len)])
+            else:
+                path_len_encoded = None
+                incoming_path = []
             ack_packet = PacketBuilder.create_path_return(
                 dest_hash=PacketBuilder._hash_byte(pubkey),
                 src_hash=PacketBuilder._hash_byte(self.local_identity.get_public_key()),
@@ -148,7 +158,10 @@ class TextMessageHandler(BaseHandler):
                 path_len_encoded=path_len_encoded,
             )
             # Firmware sends the flood PATH-return (carrying the ACK) via
-            # sendFloodScoped(from, path, TXT_ACK_DELAY).
+            # sendFloodScoped(from, path, TXT_ACK_DELAY): scope the reply to the
+            # region the request arrived under, decided synchronously here from
+            # the request packet before the delayed send task runs.
+            apply_reply_scope(ack_packet, packet)
             self.log(f"FLOOD ACK timing - delay:{TXT_ACK_DELAY_MS}ms")
             return [(ack_packet, TXT_ACK_DELAY_MS / 1000.0)]
 
@@ -168,6 +181,8 @@ class TextMessageHandler(BaseHandler):
             # dispatcher applies flood scope at send time.
             ack_packet = PacketBuilder.create_ack_from_bytes(ack_hash, route_type="flood")
             # Firmware sendAckTo with OUT_PATH_UNKNOWN floods the ACK at TXT_ACK_DELAY.
+            # Scope the discrete flood ACK to the request's region.
+            apply_reply_scope(ack_packet, packet)
             self.log(f"FLOOD ACK timing (no out_path) - delay:{TXT_ACK_DELAY_MS}ms")
             return [(ack_packet, TXT_ACK_DELAY_MS / 1000.0)]
 

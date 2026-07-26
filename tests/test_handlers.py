@@ -463,6 +463,58 @@ class TestTextMessageHandler:
         assert len(res) == 1
         assert res[0][1] == TXT_ACK_DELAY_MS / 1000.0
 
+    def _flood_ack_inner(self, pkt, sender, shared):
+        """Decrypt the inner payload of the PATH-return ACK built for ``pkt``."""
+        res = self.handler._build_ack_responses(
+            packet=pkt,
+            matched_contact=MockContact(public_key=sender.get_public_key().hex()),
+            shared_secret=shared,
+            pubkey=sender.get_public_key(),
+            ack_hash=bytes(range(6)),
+            is_flood=True,
+        )
+        return CryptoUtils.mac_then_decrypt(shared[:16], shared, bytes(res[0][0].payload[2:]))
+
+    def test_flood_ack_path_return_preserves_multibyte_hash_width(self):
+        """The taught path keeps the DM's declared width and is trimmed to it.
+
+        The path bytes and the path_len declaring their width are one decision:
+        taking the whole buffer while declaring only the first two hops makes
+        create_path_return reject the pair.
+        """
+        sender = LocalIdentity()
+        shared = Identity(sender.get_public_key()).calc_shared_secret(
+            self.local_identity.get_private_key()
+        )
+        pkt = Packet()
+        # 2 hops of 2-byte hashes, plus slack the declared length excludes.
+        pkt.path = bytearray([0xA1, 0xA2, 0xB1, 0xB2, 0xFF, 0xFF])
+        pkt.path_len = PathUtils.encode_path_len(2, 2)
+
+        plaintext = self._flood_ack_inner(pkt, sender, shared)
+        assert plaintext[0] == PathUtils.encode_path_len(2, 2)
+        assert plaintext[1:5] == bytes([0xA1, 0xA2, 0xB1, 0xB2])
+        assert plaintext[5] == PAYLOAD_TYPE_ACK  # extra_type
+
+    def test_flood_ack_path_return_drops_a_path_of_undecodable_width(self):
+        """An undecodable path_len teaches no path rather than guessing a width.
+
+        Unreachable from the wire — Packet.from_bytes rejects an invalid
+        path_len — but the two halves must stay consistent regardless of how the
+        packet was constructed.
+        """
+        sender = LocalIdentity()
+        shared = Identity(sender.get_public_key()).calc_shared_secret(
+            self.local_identity.get_private_key()
+        )
+        pkt = Packet()
+        pkt.path = bytearray([0x01, 0x02, 0x03, 0x04])
+        pkt.path_len = 0xFF  # hash_size 4 is reserved: no decodable width
+
+        plaintext = self._flood_ack_inner(pkt, sender, shared)
+        assert plaintext[0] == 0  # zero hops, nothing taught
+        assert plaintext[1] == PAYLOAD_TYPE_ACK
+
     @pytest.mark.asyncio
     async def test_received_text_stops_at_first_nul(self):
         """The delivered message text ends at the first NUL: AES zero padding and the
@@ -815,7 +867,9 @@ class TestAdvertHandler:
 
     @pytest.mark.asyncio
     async def test_advert_handler_ignores_self_advert(self):
-        """Test that handler processes self-advert (dispatcher handles filtering)."""
+        """Without a local identity the handler cannot know an advert is its own,
+        so it parses normally (the registry always supplies one — see
+        test_advert_handler_drops_self_advert_when_identity_known)."""
         local_identity = LocalIdentity()
         packet = PacketBuilder.create_advert(local_identity, "SelfNode")
 
@@ -824,6 +878,57 @@ class TestAdvertHandler:
         # Handler should still return parsed data; dispatcher filters self-adverts
         assert result is not None
         assert result["name"] == "SelfNode"
+
+    @pytest.mark.asyncio
+    async def test_advert_handler_drops_self_advert_when_identity_known(self):
+        """Mesh::onRecvPacket (Mesh.cpp:263) never reads our own advert back in."""
+        local_identity = LocalIdentity()
+        event_service = MockEventService()
+        handler = AdvertHandler(
+            self.log_fn, event_service=event_service, local_identity=local_identity
+        )
+        packet = PacketBuilder.create_advert(local_identity, "SelfNode")
+
+        result = await handler(packet)
+
+        assert result is None
+        event_service.publish_sync.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_self_advert_is_still_retransmittable(self):
+        """The self-advert guard is read-side only: it never marks the packet, so
+        the forwarding decision stays what it is for a freshly parsed copy."""
+        local_identity = LocalIdentity()
+        handler = AdvertHandler(self.log_fn, local_identity=local_identity)
+        packet = PacketBuilder.create_advert(local_identity, "SelfNode")
+        fresh = Packet()
+        assert fresh.read_from(packet.write_to())
+
+        assert await handler(packet) is None
+
+        assert packet.is_marked_do_not_retransmit() == fresh.is_marked_do_not_retransmit()
+        assert packet.is_marked_do_not_retransmit() is False
+
+    def test_registry_wires_local_identity_into_the_advert_handler(self):
+        """The factory is the only place production code supplies the identity, so
+        if this kwarg is ever dropped the self-advert guard goes inert everywhere
+        (Dispatcher, CompanionBridge, CompanionRadio) with the suite still green."""
+        from openhop_core.companion.contact_store import ContactStore
+        from openhop_core.node.handlers.registry import create_core_handlers
+
+        identity = LocalIdentity()
+
+        handlers = create_core_handlers(
+            identity=identity,
+            contacts=ContactStore(5),
+            channels=None,
+            event_service=None,
+            send_packet_fn=lambda *a, **k: None,
+            log_fn=self.log_fn,
+            node_name="test",
+        )
+
+        assert handlers.advert_handler.local_identity is identity
 
     def test_decode_appdata_rejects_truncated_optional_fields(self):
         with pytest.raises(ValueError, match="truncated"):
@@ -975,6 +1080,130 @@ class TestGroupTextHandler:
         )
         assert parsed is not None
         assert parsed["content"] == "Bob: hey"
+
+
+class TestPendingLoginDoesNotSwallowOtherReplies:
+    """A pending login must not claim an unrelated reply from the same contact.
+
+    Observed live: three login attempts to a repeater timed out at the client,
+    leaving a login waiter alive (openHop keeps one for
+    ``FRAME_LOGIN_PENDING_TTL_S`` so a late flood login reply can still
+    complete). A neighbours fetch to that repeater then answered normally — and
+    the 148-byte reply was consumed here and logged as ``Login failed to
+    'Hillcrest' (code: 0x2F)``. 0x2F is 47, the low byte of that response's
+    ``neighbours_count``: the login parser had read a neighbour count as a
+    response code, and the fetch reported failure with the data discarded.
+
+    Firmware has the same contact-based ambiguity but a one-response window
+    (``MyMesh::onContactResponse`` clears ``pending_login`` on the first reply),
+    so at most one packet can be misread. The discriminator is the reflected
+    request tag, which firmware's own source points at:
+    ``// FUTURE: tag == pending_status``.
+    """
+
+    def setup_method(self):
+        self.contacts = MockContactBook()
+        self.local_identity = LocalIdentity()
+        self.server = LocalIdentity()
+        self.server_key = self.server.get_public_key()
+        # LoginResponseHandler iterates ``contacts.contacts`` looking for a
+        # pubkey whose first byte matches the responding hash.
+        server_contact = type("_C", (), {"public_key": self.server_key, "name": "FarRepeater"})()
+        self.contacts.contacts.append(server_contact)
+        self.handler = LoginResponseHandler(self.local_identity, self.contacts, MagicMock())
+        self.forwarded = []
+
+        class _Proto:
+            _response_waiters: dict = {}
+
+            async def __call__(_self, pkt):
+                self.forwarded.append(pkt)
+                return HandlerResult.consumed()
+
+        self.proto = _Proto()
+        self.handler.set_protocol_response_handler(self.proto)
+
+    def _reply(self, plaintext: bytes) -> Packet:
+        """A RESPONSE datagram from the server to us carrying ``plaintext``."""
+        shared = Identity(self.server_key).calc_shared_secret(self.local_identity.get_private_key())
+        enc = CryptoUtils.encrypt_then_mac(shared[:16], shared, plaintext)
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_RESPONSE << 2) | ROUTE_TYPE_DIRECT
+        pkt.payload = bytearray(
+            [self.local_identity.get_public_key()[0], self.server_key[0]]
+        ) + bytearray(enc)
+        pkt.payload_len = len(pkt.payload)
+        pkt.path = bytearray()
+        pkt.path_len = 0
+        return pkt
+
+    def _neighbours_reply(self, tag: int) -> Packet:
+        """tag(4) + neighbours_count(2)=47 + results_count(2) + entries."""
+        body = struct.pack("<IHH", tag, 47, 2) + bytes(range(18))
+        return self._reply(body)
+
+    def _login_reply(self, tag: int) -> Packet:
+        """tag(4) + code(1)=OK + keep_alive(1) + is_admin(1) + perms(1) + rand(4) + ver(1)."""
+        return self._reply(struct.pack("<IBBBB", tag, 0, 0, 1, 0x03) + b"\x00\x00\x00\x00\x07")
+
+    @pytest.mark.asyncio
+    async def test_neighbours_reply_is_forwarded_not_read_as_a_login(self):
+        tag = 0x11223344
+        login_cb = MagicMock()
+        self.handler.register_login_callback(self.server_key, login_cb)
+        self.handler.set_foreign_request_probe(lambda t, key: t == tag and key == self.server_key)
+
+        result = await self.handler(self._neighbours_reply(tag))
+
+        assert self.forwarded, "the neighbours reply must reach the protocol handler"
+        assert result.authenticated is True
+        login_cb.assert_not_called()  # and must NOT be reported as a login result
+
+    @pytest.mark.asyncio
+    async def test_a_real_login_reply_still_completes_while_a_request_is_pending(self):
+        """The probe must not divert the login reply it was meant to protect."""
+        login_cb = MagicMock()
+        self.handler.register_login_callback(self.server_key, login_cb)
+        # Some *other* tag is pending; this reply reflects the login's own tag.
+        self.handler.set_foreign_request_probe(lambda t, key: t == 0xAAAAAAAA)
+
+        await self.handler(self._login_reply(0x55667788))
+
+        assert self.forwarded == []
+        login_cb.assert_called_once()
+        assert login_cb.call_args[0][0] is True
+
+    @pytest.mark.asyncio
+    async def test_without_a_probe_behaviour_is_unchanged(self):
+        """A standalone handler (no companion wiring) keeps its old behaviour."""
+        login_cb = MagicMock()
+        self.handler.register_login_callback(self.server_key, login_cb)
+
+        await self.handler(self._neighbours_reply(0x11223344))
+
+        assert self.forwarded == []
+        login_cb.assert_called_once()  # the pre-fix misread, still reachable
+
+    @pytest.mark.asyncio
+    async def test_probe_covers_pending_binary_requests_via_the_companion(self):
+        """End-to-end wiring: CompanionBase.has_pending_request_tag is the probe."""
+        from openhop_core.companion.companion_bridge import CompanionBridge
+
+        async def _injector(pkt, wait_for_ack=False, expected_crc=None):
+            return True
+
+        bridge = CompanionBridge(LocalIdentity(), _injector, node_name="b")
+        tag = 0x0BADF00D
+        assert bridge.has_pending_request_tag(tag, self.server_key) is False
+        bridge.register_binary_request(
+            tag.to_bytes(4, "little").hex(), request_type=0x06, timeout_seconds=30
+        )
+        assert bridge.has_pending_request_tag(tag, self.server_key) is True
+        # An expired registration must stop diverting replies.
+        bridge.register_binary_request(
+            tag.to_bytes(4, "little").hex(), request_type=0x06, timeout_seconds=-1
+        )
+        assert bridge.has_pending_request_tag(tag, self.server_key) is False
 
 
 # Login Response Handler Tests
@@ -1360,6 +1589,7 @@ class TestProtocolResponseHandler:
             path=[0xA1],
             extra_type=PAYLOAD_TYPE_RESPONSE,
             extra=bytes(reply),
+            path_len_encoded=PathUtils.encode_path_len(1, 1),
         )
         packet.set_path(b"\xb2", PathUtils.encode_path_len(1, 1))
 
@@ -1378,13 +1608,8 @@ class TestProtocolResponseHandler:
             "len": PathUtils.encode_path_len(1, 1),
             "path": b"\xa1",
         }
+        # The reciprocal is genuinely in flight (queued, not awaited inline).
         await asyncio.wait_for(injector_started.wait(), timeout=0.1)
-        assert (
-            await protocol_handler.return_path_teacher.maybe_teach_reverse_of_out_path(
-                server_pubkey, reason="login retry"
-            )
-            is False
-        )
         release_injector.set()
         await protocol_handler.wait_for_pending_reciprocals()
 
@@ -1538,6 +1763,48 @@ class TestProtocolRequestHandler:
         r = await handler(build_req(500))  # default req_type has a handler
         assert r.response is not None
         assert client.last_timestamp == 500
+
+    @pytest.mark.asyncio
+    async def test_direct_req_flood_fallback_accumulates_at_request_hash_width(self):
+        """With no out_path the RESPONSE floods at the REQ's hash width.
+
+        Firmware: sendFloodReply(reply, SERVER_RESPONSE_DELAY,
+        packet->getPathHashSize()) (simple_repeater onPeerDataRecv, the
+        OUT_PATH_UNKNOWN branch). A DIRECT request that reached us has had its
+        hops consumed, but removeSelfFromPath only decrements the count, so
+        path_len bits 6-7 still carry the width it was routed at.
+        """
+        handler, client, build_req = self._req_handler_with_client()
+        assert client.out_path_len == -1  # no known route: forces the flood fallback
+
+        pkt = build_req(1000)
+        pkt.path_len = PathUtils.encode_path_len(3, 0)  # 3-byte hashes, hops consumed
+
+        reply = (await handler(pkt)).response
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
+        assert PathUtils.get_path_hash_size(reply.path_len) == 3
+        assert PathUtils.get_path_hash_count(reply.path_len) == 0
+        # Marked so the dispatcher's node default cannot stamp over the mirror
+        # (see test_dispatcher.py: applied marker is not overwritten).
+        assert getattr(reply, "_path_hash_mode_applied", False) is True
+
+    @pytest.mark.asyncio
+    async def test_direct_req_reply_keeps_the_out_path_hash_width(self):
+        """A routed reply keeps its out_path's width; the mirror is flood-only.
+
+        The out_path here is zero-hop, so nothing but the branch guard stops the
+        mirror from rewriting a path_len that belongs to the stored route.
+        """
+        handler, client, build_req = self._req_handler_with_client()
+        client.out_path = b""
+        client.out_path_len = PathUtils.encode_path_len(2, 0)  # zero-hop, 2-byte hashes
+
+        pkt = build_req(1000)
+        pkt.path_len = PathUtils.encode_path_len(3, 0)  # request used a different width
+
+        reply = (await handler(pkt)).response
+        assert reply.get_route_type() == ROUTE_TYPE_DIRECT
+        assert reply.path_len == PathUtils.encode_path_len(2, 0)
 
     def test_advance_client_watermark_is_monotonic(self):
         """The watermark never moves backwards: if another accepted request
@@ -2068,6 +2335,60 @@ class TestLoginServerHandler:
         assert plaintext[1] == 0xAA
         assert plaintext[2] == 0xBB
         assert plaintext[3] == PAYLOAD_TYPE_RESPONSE  # extra_type
+
+    @pytest.mark.asyncio
+    async def test_flood_login_reply_accumulates_at_request_hash_width(self):
+        """The PATH-return accumulates hops at the *request's* hash width.
+
+        Firmware: sendFloodReply(path, SERVER_RESPONSE_DELAY,
+        packet->getPathHashSize()) (simple_repeater onAnonDataRecv). The reply's
+        own path_len declares the width repeaters use on the way back, which is
+        separate from the width declared for the path carried inside it.
+        """
+        pkt = self._build_login_packet(
+            password="admin123", route_type="flood", path=[0xAA, 0xBB, 0xCC, 0xDD]
+        )
+        pkt.path_len = PathUtils.encode_path_len(2, 2)  # 2 hops of 2-byte hashes
+
+        await self.handler(pkt)
+
+        response_pkt, _ = self.sent_packets[0]
+        assert response_pkt.get_payload_type() == PAYLOAD_TYPE_PATH
+        # Outer: reply starts at zero hops but declares the inbound width.
+        assert PathUtils.get_path_hash_size(response_pkt.path_len) == 2
+        assert PathUtils.get_path_hash_count(response_pkt.path_len) == 0
+        # Marked so the dispatcher's node default cannot stamp over the mirror
+        # (see test_dispatcher.py: applied marker is not overwritten).
+        assert getattr(response_pkt, "_path_hash_mode_applied", False) is True
+
+        # Inner: the taught path keeps its own 2-byte declaration and bytes.
+        client_id = Identity(self.client_identity_local.get_public_key())
+        shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
+        plaintext = CryptoUtils.mac_then_decrypt(
+            shared_secret[:16], shared_secret, bytes(response_pkt.payload[2:])
+        )
+        assert plaintext[0] == PathUtils.encode_path_len(2, 2)
+        assert plaintext[1:5] == bytes([0xAA, 0xBB, 0xCC, 0xDD])
+
+    @pytest.mark.asyncio
+    async def test_direct_login_flood_reply_accumulates_at_request_hash_width(self):
+        """The direct-login flood RESPONSE mirrors the width too.
+
+        Firmware runs this branch through the same sendFloodReply(...,
+        packet->getPathHashSize()) call (simple_repeater onAnonDataRecv, the
+        ``reply_path_len < 0`` case). A direct request that reached us has had
+        its hops consumed but still carries the width in path_len bits 6-7.
+        """
+        pkt = self._build_login_packet(password="admin123", route_type="direct")
+        pkt.path_len = PathUtils.encode_path_len(3, 0)  # 3-byte hashes, hops consumed
+
+        await self.handler(pkt)
+
+        response_pkt, _ = self.sent_packets[0]
+        assert response_pkt.get_payload_type() == PAYLOAD_TYPE_RESPONSE
+        assert PathUtils.get_path_hash_size(response_pkt.path_len) == 3
+        assert PathUtils.get_path_hash_count(response_pkt.path_len) == 0
+        assert getattr(response_pkt, "_path_hash_mode_applied", False) is True
 
 
 # ---------------------------------------------------------------------------

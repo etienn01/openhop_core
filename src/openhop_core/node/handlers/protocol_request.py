@@ -12,6 +12,7 @@ from openhop_core.protocol import PacketBuilder
 from openhop_core.protocol.constants import MAX_PATH_SIZE, PAYLOAD_TYPE_REQ, PAYLOAD_TYPE_RESPONSE
 from openhop_core.protocol.crypto import CryptoUtils
 from openhop_core.protocol.packet_utils import PathUtils
+from openhop_core.protocol.region_map import apply_reply_scope
 
 from .result import HandlerResult
 
@@ -336,7 +337,17 @@ class ProtocolRequestHandler:
                     if PathUtils.is_valid_path_len(path_len_byte)
                     else 1
                 )
-                reply_packet.apply_path_hash_mode(hash_size - 1)
+                # mark_applied: without it the dispatcher's node-default
+                # path_hash_mode (_apply_default_path_hash_mode, called from
+                # send_packet) overwrites this mirror on the way out, and the
+                # reply accumulates at the node's own width instead of the
+                # request's — which is what firmware's sendFloodReply(...,
+                # packet->getPathHashSize()) exists to avoid.
+                reply_packet.apply_path_hash_mode(hash_size - 1, mark_applied=True)
+                # Scope the flood PATH-return to the region the REQ arrived
+                # under: TRANSPORT_FLOOD with the code re-hashed over this
+                # reply's payload, or plain when the request was unscoped/direct.
+                apply_reply_scope(reply_packet, original_packet)
                 self.log(f"PATH (path-return) built for 0x{client_hash:02X} via FLOOD")
                 return reply_packet
 
@@ -364,6 +375,30 @@ class ProtocolRequestHandler:
             )
             if path_bytes is not None and path_len_encoded is not None:
                 reply_packet.set_path(path_bytes, path_len_encoded)
+            if route_type == "flood":
+                # Same sendFloodReply call as the PATH-return above, same third
+                # argument: accumulate at the REQ's hash width, not this node's
+                # own preference. A DIRECT request that reached us has had its
+                # hops consumed, but removeSelfFromPath only decrements the
+                # count — path_len bits 6-7 still carry the width it was routed
+                # at. Only the flood branch: the direct branch's path_len comes
+                # from the client's out_path above and must not be stamped over.
+                in_path_len = getattr(original_packet, "path_len", 0) or 0
+                in_hash_size = (
+                    PathUtils.get_path_hash_size(in_path_len)
+                    if PathUtils.is_valid_path_len(in_path_len)
+                    else 1
+                )
+                reply_packet.apply_path_hash_mode(in_hash_size - 1, mark_applied=True)
+                # No out_path, so this RESPONSE floods. Firmware sends it via
+                # sendFloodReply (simple_repeater onPeerDataRecv, the
+                # OUT_PATH_UNKNOWN branch), which for a DIRECT request means
+                # recv_pkt_region is NULL => plain, unscoped flood. Decide it
+                # here so the dispatcher's node default/override cannot stamp a
+                # region firmware would never put on this reply. On a node with
+                # no RegionMap this is inert and the reply falls through to the
+                # node default, matching BaseChatMesh's sendFloodScoped(from).
+                apply_reply_scope(reply_packet, original_packet)
 
             self.log(f"RESPONSE built for 0x{client_hash:02X} via {route_type.upper()}")
             return reply_packet

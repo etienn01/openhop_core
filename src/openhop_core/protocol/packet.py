@@ -117,6 +117,9 @@ class Packet:
         "_path_hash_mode_applied",
         "_flood_scope_applied",
         "_injected_for_tx",
+        "_injected_origin_hash",
+        "_recv_region_captured",
+        "_recv_region_key",
     )
 
     def __init__(self):
@@ -144,6 +147,18 @@ class Packet:
         # (scoped or deliberately plain); the dispatcher must not re-scope it.
         self._flood_scope_applied = False
         self._injected_for_tx = False  # Set by repeater inject path; skip engine on route
+        # Companion that originated this injected TX, as the "0xHH" hash string the
+        # host keys its frame servers by (None for host-originated injects). Set by
+        # the repeater inject path so the companion fan-out can withhold the packet
+        # from its own sender -- a node never hears its own transmission.
+        self._injected_origin_hash: Optional[str] = None
+        # Region captured from this packet on receive. Only set True when
+        # a RegionMap was actually consulted; the matched region key (or None =>
+        # reply plain) is read by region_map.apply_reply_scope when a handler
+        # builds a flood reply. Lives on the Packet, never a shared dispatcher
+        # member, because replies are sent from background tasks that would race.
+        self._recv_region_captured: bool = False
+        self._recv_region_key: Optional[bytes] = None
 
     def get_route_type(self) -> int:
         """
@@ -235,14 +250,35 @@ class Packet:
     ) -> None:
         """Set path_len bits 6-7 from path_hash_mode for 0-hop packets (skip TRACE).
 
-        Used by companion and dispatcher so the rule lives in one place. TRACE
-        packets are excluded because the repeater's trace handler uses path/path_len
-        for SNR values, not routing hashes.
+        Used by companion, handlers and dispatcher so the rule lives in one place.
+        TRACE packets are excluded because the repeater's trace handler uses
+        path/path_len for SNR values, not routing hashes.
 
         Args:
             mode: Path hash mode: 0=1-byte, 1=2-byte, 2=3-byte per hop.
-            mark_applied: If True, set _path_hash_mode_applied so dispatcher
-                does not overwrite (used when companion applies its preference).
+            mark_applied: If True, set ``_path_hash_mode_applied``, which stops
+                ``Dispatcher._apply_default_path_hash_mode`` overwriting this
+                width with the node default on the way out. Three callers claim
+                it, for the same reason -- the width was decided by something
+                that outranks the node preference:
+
+                * the companion applying its own configured preference
+                  (``base_config._apply_path_hash_mode``);
+                * a server handler mirroring the width of the request it is
+                  answering, which is what firmware's ``sendFloodReply(...,
+                  packet->getPathHashSize())`` does -- the node preference
+                  governs only self-originated floods;
+                * the dispatcher itself on a packet being forwarded, whose width
+                  belongs to the originator.
+
+                Leave it False to let the node default decide (the dispatcher's
+                own call site, which is that default).
+
+        Note:
+            ``_path_hash_mode_applied`` is an in-memory attribute, not part of
+            the wire format, so it does not survive a serialize/parse round trip.
+            Anything between a handler and the radio must pass the Packet object
+            itself, or the marked width is silently replaced by the node default.
 
         Raises:
             ValueError: If mode not in (0, 1, 2).

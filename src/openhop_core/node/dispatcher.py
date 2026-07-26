@@ -18,7 +18,8 @@ from ..protocol.constants import (  # Payload types
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
 from ..protocol.packet_utils import PathUtils, calculate_lora_airtime_ms, flood_rx_metrics
-from ..protocol.transport_keys import calc_transport_code
+from ..protocol.region_map import RegionMap, capture_recv_region
+from ..protocol.transport_keys import scope_packet
 from ..protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES
 from ..util.callbacks import invoke_maybe_awaitable
 
@@ -109,6 +110,11 @@ class Dispatcher:
         self._handler_instances: dict[int, Any] = (
             {}
         )  # Store actual handler objects for method access
+        # Payload types whose handler consumes the payload for this node (as
+        # opposed to routing or observing it). Populated via
+        # register_handler(..., local_delivery=True); read by
+        # _is_transit_direct_delivery.
+        self._local_delivery_types: set[int] = set()
 
         # Handler references for companion-layer access; populated by
         # register_default_handlers(). Declared here so callers can rely on
@@ -128,7 +134,25 @@ class Dispatcher:
         # Flood scope: 16-byte transport key for region-scoped flooding.
         # When set, flood packets are tagged with a transport code and sent
         # as ROUTE_TYPE_TRANSPORT_FLOOD.  Set via companion set_flood_scope().
+        # This is the transient send-scope OVERRIDE mirror.
         self.flood_transport_key: Optional[bytes] = None
+        # Persisted default flood scope mirror. Firmware
+        # sendFloodScoped(recipient) falls back to prefs.default_scope_key when
+        # no transient override is set; the companion applies that at its layer,
+        # but several sends build the packet and rely on the dispatcher to scope
+        # it at TX time. Mirror the default here so those sends carry it too.
+        # A null/short default resolves to None (=> plain flood).
+        self.default_flood_transport_key: Optional[bytes] = None
+        # Explicit-unscoped flag mirror (firmware send_unscoped, FW #2492). When
+        # True it suppresses BOTH the override and the default at TX time; it is
+        # not nulled by the default mirror, only cleared by a later
+        # set_flood_scope()/set_flood_region().
+        self.flood_unscoped: bool = False
+
+        # Optional region registry for reply-region capture. Standalone
+        # nodes/companions leave this None (no capture); the repeater populates
+        # it so replies carry the incoming request's region.
+        self.region_map: Optional[RegionMap] = None
 
         # Default path hash mode for flood packets with 0 hops that have not
         # had path hash mode set by the companion. 0=1-byte, 1=2-byte, 2=3-byte.
@@ -229,10 +253,26 @@ class Dispatcher:
     # Public interface - registering handlers and callbacks
     # ------------------------------------------------------------------
 
-    def register_handler(self, payload_type: int, handler_instance) -> None:
-        """Register a handler for a specific type of packet."""
+    def register_handler(
+        self, payload_type: int, handler_instance, *, local_delivery: bool = False
+    ) -> None:
+        """Register a handler for a specific type of packet.
+
+        ``local_delivery`` marks a handler that *consumes* the payload for this
+        node (decrypt, ACK, display) as opposed to one that routes or observes
+        it. Only those are gated by the firmware rule in
+        :meth:`_is_transit_direct_delivery`: MeshCore never hands a routed-direct
+        packet with hops still on its path to payload processing. It defaults to
+        False so an application handler — a repeater's router, which must see
+        exactly those transit packets — keeps receiving everything, and so an
+        application override of a core payload type takes over that decision.
+        """
         # Keep the handler instance around so we can call methods on it
         self._handler_instances[payload_type] = handler_instance
+        if local_delivery:
+            self._local_delivery_types.add(payload_type)
+        else:
+            self._local_delivery_types.discard(payload_type)
 
         # Figure out what function to call when we get this packet type
         if hasattr(handler_instance, "handle_packet"):
@@ -273,11 +313,16 @@ class Dispatcher:
         self.local_identity = local_identity
 
         # --- ACK handler (dispatcher-specific wiring) ---
+        # Deliberately NOT local_delivery: firmware peeks at a routed-direct ACK
+        # while it is still in transit ("early received ACK", Mesh::onRecvPacket)
+        # before the next-hop check, and CRC correlation is idempotent.
         ack_handler = AckHandler(self._log, self)
         ack_handler.set_ack_received_callback(self._register_ack_received)
         self.register_handler(AckHandler.payload_type(), ack_handler)
 
         # --- Multi-ack handler: extract the embedded ACK from MULTIPART packets ---
+        # Also left un-gated: it only correlates an embedded ACK CRC, the same
+        # idempotent peek as the ACK handler above.
         multipart_ack_handler = MultipartAckHandler(self._log)
         multipart_ack_handler.set_ack_received_callback(self._register_ack_received)
         self.register_handler(MultipartAckHandler.payload_type(), multipart_ack_handler)
@@ -310,24 +355,32 @@ class Dispatcher:
         from .handlers import PathHandler as _Path
         from .handlers import TextMessageHandler as _Txt
 
-        self.register_handler(_Adv.payload_type(), core.advert_handler)
-        self.register_handler(_Txt.payload_type(), core.text_handler)
-        self.register_handler(_Grp.payload_type(), core.group_text_handler)
-        self.register_handler(_Path.payload_type(), core.path_handler)
-        self.register_handler(_Login.payload_type(), core.login_response_handler)
+        # These consume the payload for this node, so they are gated by the
+        # firmware transit rule (see _is_transit_direct_delivery).
+        self.register_handler(_Adv.payload_type(), core.advert_handler, local_delivery=True)
+        self.register_handler(_Txt.payload_type(), core.text_handler, local_delivery=True)
+        self.register_handler(_Grp.payload_type(), core.group_text_handler, local_delivery=True)
+        self.register_handler(_Path.payload_type(), core.path_handler, local_delivery=True)
+        self.register_handler(
+            _Login.payload_type(), core.login_response_handler, local_delivery=True
+        )
 
         # --- Dispatcher-only handlers ---
         self.register_handler(
             AnonReqResponseHandler.payload_type(),
             AnonReqResponseHandler(local_identity, contacts, self._log),
+            local_delivery=True,
         )
 
+        # TRACE is not gated: firmware handles a direct TRACE in its own branch
+        # ahead of the routed-direct block, and this handler owns the path bytes
+        # (they carry per-hop SNR, not routing hashes).
         trace_handler = TraceHandler(self._log, core.protocol_response_handler)
         self.register_handler(TraceHandler.payload_type(), trace_handler)
         self.trace_handler = trace_handler
 
         control_handler = ControlHandler(self._log)
-        self.register_handler(ControlHandler.payload_type(), control_handler)
+        self.register_handler(ControlHandler.payload_type(), control_handler, local_delivery=True)
         self.control_handler = control_handler
 
         # --- RAW_CUSTOM handler: deliver to companion if direct and callback set ---
@@ -339,7 +392,7 @@ class Dispatcher:
             if self.raw_data_received_callback:
                 await self._invoke_callback(self.raw_data_received_callback, pkt)
 
-        self.register_handler(PAYLOAD_TYPE_RAW_CUSTOM, raw_custom_handler)
+        self.register_handler(PAYLOAD_TYPE_RAW_CUSTOM, raw_custom_handler, local_delivery=True)
 
         self._logger.info("Default handlers registered.")
 
@@ -514,6 +567,11 @@ class Dispatcher:
         pkt._rssi = rssi if rssi is not None else self.radio.get_last_rssi()
         pkt._snr = snr if snr is not None else self.radio.get_last_snr()
 
+        # Capture the region this packet arrived under before any handler
+        # runs, so a reply builder can scope its reply to that region. No-op when
+        # no RegionMap is configured (standalone node/companion).
+        capture_recv_region(self.region_map, pkt)
+
         # Let the node know about this packet for analysis (statistics, caching, etc.)
         if self.packet_analysis_callback:
             try:
@@ -585,28 +643,46 @@ class Dispatcher:
     # Public interface - sending and receiving packets
     # ------------------------------------------------------------------
 
-    def _apply_flood_scope(self, pkt: Packet) -> None:
-        """Apply flood scope transport codes to a packet in-place.
+    def _scope_packet(self, pkt: Packet, key: bytes) -> None:
+        """Attach transport codes for ``key`` and switch FLOOD -> TRANSPORT_FLOOD.
 
-        If ``flood_transport_key`` is set and the packet uses flood routing,
-        calculates the transport code, attaches it to the packet, and
-        switches the route type to ``ROUTE_TYPE_TRANSPORT_FLOOD``.
+        Delegates to the shared :func:`scope_packet` primitive so the dispatcher
+        and companion resolvers compute the wire format identically.
+        """
+        scope_packet(pkt, key)
+
+    def _apply_flood_scope(self, pkt: Packet) -> None:
+        """Apply flood scope transport codes to a packet in-place at TX time.
+
+        Mirrors firmware ``sendFloodScoped(recipient)`` precedence
+        (companion_radio/MyMesh.cpp): a packet the companion/reply layer already
+        decided is left untouched; explicit-unscoped wins first; otherwise the
+        transient override is used, else the persisted default. A null default
+        (None) leaves the packet a plain flood.
 
         Packets the companion layer already scoped (or deliberately left as
-        plain flood, e.g. explicit-unscoped mode or default-scoped adverts)
-        are marked ``_flood_scope_applied`` and skipped here.
+        plain flood, e.g. explicit-unscoped mode or default-scoped adverts) —
+        and replies whose region the reply helper already decided — are marked
+        ``_flood_scope_applied`` and skipped here.
         """
-        if self.flood_transport_key is None:
-            return
+        # Checked FIRST: a companion/reply decision is authoritative and must
+        # never be re-scoped, even when the node has an override/default set.
         if getattr(pkt, "_flood_scope_applied", False):
             return
-        route_type = pkt.get_route_type()
-        if route_type != ROUTE_TYPE_FLOOD:
+        if pkt.get_route_type() != ROUTE_TYPE_FLOOD:
             return
-        code = calc_transport_code(self.flood_transport_key, pkt)
-        pkt.transport_codes[0] = code
-        pkt.transport_codes[1] = 0  # reserved for home region
-        pkt.header = (pkt.header & ~0x03) | ROUTE_TYPE_TRANSPORT_FLOOD
+        # Explicit-unscoped wins (firmware checks send_unscoped before scope).
+        if self.flood_unscoped:
+            return
+        # Transient override else persisted default (override else DEFAULT).
+        key = (
+            self.flood_transport_key
+            if self.flood_transport_key is not None
+            else self.default_flood_transport_key
+        )
+        if key is None:
+            return
+        self._scope_packet(pkt, key)
 
     def set_default_path_hash_mode(self, mode: Optional[int]) -> None:
         """Set or clear the default path hash mode for flood packets with 0 hops.
@@ -1141,19 +1217,50 @@ class Dispatcher:
             return
 
         try:
-            result = await handler(pkt)
-            # Mirror firmware Mesh::onRecvPacket markDoNotRetransmit: a data or
-            # anon packet genuinely decrypted for this identity is consumed and
-            # must not be re-flooded. HandlerResult.authenticated is that
-            # verdict (False on a bare dest-hash collision), so the client-repeat
-            # flood forward is suppressed only on real consumption. ACK marking
-            # is done inside AckHandler (it does not return a HandlerResult).
-            if isinstance(result, HandlerResult) and result.authenticated:
-                pkt.mark_do_not_retransmit()
+            if self._is_transit_direct_delivery(pkt, payload_type):
+                # Firmware releases this packet without payload processing; the
+                # forwarding decision is made independently (see
+                # _build_client_repeat_forward / an application router).
+                self._log(
+                    f"Transit {type_name}: routed-direct with "
+                    f"{pkt.get_path_hash_count()} hop(s) left, not delivered locally"
+                )
+            else:
+                result = await handler(pkt)
+                # Mirror firmware Mesh::onRecvPacket markDoNotRetransmit: a data or
+                # anon packet genuinely decrypted for this identity is consumed and
+                # must not be re-flooded. HandlerResult.authenticated is that
+                # verdict (False on a bare dest-hash collision), so the client-repeat
+                # flood forward is suppressed only on real consumption. ACK marking
+                # is done inside AckHandler (it does not return a HandlerResult).
+                if isinstance(result, HandlerResult) and result.authenticated:
+                    pkt.mark_do_not_retransmit()
             if self.packet_received_callback:
                 await self._invoke_callback(self.packet_received_callback, pkt)
         except Exception as err:
             self._log(f"Handler error for {type_name}: {err}")
+
+    def _is_transit_direct_delivery(self, pkt: Packet, payload_type: int) -> bool:
+        """True when a local-delivery handler must be skipped for a transit packet.
+
+        MeshCore ``Mesh::onRecvPacket`` never runs payload processing for a
+        routed-direct packet that still has hops on its path: it peeks at an
+        early ACK, forwards the packet if this node is the next hop (stripping
+        itself first, so delivery only ever happens at hop count 0), and
+        otherwise releases it. Payload delivery for a direct packet therefore
+        only happens once the path is exhausted.
+
+        openHop's ``_dispatch`` serves both local delivery and, for applications
+        like the repeater, routing — so the rule is applied only to handlers
+        registered with ``local_delivery=True``. Without it a node that hears
+        both a peer's pre-relay transmission and the relay's retransmission
+        delivers the same DM twice: the copies share a path-independent packet
+        hash, and dedup no longer suppresses the un-stripped one (it must not,
+        or an overheard route variant would suppress a copy this node owns).
+        """
+        if payload_type not in self._local_delivery_types:
+            return False
+        return pkt.is_route_direct() and pkt.get_path_hash_count() > 0
 
     # ------------------------------------------------------------------
     # ACK registration system

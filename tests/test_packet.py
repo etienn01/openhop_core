@@ -22,6 +22,18 @@ def test_packet_creation():
     assert packet.get_payload() == test_payload
 
 
+def test_packet_carries_an_injected_origin_hash_slot():
+    """A downstream router tags a locally injected packet with the companion that
+    originated it, so the fan-out can withhold it from that bridge.  Packet defines
+    __slots__ and has no __dict__, so the attribute must be declared here or the
+    assignment raises AttributeError in the consumer at run time."""
+    packet = Packet()
+    assert packet._injected_origin_hash is None
+
+    packet._injected_origin_hash = "0x1a"
+    assert packet._injected_origin_hash == "0x1a"
+
+
 def test_packet_validation():
     """Test packet validation."""
     packet = Packet()

@@ -15,7 +15,7 @@ from .group_text import GroupTextHandler
 from .login_response import LoginResponseHandler
 from .path import PathHandler
 from .protocol_response import ProtocolResponseHandler
-from .return_path import ReturnPathTeacher
+from .return_path import RETURN_PATH_DEFAULT_SF, ReturnPathTeacher
 from .text import TextMessageHandler
 
 
@@ -66,10 +66,21 @@ def create_core_handlers(
         group_packet_seen_callback: Optional shared full-hash cache callback
             for companion group text/data loopback suppression.
     """
+
     # Shared by both response handlers so the per-contact re-teach cooldown is
     # accounted once, not once per handler. Its transmit path is wired later,
     # via ProtocolResponseHandler.set_packet_injector.
-    return_path_teacher = ReturnPathTeacher(log_fn, identity, contacts)
+    #
+    # The spreading factor is read through a callable, not captured: it sets the
+    # demodulator SNR limit every copy's margin is measured against, and a radio
+    # reconfigure at runtime must move that limit with it. Falls back to SF7 when
+    # the host supplies no radio config.
+    def _sf_from_radio_config() -> int:
+        return int((radio_config or {}).get("spreading_factor", RETURN_PATH_DEFAULT_SF))
+
+    return_path_teacher = ReturnPathTeacher(
+        log_fn, identity, contacts, sf_getter=_sf_from_radio_config
+    )
 
     protocol_response_handler = ProtocolResponseHandler(
         log_fn, identity, contacts, return_path_teacher=return_path_teacher
@@ -97,7 +108,7 @@ def create_core_handlers(
         radio_config,
     )
 
-    advert_handler = AdvertHandler(log_fn, event_service=event_service)
+    advert_handler = AdvertHandler(log_fn, event_service=event_service, local_identity=identity)
 
     group_text_handler = GroupTextHandler(
         identity,

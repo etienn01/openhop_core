@@ -118,7 +118,20 @@ class LocalIdentity(Identity):
         else:
             # Standard 32-byte seed or None
             self._firmware_key = None
-            self.signing_key = SigningKey(seed) if seed else SigningKey.generate()
+            if seed:
+                self.signing_key = SigningKey(seed)
+            else:
+                # Firmware reserves 0x00 and 0xFF as public-key prefixes and
+                # refuses to import a keypair with either (Identity.cpp
+                # validatePrivateKey: "disallow 00 or FF prefixed public keys"),
+                # because the first byte doubles as the 1-byte routing hash and
+                # those two values are sentinels. Re-roll rather than mint an
+                # identity that cannot interoperate.
+                while True:
+                    candidate = SigningKey.generate()
+                    if candidate.verify_key.encode()[0] not in (0x00, 0xFF):
+                        break
+                self.signing_key = candidate
             self.verify_key = self.signing_key.verify_key
 
             # Build 64-byte Ed25519 secret key: seed + pub

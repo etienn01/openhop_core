@@ -18,7 +18,7 @@ from openhop_core.companion.models import Contact
 from openhop_core.node.handlers.login_response import LoginResponseHandler
 from openhop_core.node.handlers.protocol_response import ProtocolResponseHandler
 from openhop_core.node.handlers.registry import create_core_handlers
-from openhop_core.node.handlers.return_path import ReturnPathTeacher, reverse_path
+from openhop_core.node.handlers.return_path import ReturnPathTeacher
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_PATH,
@@ -155,40 +155,6 @@ async def _teach_flood(teacher, **kwargs):
     )
     await teacher.wait_for_pending()
     return sent
-
-
-# --------------------------------------------------------------------------- #
-# reverse_path
-# --------------------------------------------------------------------------- #
-
-
-def test_reverse_path_reverses_whole_hashes_not_bytes():
-    """A 2-byte-hash path must reverse hop order, keeping each hash intact."""
-    path = bytes([0x11, 0x22, 0x33, 0x44])
-    assert reverse_path(path, PathUtils.encode_path_len(2, 2)) == bytes([0x33, 0x44, 0x11, 0x22])
-    # Byte-wise reversal would give 44332211 and corrupt every hop.
-
-
-def test_reverse_path_three_byte_hashes():
-    path = bytes([0x01, 0x02, 0x03, 0x04, 0x05, 0x06])
-    assert reverse_path(path, PathUtils.encode_path_len(3, 2)) == bytes(
-        [0x04, 0x05, 0x06, 0x01, 0x02, 0x03]
-    )
-
-
-def test_reverse_path_single_byte_hashes():
-    assert reverse_path(bytes([0xA1, 0xB2, 0xC3]), PathUtils.encode_path_len(1, 3)) == bytes(
-        [0xC3, 0xB2, 0xA1]
-    )
-
-
-def test_reverse_path_zero_hop_is_empty_not_none():
-    """A zero-hop path is valid (direct neighbour), distinct from malformed."""
-    assert reverse_path(b"", 0) == b""
-
-
-def test_reverse_path_rejects_length_mismatch():
-    assert reverse_path(bytes([0xAA]), PathUtils.encode_path_len(1, 3)) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -409,7 +375,12 @@ def test_recorded_copies_are_pruned_by_ttl():
 
 
 # --------------------------------------------------------------------------- #
-# Hop-penalized selection (a strong nearby repeater must not add a needless hop)
+# Copy selection by decodability margin, then hop count
+#
+# LoRa decodes on SNR margin over the demodulator limit, not on absolute RSSI:
+# measured here, four copies of one reply spanned 86 dB of RSSI while all
+# reported ~+11.5 dB SNR, i.e. all equally decodable. So dB only decide inside
+# the waterfall; above it, hop count does.
 # --------------------------------------------------------------------------- #
 
 
@@ -501,21 +472,87 @@ async def test_materially_stronger_one_hop_copy_beats_tenuous_zero_hop_copy():
 
 
 @pytest.mark.asyncio
-async def test_longer_route_wins_when_it_is_materially_stronger():
-    """When the shorter route's final hop is genuinely weak, the extra hop is
-    earned: a 3-hop copy at -13 beats a 2-hop copy at -60."""
+async def test_longer_route_wins_only_when_the_shorter_one_is_marginal():
+    """A hop is bought when the short route is inside the waterfall, not merely
+    when the long route reads stronger.
+
+    -60 dBm is ~55 dB above this mesh's decode threshold, so under the threshold
+    model the 2-hop copy is reliable and hop count decides. Only when the shorter
+    copy drops into the steep region does the extra hop earn its place.
+    """
     teacher = _teacher(injector=_Injector())
+    # Both reliable: fewest hops wins even though the 3-hop copy is 47 dB stronger.
     embedded = await _teach_choosing_between(teacher, short_rssi=-60, long_rssi=-13)
+    assert embedded == SHORT_2HOP
+
+    # Now the 2-hop copy is marginal (-114 dBm is ~1.5 dB of margin against the
+    # assumed -108 floor at SF7), so the reliable 3-hop copy takes over.
+    teacher2 = _teacher(injector=_Injector())
+    embedded = await _teach_choosing_between(teacher2, short_rssi=-114, long_rssi=-13)
     assert embedded == LONG_3HOP
 
 
 @pytest.mark.asyncio
-async def test_zero_penalty_restores_pure_best_rssi():
-    """With the penalty disabled, selection is pure last-hop RSSI again, so the
-    stronger 3-hop copy wins even for a 2 dB edge."""
-    teacher = _teacher(injector=_Injector(), hop_penalty_db=0.0)
-    embedded = await _teach_choosing_between(teacher, short_rssi=-15, long_rssi=-13)
-    assert embedded == LONG_3HOP
+async def test_extra_db_above_the_waterfall_never_buys_a_hop():
+    """Two reliable copies: no RSSI gap, however large, promotes the longer one."""
+    for long_rssi in (-13, -5, 0):
+        teacher = _teacher(injector=_Injector())
+        embedded = await _teach_choosing_between(teacher, short_rssi=-70, long_rssi=long_rssi)
+        assert embedded == SHORT_2HOP, f"a {long_rssi} dBm 3-hop copy displaced a healthy 2-hop"
+
+
+def test_copy_below_the_demod_floor_is_not_recorded_at_all():
+    """Below the waterfall a copy is not a route, so it is not a candidate.
+
+    At SF7 the demodulator limit is -7.5 dB SNR; against the assumed -108 dBm
+    floor that puts the decode threshold near -115.5 dBm.
+    """
+    teacher = _teacher()
+    base = _response_packet(flood=True)
+    teacher.note_flood_copy(_copy_of(base, in_path=SHORT_2HOP, rssi=-120, len_byte=SHORT_2HOP_LEN))
+    assert teacher._recent_copies == {}
+
+    teacher.note_flood_copy(_copy_of(base, in_path=SHORT_2HOP, rssi=-100, len_byte=SHORT_2HOP_LEN))
+    assert len(teacher._recent_copies) == 1
+
+
+def test_margin_uses_snr_when_it_is_the_pessimistic_estimate():
+    """SNR is the real decodability measure; RSSI is the fallback.
+
+    A copy can look strong in RSSI while its SNR says it is barely decodable
+    (a loud interferer raises both). The pessimistic estimate must win, so such a
+    copy is not treated as reliable.
+    """
+    teacher = _teacher()
+    limit = teacher._demod_limit_db()  # -7.5 at SF7
+
+    strong_rssi_bad_snr = teacher._copy_margin_db(rssi=-20, snr=limit + 1.0)
+    assert strong_rssi_bad_snr == pytest.approx(1.0)  # SNR binds, not the -20 dBm
+
+    weak_rssi_good_snr = teacher._copy_margin_db(rssi=-120, snr=limit + 20.0)
+    assert weak_rssi_good_snr < 0  # RSSI binds
+
+
+def test_margin_tracks_the_spreading_factor():
+    """The same signal is more decodable at a higher SF, so the limit must follow
+    the radio rather than being baked in."""
+    sf = {"v": 7}
+    teacher = _teacher(sf_getter=lambda: sf["v"])
+    assert teacher._demod_limit_db() == pytest.approx(-7.5)
+
+    at_sf7 = teacher._copy_margin_db(rssi=-40, snr=-6.0)
+    sf["v"] = 12
+    at_sf12 = teacher._copy_margin_db(rssi=-40, snr=-6.0)
+    assert at_sf7 == pytest.approx(1.5)  # marginal at SF7
+    assert at_sf12 == pytest.approx(14.0)  # comfortable at SF12
+    assert at_sf12 > teacher._reliable_margin_db > at_sf7
+
+
+def test_unknown_spreading_factor_falls_back_to_sf7():
+    teacher = _teacher(sf_getter=lambda: 99)
+    assert teacher._demod_limit_db() == pytest.approx(-7.5)
+    broken = _teacher(sf_getter=lambda: (_ for _ in ()).throw(RuntimeError("no radio")))
+    assert broken._demod_limit_db() == pytest.approx(-7.5)
 
 
 # --------------------------------------------------------------------------- #
@@ -593,69 +630,41 @@ async def test_failed_inject_releases_cooldown_for_the_next_trigger():
 
 
 # --------------------------------------------------------------------------- #
-# Reverse-of-out_path hardening (no firmware equivalent)
+# No guessing: only observed paths are ever taught
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.asyncio
-async def test_reverse_teach_embeds_reversed_out_path():
-    """With nothing inbound to learn from, assume a symmetric route. Uses 2-byte
-    hashes so a byte-wise reversal would not pass."""
-    out_path = bytes([0x11, 0x22, 0x33, 0x44])
-    out_len = PathUtils.encode_path_len(2, 2)
-    injector = _Injector()
-    teacher = _teacher(contacts=_contacts(out_path, out_len), injector=injector)
+def test_teacher_exposes_no_way_to_teach_an_unobserved_path():
+    """The symmetry guess is gone, not merely unused.
 
-    assert await teacher.maybe_teach_reverse_of_out_path(PEER_KEY, reason="timeout") is True
-    await teacher.wait_for_pending()
-
-    teach = injector.packets[0]
-    assert teach.get_route_type() == ROUTE_TYPE_DIRECT
-    assert bytes(teach.path) == out_path  # still routed outward along out_path
-    _, embedded_path = _decode_teach(teach)
-    assert embedded_path == bytes([0x33, 0x44, 0x11, 0x22])
+    An earlier revision taught the reverse of our own out_path on a request
+    timeout. Real routes are frequently asymmetric, and onPeerPathRecv overwrites
+    client->out_path unconditionally, so a wrong guess replaced a working route
+    with a dead one and the peer then answered DIRECT into a void — with no flood
+    reply left to correct it. The timeout case is handled by flooding the retry
+    (_SendOpsMixin._build_retry_packet) so a real inbound path can be observed.
+    """
+    teacher = _teacher()
+    assert not hasattr(teacher, "maybe_teach_reverse_of_out_path")
+    # The only public teach trigger takes a received packet to learn from.
+    assert hasattr(teacher, "maybe_teach_from_flood_reply")
 
 
 @pytest.mark.asyncio
-async def test_reverse_teach_skipped_without_known_out_path():
-    injector = _Injector()
-    teacher = _teacher(contacts=_contacts(out_path=b"", out_path_len=-1), injector=injector)
-    assert not await teacher.maybe_teach_reverse_of_out_path(PEER_KEY, reason="timeout")
-    assert injector.packets == []
-
-
-@pytest.mark.asyncio
-async def test_reverse_teach_never_overwrites_an_evidence_derived_teach():
-    """THE regression guard. The peer applies whichever path it received last
-    (MyMesh::onPeerPathRecv overwrites unconditionally). If a merely slow first
-    attempt let the symmetry guess replace the route we learned from a real
-    inbound path, and the guess is wrong, the peer would reply into a void — no
-    flood reply would ever arrive again, so nothing could re-teach it. That is
-    strictly worse than never having guessed."""
-    clock = {"t": 0.0}
+async def test_note_evidence_teach_claims_the_cooldown():
+    """Another handler's teach suppresses an immediate duplicate from this one."""
+    clock = {"t": 1000.0}
     injector = _Injector()
     teacher = _teacher(injector=injector, cooldown_s=5.0, time_fn=lambda: clock["t"])
 
-    assert await _teach_flood(teacher) is True
-    _, embedded = _decode_teach(injector.packets[0])
-    assert embedded == IN_PATH
-
-    # Well past the cooldown: only the evidence guard can stop this.
-    clock["t"] += 3600.0
-    assert await teacher.maybe_teach_reverse_of_out_path(PEER_KEY, reason="timeout") is False
-    await teacher.wait_for_pending()
-    assert len(injector.packets) == 1, "the symmetry guess clobbered a known-good route"
-
-
-@pytest.mark.asyncio
-async def test_note_evidence_teach_blocks_the_reverse_guess():
-    injector = _Injector()
-    teacher = _teacher(injector=injector)
-
     teacher.note_evidence_teach(PEER_KEY)
-
-    assert await teacher.maybe_teach_reverse_of_out_path(PEER_KEY, reason="timeout") is False
+    clock["t"] += 1.0
+    assert await _teach_flood(teacher) is False
     assert injector.packets == []
+
+    clock["t"] += 5.0
+    assert await _teach_flood(teacher) is True
+    assert len(injector.packets) == 1
 
 
 def _flood_path_packet(inner_path=OUT_PATH, inner_len=OUT_PATH_LEN):
@@ -679,29 +688,178 @@ def _flood_path_packet(inner_path=OUT_PATH, inner_len=OUT_PATH_LEN):
 
 
 @pytest.mark.asyncio
-async def test_flood_path_reciprocal_reports_itself_and_blocks_the_reverse_guess():
-    """End-to-end: the pre-existing flood-PATH reciprocal teaches from a real
-    inbound path. If ProtocolResponseHandler did not report it, a normal flood
-    login would leave the symmetry guess free to overwrite a correct route on
-    the very first retry — with no cooldown involved."""
+async def test_flood_path_reciprocal_reports_itself_to_the_teacher():
+    """End-to-end: the flood-PATH reciprocal teaches from a real inbound path and
+    reports itself, so the teacher does not immediately send a second teach for
+    the same contact and route."""
     injector = _Injector()
     handler = ProtocolResponseHandler(lambda _m: None, LOCAL_IDENTITY, _contacts())
     handler.set_packet_injector(injector)
+    # No settle: the corrective re-teach has its own tests below.
+    handler.return_path_teacher._settle_s = 0.0
 
     await handler(_flood_path_packet())
     await handler.wait_for_pending_reciprocals()
     await handler.return_path_teacher.wait_for_pending()
 
     # Exactly one packet: the reciprocal. The RESPONSE-branch teach must not
-    # also fire for a PATH packet.
+    # also fire for a PATH packet, and with no better copy recorded the
+    # corrective re-teach must transmit nothing.
+    assert len(injector.packets) == 1
+    assert PEER_KEY in handler.return_path_teacher._last_taught
+
+    # A flood RESPONSE arriving inside the cooldown is not re-taught.
+    assert await _teach_flood(handler.return_path_teacher) is False
     assert len(injector.packets) == 1
 
-    blocked = await handler.return_path_teacher.maybe_teach_reverse_of_out_path(
-        PEER_KEY, reason="timeout"
+
+# --------------------------------------------------------------------------- #
+# Correcting a teach sent from the first-arrived copy
+# --------------------------------------------------------------------------- #
+
+
+def _reteach_kwargs(pkt, *, taught_path, taught_len_byte, hash_key=None):
+    return dict(
+        contact_pubkey=PEER_KEY,
+        dest_hash=PEER_HASH,
+        taught_path=taught_path,
+        taught_len_byte=taught_len_byte,
+        out_path=OUT_PATH,
+        out_path_len=OUT_PATH_LEN,
+        shared_secret=_shared_secret(),
+        hash_key=hash_key if hash_key is not None else bytes(pkt.calculate_packet_hash()),
+        reason="test",
     )
-    await handler.return_path_teacher.wait_for_pending()
-    assert blocked is False
+
+
+@pytest.mark.asyncio
+async def test_note_flood_copy_now_records_flood_path_copies():
+    """A flood login is answered with a PATH, so PATH copies must be collected.
+
+    Before this, only RESPONSE copies were recorded, so the single most
+    consequential teach — the reciprocal after a flood login, which decides the
+    route the peer uses for every later direct reply — had no copies to choose
+    from and always embedded the first-arrived route.
+    """
+    teacher = _teacher()
+    first = _flood_path_packet()
+    first._rssi = -100
+    better = _copy_of(first, in_path=SHORT_2HOP, rssi=-40, len_byte=SHORT_2HOP_LEN)
+
+    teacher.note_flood_copy(first)
+    teacher.note_flood_copy(better)
+
+    assert len(teacher._recent_copies) == 1
+    kept = next(iter(teacher._recent_copies.values()))
+    assert kept.path == SHORT_2HOP
+    assert kept.rssi == -40
+
+
+@pytest.mark.asyncio
+async def test_reteach_sends_the_better_copy_and_keeps_routing_via_out_path():
+    injector = _Injector()
+    teacher = _teacher(injector=injector)
+    pkt = _flood_path_packet()
+    pkt._rssi = -100
+    teacher.note_flood_copy(pkt)
+    teacher.note_flood_copy(_copy_of(pkt, in_path=SHORT_2HOP, rssi=-40, len_byte=SHORT_2HOP_LEN))
+
+    sent = await teacher.maybe_reteach_better_copy(
+        **_reteach_kwargs(pkt, taught_path=IN_PATH, taught_len_byte=IN_PATH_LEN)
+    )
+
+    assert sent is True
     assert len(injector.packets) == 1
+    teach = injector.packets[0]
+    assert teach.get_payload_type() == PAYLOAD_TYPE_PATH
+    assert teach.get_route_type() == ROUTE_TYPE_DIRECT
+    # Still routed along OUR out_path; only the embedded route changed.
+    assert bytes(teach.path) == OUT_PATH
+    len_byte, embedded = _decode_teach(teach)
+    assert embedded == SHORT_2HOP
+    assert len_byte == SHORT_2HOP_LEN
+
+
+@pytest.mark.asyncio
+async def test_reteach_is_silent_when_the_first_copy_was_already_best():
+    """The common case must cost no airtime at all."""
+    injector = _Injector()
+    teacher = _teacher(injector=injector)
+    pkt = _flood_path_packet()
+    pkt._rssi = -40
+    teacher.note_flood_copy(pkt)
+    teacher.note_flood_copy(_copy_of(pkt, in_path=LONG_3HOP, rssi=-95, len_byte=LONG_3HOP_LEN))
+
+    sent = await teacher.maybe_reteach_better_copy(
+        **_reteach_kwargs(pkt, taught_path=IN_PATH, taught_len_byte=IN_PATH_LEN)
+    )
+
+    assert sent is False
+    assert injector.packets == []
+
+
+@pytest.mark.asyncio
+async def test_reteach_is_silent_when_no_copies_were_collected():
+    injector = _Injector()
+    teacher = _teacher(injector=injector)
+    pkt = _flood_path_packet()
+
+    sent = await teacher.maybe_reteach_better_copy(
+        **_reteach_kwargs(pkt, taught_path=IN_PATH, taught_len_byte=IN_PATH_LEN)
+    )
+
+    assert sent is False
+    assert injector.packets == []
+
+
+@pytest.mark.asyncio
+async def test_reteach_ignores_the_cooldown_claimed_by_the_teach_it_corrects():
+    """It corrects a teach that just claimed the cooldown, so it must not be
+    throttled by it — otherwise the peer keeps the marginal first route."""
+    clock = {"t": 1000.0}
+    injector = _Injector()
+    teacher = _teacher(injector=injector, cooldown_s=5.0, time_fn=lambda: clock["t"])
+    pkt = _flood_path_packet()
+    pkt._rssi = -100
+    teacher.note_flood_copy(pkt)
+    teacher.note_flood_copy(_copy_of(pkt, in_path=SHORT_2HOP, rssi=-40, len_byte=SHORT_2HOP_LEN))
+
+    teacher.note_evidence_teach(PEER_KEY)  # the immediate reciprocal claims it
+    clock["t"] += 0.5
+
+    sent = await teacher.maybe_reteach_better_copy(
+        **_reteach_kwargs(pkt, taught_path=IN_PATH, taught_len_byte=IN_PATH_LEN)
+    )
+
+    assert sent is True
+    assert len(injector.packets) == 1
+
+
+@pytest.mark.asyncio
+async def test_reciprocal_end_to_end_corrects_itself_to_the_best_copy():
+    """The whole path: flood-PATH login reply -> immediate teach from the copy in
+    hand -> corrective teach from the best copy collected pre-dedup."""
+    injector = _Injector()
+    handler = ProtocolResponseHandler(lambda _m: None, LOCAL_IDENTITY, _contacts())
+    handler.set_packet_injector(injector)
+    teacher = handler.return_path_teacher
+    teacher._settle_s = 0.0
+
+    first = _flood_path_packet()
+    first._rssi = -100
+    # A stronger, shorter copy of the same reply lands pre-dedup (raw subscriber).
+    teacher.note_flood_copy(first)
+    teacher.note_flood_copy(_copy_of(first, in_path=SHORT_2HOP, rssi=-40, len_byte=SHORT_2HOP_LEN))
+
+    await handler(first)
+    await handler.wait_for_pending_reciprocals()
+    await teacher.wait_for_pending()
+
+    assert len(injector.packets) == 2, "expected the immediate teach plus one correction"
+    _, first_taught = _decode_teach(injector.packets[0])
+    _, corrected = _decode_teach(injector.packets[1])
+    assert first_taught == bytes(first.path)  # the copy in hand
+    assert corrected == SHORT_2HOP  # the best copy collected
 
 
 # --------------------------------------------------------------------------- #
@@ -823,66 +981,143 @@ def test_login_handler_can_wire_its_own_injector_standalone():
 
 
 # --------------------------------------------------------------------------- #
-# base_send retry hook
+# base_send retry: flood instead of guessing a return path
 # --------------------------------------------------------------------------- #
 
 
-class _StubSender(_SendOpsMixin):
-    """Minimal carrier for the retry hook; only the handler accessor is used."""
+class _Proxy:
+    """Stand-in for ContactProxy: only the route fields matter here."""
 
-    def __init__(self, handler):
-        self._handler = handler
-
-    def _get_protocol_response_handler(self):
-        return self._handler
+    def __init__(self, out_path=OUT_PATH, out_path_len=OUT_PATH_LEN):
+        self.out_path = out_path
+        self.out_path_len = out_path_len
 
 
-@pytest.mark.asyncio
-async def test_retry_hook_asks_the_teacher_to_reverse_the_out_path():
-    injector = _Injector()
-    handler = ProtocolResponseHandler(lambda _m: None, LOCAL_IDENTITY, _contacts())
-    handler.set_packet_injector(injector)
+class _RetrySender(_SendOpsMixin):
+    """Carrier for the retry loops with radio/timing stubbed out."""
 
-    await _StubSender(handler)._teach_return_path_before_retry(PEER_KEY, "REQ 0x01")
-    await handler.return_path_teacher.wait_for_pending()
+    def __init__(self):
+        self.sent = []
 
-    assert len(injector.packets) == 1
-    _, embedded_path = _decode_teach(injector.packets[0])
-    assert embedded_path == bytes(reversed(OUT_PATH))
+    def _apply_path_hash_mode(self, pkt):
+        return None
 
+    def _response_timeout_s(self, pkt, proxy):
+        return 0.001
 
-@pytest.mark.asyncio
-async def test_retry_hook_is_best_effort_and_never_raises():
-    """A failing teach must not abort the retry it precedes."""
-
-    class _Boom:
-        @property
-        def return_path_teacher(self):
-            raise RuntimeError("handler exploded")
-
-    await _StubSender(_Boom())._teach_return_path_before_retry(PEER_KEY, "REQ")
-    # No handler at all (companion subclasses may return None).
-    await _StubSender(None)._teach_return_path_before_retry(PEER_KEY, "REQ")
+    async def _send_packet(self, pkt, wait_for_ack=False, expected_crc=None):
+        self.sent.append(pkt)
+        return True
 
 
-@pytest.mark.asyncio
-async def test_request_retry_loop_invokes_the_teach_hook():
-    """Covers the wiring in _request_with_retries itself: without this, deleting
-    the call would leave every other test in this file green."""
-    calls = []
+def _req_builder(proxy):
+    """Build a REQ the way PacketBuilder does: route chosen from out_path_len."""
 
-    class _Sender(_SendOpsMixin):
-        async def _teach_return_path_before_retry(self, contact_pubkey, log_label):
-            calls.append(bytes(contact_pubkey))
+    def _build():
+        pkt = Packet()
+        route = ROUTE_TYPE_DIRECT if proxy.out_path_len >= 0 else ROUTE_TYPE_FLOOD
+        pkt.header = (PAYLOAD_TYPE_RESPONSE << 2) | route
+        pkt.payload = bytearray(b"\x00" * 8)
+        pkt.payload_len = 8
+        if route == ROUTE_TYPE_DIRECT and proxy.out_path_len > 0:
+            pkt.path = bytearray(proxy.out_path)
+            pkt.path_len = proxy.out_path_len
+        else:
+            pkt.path = bytearray()
+            pkt.path_len = 0
+        return pkt, None
 
-        def _apply_path_hash_mode(self, pkt):
-            return None
+    return _build
 
-        def _response_timeout_s(self, pkt, proxy):
-            return 0.001
 
-        async def _send_packet(self, pkt, wait_for_ack=False, expected_crc=None):
-            return True
+async def _always_timeout(_timeout):
+    return {"timeout": True}
+
+
+def test_retry_packet_floods_a_contact_that_has_a_direct_path():
+    """Mirrors firmware's own way of forcing one request to flood: mask
+    out_path_len to OUT_PATH_UNKNOWN around the build, then restore it."""
+    proxy = _Proxy()
+    sender = _RetrySender()
+
+    pkt, _tag = sender._build_retry_packet(_req_builder(proxy), proxy, "REQ")
+
+    assert pkt.is_route_flood()
+    assert bytes(pkt.path) == b""
+    assert pkt.path_len == 0
+    # The stored route is masked, never cleared: every other caller still sees it.
+    assert proxy.out_path_len == OUT_PATH_LEN
+    assert proxy.out_path == OUT_PATH
+
+
+def test_forced_flood_retry_is_unscoped_and_survives_a_configured_scope():
+    """A region-scoped retry dies at the first region-less repeater.
+
+    Most repeaters on a mixed mesh have no regions configured, so they cannot
+    match a transport code and refuse to forward a TRANSPORT_FLOOD packet
+    (``allowPacketForward``: ``recv_pkt_region == NULL``). Scoping the retry would
+    make it strictly worse than the direct attempt it replaces, so the forced
+    flood is marked as a deliberate plain-flood decision that the dispatcher's
+    override/default resolver must not override.
+    """
+    from openhop_core.node.dispatcher import Dispatcher
+    from openhop_core.protocol.constants import ROUTE_TYPE_TRANSPORT_FLOOD
+    from openhop_core.protocol.transport_keys import get_auto_key_for
+
+    proxy = _Proxy()
+    sender = _RetrySender()
+
+    pkt, _tag = sender._build_retry_packet(_req_builder(proxy), proxy, "REQ")
+    assert pkt.is_route_flood()
+    assert pkt._flood_scope_applied is True
+
+    class _Radio:
+        def set_rx_callback(self, cb):
+            pass
+
+    dispatcher = Dispatcher(_Radio())
+    dispatcher.flood_transport_key = get_auto_key_for("#region-a")
+    dispatcher.default_flood_transport_key = get_auto_key_for("#region-b")
+    dispatcher._apply_flood_scope(pkt)
+
+    assert pkt.get_route_type() != ROUTE_TYPE_TRANSPORT_FLOOD
+    assert pkt.transport_codes == [0, 0]
+
+
+def test_retry_packet_restores_the_stored_path_when_the_builder_raises():
+    proxy = _Proxy()
+    sender = _RetrySender()
+
+    def _boom():
+        raise RuntimeError("builder exploded")
+
+    with pytest.raises(RuntimeError):
+        sender._build_retry_packet(_boom, proxy, "REQ")
+    assert proxy.out_path_len == OUT_PATH_LEN
+
+
+def test_retry_packet_leaves_an_already_flooding_contact_alone():
+    proxy = _Proxy(out_path=b"", out_path_len=-1)
+    sender = _RetrySender()
+
+    pkt, _tag = sender._build_retry_packet(_req_builder(proxy), proxy, "REQ")
+
+    assert pkt.is_route_flood()
+    assert proxy.out_path_len == -1
+
+
+def test_retry_packet_tolerates_a_proxy_that_cannot_be_masked():
+    """A non-settable contact object must not break the retry."""
+
+    class _Frozen:
+        __slots__ = ("out_path", "out_path_len")
+
+        def __init__(self):
+            self.out_path = OUT_PATH
+            self.out_path_len = OUT_PATH_LEN
+
+    proxy = _Frozen()
+    sender = _RetrySender()
 
     def _build():
         pkt = Packet()
@@ -893,59 +1128,47 @@ async def test_request_retry_loop_invokes_the_teach_hook():
         pkt.path_len = 0
         return pkt, None
 
-    async def _always_timeout(_timeout):
-        return {"timeout": True}
+    pkt, _tag = sender._build_retry_packet(_build, proxy, "REQ")
+    assert pkt is not None
+    assert proxy.out_path_len == OUT_PATH_LEN
 
-    result = await _Sender()._request_with_retries(
-        _build, _always_timeout, object(), log_label="REQ", contact_pubkey=PEER_KEY
+
+@pytest.mark.asyncio
+async def test_request_retry_loop_floods_every_attempt_after_the_first():
+    """Covers the wiring in _request_with_retries: the first attempt keeps the
+    contact's route, every retry floods so a reply can be observed."""
+    proxy = _Proxy()
+    sender = _RetrySender()
+
+    result = await sender._request_with_retries(
+        _req_builder(proxy), _always_timeout, proxy, log_label="REQ"
     )
 
     assert result["timeout"] is True
-    # One teach before every attempt after the first.
-    assert calls and all(c == PEER_KEY for c in calls)
+    assert len(sender.sent) >= 2
+    assert not sender.sent[0].is_route_flood(), "first attempt keeps the stored route"
+    assert all(p.is_route_flood() for p in sender.sent[1:]), "every retry floods"
+    assert proxy.out_path_len == OUT_PATH_LEN
 
 
 @pytest.mark.asyncio
-async def test_started_request_retry_loop_invokes_the_teach_hook():
+async def test_started_request_retry_loop_floods_every_retry():
     """Same coverage for the background continuation used by the frame-server
-    API path (_finish_started_request)."""
-    calls = []
+    API path (_finish_started_request), whose first attempt is already sent."""
+    proxy = _Proxy()
+    sender = _RetrySender()
 
-    class _Sender(_SendOpsMixin):
-        async def _teach_return_path_before_retry(self, contact_pubkey, log_label):
-            calls.append(bytes(contact_pubkey))
-
-        def _apply_path_hash_mode(self, pkt):
-            return None
-
-        def _response_timeout_s(self, pkt, proxy):
-            return 0.001
-
-        async def _send_packet(self, pkt, wait_for_ack=False, expected_crc=None):
-            return True
-
-    def _build():
-        pkt = Packet()
-        pkt.header = (PAYLOAD_TYPE_RESPONSE << 2) | ROUTE_TYPE_DIRECT
-        pkt.payload = bytearray(b"\x00" * 8)
-        pkt.payload_len = 8
-        pkt.path = bytearray()
-        pkt.path_len = 0
-        return pkt, None
-
-    async def _always_timeout(_timeout):
-        return {"timeout": True}
-
-    await _Sender()._finish_started_request(
-        _build,
+    await sender._finish_started_request(
+        _req_builder(proxy),
         _always_timeout,
-        object(),
+        proxy,
         first_timeout_s=0.001,
         deadline=None,
         log_label="REQ",
         cleanup=None,
         response_tag_registered=None,
-        contact_pubkey=PEER_KEY,
     )
 
-    assert calls and all(c == PEER_KEY for c in calls)
+    assert sender.sent, "the continuation must retry"
+    assert all(p.is_route_flood() for p in sender.sent), "every retry floods"
+    assert proxy.out_path_len == OUT_PATH_LEN

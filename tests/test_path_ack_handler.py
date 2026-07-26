@@ -119,6 +119,7 @@ async def test_path_ack_accepts_return_paths_larger_than_one_cipher_block():
         path=list(range(11)),
         extra_type=PAYLOAD_TYPE_ACK,
         extra=ack_crc.to_bytes(4, "little"),
+        path_len_encoded=PathUtils.encode_path_len(1, 11),
     )
     assert len(packet.payload) == 36
 
@@ -140,6 +141,7 @@ async def test_path_response_does_not_complete_ack_from_matching_path_bytes():
         path=ack_crc.to_bytes(4, "little"),
         extra_type=PAYLOAD_TYPE_RESPONSE,
         extra=b"data",
+        path_len_encoded=PathUtils.encode_path_len(1, 4),
     )
     assert len(packet.payload) == 20
 

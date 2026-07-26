@@ -715,7 +715,7 @@ class TestCommandResponses:
             RESP_VERSION,
             RESP_STATS,
         ]
-        assert [entry[1] for entry in modem._response_queue] == [b"\xAA", b"\x01", b"\x02"]
+        assert [entry[1] for entry in modem._response_queue] == [b"\xaa", b"\x01", b"\x02"]
 
     def test_tx_done_response(self):
         """Test SetHardware TxDone (0xF8) response sets event"""
@@ -1151,7 +1151,7 @@ class TestSerialWriteSerialization:
         modem.serial_conn = serial_conn
 
         stop_event = threading.Event()
-        data_frame = modem._encode_kiss_frame(CMD_DATA, b"\xAA\xBB\xCC")
+        data_frame = modem._encode_kiss_frame(CMD_DATA, b"\xaa\xbb\xcc")
 
         def data_tx_worker() -> None:
             for _ in range(200):
@@ -1282,7 +1282,7 @@ class TestSerialWriteSerialization:
         modem.serial_conn = serial_conn
         modem._start_reconnect_worker = MagicMock()
 
-        frame = modem._encode_kiss_frame(CMD_DATA, b"\xAA\xBB")
+        frame = modem._encode_kiss_frame(CMD_DATA, b"\xaa\xbb")
         assert modem._write_frame(frame) is False
         assert modem._degraded is True
         assert modem.is_connected is False
@@ -2414,6 +2414,203 @@ class TestBulkDecodeEquivalence:
                 chunks.append(size)
                 remaining -= size
             self._assert_equiv(stream, chunks)
+
+
+class TestWorkerFailureDuringReconnectWindow:
+    """A worker failure must never be silent just because a reconnect is underway.
+
+    ``_reconnect_loop`` starts the RX/TX workers with ``is_connected`` still
+    False and only sets it True after readiness plus the SetHardware handshake.
+    Gating the workers' error handler on ``is_connected`` therefore silenced
+    exactly the window in which a freshly reopened USB device is most likely to
+    fail: the thread died with no log and no failure marked, nothing re-armed a
+    reconnect, and the node went permanently deaf while the log read "KISS modem
+    serial reconnect successful". Seen in the field after two processes briefly
+    contended for the port, and reproduced here.
+    """
+
+    class _FailingSerial:
+        """An open port whose first read raises, as a just-reopened device can."""
+
+        def __init__(self):
+            self.is_open = True
+            self._failed = False
+            self.raised = threading.Event()
+
+        def read(self, n=1):
+            if not self._failed:
+                self._failed = True
+                self.raised.set()
+                raise OSError("device reports readiness to read but returned no data")
+            time.sleep(0.01)
+            return b""
+
+        @property
+        def in_waiting(self):
+            return 0
+
+        def close(self):
+            self.is_open = False
+
+    def _run_worker_until_failure(self, is_connected: bool):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        fake = self._FailingSerial()
+        modem.serial_conn = fake
+        modem.is_connected = is_connected
+        failures = []
+        modem._mark_serial_failure = lambda reason: failures.append(reason)
+
+        worker = threading.Thread(target=modem._rx_worker, daemon=True)
+        worker.start()
+        assert fake.raised.wait(timeout=2.0)
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+        return failures
+
+    def test_rx_failure_is_marked_inside_the_reconnect_window(self):
+        """is_connected is False there; the failure must still arm a reconnect."""
+        failures = self._run_worker_until_failure(is_connected=False)
+        assert failures, "RX died silently: nothing will ever reconnect"
+
+    def test_rx_failure_is_marked_in_steady_state_too(self):
+        failures = self._run_worker_until_failure(is_connected=True)
+        assert failures
+
+    def test_rx_failure_is_silent_only_while_deliberately_stopping(self):
+        """Teardown must stay quiet — that is what the old gate was protecting."""
+        for attr, value in (("_shutting_down", True), ("stop_event", None)):
+            modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+            fake = self._FailingSerial()
+            modem.serial_conn = fake
+            modem.is_connected = True
+            failures = []
+            modem._mark_serial_failure = lambda reason: failures.append(reason)
+            if attr == "stop_event":
+                modem.stop_event.set()
+            else:
+                setattr(modem, attr, value)
+
+            worker = threading.Thread(target=modem._rx_worker, daemon=True)
+            worker.start()
+            worker.join(timeout=2.0)
+            assert not worker.is_alive()
+            assert failures == [], f"teardown via {attr} should not report a failure"
+
+
+class TestReconnectRequiresLiveReader:
+    """A (re)connect must not be reported as successful with a dead reader.
+
+    The workers are started before readiness and the SetHardware handshake run,
+    so an RX failure inside that window used to leave a dead reader behind while
+    the caller logged "reconnect successful" — is_connected True, no error, no
+    retry, and no further packet ever delivered.
+    """
+
+    class _ReadFailsSerial:
+        def __init__(self):
+            self.is_open = True
+            self.raised = threading.Event()
+
+        def read(self, n=1):
+            self.raised.set()
+            raise OSError("device reports readiness to read but returned no data")
+
+        @property
+        def in_waiting(self):
+            return 0
+
+        def close(self):
+            self.is_open = False
+
+    def test_open_reports_failure_when_the_reader_dies_during_startup(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        fake = self._ReadFailsSerial()
+        modem._mark_serial_failure = lambda reason: None
+
+        def _ready():
+            assert fake.raised.wait(timeout=2.0)  # let the reader die first
+            modem.rx_thread.join(timeout=2.0)
+            return True
+
+        with patch(
+            "openhop_core.hardware.kiss_modem_wrapper.serial.Serial", return_value=fake
+        ), patch.object(modem, "_wait_for_modem_ready", side_effect=_ready):
+            assert modem._open_serial_and_start_threads() is False
+
+    def test_open_reports_success_when_the_reader_survives(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+
+        class QuietSerial:
+            is_open = True
+
+            def read(self, n=1):
+                time.sleep(0.01)
+                return b""
+
+            @property
+            def in_waiting(self):
+                return 0
+
+            def close(self):
+                type(self).is_open = False
+
+        fake = QuietSerial()
+        try:
+            with patch(
+                "openhop_core.hardware.kiss_modem_wrapper.serial.Serial", return_value=fake
+            ), patch.object(modem, "_wait_for_modem_ready", return_value=True):
+                assert modem._open_serial_and_start_threads() is True
+                assert modem.rx_thread.is_alive()
+        finally:
+            modem.stop_event.set()
+            fake.close()
+            if modem.rx_thread:
+                modem.rx_thread.join(timeout=2)
+
+
+class TestStopIoThreadsEndsThePreviousGeneration:
+    def test_stop_io_threads_closes_the_port_so_a_blocked_reader_exits(self):
+        """Joining alone let a reader blocked in read() outlive the join.
+
+        _mark_serial_failure defers closing the port when the connection lock is
+        busy, so the reconnect path could reach _stop_io_threads with the old
+        port still open and a worker parked in read(). It survived the 0.5s join
+        and kept decoding into the same KISS buffer as the new generation.
+        """
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+
+        class BlockingSerial:
+            def __init__(self):
+                self.is_open = True
+                self.entered = threading.Event()
+
+            def read(self, n=1):
+                self.entered.set()
+                while self.is_open:
+                    time.sleep(0.005)
+                raise OSError("port closed")
+
+            @property
+            def in_waiting(self):
+                return 0
+
+            def close(self):
+                self.is_open = False
+
+        fake = BlockingSerial()
+        modem.serial_conn = fake
+        modem.is_connected = True
+        modem._mark_serial_failure = lambda reason: None
+
+        reader = threading.Thread(target=modem._rx_worker, daemon=True)
+        modem.rx_thread = reader
+        reader.start()
+        assert fake.entered.wait(timeout=2.0)
+
+        modem._stop_io_threads(join_timeout=2.0)
+
+        assert fake.is_open is False, "the port was left open, so the reader kept running"
+        assert not reader.is_alive(), "the previous generation reader outlived the stop"
 
 
 class TestRxCallbackDisarmRace:

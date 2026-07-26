@@ -48,22 +48,39 @@ Deliberate deviations from firmware, each documented at its definition:
   task rather than inline on the RX path: the injector may block on a TX lock and
   an airtime budget, and awaiting it inline would delay delivery of the very reply
   that triggered the teach, potentially past its own response timeout.
-* openHop picks the teach source by a hop-penalized last-hop RSSI across every
-  copy of the flood reply, collected pre-dedup via ``note_flood_copy``. Firmware
-  embeds whichever copy it processed first, and only its (SNR-scored,
-  ships-disabled) reception hold makes that the best one; neither firmware mode
-  weighs hop count, so a strong nearby repeater can append itself as an extra
-  hop. openHop does not lean on the hold; it applies a fixed dependency penalty
-  before considering any routed copy, then discounts each hop. See
-  ``RETURN_PATH_SETTLE_S``, ``RETURN_PATH_ROUTED_DEPENDENCY_PENALTY_DB``, and
-  ``RETURN_PATH_HOP_PENALTY_DB``. There is deliberately no cross-reply downgrade
-  guard:
+* openHop chooses the teach source across every copy of the flood reply,
+  collected pre-dedup via ``note_flood_copy``, and ranks them by **decodability
+  rather than signal strength**: a copy's SNR margin over the demodulator limit
+  decides whether its link is reliable, and among reliable copies the shortest
+  route wins. Firmware embeds whichever copy it processed first, and only its
+  (SNR-scored, ships-disabled) reception hold makes that the best one; neither
+  firmware mode weighs hop count, so a strong nearby repeater can append itself
+  as an extra hop. See ``SF_DEMOD_SNR_LIMIT_DB``,
+  ``RETURN_PATH_RELIABLE_MARGIN_DB`` and ``_copy_rank`` for the model and the
+  measurements behind it. There is deliberately no cross-reply downgrade guard:
   firmware has none, and a flood reply from a peer we hold an ``out_path`` for is
   by this module's own premise a broken return route, so refusing to re-teach it
   because a newer copy is weaker than a previous (non-working) one would prolong
   the failure.
-* ``maybe_teach_reverse_of_out_path`` has no firmware counterpart at all. See its
-  docstring for the guard that keeps a guess from overwriting a known-good route.
+* The reciprocal teach that follows a flood login cannot wait for that window —
+  the peer needs a usable route immediately — so it goes out on the copy in hand
+  and then corrects itself once the window closes
+  (``maybe_reteach_better_copy``). Firmware never re-teaches, but it is safe
+  against firmware: ``onPeerPathRecv`` stores the path with an unconditional
+  ``copyPath``, touches no replay watermark, and returns ``false`` so no
+  reciprocal bounces back. The correction only transmits when the better copy
+  differs, so the common case costs nothing.
+
+Every teach this module sends embeds a path it actually observed. It deliberately
+does **not** guess one: an earlier revision, on a request timeout, taught the
+reverse of our own ``out_path`` on the assumption that routes are symmetric.
+Real routes frequently are not, and ``onPeerPathRecv`` overwrites
+``client->out_path`` unconditionally (``BaseChatMesh.cpp``), so a wrong guess
+replaced a working route with a dead one and the peer then answered DIRECT into a
+void — leaving no flood reply to correct it. The timeout case is handled where the
+evidence can actually be obtained instead: the request itself is re-sent as a
+flood on retry (``_SendOpsMixin._build_retry_packet``), and the peer answers a
+flood request with a PATH-return, which is a real inbound path to teach from.
 
 Not yet covered: firmware also re-teaches from ``onAckRecv``. A discrete ACK on
 the wire is a bare 4-byte CRC with no source hash, and openHop's dispatcher
@@ -80,9 +97,20 @@ from collections import OrderedDict
 from typing import Any, Callable, Optional, Set
 
 from ...protocol import Identity, Packet
-from ...protocol.constants import PAYLOAD_TYPE_RESPONSE, PH_ROUTE_MASK, ROUTE_TYPE_DIRECT
+from ...protocol.constants import (
+    PAYLOAD_TYPE_PATH,
+    PAYLOAD_TYPE_RESPONSE,
+    PH_ROUTE_MASK,
+    ROUTE_TYPE_DIRECT,
+)
 from ...protocol.packet_builder import PacketBuilder
 from ...protocol.packet_utils import PathUtils
+
+# Flood payload types whose arrival can trigger a return-path teach, and whose
+# copies are therefore worth collecting: RESPONSE (a server answering a direct
+# request by flood) and PATH (the path-return that answers a flood request or
+# flood login). Both carry ``dest_hash | src_hash | encrypted``.
+_TEACHABLE_COPY_TYPES = (PAYLOAD_TYPE_RESPONSE, PAYLOAD_TYPE_PATH)
 
 # Minimum gap between two return-path teaches aimed at the same contact.
 # Firmware has no equivalent throttle: it re-teaches on every qualifying flood
@@ -119,42 +147,68 @@ RETURN_PATH_COOLDOWN_S = 5.0
 # the enabling line is commented "enable once new algo fixed"), so on a stock
 # node firmware embeds the first-arrived copy -- and its 3 s delay only defers
 # the transmit, it does not re-pick the copy. openHop therefore selects the
-# teach source itself, by a hop-penalized last-hop RSSI (see
-# ``RETURN_PATH_HOP_PENALTY_DB`` and ``note_flood_copy``), during this window
+# teach source itself, by decodability margin and hop count (see
+# ``_copy_rank`` and ``note_flood_copy``), during this window
 # instead of leaning on the hold. Unchanged on the wire, strictly better than
 # firmware when the hold is off and no worse when it is on.
 RETURN_PATH_SETTLE_S = 3.0
 
-# Deliberate firmware divergence: fixed cost, in dB of last-hop RSSI, charged
-# once to every routed copy. Firmware embeds whichever flood copy it processes;
-# it does not give direct reception an explicit preference.
+# --- Copy selection: decodability, not raw signal strength -------------------
 #
-# This penalty represents the new forwarding dependency introduced by replacing
-# a proven zero-hop route with any routed route. It is intentionally finite:
-# HOWL Repeater's observed zero-hop -46 dBm copy should beat its one-hop B5B5
-# copy at -12 dBm, but a tenuous zero-hop copy around -120 dBm should still lose
-# to a materially stronger routed copy. Applying the same fixed cost to every
-# non-zero-hop candidate leaves comparisons among routed paths unchanged.
-RETURN_PATH_ROUTED_DEPENDENCY_PENALTY_DB = 30.0
+# LoRa demodulates below the noise floor, so what decides whether a copy's link
+# works is its SNR margin over the demodulator limit for the spreading factor --
+# not its absolute RSSI. Measured on this mesh (SF7/62.5 kHz): four copies of one
+# reply arrived at -16, -21, -69 and -80 dBm and *every one* reported +11.25 to
+# +12.5 dB SNR, i.e. ~19 dB of margin. RSSI spanned 86 dB while decodability was
+# pinned at "certain" for all of them. Ranking those by RSSI ranks noise.
+#
+# The PER-vs-SNR curve is a waterfall: it goes from ~0 to ~1 across roughly 3-6 dB
+# around the limit. Above ~6 dB of margin, loss is dominated by collisions rather
+# than signal, so extra dB buy nothing and an extra hop can never be an RF
+# improvement. Below the limit the link is dead. dB are only currency inside that
+# narrow band, which is why selection is a threshold rule rather than the linear
+# dB-per-hop trade this replaced (that trade was calibrated around -56 dBm, some
+# 60 dB above where decodability actually changes).
+#
+# Semtech SX126x LoRa demodulator SNR limits, dB, by spreading factor.
+SF_DEMOD_SNR_LIMIT_DB = {
+    5: -2.5,
+    6: -5.0,
+    7: -7.5,
+    8: -10.0,
+    9: -12.5,
+    10: -15.0,
+    11: -17.5,
+    12: -20.0,
+}
+RETURN_PATH_DEFAULT_SF = 7
 
-# Additional cost, in dB of last-hop RSSI, charged per hop when choosing between
-# copies of a flood reply. Together with the fixed dependency penalty above,
-# copies are ranked by:
-#
-#   rssi - ROUTED_DEPENDENCY_PENALTY_DB - HOP_PENALTY_DB * hop_count
-#
-# (The fixed term is omitted for zero-hop copies.) A longer route therefore only
-# wins when it is materially stronger, not merely a couple dB.
-#
-# Neither firmware mode weighs hop count: the default embeds the first-arrived
-# copy (Mesh.cpp notes the path "may not be the best in terms of hops"), and the
-# optional SNR hold would embed the strongest copy regardless of length. Without
-# this penalty, a strong nearby repeater -- e.g. one on the same desk as the
-# node -- re-floods almost every reply and appends itself as a final hop, so
-# pure best-RSSI would route returns through it even when a shorter route is
-# adequate. ~10 dB/hop keeps that extra hop only when it genuinely buys signal:
-# a 3-hop copy at -13 still beats a 2-hop copy at -40, but loses to one at -15.
-RETURN_PATH_HOP_PENALTY_DB = 10.0
+# Fallback noise floor for turning an RSSI into a margin when SNR is unavailable.
+# Measured floor on this mesh ran -100 to -114 dBm (typical -107/-108), i.e. ~18 dB
+# above thermal for SF7/62.5 kHz -- these nodes are noise-limited, not
+# sensitivity-limited (datasheet sensitivity would be ~-126 dBm).
+RETURN_PATH_ASSUMED_NOISE_FLOOR_DBM = -108.0
+
+# Hard floor: below this margin a copy is not a route at all, so it is never
+# recorded as a teach candidate. Sits just above the demodulator limit, inside the
+# waterfall, where PER is already climbing steeply.
+RETURN_PATH_MIN_MARGIN_DB = 2.0
+
+# Margin at which a link is "reliable enough": past the waterfall, into the region
+# where loss is collision-driven and further dB are worthless. Copies at or above
+# this are ranked by HOP COUNT alone -- the whole point of the policy.
+RETURN_PATH_RELIABLE_MARGIN_DB = 6.0
+
+# Why hops are penalised at all, given the signal says they are free:
+#   1. We only ever measure the LAST hop. For a zero-hop copy that is the entire
+#      path; for an N-hop copy it is 1 of N links, and the others are known only
+#      to have worked once. Confidence is structurally lower.
+#   2. Each hop adds airtime plus MeshCore's randomised getDirectRetransmitDelay,
+#      and consumes shared channel capacity on a mesh where collisions dominate.
+#   3. The relay has to be *willing* to forward routed traffic (disable_fwd, ACL,
+#      region policy). No signal metric can see that -- observed here: the
+#      strongest-RSSI relay on the mesh forwarded none of it.
+# So a hop is only ever bought when the shorter alternative is genuinely marginal.
 
 # Bounds for the best-copy table (``note_flood_copy``): entries older than the
 # TTL are dropped and the table never holds more than ``_MAX`` hashes (oldest
@@ -164,44 +218,33 @@ RETURN_PATH_COPY_TTL_S = 8.0
 RETURN_PATH_COPY_CACHE_MAX = 128
 
 
-def reverse_path(path: bytes, path_len_byte: int) -> Optional[bytes]:
-    """Reverse a routing path hash-by-hash.
-
-    A path is ``hash_count`` entries of ``hash_size`` bytes each, ordered from
-    the sender outward. The route back is the same repeaters in the opposite
-    order, so the reversal has to work on whole hashes — reversing the raw bytes
-    would corrupt any path using 2- or 3-byte hashes.
-
-    Returns ``None`` when ``path_len_byte`` is malformed or does not describe
-    exactly ``path``.
-    """
-    if not PathUtils.is_valid_path_len(path_len_byte):
-        return None
-    hash_size = PathUtils.get_path_hash_size(path_len_byte)
-    hash_count = PathUtils.get_path_hash_count(path_len_byte)
-    if len(path) != hash_size * hash_count:
-        return None
-    hops = [path[i * hash_size : (i + 1) * hash_size] for i in range(hash_count)]
-    return b"".join(reversed(hops))
-
-
 class _FloodCopy:
     """The best-received copy of one flood reply, keyed by its packet hash.
 
-    ``rssi`` is the last-hop RSSI of the copy (higher is stronger); ``path`` /
-    ``len_byte`` are the flood accumulation path that copy arrived on — the route
-    the peer should be taught to use back to us. ``score`` is the hop-penalized
-    rank, including the fixed routed-dependency penalty documented above.
-    ``ts`` is the monotonic time the entry was last improved, for TTL pruning.
+    ``path`` / ``len_byte`` are the flood accumulation path that copy arrived on —
+    the route the peer should be taught to use back to us. ``rssi`` and ``margin``
+    are the last-hop measurements kept for logging and tie-breaks; ``rank`` is the
+    comparable tuple copies are ordered by (see
+    :meth:`ReturnPathTeacher._copy_rank`). ``ts`` is the monotonic time the entry
+    was last improved, for TTL pruning.
     """
 
-    __slots__ = ("path", "len_byte", "rssi", "score", "ts")
+    __slots__ = ("path", "len_byte", "rssi", "margin", "rank", "ts")
 
-    def __init__(self, path: bytes, len_byte: int, rssi: int, score: float, ts: float) -> None:
+    def __init__(
+        self,
+        path: bytes,
+        len_byte: int,
+        rssi: int,
+        margin: float,
+        rank: tuple,
+        ts: float,
+    ) -> None:
         self.path = path
         self.len_byte = len_byte
         self.rssi = rssi
-        self.score = score
+        self.margin = margin
+        self.rank = rank
         self.ts = ts
 
 
@@ -221,7 +264,10 @@ class ReturnPathTeacher:
         *,
         cooldown_s: float = RETURN_PATH_COOLDOWN_S,
         settle_s: float = RETURN_PATH_SETTLE_S,
-        hop_penalty_db: float = RETURN_PATH_HOP_PENALTY_DB,
+        sf_getter: Optional[Callable[[], int]] = None,
+        noise_floor_dbm: float = RETURN_PATH_ASSUMED_NOISE_FLOOR_DBM,
+        min_margin_db: float = RETURN_PATH_MIN_MARGIN_DB,
+        reliable_margin_db: float = RETURN_PATH_RELIABLE_MARGIN_DB,
         time_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         self._log = log_fn
@@ -229,21 +275,18 @@ class ReturnPathTeacher:
         self._contact_book = contact_book
         self._cooldown_s = cooldown_s
         self._settle_s = settle_s
-        self._hop_penalty_db = hop_penalty_db
+        # Spreading factor decides the demodulator limit every margin is measured
+        # against. A callable so a runtime radio reconfigure is picked up; falls
+        # back to SF7 when the host does not supply one.
+        self._sf_getter = sf_getter
+        self._noise_floor_dbm = noise_floor_dbm
+        self._min_margin_db = min_margin_db
+        self._reliable_margin_db = reliable_margin_db
         self._time = time_fn
         self._injector: Optional[Callable] = None
         # contact pubkey -> monotonic timestamp of the last teach dispatched.
         # Bounded by the contact book: keys only come from resolved contacts.
         self._last_taught: dict[bytes, float] = {}
-        # Contacts we have taught from a real inbound path. Once a contact is in
-        # here, the reverse-of-out_path guess is permanently disabled for it —
-        # see maybe_teach_reverse_of_out_path.
-        self._taught_from_evidence: Set[bytes] = set()
-        # Reciprocal PATH sends are now queued so response delivery is never
-        # blocked by TX. Count queued evidence teaches per contact so a request
-        # timeout cannot launch a speculative reverse-path teach while a real
-        # observed-path teach is still in flight.
-        self._pending_evidence_teaches: dict[bytes, int] = {}
         # In-flight teach tasks, so callers (and tests) can await completion.
         self._pending_teaches: Set[asyncio.Task] = set()
         # packet hash -> best-received copy, populated pre-dedup by
@@ -262,34 +305,14 @@ class ReturnPathTeacher:
         self._injector = injector
 
     def note_evidence_teach(self, contact_pubkey: bytes) -> None:
-        """Record that a return path was taught to ``contact_pubkey`` from a real
-        inbound path by some *other* code path.
+        """Record that a return path was taught to ``contact_pubkey`` elsewhere.
 
         :meth:`ProtocolResponseHandler._send_reciprocal_path` also teaches a
-        return path (its flood-PATH reciprocal). It must report that here, or
-        this teacher would believe the contact has never been taught and would
-        let the reverse-of-out_path guess overwrite a route that is known good.
+        return path (its flood-PATH reciprocal). Reporting it here claims the
+        cooldown, so this teacher does not immediately re-teach the same contact
+        the same route.
         """
-        key = bytes(contact_pubkey)
-        self._finish_pending_evidence_teach(key)
-        self._taught_from_evidence.add(key)
-        self._last_taught[key] = self._time()
-
-    def begin_evidence_teach(self, contact_pubkey: bytes) -> None:
-        """Record one observed-path teach queued by another handler."""
-        key = bytes(contact_pubkey)
-        self._pending_evidence_teaches[key] = self._pending_evidence_teaches.get(key, 0) + 1
-
-    def fail_evidence_teach(self, contact_pubkey: bytes) -> None:
-        """Release one queued evidence teach that failed before transmission."""
-        self._finish_pending_evidence_teach(bytes(contact_pubkey))
-
-    def _finish_pending_evidence_teach(self, key: bytes) -> None:
-        count = self._pending_evidence_teaches.get(key, 0)
-        if count <= 1:
-            self._pending_evidence_teaches.pop(key, None)
-        else:
-            self._pending_evidence_teaches[key] = count - 1
+        self._last_taught[bytes(contact_pubkey)] = self._time()
 
     def note_flood_copy(self, pkt: Packet, data: Any = None, analysis: Any = None) -> None:
         """Record a flood reply copy for best-route selection (raw RX subscriber).
@@ -297,20 +320,29 @@ class ReturnPathTeacher:
         Wired via ``dispatcher.add_raw_packet_subscriber``, which fires for every
         received packet *before* dedup — the only place later copies of a flood
         reply are visible, since dedup drops them before any handler runs. Keeps,
-        per packet hash, the highest-scoring copy (hop-penalized last-hop RSSI,
-        see :meth:`_copy_score`) so a teach triggered on the first-arrived copy
+        per packet hash, the best-ranked copy (decodability margin then hop count,
+        see :meth:`_copy_rank`) so a teach triggered on the first-arrived copy
         can still embed the best route (see :meth:`maybe_teach_from_flood_reply`).
 
-        Best-effort and cheap: only flood ``RESPONSE`` packets addressed to us are
-        recorded (exactly what triggers a teach), and any error is swallowed —
-        this runs on the hot RX path and must never disturb packet processing.
+        Best-effort and cheap: only flood packets addressed to us whose type can
+        trigger a teach are recorded (``RESPONSE`` and ``PATH``), and any error is
+        swallowed — this runs on the hot RX path and must never disturb packet
+        processing.
+
+        ``PATH`` is included because a *flood login* is answered with a flood
+        PATH-return, and the reciprocal teach that follows it
+        (``ProtocolResponseHandler._send_reciprocal_path``) is the single most
+        consequential teach we send: it decides the route the peer will use for
+        every later direct reply. Both types share the
+        ``dest_hash | src_hash | encrypted`` payload prefix, and the packet hash
+        is path-independent, so copies of either key together.
         """
         if self._injector is None:
             return
         try:
             if not pkt.is_route_flood():
                 return
-            if pkt.get_payload_type() != PAYLOAD_TYPE_RESPONSE:
+            if pkt.get_payload_type() not in _TEACHABLE_COPY_TYPES:
                 return
             payload = getattr(pkt, "payload", None)
             if payload is None or len(payload) < 2:
@@ -323,7 +355,8 @@ class ReturnPathTeacher:
                 return
             packet_hash = bytes(pkt.calculate_packet_hash())
             rssi = int(getattr(pkt, "_rssi", 0) or 0)
-            self._record_copy(packet_hash, path, len_byte, rssi)
+            snr = float(getattr(pkt, "_snr", 0) or 0)
+            self._record_copy(packet_hash, path, len_byte, rssi, snr)
         except Exception as e:  # never let a bad copy disturb RX
             self._log(f"[ReturnPath] note_flood_copy ignored a packet: {e}")
 
@@ -391,7 +424,11 @@ class ReturnPathTeacher:
         # note_flood_copy improves it with better copies during the settle window.
         packet_hash = bytes(pkt.calculate_packet_hash())
         self._record_copy(
-            packet_hash, embedded_path, in_len_byte, int(getattr(pkt, "_rssi", 0) or 0)
+            packet_hash,
+            embedded_path,
+            in_len_byte,
+            int(getattr(pkt, "_rssi", 0) or 0),
+            float(getattr(pkt, "_snr", 0) or 0),
         )
 
         return await self._teach(
@@ -403,80 +440,112 @@ class ReturnPathTeacher:
             out_path_len=out_path_len,
             shared_secret=shared_secret,
             reason=reason,
-            from_evidence=True,
             hash_key=packet_hash,
             settle_s=self._settle_s,
         )
 
     # ------------------------------------------------------------------
-    # openHop hardening: re-teach when nothing comes back at all
+    # Refine a teach that was already sent from the first-arrived copy
     # ------------------------------------------------------------------
 
-    async def maybe_teach_reverse_of_out_path(
+    def schedule_reteach_better_copy(self, **kwargs: Any) -> None:
+        """Run :meth:`maybe_reteach_better_copy` as a tracked background task.
+
+        The corrective teach waits out the settle window, so it must not be
+        awaited by the caller: the reciprocal's own send task should complete as
+        soon as the wire write does, or ``wait_for_pending_reciprocals`` (and
+        shutdown behind it) would block for the whole window. The task is tracked
+        in ``_pending_teaches``, so :meth:`wait_for_pending` still covers it.
+        """
+        if self._injector is None:
+            return
+        task = asyncio.ensure_future(self.maybe_reteach_better_copy(**kwargs))
+        self._pending_teaches.add(task)
+        task.add_done_callback(self._pending_teaches.discard)
+
+    async def maybe_reteach_better_copy(
         self,
-        contact_pubkey: bytes,
         *,
+        contact_pubkey: bytes,
+        dest_hash: int,
+        taught_path: bytes,
+        taught_len_byte: int,
+        out_path: bytes,
+        out_path_len: int,
+        shared_secret: bytes,
+        hash_key: bytes,
         reason: str,
     ) -> bool:
-        """Teach the reverse of our own ``out_path`` as the peer's route back.
+        """Re-teach once if the settle window found a better route than ``taught_path``.
 
-        This has no firmware equivalent and covers the case firmware cannot:
-        when the peer answers DIRECT down a stale route, *nothing* arrives, so
-        there is no flood reply to trigger :meth:`maybe_teach_from_flood_reply`
-        and no inbound path to embed. The best available guess is that the route
-        is symmetric — the same repeaters traversed in reverse — which is
-        exactly what a user-forced path asserts.
+        A flood reply arrives as several copies over a couple of seconds, but the
+        teach it triggers must go out immediately — the peer needs *some* usable
+        route, and delaying the reciprocal would delay the login that carries it.
+        So the caller teaches from the first-arrived copy and then calls this to
+        correct itself once the better copies have landed.
 
-        It is only ever a guess, and the peer applies whatever it last received
-        (``MyMesh::onPeerPathRecv`` overwrites ``client->out_path``
-        unconditionally). So it is strictly a **last resort**: once we have
-        taught this contact from a real inbound path, the guess is disabled for
-        good. Without that guard a merely slow first attempt would replace a
-        correct, evidence-derived route with a symmetry assumption — and if the
-        assumption is wrong the peer then replies into a void, no flood reply
-        ever arrives again, and nothing can re-teach it. That is strictly worse
-        than the pre-existing behaviour, where an untaught peer falls back to
-        flood replies that do reach us.
+        Teaching twice is safe against firmware. ``simple_repeater``'s
+        ``onPeerPathRecv`` (and ``simple_room_server``'s) stores the path with an
+        unconditional ``copyPath`` — last write wins, no comparison — touches only
+        ``last_activity`` so the REQ replay watermark is unaffected, and returns
+        ``false`` with an explicit ``// NOTE: no reciprocal path send!!``, so there
+        is no ping-pong. ``Mesh.cpp`` gates its own reciprocal on
+        ``isRouteFlood()`` too, and this teach is DIRECT, so even a
+        ``BaseChatMesh`` peer will not bounce one back.
 
-        Only meaningful when we already hold an ``out_path``; a contact still on
-        flood needs no teach because flood replies reach us anyway.
+        The residual risk is wire-order inversion: ``copyPath`` has no sequence
+        number, so if the first (worse) teach somehow landed *after* this one the
+        peer would keep the worse route. The settle window's seconds of separation
+        make that far beyond normal relay jitter, and this only transmits when the
+        route actually differs, so the common case sends nothing at all.
 
-        Returns True when a teach was dispatched.
+        Returns True when a corrective teach was transmitted.
         """
         if self._injector is None:
             return False
+        if self._settle_s > 0.0:
+            await self._settle(self._settle_s)
+
+        best = self._recent_copies.pop(bytes(hash_key), None)
+        if best is None:
+            return False
+        if best.path == taught_path and best.len_byte == taught_len_byte:
+            return False  # first copy was already the best; nothing to correct
 
         key = bytes(contact_pubkey)
-        if key in self._taught_from_evidence or key in self._pending_evidence_teaches:
-            self._log(
-                f"[ReturnPath] Skip reverse teach to 0x{key[0]:02X} ({reason}): "
-                "already taught, or being taught, from an observed inbound path"
+        try:
+            teach = PacketBuilder.create_path_return(
+                dest_hash=dest_hash,
+                src_hash=self._local_identity.get_public_key()[0],
+                secret=shared_secret,
+                path=best.path,
+                extra_type=0xFF,  # no extra payload (firmware passes NULL/0)
+                extra=b"",
+                path_len_encoded=best.len_byte,
             )
+            teach.header = (teach.header & ~PH_ROUTE_MASK) | ROUTE_TYPE_DIRECT
+            teach.set_path(out_path, out_path_len)
+            await self._injector(teach)
+        except Exception as e:
+            self._log(f"[ReturnPath] Failed to re-teach 0x{dest_hash:02X}: {e}")
             return False
 
-        out_path, out_path_len = self._known_out_path(contact_pubkey)
-        if out_path is None:
-            return False
-
-        embedded = reverse_path(out_path, out_path_len)
-        if embedded is None:
-            self._log(
-                "[ReturnPath] Skip reverse teach: stored out_path "
-                f"({len(out_path)}B) does not match path_len 0x{out_path_len:02X}"
-            )
-            return False
-
-        return await self._teach(
-            contact_pubkey=contact_pubkey,
-            dest_hash=contact_pubkey[0],
-            embedded_path=embedded,
-            embedded_len_byte=out_path_len,
-            out_path=out_path,
-            out_path_len=out_path_len,
-            shared_secret=None,
-            reason=reason,
-            from_evidence=False,
+        # Deliberately does NOT consult the cooldown: this is a correction to a
+        # teach just sent (which claimed it), not a new one. It does refresh the
+        # claim so an unrelated trigger still gets throttled.
+        self._last_taught[key] = self._time()
+        try:
+            hops = PathUtils.get_path_hash_count(best.len_byte)
+        except Exception:
+            hops = "?"
+        self._log(
+            f"[ReturnPath] Re-taught 0x{dest_hash:02X} its route back ({reason}): "
+            f"better copy {best.path.hex() or '(zero-hop)'} "
+            f"(path_len=0x{best.len_byte:02X}, {hops} hop(s), last-hop margin "
+            f"{best.margin:.1f}dB, RSSI {best.rssi}) replaces "
+            f"{taught_path.hex() or '(zero-hop)'}"
         )
+        return True
 
     # ------------------------------------------------------------------
     # Internals
@@ -527,24 +596,70 @@ class ReturnPathTeacher:
             return None
 
     def _cooldown_active(self, key: bytes) -> bool:
+        """Whether ``key``'s cooldown blocks the teach about to be dispatched.
+
+        Every teach now embeds an observed path, so there is one kind of claim
+        and the window is a plain rate limit.
+        """
         last = self._last_taught.get(key)
         return last is not None and (self._time() - last) < self._cooldown_s
 
-    # ---- best-copy collection (hop-penalized RSSI selection) ---------------
+    # ---- best-copy collection (decodability-threshold selection) ------------
 
-    def _copy_score(self, rssi: int, len_byte: int) -> float:
-        """Rank a flood copy by last-hop RSSI and routing dependency.
+    def _demod_limit_db(self) -> float:
+        """SNR limit of the demodulator at the current spreading factor."""
+        sf = RETURN_PATH_DEFAULT_SF
+        if self._sf_getter is not None:
+            try:
+                sf = int(self._sf_getter())
+            except Exception:
+                sf = RETURN_PATH_DEFAULT_SF
+        return SF_DEMOD_SNR_LIMIT_DB.get(sf, SF_DEMOD_SNR_LIMIT_DB[RETURN_PATH_DEFAULT_SF])
 
-        A routed copy pays one fixed dependency penalty plus the per-hop
-        penalty. A zero-hop copy pays neither. Both costs are finite, so a
-        materially stronger routed copy can still beat a tenuous direct link.
+    def _copy_margin_db(self, rssi: int, snr: float) -> float:
+        """How many dB of margin this copy's last hop had over the demod limit.
+
+        Two independent estimates, and the **pessimistic** one is used:
+
+        * from SNR directly — ``snr - demod_limit`` — which self-normalises for
+          whatever the noise floor happens to be;
+        * from RSSI against an assumed noise floor, for radios or paths that
+          report no SNR.
+
+        Taking the minimum means a copy counts as reliable only when neither
+        estimate calls it marginal, and it removes any need to guess whether a
+        reported ``0`` means "0 dB" or "not measured": at a genuine 0 dB SNR the
+        RSSI sits at about the noise floor, so the two estimates agree anyway.
+        """
+        limit = self._demod_limit_db()
+        from_snr = float(snr) - limit
+        from_rssi = float(rssi) - (self._noise_floor_dbm + limit)
+        return min(from_snr, from_rssi)
+
+    def _copy_rank(self, margin: float, len_byte: int, rssi: int) -> tuple:
+        """Comparable rank for a copy; larger is better.
+
+        Lexicographic, because dB only matter inside the waterfall:
+
+        * A copy at or above ``reliable_margin_db`` outranks every copy below it,
+          however strong the weaker one's signal looks. Within that reliable tier
+          the order is **fewest hops**, then margin, then RSSI — extra dB above
+          the waterfall buy nothing, so hop count decides.
+        * Below the threshold the copy is in the steep region, where each dB does
+          change delivery odds: order by margin, then fewest hops, then RSSI.
+
+        The two tiers never compare their later elements against each other (the
+        leading tier flag decides first), so an extra hop is only ever bought when
+        every shorter copy is genuinely marginal and the longer one clears the
+        threshold.
         """
         try:
             hops = PathUtils.get_path_hash_count(len_byte)
         except Exception:
             hops = 0
-        dependency_penalty = RETURN_PATH_ROUTED_DEPENDENCY_PENALTY_DB if hops else 0.0
-        return rssi - dependency_penalty - self._hop_penalty_db * hops
+        if margin >= self._reliable_margin_db:
+            return (1, -hops, margin, rssi)
+        return (0, margin, -hops, rssi)
 
     def _addressed_to_us(self, dest_hash: int) -> bool:
         """True when ``dest_hash`` is our own hash (or our hash is unknown).
@@ -574,23 +689,34 @@ class ReturnPathTeacher:
             return None
         return raw[:byte_len]
 
-    def _record_copy(self, packet_hash: bytes, path: bytes, len_byte: int, rssi: int) -> None:
-        """Keep the highest-scoring copy of a flood reply, keyed by packet hash.
+    def _record_copy(
+        self,
+        packet_hash: bytes,
+        path: bytes,
+        len_byte: int,
+        rssi: int,
+        snr: float = 0.0,
+    ) -> None:
+        """Keep the best-ranked copy of a flood reply, keyed by packet hash.
 
-        Copies are ranked by :meth:`_copy_score`, including the finite
-        routed-dependency and per-hop penalties. A routed copy can displace a
-        direct or shorter copy only when its last-hop RSSI advantage is large
-        enough to pay those costs.
+        Copies are ordered by :meth:`_copy_rank`. A copy whose margin is below
+        ``min_margin_db`` is discarded outright rather than recorded: below the
+        waterfall it is not a route, and teaching it would hand the peer a link
+        that cannot carry its replies. Discarding leaves whatever the caller
+        seeded (the first-arrived copy) as the fallback, so a teach is never lost.
         """
+        margin = self._copy_margin_db(rssi, snr)
+        if margin < self._min_margin_db:
+            return
         now = self._time()
         self._prune_copies(now)
-        score = self._copy_score(rssi, len_byte)
+        rank = self._copy_rank(margin, len_byte, rssi)
         existing = self._recent_copies.get(packet_hash)
-        if existing is not None and score <= existing.score:
+        if existing is not None and rank <= existing.rank:
             existing.ts = now  # refresh so the winning copy outlives the window
             self._recent_copies.move_to_end(packet_hash)
             return
-        self._recent_copies[packet_hash] = _FloodCopy(path, len_byte, rssi, score, now)
+        self._recent_copies[packet_hash] = _FloodCopy(path, len_byte, rssi, margin, rank, now)
         self._recent_copies.move_to_end(packet_hash)
         if len(self._recent_copies) > self._copy_cache_max:
             self._recent_copies.popitem(last=False)  # evict least-recently-touched
@@ -621,7 +747,6 @@ class ReturnPathTeacher:
         out_path_len: int,
         shared_secret: Optional[bytes],
         reason: str,
-        from_evidence: bool,
         hash_key: Optional[bytes] = None,
         settle_s: float = 0.0,
     ) -> bool:
@@ -670,7 +795,6 @@ class ReturnPathTeacher:
                 out_path=out_path,
                 out_path_len=out_path_len,
                 reason=reason,
-                from_evidence=from_evidence,
                 hash_key=hash_key,
                 settle_s=settle_s,
             )
@@ -691,7 +815,6 @@ class ReturnPathTeacher:
         out_path: bytes,
         out_path_len: int,
         reason: str,
-        from_evidence: bool,
         hash_key: Optional[bytes],
         settle_s: float,
     ) -> None:
@@ -736,12 +859,6 @@ class ReturnPathTeacher:
                 self._last_taught[key] = previous_cooldown
             self._log(f"[ReturnPath] Failed to send teach to 0x{dest_hash:02X}: {e}")
             return
-
-        # Only a confirmed send counts as evidence: marking it optimistically
-        # would permanently disable the reverse-path fallback on a teach that
-        # never left the node.
-        if from_evidence:
-            self._taught_from_evidence.add(key)
 
         if chosen_rssi is not None:
             try:

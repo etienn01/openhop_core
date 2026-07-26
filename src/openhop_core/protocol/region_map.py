@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence
 
+from .constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
 from .packet import Packet
-from .transport_keys import calc_transport_code, get_auto_key_for
+from .transport_keys import calc_transport_code, get_auto_key_for, scope_packet
 
 # Region flags mirror the MeshCore C++ definitions in RegionMap.h
 REGION_DENY_FLOOD = 0x01
@@ -85,6 +86,20 @@ class RegionMap:
             # Invalid region name; ignore it rather than raising in callers.
             return
 
+    def first_key_for(self, region: Optional[RegionEntry]) -> Optional[bytes]:
+        """Return the first transport key for ``region``, or None.
+
+        Mirrors MeshCore ``RegionMap::getTransportKeysFor(..., max_num=1)``: a
+        region resolves to at most one key here (the first one yielded), and a
+        region with no usable key (e.g. an empty private ``$`` region) yields
+        None => the caller replies plain.
+        """
+        if region is None:
+            return None
+        for key in self._iter_region_keys(region):
+            return key
+        return None
+
     def find_match(self, packet: Packet, *, mask: int = 0) -> Optional[RegionEntry]:
         """Return the first RegionEntry whose scope matches this packet.
 
@@ -116,3 +131,53 @@ class RegionMap:
                 if expected == code:
                     return region
         return None
+
+
+def capture_recv_region(region_map: Optional[RegionMap], pkt: Packet) -> None:
+    """Record the region a received packet arrived under, onto the packet.
+
+    Shared by both RX entrypoints (``Dispatcher._process_received_packet`` and
+    ``CompanionBridge.process_received_packet``) so capture is identical.
+    Mirrors firmware ``recv_pkt_region`` capture:
+
+    - ``TRANSPORT_FLOOD``: match against ``REGION_DENY_FLOOD``-honouring regions
+      and record that region's (single) key.
+    - ``FLOOD`` (wildcard) or direct: record None => a reply is sent plain,
+      never the node default.
+
+    A ``None`` region_map (standalone companion) is a no-op: ``_recv_region_captured``
+    stays False, so a reply falls through to the dispatcher default.
+    """
+    if region_map is None:
+        return
+    pkt._recv_region_captured = True
+    if pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD:
+        entry = region_map.find_match(pkt, mask=REGION_DENY_FLOOD)
+        pkt._recv_region_key = region_map.first_key_for(entry)
+    else:
+        pkt._recv_region_key = None
+
+
+def apply_reply_scope(reply_pkt: Packet, request_pkt: Optional[Packet]) -> None:
+    """Scope a freshly-built flood reply to the region its request arrived under.
+
+    A repeater/room-server reply carries the request's region (or plain when
+    the request was unscoped/direct), re-hashing the transport code over the
+    reply's own payload — never the request's code, never the node default.
+
+    - Not captured (standalone companion, ``region_map`` None): return without
+      marking, so the reply falls through to the dispatcher default.
+    - Captured with a key and the reply is a plain FLOOD: scope it
+      (=> TRANSPORT_FLOOD).
+    - Captured with no key (plain-flood/direct request, or unknown region):
+      leave the reply plain.
+
+    In every captured case the reply is marked ``_flood_scope_applied`` so the
+    dispatcher's node-default scope cannot override this decision.
+    """
+    if not getattr(request_pkt, "_recv_region_captured", False):
+        return
+    key = getattr(request_pkt, "_recv_region_key", None)
+    if key is not None and reply_pkt.get_route_type() == ROUTE_TYPE_FLOOD:
+        scope_packet(reply_pkt, key)
+    reply_pkt._flood_scope_applied = True

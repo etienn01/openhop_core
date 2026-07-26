@@ -103,6 +103,19 @@ def parse_advert_payload(payload: bytes):
     }
 
 
+def is_self_advert(payload: bytes, self_public_key: bytes) -> bool:
+    """Return True when an ADVERT payload carries our own public key.
+
+    Mesh::onRecvPacket tests ``self_id.matches(id.pub_key)`` in its ADVERT
+    branch before wasSeen() and before signature verification (Mesh.cpp:263),
+    and never routes the packet on.  A self advert is self-signed, so every
+    other check downstream passes it.
+    """
+    if not self_public_key:
+        return False
+    return len(payload) >= PUB_KEY_SIZE and payload[:PUB_KEY_SIZE] == self_public_key
+
+
 def decode_appdata(appdata: bytes) -> dict:
     result = {}
     if len(appdata) < 1:

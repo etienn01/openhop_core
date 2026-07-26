@@ -32,6 +32,7 @@ from ..protocol.constants import (
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
 from ..protocol.packet_utils import PathUtils
+from ..protocol.region_map import RegionMap, capture_recv_region
 from .companion_base import CompanionBase
 from .constants import (
     ADV_TYPE_CHAT,
@@ -206,6 +207,12 @@ class CompanionBridge(CompanionBase):
         )
         self._packet_injector = packet_injector
 
+        # Region registry for reply-region capture. None by default so a
+        # standalone bridge captures nothing (replies fall through to plain). The
+        # host repeater points this at its dispatcher's region_map so incoming
+        # request regions are captured and mirrored onto replies.
+        self.region_map: Optional[RegionMap] = None
+
         async def _handler_send_packet(pkt: Packet, wait_for_ack: bool = False) -> bool:
             return await self._packet_injector(pkt, wait_for_ack=wait_for_ack)
 
@@ -263,11 +270,41 @@ class CompanionBridge(CompanionBase):
         self._protocol_response_handler = core.protocol_response_handler
         self._login_response_handler = core.login_response_handler
         self._text_handler_ref = core.text_handler
+        # A pending login must not let the login handler claim an unrelated
+        # status/telemetry/neighbours reply from the same contact.
+        core.login_response_handler.set_foreign_request_probe(self.has_pending_request_tag)
         core.protocol_response_handler.set_binary_response_callback(self._on_binary_response)
         core.protocol_response_handler.set_packet_injector(self._packet_injector)
         core.protocol_response_handler.set_contact_path_updated_callback(
             self._on_contact_path_updated
         )
+
+    # -------------------------------------------------------------------------
+    # Pre-dedup flood-copy feed (host-wired)
+    # -------------------------------------------------------------------------
+
+    def note_flood_copy(self, pkt: Packet, data: Any = None, analysis: Any = None) -> None:
+        """Feed one pre-dedup copy of a flood reply to the return-path teacher.
+
+        The host must wire this into its dispatcher's raw subscribers::
+
+            dispatcher.add_raw_packet_subscriber(bridge.note_flood_copy)
+
+        A bridge does not own a dispatcher, and the host delivers only the
+        *first* copy of a flood reply to :meth:`process_received_packet` — later
+        copies are dropped by the host's own seen-table before they get here. So
+        without this hook the teacher only ever sees the first-arrived route,
+        which on a live mesh is routinely the worst one: observed here, four
+        copies of one login reply landed over ~1.8 s and the teach went out
+        0.4 s in, embedding the marginal first route. See
+        :meth:`ReturnPathTeacher.note_flood_copy` for the selection itself.
+
+        Best-effort and never raises: this runs on the host's hot RX path.
+        """
+        teacher = getattr(self._protocol_response_handler, "return_path_teacher", None)
+        if teacher is None:
+            return
+        teacher.note_flood_copy(pkt, data, analysis)
 
     # -------------------------------------------------------------------------
     # Handler accessors (used by CompanionBase concrete send methods)
@@ -420,6 +457,11 @@ class CompanionBridge(CompanionBase):
         route_type = packet.get_route_type()
         is_flood = route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD)
         self.stats.record_rx(is_flood=is_flood)
+
+        # Capture the region this request arrived under before the handler
+        # builds any reply, so a flood reply is scoped to that region (or plain).
+        # No-op when no RegionMap is configured (standalone bridge).
+        capture_recv_region(self.region_map, packet)
 
         handler = self._handlers.get(ptype)
         if handler:

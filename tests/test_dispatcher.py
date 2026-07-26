@@ -583,6 +583,60 @@ class TestDispatcherSendPacket:
         assert path_len_byte == 0x40
 
     @pytest.mark.asyncio
+    async def test_server_reply_width_survives_to_the_wire(self, dispatcher):
+        """A handler's mirrored reply width reaches the radio, node default and all.
+
+        The seam test for the rest of this behaviour: LoginServerHandler marks
+        ``_path_hash_mode_applied`` and the dispatcher honours the marker, but
+        each half is otherwise asserted in its own file. This drives a real
+        handler-built login reply through ``send_packet`` with a *conflicting*
+        node default and checks the serialized ``path_len`` byte, so a future
+        change that reconstructs the reply between handler and radio -- dropping
+        an attribute that is not part of the wire format -- fails here rather
+        than silently reverting to the node's own width on the air.
+        """
+        import struct
+        import time
+
+        from openhop_core.node.handlers.login_server import LoginServerHandler
+        from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity
+        from openhop_core.protocol.constants import PAYLOAD_TYPE_ANON_REQ, PH_TYPE_SHIFT
+
+        server, client = LocalIdentity(), LocalIdentity()
+        secret = Identity(server.get_public_key()).calc_shared_secret(client.get_private_key())
+
+        sent = []
+        handler = LoginServerHandler(
+            server, lambda *_: None, authenticate_callback=lambda *a, **k: (True, 0x03)
+        )
+        handler.set_send_packet_callback(lambda pkt, delay: sent.append(pkt))
+
+        # Flood login carrying two hops of 3-byte hashes.
+        plaintext = struct.pack("<I", int(time.time())) + b"admin123\x00"
+        login = Packet()
+        login.header = (PAYLOAD_TYPE_ANON_REQ << PH_TYPE_SHIFT) | ROUTE_TYPE_FLOOD
+        login.payload = bytearray(
+            bytes([server.get_public_key()[0]])
+            + client.get_public_key()
+            + CryptoUtils.encrypt_then_mac(secret[:16], secret, plaintext)
+        )
+        login.payload_len = len(login.payload)
+        login.path = bytearray(range(6))
+        login.path_len = PathUtils.encode_path_len(3, 2)
+
+        await handler(login)
+        assert len(sent) == 1
+
+        # Node prefers 1-byte; the request's 3-byte width must win on the wire.
+        dispatcher.set_default_path_hash_mode(0)
+        await dispatcher.send_packet(sent[0])
+
+        raw = dispatcher.radio.tx_data
+        assert raw is not None
+        assert PathUtils.get_path_hash_size(raw[1]) == 3
+        assert PathUtils.get_path_hash_count(raw[1]) == 0
+
+    @pytest.mark.asyncio
     async def test_trace_flood_rejected(self, dispatcher):
         """TRACE payload with flood route is rejected; send_packet returns False and no TX."""
         from openhop_core.protocol.constants import PH_TYPE_SHIFT

@@ -38,6 +38,7 @@ from ...protocol.constants import (
     PAYLOAD_TYPE_RESPONSE,
 )
 from ...protocol.packet_utils import PathUtils
+from ...protocol.region_map import apply_reply_scope
 from .base import BaseHandler
 from .login_server import LoginServerHandler
 from .result import HandlerResult
@@ -312,6 +313,25 @@ class AnonRequestHandler(BaseHandler):
                     extra=reply_data,
                     path_len_encoded=(packet.path_len if packet.path_len > 0 else None),
                 )
+                # Accumulate this reply's path at the *request's* hash width.
+                # Firmware: sendFloodReply(path, SERVER_RESPONSE_DELAY,
+                # packet->getPathHashSize()) (simple_repeater onAnonDataRecv).
+                # The node's own path_hash_mode governs self-originated floods,
+                # not replies, so mark it applied to keep the dispatcher default
+                # from stamping over the mirror. Distinct from ``hash_size``
+                # above, which is the client's *reply-path* descriptor.
+                #
+                # This branch is currently unreachable: every discovery sub-type
+                # is gated route-direct in ``__call__`` (firmware gates all three
+                # the same way), and the login sub-type is delegated to
+                # LoginServerHandler, which mirrors the width itself. Kept correct
+                # so relaxing that gate cannot silently reintroduce the mismatch.
+                in_hash_size = (
+                    PathUtils.get_path_hash_size(packet.path_len)
+                    if PathUtils.is_valid_path_len(packet.path_len)
+                    else 1
+                )
+                response_pkt.apply_path_hash_mode(in_hash_size - 1, mark_applied=True)
             else:
                 # Direct reply routed along the path supplied in the request.
                 response_pkt = PacketBuilder.create_datagram(
@@ -325,6 +345,10 @@ class AnonRequestHandler(BaseHandler):
                 if reply_path_len > 0 and path_bytes:
                     encoded = PathUtils.encode_path_len(hash_size, reply_path_len)
                     response_pkt.set_path(path_bytes, encoded)
+
+            # Scope the flood path-return reply to the region the request arrived
+            # under; a direct reply captures no region and stays plain.
+            apply_reply_scope(response_pkt, packet)
 
             self._send_packet_callback(response_pkt, SERVER_RESPONSE_DELAY_MS)
             route = "flood" if packet.is_route_flood() else "direct"
