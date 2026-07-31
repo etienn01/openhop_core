@@ -1,21 +1,21 @@
-# pyMC_Core
+# openHop Core
 
-[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://pymc-dev.github.io/pyMC_core/)
-[![PyPI](https://img.shields.io/pypi/v/pymc-core)](https://pypi.org/project/pymc-core/)
+[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://pymc-dev.github.io/openhop-core/)
+[![PyPI](https://img.shields.io/pypi/v/openhop-core)](https://pypi.org/project/openhop-core/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**pyMC_Core** is a Python reimplementation of [MeshCore](https://github.com/meshcore-dev/meshcore) — a lightweight, portable C++ library for multi-hop packet routing using LoRa radios. Designed for **Raspberry Pi** and similar hardware, pyMC_Core communicates with LoRa modules over **SPI**.
+**openHop Core** is a Python reimplementation of [MeshCore](https://github.com/meshcore-dev/meshcore) — a lightweight, portable C++ library for multi-hop packet routing using LoRa radios. Designed for **Raspberry Pi** and similar hardware, openHop Core communicates with LoRa modules over **SPI**.
 
-> pyMC_Core is under active development. It's compatible with the original MeshCore protocol, but not yet as optimized or elegant as its C++ counterpart.
+> openHop Core is under active development. It's compatible with the original MeshCore protocol, but not yet as optimized or elegant as its C++ counterpart.
 
 ## Documentation
 
-**Complete documentation is available at **[https://rightup.github.io/pyMC_core/](https://pymc-dev.github.io/pyMC_core/)**
+**Complete documentation is available at **[https://rightup.github.io/openhop-core/](https://pymc-dev.github.io/openhop-core/)**
 
 ### Quick Links
-- [Node Usage Guide](https://pymc-dev.github.io/pyMC_core/node/) - Guide for using MeshNode
-- [Examples](https://pymc-dev.github.io/pyMC_core/examples/) - Working code examples
-- [API Reference](https://pymc-dev.github.io/pyMC_core/api/) - Detailed API documentation
+- [Node Usage Guide](https://pymc-dev.github.io/openhop-core/node/) - Guide for using MeshNode
+- [Examples](https://pymc-dev.github.io/openhop-core/examples/) - Working code examples
+- [API Reference](https://pymc-dev.github.io/openhop-core/api/) - Detailed API documentation
 
 ## Quick Start
 
@@ -25,32 +25,32 @@
 >
 > ```bash
 > # Create virtual environment
-> python3 -m venv pymc_env
+> python3 -m venv openhop_env
 >
 > # Activate virtual environment
 > # On Linux/Mac:
-> source pymc_env/bin/activate
+> source openhop_env/bin/activate
 > # On Windows:
-> pymc_env\Scripts\activate
+> openhop_env\Scripts\activate
 > ```
 
 ```bash
 # Install from PyPI
-pip install pymc-core
+pip install openhop-core
 
 # For hardware support (SX1262 radios)
-pip install pymc-core[hardware]
+pip install openhop-core[hardware]
 
 # Install all dependencies
-pip install pymc-core[all]
+pip install openhop-core[all]
 ```
 
 ### Basic Usage
 
 ```python
 import asyncio
-from pymc_core import MeshNode, LocalIdentity
-from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+from openhop_core import MeshNode, LocalIdentity
+from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
 async def main():
     # Create radio (Waveshare HAT example)
@@ -71,7 +71,7 @@ async def main():
 asyncio.run(main())
 ```
 
-For examples, see the [documentation](https://pymc-dev.github.io/pyMC_core/examples/).
+For examples, see the [documentation](https://pymc-dev.github.io/openhop-core/examples/).
 
 ## Hardware Support
 
@@ -84,7 +84,7 @@ For examples, see the [documentation](https://pymc-dev.github.io/pyMC_core/examp
 - Raspberry Pi (or compatible SBC)
 - SX1262 LoRa module
 - SPI interface enabled
-- Python 3.8+
+- Python 3.9+
 
 ## What is MeshCore?
 
@@ -126,8 +126,8 @@ It occupies a middle ground between:
 ## Project Structure
 
 ```
-pyMC_Core/
-├── src/pymc_core/          # Main package
+openHop Core/
+├── src/openhop_core/          # Main package
 │   ├── hardware/           # Radio hardware interfaces
 │   ├── node/               # MeshNode implementation
 │   ├── protocol/           # Packet protocols
@@ -149,14 +149,14 @@ pyMC_Core/
 
 ## Contributing
 
-Contributions are welcome! Please see our [contributing guide](https://pymc-dev.github.io/pyMC_core/contributing/) for details.
+Contributions are welcome! Please see our [contributing guide](https://pymc-dev.github.io/openhop-core/contributing/) for details.
 
 ### Development Setup
 
 ```bash
 # Clone the repository
-git clone https://github.com/rightup/pyMC_Core.git
-cd pyMC_Core
+git clone https://github.com/rightup/openHop Core.git
+cd openHop Core
 
 # Install development dependencies
 pip install -e .[dev]
@@ -177,9 +177,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Support
 
-- [Documentation](https://pymc-dev.github.io/pyMC_core/)
-- [Issues](https://github.com/pymc-dev/pyMC_Core/issues)
-- [Discussions](https://github.com/pymc-dev/pyMC_Core/discussions)
+- [Documentation](https://pymc-dev.github.io/openhop-core/)
+- [Issues](https://github.com/openhop-dev/openHop Core/issues)
+- [Discussions](https://github.com/openhop-dev/openHop Core/discussions)
 - [pyMC Discord](https://discord.gg/3s8MMaSTzq)
 - [Meshcore Discord](https://meshcore.gg/)
 
