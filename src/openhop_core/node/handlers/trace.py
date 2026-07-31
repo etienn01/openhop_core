@@ -5,7 +5,7 @@ for network diagnostics and analysis.
 """
 
 import struct
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from ...protocol import Packet
 from ...protocol.constants import PAYLOAD_TYPE_TRACE
@@ -19,9 +19,18 @@ class TraceHandler:
     They contain tag, auth_code, flags, and trace path information with SNR data.
     """
 
-    def __init__(self, log_fn: Callable[[str], None], protocol_response_handler=None):
+    def __init__(
+        self,
+        log_fn: Callable[[str], None],
+        protocol_response_handler=None,
+        on_trace_complete: Optional[Callable[[Packet, Dict[str, Any]], Awaitable[None]]] = None,
+    ):
         self._log = log_fn
         self._protocol_response_handler = protocol_response_handler
+
+        # Optional: when a direct TRACE reaches the end of its path (firmware
+        # onTraceRecv), call this (packet, parsed_data) to push 0x89 to clients.
+        self.on_trace_complete = on_trace_complete
 
         # Callbacks for trace responses
         self._response_callbacks: Dict[int, Callable[[bool, str, Dict[str, Any]], None]] = {}
@@ -98,11 +107,29 @@ class TraceHandler:
                             f"for 0x{contact_hash:02X}"
                         )
 
+            # When the trace has reached the end of its path this node is the
+            # originator/final hop, so push completion data instead of relaying.
+            if self.on_trace_complete:
+                trace_bytes: bytes = parsed_data.get("trace_path_bytes") or b""
+                hash_width = parsed_data.get("path_hash_width", 0)
+                if self._is_trace_complete(pkt, trace_bytes, hash_width):
+                    try:
+                        await self.on_trace_complete(pkt, parsed_data)
+                    except Exception as e:
+                        self._log(f"[TraceHandler] on_trace_complete error: {e}")
+
             return parsed_data
 
         except Exception as e:
             self._log(f"[TraceHandler] Error processing trace packet: {e}")
             return None
+
+    def _is_trace_complete(self, pkt: Packet, trace_bytes: bytes, hash_width: int) -> bool:
+        """Mirror Mesh.cpp: offset = path_len<<path_sz >= len(trace hash bytes)."""
+        if not trace_bytes or hash_width <= 0:
+            return False
+        snr_count = len(pkt.path)
+        return snr_count * hash_width >= len(trace_bytes)
 
     def _parse_trace_payload(self, payload: bytes) -> Dict[str, Any]:
         """Parse trace packet payload.

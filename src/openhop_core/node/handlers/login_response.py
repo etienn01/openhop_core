@@ -1,11 +1,13 @@
-import asyncio
 import struct
 from typing import Callable, Optional
 
 from ...protocol import CryptoUtils, Identity, Packet
 from ...protocol.constants import PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_RESPONSE
 from ...protocol.packet_utils import PathUtils
+from ...util.callbacks import invoke_maybe_awaitable
 from .base import BaseHandler
+from .result import HandlerResult
+from .return_path import ReturnPathTeacher
 
 # Response codes from C++ server
 RESP_SERVER_LOGIN_OK = 0x80
@@ -31,27 +33,113 @@ class LoginResponseHandler(BaseHandler):
     def payload_type() -> int:
         return PAYLOAD_TYPE_RESPONSE
 
-    def __init__(self, local_identity, contacts, log_fn, login_callback=None):
+    def __init__(self, local_identity, contacts, log_fn, *, return_path_teacher=None):
         self.local_identity = local_identity
         self.contacts = contacts
         self.log = log_fn
-        self.login_callback = login_callback  # Callback to notify of login success/failure
+        # Shared with ProtocolResponseHandler by the factory; constructed here
+        # when absent so standalone use still works (see :mod:`.return_path`).
+        self.return_path_teacher = return_path_teacher or ReturnPathTeacher(
+            log_fn, local_identity, contacts
+        )
+        # Pending login completions keyed by the target contact's full public key
+        # (32 bytes). A response is dispatched only to the waiter whose target
+        # matches the authenticated sender, mirroring the firmware sender gate
+        # (companion_radio MyMesh.cpp: pending_login compared against the
+        # responding contact's pubkey) generalized to concurrent logins.
+        self._pending_logins = {}  # pubkey bytes -> callback
         # Store login passwords persistently (not tied to contact objects)
         self._active_login_passwords = {}  # dest_hash -> password
         # Protocol response handler for forwarding telemetry responses
         self._protocol_response_handler = None
+        # See set_foreign_request_probe: distinguishes a login reply from any
+        # other reply that happens to arrive while a login is pending.
+        self._foreign_request_probe: Optional[Callable[[int, bytes], bool]] = None
+
+    def set_packet_injector(self, injector) -> None:
+        """Wire the transmit path used for return-path teaching.
+
+        Companion layers normally reach the shared teacher through
+        ``ProtocolResponseHandler.set_packet_injector``; this exists so a
+        standalone ``LoginResponseHandler`` can teach too, instead of silently
+        no-opping.
+        """
+        self.return_path_teacher.set_injector(injector)
 
     def set_protocol_response_handler(self, protocol_response_handler):
         """Set protocol response handler for forwarding telemetry responses."""
         self._protocol_response_handler = protocol_response_handler
 
-    def set_login_callback(self, callback: Callable[[bool, dict], None]):
-        """Set callback to notify when login response is received.
+    def register_login_callback(self, pubkey: bytes, callback: Callable[[bool, dict], None]):
+        """Register a completion for a login to the contact with ``pubkey``.
 
-        Args:
-            callback: Function that accepts (success: bool, response_data: dict)
+        Keyed by the target's full public key (not the 1-byte dest hash, which
+        collides). The callback accepts (success: bool, response_data: dict).
         """
-        self.login_callback = callback
+        self._pending_logins[bytes(pubkey)] = callback
+
+    def remove_login_callback(self, pubkey: bytes, callback) -> None:
+        """Remove the pending login for ``pubkey`` only if it is ``callback``.
+
+        Identity-guarded so a timed-out login never clears a concurrent login's
+        pending completion.
+        """
+        key = bytes(pubkey)
+        if self._pending_logins.get(key) is callback:
+            del self._pending_logins[key]
+
+    @staticmethod
+    def _pubkey_bytes(contact) -> bytes:
+        """Return a contact's public key as 32 raw bytes (hex str or bytes)."""
+        pk = contact.public_key
+        return pk if isinstance(pk, bytes) else bytes.fromhex(pk)
+
+    def _is_foreign_request_reply(self, response_data: Optional[dict], contact) -> bool:
+        """True when this reply answers some *other* pending request, not a login.
+
+        Best-effort: with no probe wired, or no decodable tag, behaviour is
+        unchanged (the login branch decides), so a standalone handler keeps
+        working exactly as before.
+        """
+        if self._foreign_request_probe is None or not response_data:
+            return False
+        tag = response_data.get("timestamp")
+        if tag is None:
+            return False
+        try:
+            if not self._foreign_request_probe(int(tag) & 0xFFFFFFFF, self._pubkey_bytes(contact)):
+                return False
+        except Exception as e:
+            self.log(f"Foreign-request probe failed: {e}")
+            return False
+        self.log(
+            f"Response from '{getattr(contact, 'name', '?')}' reflects tag "
+            f"0x{int(tag) & 0xFFFFFFFF:08X} of a pending request, not a login; forwarding"
+        )
+        return True
+
+    def _has_pending_login_for_hash(self, lookup_hash: int) -> bool:
+        """True when any pending login (or stored password) targets this hash."""
+        if lookup_hash in self._active_login_passwords:
+            return True
+        return any(key and key[0] == lookup_hash for key in self._pending_logins)
+
+    async def _forward_to_protocol_handler(self, packet) -> HandlerResult:
+        """Route a RESPONSE that is not a pending login onward.
+
+        Telemetry/status responses correlate in the protocol response handler.
+        PATH packets are skipped: PathHandler already invoked the protocol
+        response handler for them before we were called.
+        """
+        if self._protocol_response_handler:
+            if packet.get_payload_type() == PAYLOAD_TYPE_PATH:
+                return HandlerResult.not_for_us()
+            try:
+                result = await self._protocol_response_handler(packet)
+                return result if isinstance(result, HandlerResult) else HandlerResult.not_for_us()
+            except Exception as e:
+                self.log("Error forwarding RESPONSE packet to " f"protocol response handler: {e}")
+        return HandlerResult.not_for_us()
 
     def store_login_password(self, dest_hash: int, password: str):
         """Store password for response decryption by destination hash."""
@@ -62,10 +150,35 @@ class LoginResponseHandler(BaseHandler):
         if dest_hash in self._active_login_passwords:
             del self._active_login_passwords[dest_hash]
 
-    async def __call__(self, packet: Packet) -> None:
-        """Handle RESPONSE or ANON_REQ packets for login authentication."""
+    def set_foreign_request_probe(self, probe: Optional[Callable[[int, bytes], bool]]) -> None:
+        """Wire a check for "this reflected tag belongs to some other request".
+
+        ``probe(tag, contact_pubkey)`` returns True when the tag matches a pending
+        binary/protocol request rather than a login. Without it, a pending login
+        makes this handler claim *every* authenticated RESPONSE from that contact,
+        because a login reply and a status/telemetry/neighbours reply are
+        indistinguishable by contact alone.
+
+        Firmware has the same ambiguity but a one-response window — MyMesh
+        ``onContactResponse`` clears ``pending_login`` on the first response from
+        the contact, so at most one packet can be misread. openHop deliberately
+        keeps a login waiter alive far longer (``FRAME_LOGIN_PENDING_TTL_S``, so a
+        late flood login reply still completes), which without this probe turns
+        that one-packet window into a two-minute one: observed live, a 148-byte
+        neighbours reply was consumed here and reported as ``Login failed (code:
+        0x2F)`` — 0x2F being the low byte of its ``neighbours_count`` of 47.
+
+        The reflected request tag is the discriminator firmware itself points at
+        (``// FUTURE: tag == pending_status``): every protocol/binary request
+        reflects its timestamp in the response's first four bytes, and the sender
+        registered that tag when it sent the request.
+        """
+        self._foreign_request_probe = probe
+
+    async def __call__(self, packet: Packet) -> HandlerResult:
+        """Handle RESPONSE/ANON_REQ packets and report MAC ownership."""
         if len(packet.payload) < 4:
-            return
+            return HandlerResult.not_for_us()
 
         # Determine packet structure: ANON_REQ has our pubkey at bytes 1-33
         if (
@@ -83,28 +196,18 @@ class LoginResponseHandler(BaseHandler):
             encrypted_start = 2
             lookup_hash = src_hash  # For RESPONSE, look up by source hash
 
-            # Check if this response is for us
-            our_hash = self.local_identity.get_public_key()[0]
-            if dest_hash != our_hash and src_hash != our_hash:
-                return
+        # Check the on-air destination before trying any candidate secret.
+        if dest_hash != self.local_identity.get_public_key()[0]:
+            return HandlerResult.not_for_us()
 
-        # Find stored password and matching contact(s)
-        if lookup_hash not in self._active_login_passwords:
-            # This might be a telemetry response, not a login response
-            # Forward to protocol response handler if available (only for RESPONSE packets;
-            # PATH packets are already handled by PathHandler before we are called).
-            if self._protocol_response_handler:
-                pkt_type = (packet.header >> 2) & 0x0F
-                if pkt_type == PAYLOAD_TYPE_PATH:
-                    return  # PathHandler already invoked protocol_response_handler for this packet
-                try:
-                    await self._protocol_response_handler(packet)
-                    return
-                except Exception as e:
-                    self.log(
-                        "Error forwarding RESPONSE packet to " f"protocol response handler: {e}"
-                    )
-            return
+        # Gate: only attempt login processing while a login is actually pending
+        # for this 1-byte hash. The full-pubkey pending map is authoritative so
+        # one login completing cannot close the gate on a concurrent login to a
+        # hash-colliding contact; the legacy per-hash password store is kept as
+        # a compatibility gate.
+        if not self._has_pending_login_for_hash(lookup_hash):
+            # Not a login response (e.g. telemetry/status); route onward.
+            return await self._forward_to_protocol_handler(packet)
 
         # Collect all contacts whose public_key first byte matches (hash collision / multiple peers)
         candidates = []
@@ -118,35 +221,70 @@ class LoginResponseHandler(BaseHandler):
                 continue
 
         if not candidates:
-            if self.login_callback:
-                await self._safe_callback(
-                    False,
-                    {
-                        "error": "No contact found for login response (src_hash=0x%02x)"
-                        % lookup_hash
-                    },
-                )
-            return
+            # No contact matches the responding key: nothing to correlate to a
+            # waiter (firmware ignores a response from a non-matching contact).
+            self.log("No contact found for login response (src_hash=0x%02x)" % lookup_hash)
+            return HandlerResult.not_for_us()
 
         # Try each candidate until one decrypts successfully (same shared-secret as firmware)
+        authenticated = False
         response_data = None
         matched_contact = None
         for contact in candidates:
-            response_data = await self._decrypt_response(packet, contact, encrypted_start)
-            if response_data:
+            authenticated, response_data = await self._decrypt_response(
+                packet, contact, encrypted_start
+            )
+            if authenticated:
                 matched_contact = contact
                 break
 
-        if response_data and matched_contact:
+        if authenticated and matched_contact:
+            # A reply whose reflected tag belongs to a pending binary/protocol
+            # request is not a login reply, even though a login is pending for
+            # this contact. Checked before the login branch so the payload is
+            # never parsed with the login layout — doing so reads a foreign field
+            # as a response code and reports a bogus login failure, and the real
+            # request's data is lost. Forwarding also leaves the return-path teach
+            # to the protocol handler, which does it for its own responses.
+            if self._is_foreign_request_reply(response_data, matched_contact):
+                return await self._forward_to_protocol_handler(packet)
+            if self._pubkey_bytes(matched_contact) not in self._pending_logins:
+                # Authenticated, but this contact has no login pending: not a
+                # login response. Mirrors firmware onContactResponse, where a
+                # pending_login pubkey mismatch falls through to the status/
+                # telemetry matchers instead of being treated as a login.
+                return await self._forward_to_protocol_handler(packet)
+            # Firmware parity (BaseChatMesh::onPeerDataRecv RESPONSE branch):
+            # a login sent DIRECT down a forced path is answered by the server
+            # with a *flood* RESPONSE (simple_repeater MyMesh::onAnonDataRecv,
+            # the reply_path_len < 0 branch). That is the tell that the server
+            # holds no usable out_path for us, and it is the only signal we get
+            # before the first CLI request goes out — so teach the route back
+            # now, or every subsequent REQ is answered down a dead route.
+            # PATH-shaped responses are excluded: the reciprocal for those is
+            # already sent by ProtocolResponseHandler.
+            if packet.get_payload_type() == PAYLOAD_TYPE_RESPONSE:
+                await self.return_path_teacher.maybe_teach_from_flood_reply(
+                    packet,
+                    self._pubkey_bytes(matched_contact),
+                    lookup_hash,
+                    reason="flood login RESPONSE",
+                )
+            if response_data is None:
+                self.log("Authenticated login response had invalid or incomplete contents")
+                return HandlerResult.consumed()
             await self._process_login_response(response_data, matched_contact)
             self.clear_login_password(lookup_hash)
-        elif self.login_callback:
-            await self._safe_callback(False, {"error": "Failed to decrypt login response"})
+            return HandlerResult.consumed()
+        # Decryption failed for every candidate: the response is not authentically
+        # ours, so no waiter is resolved (firmware ignores it).
+        self.log("Failed to decrypt login response")
+        return HandlerResult.not_for_us()
 
     async def _decrypt_response(
         self, packet: Packet, contact, encrypted_start: int = 2
-    ) -> Optional[dict]:
-        """Decrypt the login response using the contact's password."""
+    ) -> tuple[bool, Optional[dict]]:
+        """Decrypt the login response and separately report MAC authentication."""
         try:
             # Extract encrypted portion (skip the header part)
             encrypted_data = packet.payload[encrypted_start:]
@@ -164,23 +302,27 @@ class LoginResponseHandler(BaseHandler):
             plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_data)
 
             if not plaintext:
-                return None
+                return False, None
 
             # If this is a PATH packet, unwrap the path-return envelope to get
             # the inner response.  PATH format after decryption:
             #   path_len(1) + path(N) + extra_type(1) + extra_data(M)
-            pkt_type = (packet.header >> 2) & 0x0F
-            if pkt_type == PAYLOAD_TYPE_PATH and len(plaintext) >= 2:
+            pkt_type = packet.get_payload_type()
+            if pkt_type == PAYLOAD_TYPE_PATH:
+                if len(plaintext) < 1 or not PathUtils.is_valid_path_len(plaintext[0]):
+                    return False, None
                 path_len_byte = plaintext[0]
                 path_byte_len = PathUtils.get_path_byte_len(path_len_byte)
                 inner_offset = 1 + path_byte_len + 1  # skip path_len + path + extra_type
-                if PathUtils.is_valid_path_len(path_len_byte) and len(plaintext) >= inner_offset:
-                    extra_type = plaintext[1 + path_byte_len] & 0x0F
-                    if extra_type == PAYLOAD_TYPE_RESPONSE and len(plaintext) > inner_offset:
-                        plaintext = plaintext[inner_offset:]
+                if len(plaintext) < inner_offset:
+                    return False, None
+                extra_type = plaintext[1 + path_byte_len] & 0x0F
+                if extra_type != PAYLOAD_TYPE_RESPONSE or len(plaintext) <= inner_offset:
+                    return True, None
+                plaintext = plaintext[inner_offset:]
 
             if len(plaintext) < 12:
-                return None
+                return True, None
 
             # Parse the C++ response format (handleLoginReq reply_data):
             # timestamp(4) + response_code(1) + keep_alive(1) + is_admin(1) +
@@ -191,7 +333,7 @@ class LoginResponseHandler(BaseHandler):
             random_blob = plaintext[8:12]
             firmware_ver_level = int(plaintext[12]) if len(plaintext) >= 13 else None
 
-            return {
+            return True, {
                 "timestamp": timestamp,
                 "response_code": response_code,
                 "keep_alive_interval": keep_alive,
@@ -203,7 +345,7 @@ class LoginResponseHandler(BaseHandler):
             }
 
         except Exception:
-            return None
+            return False, None
 
     async def _process_login_response(self, response_data: dict, contact):
         """Process the decrypted login response."""
@@ -217,17 +359,19 @@ class LoginResponseHandler(BaseHandler):
         else:
             self.log(f"Login failed to '{contact.name}' " f"(code: 0x{response_code:02X})")
 
-        if self.login_callback:
-            await self._safe_callback(success, response_data)
+        # Dispatch ONLY to the waiter whose target matches this authenticated
+        # sender's full public key. No pending login for this contact → resolve
+        # nothing (firmware ignores a response from a non-pending contact).
+        callback = self._pending_logins.get(self._pubkey_bytes(contact))
+        if callback is not None:
+            await self._safe_callback(callback, success, response_data)
+        else:
+            self.log(f"No pending login for '{contact.name}' - login response ignored")
 
-    async def _safe_callback(self, success: bool, data: dict):
-        """Safely call the login callback without blocking."""
+    async def _safe_callback(self, callback, success: bool, data: dict):
+        """Safely invoke a login completion callback without blocking."""
         try:
-            if self.login_callback is not None:
-                if asyncio.iscoroutinefunction(self.login_callback):
-                    await self.login_callback(success, data)
-                else:
-                    self.login_callback(success, data)
+            await invoke_maybe_awaitable(callback, success, data)
         except Exception as e:
             self.log(f"Error in login callback: {e}")
 
@@ -245,8 +389,11 @@ class AnonReqResponseHandler(BaseHandler):
         self.log = log_fn
         self.login_response_handler = LoginResponseHandler(local_identity, contacts, log_fn)
 
-    def set_login_callback(self, callback):
-        self.login_response_handler.set_login_callback(callback)
+    def register_login_callback(self, pubkey: bytes, callback):
+        self.login_response_handler.register_login_callback(pubkey, callback)
+
+    def remove_login_callback(self, pubkey: bytes, callback):
+        self.login_response_handler.remove_login_callback(pubkey, callback)
 
     def store_login_password(self, dest_hash: int, password: str):
         self.login_response_handler.store_login_password(dest_hash, password)

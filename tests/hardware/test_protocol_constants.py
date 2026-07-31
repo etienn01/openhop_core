@@ -24,7 +24,6 @@ from openhop_core.hardware.protocol_constants import (
     crc16_ccitt,
 )
 
-
 # ───────────────────────── CRC ─────────────────────────────────────
 
 

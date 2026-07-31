@@ -14,6 +14,7 @@ from .path import PathHandler
 from .protocol_request import ProtocolRequestHandler
 from .protocol_response import ProtocolResponseHandler
 from .registry import CoreHandlers, create_core_handlers
+from .result import HandlerResult
 from .text import TextMessageHandler
 from .trace import TraceHandler
 
@@ -35,4 +36,5 @@ __all__ = [
     "ControlHandler",
     "CoreHandlers",
     "create_core_handlers",
+    "HandlerResult",
 ]

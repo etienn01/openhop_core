@@ -75,9 +75,16 @@ from .packet_utils import (
     PathUtils,
     RouteTypeUtils,
 )
-from .region_map import REGION_DENY_DIRECT, REGION_DENY_FLOOD, RegionEntry, RegionMap
-from .transport_keys import calc_transport_code, get_auto_key_for
-from .utils import decode_appdata, parse_advert_payload
+from .region_map import (
+    REGION_DENY_DIRECT,
+    REGION_DENY_FLOOD,
+    RegionEntry,
+    RegionMap,
+    apply_reply_scope,
+    capture_recv_region,
+)
+from .transport_keys import calc_transport_code, get_auto_key_for, scope_packet
+from .utils import decode_appdata, is_self_advert, parse_advert_payload
 
 __all__ = [
     # Core classes
@@ -93,12 +100,16 @@ __all__ = [
     "RegionEntry",
     "REGION_DENY_FLOOD",
     "REGION_DENY_DIRECT",
+    "capture_recv_region",
+    "apply_reply_scope",
     # Utility functions
     "parse_advert_payload",
     "decode_appdata",
     "describe_advert_flags",
+    "is_self_advert",
     "get_auto_key_for",
     "calc_transport_code",
+    "scope_packet",
     # Utility classes
     "PacketValidationUtils",
     "PacketDataUtils",

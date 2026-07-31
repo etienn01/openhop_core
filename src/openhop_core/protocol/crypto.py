@@ -10,8 +10,7 @@ from nacl.bindings import (
     crypto_sign_ed25519_sk_to_curve25519,
 )
 
-CIPHER_MAC_SIZE = 2  # matches firmware
-CIPHER_BLOCK_SIZE = 16
+from .constants import CIPHER_BLOCK_SIZE, CIPHER_MAC_SIZE
 
 
 class CryptoUtils:

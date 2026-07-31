@@ -4,6 +4,7 @@ from typing import Callable
 
 from ...protocol import Packet
 from ...protocol.constants import PAYLOAD_TYPE_PATH
+from .result import HandlerResult
 
 
 class PathHandler:
@@ -45,16 +46,23 @@ class PathHandler:
         """Set the ACK handler for processing bundled/encrypted ACKs in PATH packets."""
         self._ack_handler = ack_handler
 
-    async def __call__(self, pkt: Packet) -> None:
-        """Handle incoming PATH packet according to official specification."""
+    async def __call__(self, pkt: Packet) -> HandlerResult:
+        """Handle PATH and aggregate authenticated sub-handler results."""
+        authenticated = False
         try:
             # First, check if this PATH packet contains protocol responses
             if self._protocol_response_handler:
-                await self._protocol_response_handler(pkt)
+                result = await self._protocol_response_handler(pkt)
+                authenticated = authenticated or (
+                    isinstance(result, HandlerResult) and result.authenticated
+                )
 
             # Then, check if this PATH packet contains login responses
             if self._login_response_handler:
-                await self._login_response_handler(pkt)
+                result = await self._login_response_handler(pkt)
+                authenticated = authenticated or (
+                    isinstance(result, HandlerResult) and result.authenticated
+                )
 
             # Then, check if this PATH packet contains ACKs and delegate to ACK handler
             if self._ack_handler:
@@ -95,3 +103,5 @@ class PathHandler:
             import traceback
 
             self._log(traceback.format_exc())
+
+        return HandlerResult.consumed() if authenticated else HandlerResult.not_for_us()

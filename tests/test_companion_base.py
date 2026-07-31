@@ -218,6 +218,55 @@ class TestApplyPathHashMode:
 
 
 # ---------------------------------------------------------------------------
+# set_advert_name — 31-byte firmware field (char node_name[32], NodePrefs.h),
+# truncation is on UTF-8 bytes, not Python characters.
+# ---------------------------------------------------------------------------
+
+
+class TestSetAdvertName:
+    def test_ascii_name_longer_than_limit_truncates_to_31_bytes(self):
+        bridge = _make_bridge()
+        bridge.set_advert_name("a" * 40)
+        assert bridge.prefs.node_name == "a" * 31
+        assert len(bridge.prefs.node_name.encode("utf-8")) == 31
+
+    def test_ascii_name_exactly_at_limit_is_unchanged(self):
+        bridge = _make_bridge()
+        name = "a" * 31
+        bridge.set_advert_name(name)
+        assert bridge.prefs.node_name == name
+        assert len(bridge.prefs.node_name.encode("utf-8")) == 31
+
+    def test_multibyte_utf8_name_straddling_boundary_cuts_at_codepoint(self):
+        """30 ASCII bytes + one 3-byte codepoint (e.g. 'ééé' would be
+
+        2 bytes each; use a 3-byte char, e.g. '☃' SNOWMAN, so it can only
+        fit whole or not at all across the 31-byte boundary.
+        """
+        bridge = _make_bridge()
+        # 30 'a' bytes + a 3-byte snowman = 33 raw bytes; the snowman straddles
+        # byte 31 and must be dropped whole, never split into invalid UTF-8.
+        name = ("a" * 30) + "☃" + "b"
+        bridge.set_advert_name(name)
+        stored = bridge.prefs.node_name
+        encoded = stored.encode("utf-8")
+        assert len(encoded) <= 31
+        # Round-trips cleanly (no partial multi-byte sequence survived).
+        assert encoded.decode("utf-8") == stored
+        # The snowman didn't fit in the remaining 1 byte, so it (and the
+        # trailing 'b') were dropped; only the 30 leading ASCII bytes remain.
+        assert stored == "a" * 30
+
+    def test_multibyte_utf8_name_that_fits_is_preserved_whole(self):
+        """A multi-byte codepoint that fits cleanly within 31 bytes is kept intact."""
+        bridge = _make_bridge()
+        name = ("a" * 28) + "☃"  # 28 + 3 = 31 bytes exactly
+        bridge.set_advert_name(name)
+        assert bridge.prefs.node_name == name
+        assert len(bridge.prefs.node_name.encode("utf-8")) == 31
+
+
+# ---------------------------------------------------------------------------
 # share_contact — replay cached ADVERT blob (firmware shareContactZeroHop)
 # ---------------------------------------------------------------------------
 
@@ -326,6 +375,59 @@ def test_apply_flood_scope_uses_default_scope_when_transient_unset():
     assert pkt.transport_codes[0] != 0
 
 
+def test_set_flood_scope_zero_key_resets_to_default_scope():
+    """An all-zero key is firmware's null override, so default scope still applies."""
+    bridge = _make_bridge(path_hash_mode=0)
+    default_key = b"\x22" * 16
+    assert bridge.set_default_flood_scope("region1", default_key) is True
+    key = b"\x11" * 16
+    bridge.set_flood_scope(key)
+    assert bridge._resolve_flood_transport_key() == key
+
+    bridge.set_flood_scope(b"\x00" * 16)
+
+    assert bridge._flood_transport_key is None
+    assert bridge._resolve_flood_transport_key() == default_key
+
+    pkt = _make_flood_pkt()
+    bridge._apply_flood_scope(pkt)
+    assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+
+
+def test_set_flood_scope_none_after_zero_key_uses_default_scope():
+    """Mode 0 without a key resets the null override and lets default scope apply."""
+    bridge = _make_bridge(path_hash_mode=0)
+    assert bridge.set_default_flood_scope("region1", b"\x22" * 16) is True
+    assert bridge._resolve_flood_transport_key() == b"\x22" * 16
+
+    bridge.set_flood_scope(b"\x00" * 16)
+    assert bridge._resolve_flood_transport_key() == b"\x22" * 16
+    bridge.set_flood_scope(None)
+    assert bridge._resolve_flood_transport_key() == b"\x22" * 16
+
+    pkt = _make_flood_pkt()
+    bridge._apply_flood_scope(pkt)
+    assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+
+    pkt2 = _make_flood_pkt()
+    bridge._apply_flood_scope(pkt2)
+    assert pkt2.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+
+
+def test_set_flood_scope_none_clears_sticky_unscoped_state():
+    """Mode 0 set/reset cancels sticky unscoped, so the default scope applies again."""
+    bridge = _make_bridge(path_hash_mode=0)
+    assert bridge.set_default_flood_scope("region1", b"\x33" * 16) is True
+    bridge.set_flood_unscoped()
+
+    bridge.set_flood_scope(None)
+
+    assert bridge._resolve_flood_transport_key() == b"\x33" * 16
+    pkt = _make_flood_pkt()
+    bridge._apply_flood_scope(pkt)
+    assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+
+
 def _make_flood_pkt() -> Packet:
     pkt = Packet()
     pkt.header = (PAYLOAD_TYPE_TRACE << 2) | 0x01  # route type FLOOD
@@ -336,7 +438,7 @@ def _make_flood_pkt() -> Packet:
     return pkt
 
 
-def test_set_flood_unscoped_overrides_default_scope_one_shot():
+def test_set_flood_unscoped_overrides_default_scope_sticky():
     """FW #2492: explicit unscoped forces a plain flood, bypassing the default scope."""
     bridge = _make_bridge(path_hash_mode=0)
     assert bridge.set_default_flood_scope("region1", bytes(range(16))) is True
@@ -348,11 +450,11 @@ def test_set_flood_unscoped_overrides_default_scope_one_shot():
     assert pkt.get_route_type() == ROUTE_TYPE_FLOOD
     assert pkt.transport_codes[0] == 0
 
-    # One-shot: the next flood falls back to the default scope.
+    # Sticky: following floods stay plain until mode 0 sets/resets scope.
     pkt2 = _make_flood_pkt()
     bridge._apply_flood_scope(pkt2)
-    assert pkt2.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
-    assert pkt2.transport_codes[0] != 0
+    assert pkt2.get_route_type() == ROUTE_TYPE_FLOOD
+    assert pkt2.transport_codes[0] == 0
 
 
 def test_set_flood_scope_cancels_pending_unscoped():
@@ -541,3 +643,41 @@ async def test_send_text_to_old_key_still_addresses_old_key():
     assert b"for the old one" in _decrypt_dm(pkt, sender_pub, old)
     with pytest.raises(Exception):
         _decrypt_dm(pkt, sender_pub, new)
+
+
+# ---------------------------------------------------------------------------
+# Login-session connection registry (mirrors BaseChatMesh connections[])
+# ---------------------------------------------------------------------------
+
+
+def test_login_connection_registry_note_has_clear():
+    bridge = CompanionBridge(LocalIdentity(), lambda *a, **k: None)
+    pubkey = b"\x11" * 32
+    assert bridge.has_login_connection(pubkey) is False
+    bridge.note_login_connection(pubkey, 4)  # 4 * 16 = 64s window
+    assert bridge.has_login_connection(pubkey) is True
+    bridge.clear_login_connection(pubkey)
+    assert bridge.has_login_connection(pubkey) is False
+
+
+def test_login_connection_zero_interval_not_recorded():
+    """Firmware only startConnection() with keep_alive_secs > 0 (MyMesh.cpp:688)."""
+    bridge = CompanionBridge(LocalIdentity(), lambda *a, **k: None)
+    pubkey = b"\x12" * 32
+    bridge.note_login_connection(pubkey, 0)
+    assert bridge.has_login_connection(pubkey) is False
+
+
+def test_login_connection_expires(monkeypatch):
+    """Expiry window is 2.5x the keep-alive interval (BaseChatMesh.cpp:749)."""
+    import openhop_core.companion.base_send as base_send
+
+    clock = {"now": 500.0}
+    monkeypatch.setattr(base_send.time, "monotonic", lambda: clock["now"])
+    bridge = CompanionBridge(LocalIdentity(), lambda *a, **k: None)
+    pubkey = b"\x13" * 32
+    bridge.note_login_connection(pubkey, 4)  # 64s keep-alive -> 160s window
+    clock["now"] = 500.0 + 159.9
+    assert bridge.has_login_connection(pubkey) is True
+    clock["now"] = 500.0 + 160.1
+    assert bridge.has_login_connection(pubkey) is False

@@ -8,6 +8,7 @@ Simple implementation matching the C++ MeshCore transport key functionality:
 
 import struct
 
+from .constants import ROUTE_TYPE_TRANSPORT_FLOOD
 from .crypto import CryptoUtils
 
 
@@ -72,3 +73,23 @@ def calc_transport_code(key: bytes, packet) -> int:
         code = 0xFFFE
 
     return code
+
+
+def scope_packet(pkt, key: bytes) -> None:
+    """Attach transport codes for ``key`` and switch FLOOD -> TRANSPORT_FLOOD.
+
+    The single shared scoping primitive: the companion resolver
+    (``base_config._apply_flood_scope``), the dispatcher resolver
+    (``Dispatcher._apply_flood_scope``) and the reply-scope helper
+    (``region_map.apply_reply_scope``) all funnel through this so the wire
+    format is computed in exactly one place. The code is (re-)hashed from the
+    packet's own payload via :func:`calc_transport_code`, so a reply's code is
+    derived from the reply payload, never copied from the request.
+
+    Does not set ``_flood_scope_applied``: the double-scope gate stays the
+    responsibility of the calling resolver (which must mark plain-flood
+    decisions too).
+    """
+    pkt.transport_codes[0] = calc_transport_code(key, pkt)
+    pkt.transport_codes[1] = 0  # reserved for home region (firmware TODO)
+    pkt.header = (pkt.header & ~0x03) | ROUTE_TYPE_TRANSPORT_FLOOD

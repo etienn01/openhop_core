@@ -91,7 +91,7 @@ class CH341SPITransport(SPITransport):
                     "\n\n*** CONTAINER DETECTED ***\n"
                     "Udev rules inside a container have NO effect.\n"
                     "You must install the udev rule on the HOST machine:\n"
-                    "  echo 'SUBSYSTEM==\"usb\", ATTR{idVendor}==\"1a86\", "
+                    '  echo \'SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", '
                     'ATTR{idProduct}=="5512", MODE="0666"\' '
                     "| sudo tee /etc/udev/rules.d/99-ch341.rules\n"
                     "  sudo udevadm control --reload-rules\n"

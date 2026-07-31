@@ -72,8 +72,24 @@ class ControlHandler:
                 self._log("[ControlHandler] Empty payload, ignoring")
                 return None
 
-            # Check if this is a zero-hop packet (path_len must be 0)
-            if pkt.path_len != 0:
+            # MeshCore (Mesh.cpp) only accepts the high-bit CONTROL discovery
+            # subset on a direct route (ROUTE_TYPE_DIRECT / TRANSPORT_DIRECT).
+            # Flood and transport-flood control packets are ignored, matching
+            # the firmware's pkt->isRouteDirect() gate.
+            if not pkt.is_route_direct():
+                self._log("[ControlHandler] Non-direct route, ignoring")
+                return None
+
+            # Require the CONTROL high bit (payload[0] & 0x80). This subset is
+            # the only CONTROL payload this handler serves.
+            if (pkt.payload[0] & 0x80) == 0:
+                self._log("[ControlHandler] CONTROL high bit not set, ignoring")
+                return None
+
+            # Check if this is a zero-hop packet. The on-wire path_len byte is
+            # encoded (bits 6-7 carry hash-size mode), so zero-hop can be 0,
+            # 64, or 128 depending on hash-size mode.
+            if pkt.get_path_hash_count() != 0:
                 self._log(f"[ControlHandler] Non-zero path length ({pkt.path_len}), ignoring")
                 return None
 

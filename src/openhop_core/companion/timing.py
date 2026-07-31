@@ -12,9 +12,7 @@ packet stalled for 10-15 s where firmware recovers in ~3 s.  This module
 reproduces the firmware math so login/stats/discovery use the same cadence.
 """
 
-import math
-
-from ..protocol.packet_utils import PathUtils
+from ..protocol.packet_utils import PathUtils, calculate_lora_airtime_ms
 
 # Firmware constants (examples/companion_radio/MyMesh.cpp).
 SEND_TIMEOUT_BASE_MILLIS = 500
@@ -41,29 +39,21 @@ def estimate_airtime_ms(
     preamble_symbols: int = 8,
     low_dr_opt: bool = None,
 ) -> float:
-    """Estimate LoRa airtime (ms) for a packet, per the Semtech formula.
+    """Estimate LoRa airtime (ms) for a packet: explicit header, CRC on.
 
-    Mirrors ``SX1262Wrapper`` airtime math: explicit header, CRC on. ``cr`` is
-    the MeshCore coding-rate index (1->4/5 .. 4->4/8). ``packet_length`` is the
-    full on-air byte length (use ``Packet.get_raw_length()``).
+    Thin wrapper over ``calculate_lora_airtime_ms`` (the shared
+    RadioLib-matching formula). ``cr`` accepts either coding-rate
+    representation. ``packet_length`` is the full on-air byte length (use
+    ``Packet.get_raw_length()``).
     """
-    sf = max(6, min(12, int(sf)))
-    bw_hz = int(bw_hz) or 250000
-    cr = max(1, min(4, int(cr)))
-    if low_dr_opt is None:
-        low_dr_opt = sf >= 11 and bw_hz <= 125000
-    ldro = 1 if low_dr_opt else 0
-
-    symbol_time = (1 << sf) / float(bw_hz)
-    preamble_time = (preamble_symbols + 4.25) * symbol_time
-    tmp = 8 * packet_length - 4 * sf + 28 + 16 * 1 - 20 * 0  # crc=1, explicit header
-    denom = 4 * (sf - 2 * ldro)
-    if tmp > 0 and denom > 0:
-        payload_symbols = 8 + max(math.ceil(tmp / denom) * (cr + 4), 0)
-    else:
-        payload_symbols = 8
-    payload_time = payload_symbols * symbol_time
-    return (preamble_time + payload_time) * 1000.0
+    return calculate_lora_airtime_ms(
+        packet_length,
+        sf,
+        int(bw_hz) or 250000,
+        cr,
+        preamble_symbols=preamble_symbols,
+        low_dr_opt=low_dr_opt,
+    )
 
 
 def calc_flood_timeout_ms(airtime_ms: float) -> int:
@@ -71,14 +61,25 @@ def calc_flood_timeout_ms(airtime_ms: float) -> int:
     return int(SEND_TIMEOUT_BASE_MILLIS + FLOOD_SEND_TIMEOUT_FACTOR * airtime_ms)
 
 
+def calc_direct_timeout_ms_for_hops(airtime_ms: float, hop_count: int) -> int:
+    """Firmware ``calcDirectTimeoutMillisFor`` taking an explicit hop count.
+
+    Firmware masks the hop count to 6 bits (``path_hash_count = path_len & 63``,
+    MyMesh.cpp:851). Use this when the hop count is known directly (e.g. a TRACE
+    packet's ``path_len // hash_width``) rather than encoded in a contact's
+    path_len byte.
+    """
+    hops = max(0, int(hop_count)) & 63
+    return int(
+        SEND_TIMEOUT_BASE_MILLIS
+        + (DIRECT_SEND_PERHOP_FACTOR * airtime_ms + DIRECT_SEND_PERHOP_EXTRA_MILLIS) * (hops + 1)
+    )
+
+
 def calc_direct_timeout_ms(airtime_ms: float, out_path_len: int) -> int:
     """Firmware ``calcDirectTimeoutMillisFor`` (out_path_len is the encoded byte)."""
     hops = PathUtils.get_path_hash_count(out_path_len) if out_path_len > 0 else 0
-    return int(
-        SEND_TIMEOUT_BASE_MILLIS
-        + (DIRECT_SEND_PERHOP_FACTOR * airtime_ms + DIRECT_SEND_PERHOP_EXTRA_MILLIS)
-        * (hops + 1)
-    )
+    return calc_direct_timeout_ms_for_hops(airtime_ms, hops)
 
 
 def response_timeout_ms(

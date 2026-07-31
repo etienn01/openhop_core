@@ -98,7 +98,11 @@ def _make_mock_lora() -> MagicMock:
     lora.CRC_ON = 1
     lora.IQ_STANDARD = 0
     lora.RX_GAIN_BOOSTED = 1
-    lora.CAD_ON_2_SYMB = 0
+    lora.CAD_ON_1_SYMB = 0
+    lora.CAD_ON_2_SYMB = 1
+    lora.CAD_ON_4_SYMB = 2
+    lora.CAD_ON_8_SYMB = 3
+    lora.CAD_ON_16_SYMB = 4
     lora.CAD_EXIT_STDBY = 0
     lora.REGULATOR_DC_DC = 0
     lora.TCXO_DELAY_5 = 5
@@ -714,9 +718,26 @@ class TestCADAndLBT:
         result = await radio.perform_cad(timeout=1.0, calibration=True)
         assert isinstance(result, dict)
         assert "detected" in result
+        assert "cad_done" in result
         assert "det_peak" in result
         assert "sf" in result
         assert "timestamp" in result
+
+    async def test_perform_cad_calibration_reports_done_without_detected(self, radio):
+        asyncio.get_running_loop().create_task(
+            self._fire_cad_event(radio, detected=False, delay=0.01)
+        )
+        result = await radio.perform_cad(timeout=1.0, calibration=True)
+        assert result["cad_done"] is True
+        assert result["detected"] is False
+
+    async def test_perform_cad_calibration_reports_done_and_detected(self, radio):
+        asyncio.get_running_loop().create_task(
+            self._fire_cad_event(radio, detected=True, delay=0.01)
+        )
+        result = await radio.perform_cad(timeout=1.0, calibration=True)
+        assert result["cad_done"] is True
+        assert result["detected"] is True
 
     async def test_perform_cad_calibration_timeout_returns_dict_with_timeout_key(
         self, radio, mock_lora
@@ -725,6 +746,27 @@ class TestCADAndLBT:
         result = await radio.perform_cad(timeout=0.05, calibration=True)
         assert isinstance(result, dict)
         assert result.get("timeout") is True
+        assert result.get("cad_done") is False
+
+    async def test_perform_cad_symbol_mapping_uses_requested_symbol_count(
+        self, radio, mock_lora
+    ):
+        asyncio.get_running_loop().create_task(
+            self._fire_cad_event(radio, detected=False, delay=0.01)
+        )
+        await radio.perform_cad(timeout=1.0, calibration=True, cad_symbol_num=8)
+        mock_lora.setCadParams.assert_called()
+        cad_symbol_arg = mock_lora.setCadParams.call_args[0][0]
+        assert cad_symbol_arg == mock_lora.CAD_ON_8_SYMB
+
+    async def test_perform_cad_invalid_symbol_count_returns_error_in_calibration_mode(
+        self, radio
+    ):
+        result = await radio.perform_cad(
+            timeout=0.05, calibration=True, cad_symbol_num=3
+        )
+        assert "error" in result
+        assert "cad_symbol_num must be one of" in result["error"]
 
     async def test_perform_cad_exception_returns_false(self, radio, mock_lora):
         mock_lora.setStandby.side_effect = RuntimeError("hardware fault")
@@ -1007,72 +1049,146 @@ class TestNoiseFloorSampling:
     def test_no_sample_when_tx_lock_held(self, radio):
         radio._tx_lock = MagicMock()
         radio._tx_lock.locked.return_value = True
-        initial = radio._num_floor_samples
-        radio._sample_noise_floor()
-        assert radio._num_floor_samples == initial
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=10.0):
+            radio._sample_noise_floor()
+        radio.lora.getRssiInst.assert_not_called()
 
     def test_no_sample_during_packet_reception(self, radio):
         radio._is_receiving_packet = True
-        initial = radio._num_floor_samples
-        radio._sample_noise_floor()
-        assert radio._num_floor_samples == initial
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=20.0):
+            radio._sample_noise_floor()
+        radio.lora.getRssiInst.assert_not_called()
+
+    def test_no_sample_with_pending_rx_irq_status(self, radio):
+        radio._pending_rx_irq_status = IRQ_RX_DONE
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=30.0):
+            radio._sample_noise_floor()
+        radio.lora.getRssiInst.assert_not_called()
+
+    def test_no_sample_during_active_rx_irq_flags(self, radio, mock_lora):
+        mock_lora.getIrqStatus.return_value = IRQ_PREAMBLE_DETECTED | IRQ_HEADER_VALID
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=40.0):
+            radio._sample_noise_floor()
+        mock_lora.getRssiInst.assert_not_called()
 
     def test_no_sample_within_500ms_of_last_packet(self, radio):
-        radio._last_packet_activity = time.time()
-        initial = radio._num_floor_samples
-        radio._sample_noise_floor()
-        assert radio._num_floor_samples == initial
+        radio._last_packet_activity = 50.0
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=50.3):
+            radio._sample_noise_floor()
+        radio.lora.getRssiInst.assert_not_called()
 
-    def test_sample_accumulated_during_quiet_period(self, radio, mock_lora):
+    def test_rate_limit_enforced_at_5_seconds(self, radio, mock_lora):
+        radio._last_sample_check = 100.0
+        with patch(
+            "openhop_core.hardware.sx1262_wrapper.time.time", return_value=104.9
+        ):
+            radio._sample_noise_floor()
+        mock_lora.getRssiInst.assert_not_called()
+
+    def test_sample_accepted_during_quiet_period(self, radio, mock_lora):
         mock_lora.getRssiInst.return_value = 160  # -80 dBm
         radio._last_packet_activity = 0.0
         radio._is_receiving_packet = False
-        radio._noise_floor = -99.0  # bootstrap mode
-        radio._sample_noise_floor()
+        with patch(
+            "openhop_core.hardware.sx1262_wrapper.time.time", return_value=200.0
+        ):
+            radio._sample_noise_floor()
+        assert radio._num_floor_samples == 1
+        assert radio._noise_floor == pytest.approx(-80.0)
+
+    def test_rolling_window_averages_latest_20_samples(self, radio, mock_lora):
+        radio._last_packet_activity = 0.0
+        radio._is_receiving_packet = False
+        samples_dbm = [(-120.0 + i) for i in range(21)]
+        mock_lora.getRssiInst.side_effect = [
+            int(-(sample * 2)) for sample in samples_dbm
+        ]
+
+        base_ts = 1000.0
+        for idx in range(21):
+            with patch(
+                "openhop_core.hardware.sx1262_wrapper.time.time",
+                return_value=base_ts + (idx * 6.0),
+            ):
+                radio._sample_noise_floor()
+
+        expected_floor = sum(samples_dbm[1:]) / 20.0
+        assert radio._num_floor_samples == 20
+        assert radio._noise_floor == pytest.approx(expected_floor)
+        assert len(radio._noise_floor_samples) == 20
+
+    def test_raw_rssi_conversion_divide_by_two(self, radio, mock_lora):
+        mock_lora.getRssiInst.return_value = 237  # -(237/2) = -118.5 dBm
+        radio._last_packet_activity = 0.0
+        with patch(
+            "openhop_core.hardware.sx1262_wrapper.time.time", return_value=300.0
+        ):
+            radio._sample_noise_floor()
+        assert radio._noise_floor == pytest.approx(-118.5)
+
+    def test_out_of_range_rssi_is_rejected(self, radio, mock_lora):
+        mock_lora.getRssiInst.return_value = 255  # -127.5 dBm edge is valid
+        radio._last_packet_activity = 0.0
+        with patch(
+            "openhop_core.hardware.sx1262_wrapper.time.time", return_value=310.0
+        ):
+            radio._sample_noise_floor()
         assert radio._num_floor_samples == 1
 
-    def test_floor_calculated_after_n_samples(self, radio, mock_lora):
-        mock_lora.getRssiInst.return_value = 160  # -80 dBm
-        radio._last_packet_activity = 0.0
-        radio._is_receiving_packet = False
-        radio._noise_floor = -99.0
+        mock_lora.getRssiInst.return_value = 256  # -128.0 dBm -> reject
+        with patch(
+            "openhop_core.hardware.sx1262_wrapper.time.time", return_value=316.0
+        ):
+            radio._sample_noise_floor()
+        assert radio._num_floor_samples == 1
 
-        for _ in range(radio.NUM_NOISE_FLOOR_SAMPLES):
+    def test_old_noise_floor_plus_10_filter_removed(self, radio, mock_lora):
+        radio._noise_floor = -120.0
+        radio._noise_floor_samples = []
+        radio._num_floor_samples = 0
+        radio._floor_sample_sum = 0.0
+        radio._last_packet_activity = 0.0
+        mock_lora.getRssiInst.return_value = 200  # -100 dBm
+        with patch(
+            "openhop_core.hardware.sx1262_wrapper.time.time", return_value=400.0
+        ):
             radio._sample_noise_floor()
 
-        # One more call triggers the calculation branch
-        radio._sample_noise_floor()
+        assert radio._num_floor_samples == 1
+        assert radio._noise_floor == pytest.approx(-100.0)
 
-        assert radio._noise_floor != -99.0
-        assert radio._num_floor_samples == 0  # reset post-calculation
-
-    def test_noise_floor_clamped_at_lower_bound(self, radio):
-        n = radio.NUM_NOISE_FLOOR_SAMPLES
-        radio._floor_sample_sum = -200.0 * n  # impossible low
-        radio._num_floor_samples = n
-        radio._last_packet_activity = 0.0
-        radio._is_receiving_packet = False
-        radio._noise_floor = -60.0
-        radio._sample_noise_floor()
-        assert radio._noise_floor >= -150.0
-
-    def test_noise_floor_clamped_at_upper_bound(self, radio):
-        n = radio.NUM_NOISE_FLOOR_SAMPLES
-        radio._floor_sample_sum = -20.0 * n  # unrealistically high
-        radio._num_floor_samples = n
-        radio._last_packet_activity = 0.0
-        radio._is_receiving_packet = False
-        radio._noise_floor = -60.0
-        radio._sample_noise_floor()
-        assert radio._noise_floor <= -50.0
-
-    def test_get_noise_floor_returns_0_when_uninitialized(self, radio):
+    def test_get_noise_floor_returns_none_when_uninitialized(self, radio):
         radio._initialized = False
-        assert radio.get_noise_floor() == 0.0
+        assert radio.get_noise_floor() is None
 
-    def test_get_noise_floor_returns_0_when_lora_none(self, radio):
+    def test_get_noise_floor_returns_none_when_lora_none(self, radio):
         radio.lora = None
-        assert radio.get_noise_floor() == 0.0
+        assert radio.get_noise_floor() is None
+
+    def test_get_noise_floor_returns_none_while_tx_lock_held(self, radio):
+        radio._num_floor_samples = 1
+        radio._noise_floor = -101.5
+        radio._tx_lock = MagicMock()
+        radio._tx_lock.locked.return_value = True
+        assert radio.get_noise_floor() is None
+
+    def test_get_noise_floor_returns_none_for_uninitialized_internal_sentinel(
+        self, radio
+    ):
+        radio._noise_floor = -120.0
+        radio._num_floor_samples = 0
+        radio._noise_floor_samples = []
+        assert radio.get_noise_floor() is None
+
+    def test_get_noise_floor_returns_valid_negative_measurements(self, radio):
+        radio._noise_floor = -101.5
+        radio._num_floor_samples = 3
+        assert radio.get_noise_floor() == pytest.approx(-101.5)
+
+    def test_get_noise_floor_preserves_measured_minus_120(self, radio):
+        radio._noise_floor = -120.0
+        radio._num_floor_samples = 1
+        assert radio.get_noise_floor() == pytest.approx(-120.0)
 
 
 # ===========================================================================
@@ -1152,6 +1268,138 @@ class TestEventOrdering:
             await task
         except (asyncio.CancelledError, Exception):
             pass
+
+    async def test_completed_rx_packet_is_not_lost_when_send_starts(
+        self, radio, mock_lora
+    ):
+        received = []
+        radio.set_rx_callback(received.append)
+
+        # Simulate a fully received packet whose IRQ handler has run,
+        # but whose background RX task has not consumed it yet.
+        mock_lora.getIrqStatus.return_value = mock_lora.IRQ_RX_DONE
+        radio._handle_interrupt()
+
+        mock_lora.getRxBufferStatus.return_value = (4, 0x80)
+        mock_lora.readBuffer.return_value = list(b"test")
+
+        _make_tx_succeed(radio, mock_lora)
+        await radio.send(b"outbound")
+
+        assert received == [b"test"]
+
+        read_idx = next(
+            i
+            for i, c in enumerate(mock_lora.mock_calls)
+            if c == call.readBuffer(0x80, 4)
+        )
+        write_idx = next(
+            i
+            for i, c in enumerate(mock_lora.mock_calls)
+            if c == call.writeBuffer(0x00, list(b"outbound"), len(b"outbound"))
+        )
+        assert read_idx < write_idx
+
+    async def test_rx_done_while_tx_lock_held_is_latched_and_drained_before_tx_reuse(
+        self, radio, mock_lora
+    ):
+        received = []
+        radio.set_rx_callback(received.append)
+
+        await radio._tx_lock.acquire()
+        try:
+            # IRQ arrives while TX lock is held: hardware IRQ is cleared and
+            # background RX task is not woken, so software latch must preserve it.
+            mock_lora.getIrqStatus.return_value = mock_lora.IRQ_RX_DONE
+            radio._handle_interrupt()
+        finally:
+            radio._tx_lock.release()
+
+        assert radio._pending_rx_irq_status & mock_lora.IRQ_RX_DONE
+        assert not radio._rx_done_event.is_set()
+
+        mock_lora.getRxBufferStatus.return_value = (4, 0x80)
+        mock_lora.readBuffer.return_value = list(b"test")
+
+        _make_tx_succeed(radio, mock_lora)
+        await radio.send(b"outbound")
+
+        assert received == [b"test"]
+
+        read_idx = next(
+            i
+            for i, c in enumerate(mock_lora.mock_calls)
+            if c == call.readBuffer(0x80, 4)
+        )
+        write_idx = next(
+            i
+            for i, c in enumerate(mock_lora.mock_calls)
+            if c == call.writeBuffer(0x00, list(b"outbound"), len(b"outbound"))
+        )
+        assert read_idx < write_idx
+
+    async def test_background_rx_processing_claims_and_clears_pending_latch(
+        self, radio, mock_lora
+    ):
+        received = []
+        radio.set_rx_callback(received.append)
+
+        mock_lora.getRxBufferStatus.return_value = (4, 0x80)
+        mock_lora.readBuffer.return_value = list(b"test")
+        mock_lora.getIrqStatus.return_value = mock_lora.IRQ_RX_DONE
+
+        radio._handle_interrupt()
+        assert radio._pending_rx_irq_status & mock_lora.IRQ_RX_DONE
+
+        task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
+        await _wait_condition(lambda: received == [b"test"], timeout=1.0)
+
+        # The RX consumer must claim and clear the corresponding software latch,
+        # preventing the pre-TX drain from delivering the same packet again.
+        assert (radio._pending_rx_irq_status & mock_lora.IRQ_RX_DONE) == 0
+
+        await radio._drain_pending_rx_irq_before_buffer_reuse()
+        assert received == [b"test"]
+
+        radio._initialized = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def test_standalone_cad_acquires_tx_lock_before_pending_rx_drain(
+        self, radio, mock_lora
+    ):
+        drain_lock_states = []
+
+        async def _drain_spy():
+            drain_lock_states.append(radio._tx_lock.locked())
+
+        radio._drain_pending_rx_irq_before_buffer_reuse = AsyncMock(
+            side_effect=_drain_spy
+        )
+        mock_lora.getIrqStatus.return_value = IRQ_NONE
+
+        result = await radio.perform_cad(timeout=0.05)
+        assert result is False
+        assert drain_lock_states == [True]
+
+    async def test_pending_drain_crc_and_rx_done_uses_crc_branch_only(
+        self, radio, mock_lora
+    ):
+        received = []
+        radio.set_rx_callback(received.append)
+
+        radio._pending_rx_irq_status = mock_lora.IRQ_CRC_ERR | mock_lora.IRQ_RX_DONE
+        start_crc_errors = radio.crc_error_count
+
+        mock_lora.getRxBufferStatus.return_value = (4, 0x80)
+        mock_lora.readBuffer.return_value = list(b"test")
+
+        await radio._drain_pending_rx_irq_before_buffer_reuse()
+
+        assert radio.crc_error_count == start_crc_errors + 1
+        mock_lora.readBuffer.assert_not_called()
+        assert received == []
 
     async def test_stale_cad_detected_not_inherited_by_next_cad(self, radio):
         """
@@ -1300,7 +1548,9 @@ class TestRaceConditionSimulations:
             # Prevent stale wakeups from reusing the previous CRC IRQ status.
             radio._last_irq_status = IRQ_NONE
             await _wait_condition(
-                lambda: not radio._is_receiving_packet and not radio._rx_done_event.is_set(),
+                lambda: (
+                    not radio._is_receiving_packet and not radio._rx_done_event.is_set()
+                ),
                 timeout=1.0,
             )
 
@@ -1404,7 +1654,7 @@ class TestCADThresholds:
 
     def test_custom_thresholds_out_of_range_raises(self, radio):
         with pytest.raises(ValueError):
-            radio.set_custom_cad_thresholds(peak=32, min_val=0)
+            radio.set_custom_cad_thresholds(peak=256, min_val=0)
         with pytest.raises(ValueError):
             radio.set_custom_cad_thresholds(peak=10, min_val=-1)
 
@@ -1765,7 +2015,6 @@ class TestFIFOCorruptionRace:
         # (which happens inside _handle_interrupt), then restoring it so the
         # rest of send() works normally.
         call_count = [0]
-        original_side_effect = mock_lora.getIrqStatus.side_effect
 
         def _fail_first_irq_read():
             call_count[0] += 1
@@ -2159,10 +2408,10 @@ class TestCoverageGapBranches:
         mock_lora.sleep.side_effect = RuntimeError("sleep failed")
         radio.sleep()  # must not raise
 
-    def test_get_noise_floor_returns_zero_while_tx_lock_held(self, radio):
+    def test_get_noise_floor_returns_none_while_tx_lock_held(self, radio):
         radio._tx_lock = MagicMock()
         radio._tx_lock.locked.return_value = True
-        assert radio.get_noise_floor() == 0.0
+        assert radio.get_noise_floor() is None
 
     def test_noise_floor_sampling_handles_rssi_read_exception(self, radio, mock_lora):
         radio._last_packet_activity = 0.0
@@ -2822,15 +3071,24 @@ class TestCoverageSecondPass:
         with pytest.raises(RuntimeError, match="Radio failed to start TX"):
             await radio.send(b"data")
 
-    def test_noise_floor_rejects_sample_above_threshold(self, radio, mock_lora):
-        radio._noise_floor = -100.0
+    def test_noise_floor_accepts_valid_sample_without_adaptive_threshold(
+        self, radio, mock_lora
+    ):
+        radio._noise_floor = -120.0
+        radio._noise_floor_samples = []
+        radio._num_floor_samples = 0
+        radio._floor_sample_sum = 0.0
         radio._last_packet_activity = 0.0
         radio._is_receiving_packet = False
-        before = radio._num_floor_samples
-        # -50 dBm is above threshold (-90), should be rejected.
-        mock_lora.getRssiInst.return_value = 100
-        radio._sample_noise_floor()
-        assert radio._num_floor_samples == before
+        mock_lora.getRssiInst.return_value = 100  # -50 dBm, valid range
+
+        with patch(
+            "openhop_core.hardware.sx1262_wrapper.time.time", return_value=500.0
+        ):
+            radio._sample_noise_floor()
+
+        assert radio._num_floor_samples == 1
+        assert radio._noise_floor == pytest.approx(-50.0)
 
     def test_cleanup_cancels_not_done_rx_task(self, radio):
         task = MagicMock()
@@ -2838,3 +3096,15 @@ class TestCoverageSecondPass:
         radio._rx_irq_task = task
         radio.cleanup()
         task.cancel.assert_called_once()
+
+
+class TestHandleInterruptIdempotency:
+    def test_second_call_with_zero_irq_preserves_last_irq_status(self, radio):
+        radio.lora.getIrqStatus.return_value = IRQ_CRC_ERR
+        radio._handle_interrupt()
+        assert radio._last_irq_status == IRQ_CRC_ERR
+
+        radio.lora.getIrqStatus.return_value = IRQ_NONE
+        radio._handle_interrupt()
+
+        assert radio._last_irq_status == IRQ_CRC_ERR

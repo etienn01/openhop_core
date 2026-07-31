@@ -5,6 +5,7 @@ Tests the KISS frame encoding/decoding, command/response handling,
 and LoRaRadio interface implementation.
 """
 
+import gc
 import struct
 import threading
 import time
@@ -56,6 +57,7 @@ from openhop_core.hardware.kiss_modem_wrapper import (
     RESP_TX_DONE,
     RESP_VERSION,
     RESPONSE_TIMEOUT,
+    RX_META_WAIT_SECONDS,
     KissModemWrapper,
 )
 
@@ -229,7 +231,7 @@ class TestKissFrameEncoding:
 
         assert len(received) == 0
         assert len(modem._pending_rx_queue) == 1
-        assert modem._pending_rx_queue[0] == b"\x01\x02\x03"
+        assert modem._pending_rx_queue[0][0] == b"\x01\x02\x03"
 
     def test_port_non_zero_discarded(self):
         """Frames with port != 0 are ignored (type byte 0x10 = port 1, cmd 0)"""
@@ -246,6 +248,172 @@ class TestKissFrameEncoding:
 
         assert len(received) == 0
         assert len(modem._pending_rx_queue) == 0
+
+
+class TestRxMetaBoundedWait:
+    """Data frames must be delivered even when RxMeta never arrives.
+
+    Firmware emits Data unconditionally and RxMeta only when signal reporting is
+    enabled, so reception must not be gated on RxMeta. A queued Data frame waits at
+    most RX_META_WAIT_SECONDS for its RxMeta, then is flushed with sentinel metrics.
+    """
+
+    @staticmethod
+    def _feed(modem, frame):
+        for byte in frame:
+            modem._decode_kiss_byte(byte)
+
+    @staticmethod
+    def _expire_pending(modem):
+        """Force every queued Data frame's deadline into the past."""
+        q = modem._pending_rx_queue
+        for i in range(len(q)):
+            q[i] = (q[i][0], time.monotonic() - 1.0)
+
+    def test_data_with_prompt_rx_meta_uses_real_metrics(self):
+        """Data followed promptly by RxMeta is dispatched with real metrics."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        received = []
+        modem.on_frame_received = lambda d, r, s: received.append((d, r, s))
+
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0x01, 0x02, KISS_FEND]))
+        # SNR=0x10 (4.0 dB), RSSI=0xB0 (-80)
+        self._feed(
+            modem,
+            bytes([KISS_FEND, KISS_CMD_SETHARDWARE, HW_RESP_RX_META, 0x10, 0xB0, KISS_FEND]),
+        )
+
+        assert received == [(b"\x01\x02", -80, 4.0)]
+        assert modem.stats["last_snr"] == pytest.approx(4.0)
+        assert modem.stats["last_rssi"] == -80
+        assert len(modem._pending_rx_queue) == 0
+
+    def test_flush_does_not_fire_before_deadline(self):
+        """A freshly queued Data frame is not flushed while its deadline is in future."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        received = []
+        modem.on_frame_received = lambda d, r, s: received.append((d, r, s))
+
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0x09, KISS_FEND]))
+        modem._flush_expired_rx_frames()
+
+        assert received == []
+        assert len(modem._pending_rx_queue) == 1
+
+    def test_data_without_rx_meta_flushed_with_sentinel(self):
+        """Data with no RxMeta is dispatched after the wait with sentinel metrics.
+
+        rx_packets is counted, but last_snr / last_rssi keep their real values.
+        """
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        received = []
+        modem.on_frame_received = lambda d, r, s: received.append((d, r, s))
+
+        # Seed known real metrics so we can prove sentinels don't overwrite them.
+        modem.stats["last_snr"] = 7.0
+        modem.stats["last_rssi"] = -50
+        rx_before = modem.stats["rx_packets"]
+
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0x01, 0x02, 0x03, KISS_FEND]))
+        self._expire_pending(modem)
+        modem._flush_expired_rx_frames()
+
+        assert received == [(b"\x01\x02\x03", -999, -999.0)]
+        assert modem.stats["rx_packets"] == rx_before + 1
+        assert modem.stats["last_snr"] == 7.0
+        assert modem.stats["last_rssi"] == -50
+        assert len(modem._pending_rx_queue) == 0
+
+    def test_flush_preserves_arrival_order(self):
+        """A timed-out head is delivered before a later Data whose RxMeta is prompt."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        received = []
+        modem.on_frame_received = lambda d, r, s: received.append((d, r, s))
+
+        # DATA1 arrives with no RxMeta and times out.
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0x01, KISS_FEND]))
+        self._expire_pending(modem)
+        modem._flush_expired_rx_frames()
+
+        # DATA2 arrives later with a prompt RxMeta (SNR=2.0 dB, RSSI=-100).
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0x02, KISS_FEND]))
+        self._feed(
+            modem,
+            bytes([KISS_FEND, KISS_CMD_SETHARDWARE, HW_RESP_RX_META, 0x08, 0x9C, KISS_FEND]),
+        )
+
+        assert [entry[0] for entry in received] == [b"\x01", b"\x02"]
+        assert received[0] == (b"\x01", -999, -999.0)
+        assert received[1] == (b"\x02", -100, 2.0)
+
+    def test_lost_rx_meta_costs_only_one_packets_metrics(self):
+        """One lost RxMeta must not permanently shift metric attribution.
+
+        DATA1's RxMeta is lost; after DATA1 times out, DATA2's RxMeta pairs with
+        DATA2 (the new head), so DATA2 gets its own metrics rather than inheriting
+        DATA1's leftover.
+        """
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        received = []
+        modem.on_frame_received = lambda d, r, s: received.append((d, r, s))
+
+        # DATA1 with its RxMeta lost -> flushed sentinel on timeout.
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0xAA, KISS_FEND]))
+        self._expire_pending(modem)
+        modem._flush_expired_rx_frames()
+
+        # DATA2 with its own RxMeta (SNR=4.0 dB, RSSI=-80).
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0xBB, KISS_FEND]))
+        self._feed(
+            modem,
+            bytes([KISS_FEND, KISS_CMD_SETHARDWARE, HW_RESP_RX_META, 0x10, 0xB0, KISS_FEND]),
+        )
+
+        assert received[0] == (b"\xaa", -999, -999.0)
+        assert received[1] == (b"\xbb", -80, 4.0)  # its own metrics, not leftover
+        assert len(modem._pending_rx_queue) == 0
+
+    def test_rx_meta_with_empty_queue_is_ignored(self):
+        """A leftover RxMeta with nothing pending updates stats but dispatches nothing."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        received = []
+        modem.on_frame_received = lambda d, r, s: received.append((d, r, s))
+
+        self._feed(
+            modem,
+            bytes([KISS_FEND, KISS_CMD_SETHARDWARE, HW_RESP_RX_META, 0x10, 0xB0, KISS_FEND]),
+        )
+
+        assert received == []
+        assert len(modem._pending_rx_queue) == 0
+
+    def test_disconnect_clears_pending_rx_queue(self):
+        """Reconnect/disconnect must drop stale Data frames so they cannot pair with
+        an RxMeta from a later link session."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+
+        self._feed(modem, bytes([KISS_FEND, CMD_DATA, 0x01, 0x02, KISS_FEND]))
+        assert len(modem._pending_rx_queue) == 1
+
+        modem.disconnect()
+
+        assert len(modem._pending_rx_queue) == 0
+
+    def test_bounded_wait_constant_is_subsecond(self):
+        """Sanity guard: the RxMeta wait stays short so reception is not stalled."""
+        assert 0 < RX_META_WAIT_SECONDS <= 0.5
 
 
 class TestCommandResponses:
@@ -547,7 +715,7 @@ class TestCommandResponses:
             RESP_VERSION,
             RESP_STATS,
         ]
-        assert [entry[1] for entry in modem._response_queue] == [b"\xAA", b"\x01", b"\x02"]
+        assert [entry[1] for entry in modem._response_queue] == [b"\xaa", b"\x01", b"\x02"]
 
     def test_tx_done_response(self):
         """Test SetHardware TxDone (0xF8) response sets event"""
@@ -983,7 +1151,7 @@ class TestSerialWriteSerialization:
         modem.serial_conn = serial_conn
 
         stop_event = threading.Event()
-        data_frame = modem._encode_kiss_frame(CMD_DATA, b"\xAA\xBB\xCC")
+        data_frame = modem._encode_kiss_frame(CMD_DATA, b"\xaa\xbb\xcc")
 
         def data_tx_worker() -> None:
             for _ in range(200):
@@ -1114,7 +1282,7 @@ class TestSerialWriteSerialization:
         modem.serial_conn = serial_conn
         modem._start_reconnect_worker = MagicMock()
 
-        frame = modem._encode_kiss_frame(CMD_DATA, b"\xAA\xBB")
+        frame = modem._encode_kiss_frame(CMD_DATA, b"\xaa\xbb")
         assert modem._write_frame(frame) is False
         assert modem._degraded is True
         assert modem.is_connected is False
@@ -1507,20 +1675,41 @@ class TestKissTuningMethods:
         modem.set_kiss_full_duplex(False)
         assert written[0][2] == 0x00
 
-    def test_set_signal_report_returns_true_on_ok_response(self):
-        """Test set_signal_report returns True when modem responds OK or SignalReport"""
+    def test_set_signal_report_round_trip_via_real_send_command(self):
+        """Firmware answers SET_SIGNAL_REPORT (0x19) with HW_RESP_SIGNAL_REPORT (0x9A).
+
+        Drive the real _send_command so the acceptable-response set is exercised:
+        the 0x9A reply must complete the waiter (no 5s timeout), set_signal_report
+        must return True, and nothing may be left stranded in _response_queue.
+        """
         modem = KissModemWrapper(port="/dev/null", auto_configure=False)
-
-        def mock_send_command(cmd, data=b"", timeout=5.0):
-            if cmd == HW_CMD_SET_SIGNAL_REPORT:
-                return (HW_RESP_SIGNAL_REPORT, bytes([0x01]))
-            return None
-
-        modem._send_command = mock_send_command
         modem.is_connected = True
 
-        assert modem.set_signal_report(True) is True
-        assert modem.set_signal_report(False) is True
+        mock_serial = MagicMock()
+        mock_serial.is_open = True
+        mock_serial.write.side_effect = lambda b: len(b)
+        modem.serial_conn = mock_serial
+
+        result_holder: dict[str, object] = {}
+
+        def caller():
+            result_holder["resp"] = modem.set_signal_report(True)
+
+        t = threading.Thread(target=caller)
+        started = time.monotonic()
+        t.start()
+
+        # Synthetic 0x9A reply carrying the enabled flag, fed through real parsing.
+        reply = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, HW_RESP_SIGNAL_REPORT, 0x01, KISS_FEND])
+        for b in reply:
+            modem._decode_kiss_byte(b)
+
+        t.join(timeout=2.0)
+        elapsed = time.monotonic() - started
+
+        assert result_holder.get("resp") is True
+        assert elapsed < RESPONSE_TIMEOUT  # completed on the reply, not a timeout
+        assert len(modem._response_queue) == 0  # 0x9A consumed, nothing stray left
 
     def test_set_signal_report_returns_true_on_ok(self):
         """Test set_signal_report returns True when modem responds HW_RESP_OK"""
@@ -1594,6 +1783,10 @@ class TestContextManager:
 
     def test_context_manager_calls_connect_disconnect(self):
         """Test context manager calls connect and disconnect"""
+        # Drain finalizers from GC-collectable modems left by earlier tests so their
+        # __del__ -> cleanup -> disconnect does not land inside the patch window below
+        # and inflate the call count.
+        gc.collect()
         with patch.object(KissModemWrapper, "connect", return_value=True) as mock_connect:
             with patch.object(KissModemWrapper, "disconnect") as mock_disconnect:
                 with KissModemWrapper(port="/dev/null", auto_configure=False) as modem:
@@ -1768,6 +1961,107 @@ class TestSerialRecovery:
         modem._reconnecting_event.set()
         modem._start_reconnect_worker()
         assert modem.reconnect_thread is None
+
+    def test_mark_serial_failure_does_not_deadlock_with_reconnect_lock_order(self):
+        """A failed command must not wait for a reconnect handshake's lock.
+
+        An ordinary SetHardware caller holds _command_lock when its UART write
+        fails. A reconnect worker holds _connection_lock while it starts its
+        handshake and then needs _command_lock. Blocking failure handling creates
+        an ABBA deadlock; the failure transition must return promptly instead.
+        """
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        # Prevent the failure path from starting a real background reconnect.
+        modem._reconnecting_event.set()
+
+        command_held = threading.Event()
+        connection_held = threading.Event()
+        reconnect_waiting_on_command = threading.Event()
+        failure_returned = threading.Event()
+        reconnect_acquired_command = threading.Event()
+
+        def failed_command():
+            with modem._command_lock:
+                command_held.set()
+                assert connection_held.wait(1.0)
+                modem._mark_serial_failure("simulated overlapping write failure")
+                failure_returned.set()
+
+        def reconnect_handshake():
+            assert command_held.wait(1.0)
+            with modem._connection_lock:
+                connection_held.set()
+                reconnect_waiting_on_command.set()
+                with modem._command_lock:
+                    reconnect_acquired_command.set()
+
+        command_thread = threading.Thread(target=failed_command, daemon=True)
+        reconnect_thread = threading.Thread(target=reconnect_handshake, daemon=True)
+        command_thread.start()
+        reconnect_thread.start()
+
+        assert reconnect_waiting_on_command.wait(1.0)
+        assert failure_returned.wait(0.5)
+        assert reconnect_acquired_command.wait(0.5)
+        command_thread.join(timeout=0.5)
+        reconnect_thread.join(timeout=0.5)
+        assert not command_thread.is_alive()
+        assert not reconnect_thread.is_alive()
+
+    def test_mark_serial_failure_does_not_deadlock_with_reconnect_write(self):
+        """A failed UART write must not wait for a reconnect UART write.
+
+        _write_frame holds _serial_write_lock while it invokes failure handling.
+        A reconnect handshake holds _connection_lock while it waits to write its
+        PING. Waiting for _connection_lock in the failure path would deadlock the
+        two workers just as it does for SetHardware's _command_lock.
+        """
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._reconnecting_event.set()
+        serial_conn = MagicMock()
+        serial_conn.is_open = True
+        serial_conn.write.side_effect = lambda data: len(data)
+        modem.serial_conn = serial_conn
+
+        connection_held = threading.Event()
+        serial_write_held = threading.Event()
+        failure_returned = threading.Event()
+        reconnect_wrote = threading.Event()
+
+        def failed_write():
+            with modem._serial_write_lock:
+                serial_write_held.set()
+                assert connection_held.wait(1.0)
+                modem._mark_serial_failure("simulated overlapping write failure")
+                failure_returned.set()
+
+        def reconnect_handshake():
+            with modem._connection_lock:
+                connection_held.set()
+                assert serial_write_held.wait(1.0)
+                assert modem._write_frame(b"reconnect ping") is True
+                reconnect_wrote.set()
+
+        failed_thread = threading.Thread(target=failed_write, daemon=True)
+        reconnect_thread = threading.Thread(target=reconnect_handshake, daemon=True)
+        failed_thread.start()
+        reconnect_thread.start()
+
+        assert failure_returned.wait(0.5)
+        assert reconnect_wrote.wait(0.5)
+        failed_thread.join(timeout=0.5)
+        reconnect_thread.join(timeout=0.5)
+        assert not failed_thread.is_alive()
+        assert not reconnect_thread.is_alive()
+
+    def test_reconnect_worker_clears_gate_after_unexpected_exception(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._reconnecting_event.set()
+        modem._reconnect_loop = MagicMock(side_effect=RuntimeError("simulated reconnect error"))
+
+        modem._reconnect_worker()
+
+        assert modem._reconnecting_event.is_set() is False
 
     def test_connect_clears_reconnecting_gate_after_success(self):
         modem = KissModemWrapper(port="/dev/null", auto_configure=False)
@@ -2120,3 +2414,242 @@ class TestBulkDecodeEquivalence:
                 chunks.append(size)
                 remaining -= size
             self._assert_equiv(stream, chunks)
+
+
+class TestWorkerFailureDuringReconnectWindow:
+    """A worker failure must never be silent just because a reconnect is underway.
+
+    ``_reconnect_loop`` starts the RX/TX workers with ``is_connected`` still
+    False and only sets it True after readiness plus the SetHardware handshake.
+    Gating the workers' error handler on ``is_connected`` therefore silenced
+    exactly the window in which a freshly reopened USB device is most likely to
+    fail: the thread died with no log and no failure marked, nothing re-armed a
+    reconnect, and the node went permanently deaf while the log read "KISS modem
+    serial reconnect successful". Seen in the field after two processes briefly
+    contended for the port, and reproduced here.
+    """
+
+    class _FailingSerial:
+        """An open port whose first read raises, as a just-reopened device can."""
+
+        def __init__(self):
+            self.is_open = True
+            self._failed = False
+            self.raised = threading.Event()
+
+        def read(self, n=1):
+            if not self._failed:
+                self._failed = True
+                self.raised.set()
+                raise OSError("device reports readiness to read but returned no data")
+            time.sleep(0.01)
+            return b""
+
+        @property
+        def in_waiting(self):
+            return 0
+
+        def close(self):
+            self.is_open = False
+
+    def _run_worker_until_failure(self, is_connected: bool):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        fake = self._FailingSerial()
+        modem.serial_conn = fake
+        modem.is_connected = is_connected
+        failures = []
+        modem._mark_serial_failure = lambda reason: failures.append(reason)
+
+        worker = threading.Thread(target=modem._rx_worker, daemon=True)
+        worker.start()
+        assert fake.raised.wait(timeout=2.0)
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+        return failures
+
+    def test_rx_failure_is_marked_inside_the_reconnect_window(self):
+        """is_connected is False there; the failure must still arm a reconnect."""
+        failures = self._run_worker_until_failure(is_connected=False)
+        assert failures, "RX died silently: nothing will ever reconnect"
+
+    def test_rx_failure_is_marked_in_steady_state_too(self):
+        failures = self._run_worker_until_failure(is_connected=True)
+        assert failures
+
+    def test_rx_failure_is_silent_only_while_deliberately_stopping(self):
+        """Teardown must stay quiet — that is what the old gate was protecting."""
+        for attr, value in (("_shutting_down", True), ("stop_event", None)):
+            modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+            fake = self._FailingSerial()
+            modem.serial_conn = fake
+            modem.is_connected = True
+            failures = []
+            modem._mark_serial_failure = lambda reason: failures.append(reason)
+            if attr == "stop_event":
+                modem.stop_event.set()
+            else:
+                setattr(modem, attr, value)
+
+            worker = threading.Thread(target=modem._rx_worker, daemon=True)
+            worker.start()
+            worker.join(timeout=2.0)
+            assert not worker.is_alive()
+            assert failures == [], f"teardown via {attr} should not report a failure"
+
+
+class TestReconnectRequiresLiveReader:
+    """A (re)connect must not be reported as successful with a dead reader.
+
+    The workers are started before readiness and the SetHardware handshake run,
+    so an RX failure inside that window used to leave a dead reader behind while
+    the caller logged "reconnect successful" — is_connected True, no error, no
+    retry, and no further packet ever delivered.
+    """
+
+    class _ReadFailsSerial:
+        def __init__(self):
+            self.is_open = True
+            self.raised = threading.Event()
+
+        def read(self, n=1):
+            self.raised.set()
+            raise OSError("device reports readiness to read but returned no data")
+
+        @property
+        def in_waiting(self):
+            return 0
+
+        def close(self):
+            self.is_open = False
+
+    def test_open_reports_failure_when_the_reader_dies_during_startup(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        fake = self._ReadFailsSerial()
+        modem._mark_serial_failure = lambda reason: None
+
+        def _ready():
+            assert fake.raised.wait(timeout=2.0)  # let the reader die first
+            modem.rx_thread.join(timeout=2.0)
+            return True
+
+        with patch(
+            "openhop_core.hardware.kiss_modem_wrapper.serial.Serial", return_value=fake
+        ), patch.object(modem, "_wait_for_modem_ready", side_effect=_ready):
+            assert modem._open_serial_and_start_threads() is False
+
+    def test_open_reports_success_when_the_reader_survives(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+
+        class QuietSerial:
+            is_open = True
+
+            def read(self, n=1):
+                time.sleep(0.01)
+                return b""
+
+            @property
+            def in_waiting(self):
+                return 0
+
+            def close(self):
+                type(self).is_open = False
+
+        fake = QuietSerial()
+        try:
+            with patch(
+                "openhop_core.hardware.kiss_modem_wrapper.serial.Serial", return_value=fake
+            ), patch.object(modem, "_wait_for_modem_ready", return_value=True):
+                assert modem._open_serial_and_start_threads() is True
+                assert modem.rx_thread.is_alive()
+        finally:
+            modem.stop_event.set()
+            fake.close()
+            if modem.rx_thread:
+                modem.rx_thread.join(timeout=2)
+
+
+class TestStopIoThreadsEndsThePreviousGeneration:
+    def test_stop_io_threads_closes_the_port_so_a_blocked_reader_exits(self):
+        """Joining alone let a reader blocked in read() outlive the join.
+
+        _mark_serial_failure defers closing the port when the connection lock is
+        busy, so the reconnect path could reach _stop_io_threads with the old
+        port still open and a worker parked in read(). It survived the 0.5s join
+        and kept decoding into the same KISS buffer as the new generation.
+        """
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+
+        class BlockingSerial:
+            def __init__(self):
+                self.is_open = True
+                self.entered = threading.Event()
+
+            def read(self, n=1):
+                self.entered.set()
+                while self.is_open:
+                    time.sleep(0.005)
+                raise OSError("port closed")
+
+            @property
+            def in_waiting(self):
+                return 0
+
+            def close(self):
+                self.is_open = False
+
+        fake = BlockingSerial()
+        modem.serial_conn = fake
+        modem.is_connected = True
+        modem._mark_serial_failure = lambda reason: None
+
+        reader = threading.Thread(target=modem._rx_worker, daemon=True)
+        modem.rx_thread = reader
+        reader.start()
+        assert fake.entered.wait(timeout=2.0)
+
+        modem._stop_io_threads(join_timeout=2.0)
+
+        assert fake.is_open is False, "the port was left open, so the reader kept running"
+        assert not reader.is_alive(), "the previous generation reader outlived the stop"
+
+
+class TestRxCallbackDisarmRace:
+    """RX dispatch must tolerate the callback being cleared concurrently.
+
+    The dispatcher's RX disarm (and wait_for_rx's callback swap) can null
+    on_frame_received between the dispatch-time guard and the deferred
+    invoke, so dispatch must act on a snapshot, never a re-read.
+    """
+
+    def test_invoke_rx_callback_tolerates_none(self):
+        from openhop_core.hardware.kiss_modem_wrapper import _invoke_rx_callback
+
+        _invoke_rx_callback(None, b"data", -50, 7.5)  # must not raise
+
+    def test_event_loop_dispatch_uses_snapshotted_callback(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        scheduled = []
+        fake_loop = MagicMock()
+        fake_loop.call_soon_threadsafe.side_effect = lambda fn, *a: scheduled.append((fn, a))
+        modem.set_event_loop(fake_loop)
+        received = []
+        modem.on_frame_received = lambda data: received.append(data)
+
+        modem._dispatch_rx_callback(b"payload", -50, 7.5)
+        # Callback cleared (e.g. dispatcher RX disarm) before the loop drains.
+        modem.on_frame_received = None
+
+        assert len(scheduled) == 1
+        fn, args = scheduled[0]
+        fn(*args)  # must invoke the snapshot, not re-read the cleared attribute
+        assert received == [b"payload"]
+
+    def test_dispatch_returns_quietly_when_callback_already_none(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        fake_loop = MagicMock()
+        modem.set_event_loop(fake_loop)
+        modem.on_frame_received = None
+
+        modem._dispatch_rx_callback(b"payload", -50, 7.5)  # must not raise
+
+        fake_loop.call_soon_threadsafe.assert_not_called()

@@ -15,16 +15,18 @@ import struct
 import time
 from typing import Callable, Optional
 
-from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder
+from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder, PathUtils
 from ...protocol.constants import PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_RESPONSE
+from ...protocol.region_map import apply_reply_scope
 from .base import BaseHandler
+from .result import HandlerResult
 
 # Response codes
 RESP_SERVER_LOGIN_OK = 0x00  # Login successful
 RESP_SERVER_LOGIN_FAILED = 0x01  # Login failed
 
 # Firmware version
-FIRMWARE_VER_LEVEL = 1
+FIRMWARE_VER_LEVEL = 2
 
 
 class LoginServerHandler(BaseHandler):
@@ -85,8 +87,19 @@ class LoginServerHandler(BaseHandler):
         """Set callback for sending response packets."""
         self._send_packet_callback = callback
 
-    async def __call__(self, packet: Packet) -> None:
-        """Handle ANON_REQ login packet from client."""
+    async def __call__(self, packet: Packet) -> HandlerResult:
+        """Handle ANON_REQ login packet from client.
+
+        Returns an authenticated HandlerResult when the request was decrypted for
+        this identity — i.e. it is genuinely addressed to us and the caller should
+        consume it (a failed password is still ours to reject, not a collision).
+        Returns a not-for-us result when it was not for us (wrong dest hash, or an
+        HMAC failure from a dest-hash collision), so the caller may forward/re-flood
+        it instead of dropping it.
+        """
+        # Flipped to True once decryption succeeds; used by the outer handler so a
+        # post-decrypt error still counts as "for us" while a pre-decrypt error forwards.
+        for_us = False
         try:
             # Debug: Log packet routing info
             path_data = packet.get_path_hashes_hex() if packet.path_len > 0 else []
@@ -98,7 +111,7 @@ class LoginServerHandler(BaseHandler):
             # Parse ANON_REQ structure: dest_hash(1) + client_pubkey(32) + encrypted_data
             if len(packet.payload) < 34:
                 self.log("[LoginServer] ANON_REQ packet too short")
-                return
+                return HandlerResult.not_for_us()
 
             dest_hash = packet.payload[0]
             client_pubkey = bytes(packet.payload[1:33])
@@ -107,7 +120,7 @@ class LoginServerHandler(BaseHandler):
             # Verify this is for us
             our_hash = self.local_identity.get_public_key()[0]
             if dest_hash != our_hash:
-                return  # Not for us
+                return HandlerResult.not_for_us()  # Not for us
 
             # Create client identity and calculate shared secret
             client_identity = Identity(client_pubkey)
@@ -121,11 +134,15 @@ class LoginServerHandler(BaseHandler):
                 plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_data)
             except Exception as e:
                 self.log(f"[LoginServer] Failed to decrypt login request: {e}")
-                return
+                return HandlerResult.not_for_us()
+
+            # Decryption succeeded: this ANON_REQ is genuinely for us. Consume it
+            # from here on regardless of parse/auth outcome.
+            for_us = True
 
             if len(plaintext) < 4:
                 self.log("[LoginServer] Decrypted data too short")
-                return
+                return HandlerResult.consumed()
 
             # Parse plaintext - two formats:
             # Repeater format: timestamp(4) + password(variable) + null
@@ -142,7 +159,7 @@ class LoginServerHandler(BaseHandler):
                 # Room server format: sync_since(4) + password
                 if len(plaintext) < 8:
                     self.log("[LoginServer] Room server packet too short for sync_since field")
-                    return
+                    return HandlerResult.consumed()
                 sync_since = struct.unpack("<I", plaintext[4:8])[0]
 
                 # Find null terminator AFTER sync_since field (starting from byte 8)
@@ -187,7 +204,11 @@ class LoginServerHandler(BaseHandler):
             sig = inspect.signature(self.authenticate)
             if "sync_since" in sig.parameters:
                 success, permissions = self.authenticate(
-                    client_identity, shared_secret, password, client_timestamp, sync_since
+                    client_identity,
+                    shared_secret,
+                    password,
+                    client_timestamp,
+                    sync_since,
                 )
             else:
                 # Old signature without sync_since
@@ -211,8 +232,11 @@ class LoginServerHandler(BaseHandler):
                 # Optionally send failure response (or just ignore)
                 # Most implementations just ignore failed attempts
 
+            return HandlerResult.consumed()
+
         except Exception as e:
             self.log(f"[LoginServer] Error handling login packet: {e}")
+            return HandlerResult(authenticated=for_us)
 
     async def _send_login_response(
         self,
@@ -291,9 +315,23 @@ class LoginServerHandler(BaseHandler):
                     route_type="flood",
                 )
                 packet_type_name = "RESPONSE(flood)"
-                self.log(
-                    f"[LoginServer] Creating RESPONSE datagram (direct login, flood reply)"
-                )
+                self.log("[LoginServer] Creating RESPONSE datagram (direct login, flood reply)")
+
+            # Accumulate the reply's path at the *request's* hash width, not this
+            # node's own preference. Firmware sends both branches through
+            # sendFloodReply(..., packet->getPathHashSize()) (simple_repeater
+            # onAnonDataRecv); the node's path_hash_mode governs only packets it
+            # originates itself (sendFloodScoped(default_scope, ..., _prefs
+            # .path_hash_mode + 1)). Marked applied so the dispatcher's node
+            # default cannot stamp over the mirror, the same way apply_reply_scope
+            # protects the region decision below.
+            in_path_len = getattr(original_packet, "path_len", 0) if original_packet else 0
+            in_hash_size = (
+                PathUtils.get_path_hash_size(in_path_len)
+                if PathUtils.is_valid_path_len(in_path_len)
+                else 1
+            )
+            response_pkt.apply_path_hash_mode(in_hash_size - 1, mark_applied=True)
 
             # Debug: Log packet details
             self.log(
@@ -303,6 +341,12 @@ class LoginServerHandler(BaseHandler):
                 f"path_len={response_pkt.path_len}, "
                 f"payload[0:2]={bytes(response_pkt.payload[:2]).hex()}"
             )
+
+            # Scope the flood reply (PATH-return for a flood login, or the flood
+            # RESPONSE datagram for a direct login) to the region the request
+            # arrived under. Both branches build a flood reply; a direct request
+            # captures no region and stays plain.
+            apply_reply_scope(response_pkt, original_packet)
 
             # Send with delay (matches C++ SERVER_RESPONSE_DELAY)
             delay_ms = 300

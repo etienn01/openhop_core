@@ -18,6 +18,7 @@ from .constants import (
     MAX_ADVERT_DATA_SIZE,
     MAX_PACKET_PAYLOAD,
     MAX_PATH_SIZE,
+    MAX_TEXT_LEN,
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_ANON_REQ,
@@ -36,6 +37,7 @@ from .constants import (
     TELEM_PERM_BASE,
     TELEM_PERM_ENVIRONMENT,
     TELEM_PERM_LOCATION,
+    TXT_TYPE_SIGNED_PLAIN,
 )
 from .identity import Identity, LocalIdentity
 from .packet_utils import (
@@ -74,6 +76,7 @@ class PacketBuilder:
     @staticmethod
     def _create_packet(header: int, payload: bytes) -> Packet:
         """Create a packet with the given header and payload."""
+        PacketValidationUtils.validate_payload_size(len(payload))
         pkt = Packet()
         pkt.header = header
         pkt.payload = bytearray(payload)
@@ -431,7 +434,12 @@ class PacketBuilder:
             # Returns: 3
             ```
         """
-        timestamp = PacketBuilder._get_timestamp()
+        # Plain wall time, matching firmware Mesh::createAdvert's getCurrentTime().
+        # The strictly-increasing _get_timestamp() is reserved for request/login
+        # tags: sharing it here would let a burst of requests inflate the counter
+        # past real time, and peers would then drop this node's later wall-time
+        # adverts as replays until the clock caught up.
+        timestamp = int(time.time())
         pubkey = local_identity.get_public_key()
         ts_bytes = struct.pack("<I", timestamp)
         appdata = PacketBuilder._encode_advert_data(name, lat, lon, feature1, feature2, flags)
@@ -644,8 +652,10 @@ class PacketBuilder:
             Packet: Encrypted login packet ready for transmission.
         """
         timestamp = PacketBuilder._get_timestamp()
-        password_truncated = password[:15]
-        password_bytes = password_truncated.encode("utf-8")
+        # Firmware BaseChatMesh::sendLogin bounds the password at 15 *bytes* of the
+        # encoded buffer (strlen + memcpy). Encode first, then truncate so a
+        # multibyte character cannot push the field past the wire limit.
+        password_bytes = password.encode("utf-8")[:15]
 
         is_room = getattr(contact, "type", 0) == CONTACT_TYPE_ROOM_SERVER
 
@@ -693,6 +703,7 @@ class PacketBuilder:
         message: str,
         sender_name: str = "Unknown",
         channels_config: Optional[Any] = None,
+        timestamp: Optional[int] = None,
     ) -> Packet:
         """
         Create an encrypted group message for a specified channel.
@@ -751,8 +762,18 @@ class PacketBuilder:
         channel_hash = hashlib.sha256(hash_input).digest()[0]
         secret_bytes = (secret_bytes + b"\x00" * 32)[:32]
 
-        timestamp, flags = PacketBuilder._get_timestamp(), 0x00
-        content = f"{sender_name}: {message}".encode("utf-8")
+        if timestamp is None:
+            timestamp = PacketBuilder._get_timestamp()
+        flags = 0x00
+        # Firmware sendGroupMessage caps "<sender>: <text>" at MAX_TEXT_LEN bytes,
+        # truncating the text (never the prefix). Re-encode after the byte cut so a
+        # multi-byte UTF-8 sequence split at the boundary is dropped, not corrupted.
+        prefix = f"{sender_name}: ".encode("utf-8")
+        text_bytes = message.encode("utf-8")
+        max_text = max(MAX_TEXT_LEN - len(prefix), 0)
+        if len(text_bytes) > max_text:
+            text_bytes = text_bytes[:max_text].decode("utf-8", errors="ignore").encode("utf-8")
+        content = prefix + text_bytes
         plaintext = PacketBuilder._pack_timestamp_data(timestamp, flags, content)
 
         ciphertext = CryptoUtils._aes_encrypt(secret_bytes[:16], plaintext)
@@ -792,7 +813,7 @@ class PacketBuilder:
         if ptype not in (PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_GRP_DATA):
             raise ValueError("invalid payload type")
 
-        aes_key = CryptoUtils.sha256(secret)
+        aes_key = secret[:16]
         cipher = PacketBuilder._encrypt_payload(aes_key, secret, plaintext)
         payload = bytearray([channel_hash]) + cipher
 
@@ -873,10 +894,20 @@ class PacketBuilder:
         two-way communication, with optional additional data.
 
         The inner payload first byte is the encoded path_len (bits 6-7 = hash
-        size - 1, bits 0-5 = hop count). When path_len_encoded is provided
-        and valid, it is used so 2- and 3-byte path hashes match firmware.
-        When path_len_encoded is None, the first byte is len(path) (1-byte
-        hash semantics).
+        size - 1, bits 0-5 = hop count), so ``path_len_encoded`` is required
+        for a non-empty path: ``path`` is a flat byte sequence and its length
+        alone cannot distinguish N 1-byte hashes from one N-byte hash.
+
+        Guessing 1-byte semantics here is unrecoverable in the field.  Firmware
+        stores a taught path verbatim (``simple_repeater`` ``onPeerPathRecv``:
+        ``client->out_path_len = copyPath(...)``), persists it to flash, and
+        never re-derives it — ``onPeerPathRecv`` is its only writer.  A path
+        taught with the wrong hash size therefore makes the peer answer down a
+        route that resolves to nobody, for every subsequent DIRECT exchange,
+        until something re-teaches it or a *flood* login resets it
+        (``handleLoginReq``: ``if (is_flood) client->out_path_len =
+        OUT_PATH_UNKNOWN;``).  Failing loudly at build time is the only place
+        the mistake is still cheap.
 
         Args:
             dest_hash: Destination node hash (1 byte).
@@ -885,20 +916,36 @@ class PacketBuilder:
             path: Sequence of node hashes for the return path.
             extra_type: Type identifier for extra data (default: 0xFF).
             extra: Additional binary data to include.
-            path_len_encoded: Encoded path_len byte from the original packet.
-                If None, first byte of inner payload is len(path) (1-byte hashes).
+            path_len_encoded: Encoded path_len byte, normally the ``path_len``
+                of the packet the path was observed on.  Required whenever
+                ``path`` is non-empty; for a 1-byte-hash path pass
+                ``PathUtils.encode_path_len(1, hop_count)``.  May be None only
+                for an empty path.
 
         Returns:
             Packet: Encrypted return path packet.
 
         Raises:
             ValueError: If combined path and extra data exceed packet limits,
-                or if path_len_encoded is provided but path length does not match.
+                if path_len_encoded is omitted for a non-empty path, if it is
+                not a valid encoded path_len, or if it disagrees with the
+                actual path length.
         """
         if len(path) + len(extra) + 5 > (MAX_PACKET_PAYLOAD - 2 - CIPHER_BLOCK_SIZE):
             raise ValueError("Combined path/extra too long")
 
-        if path_len_encoded is not None and PathUtils.is_valid_path_len(path_len_encoded):
+        if path_len_encoded is None:
+            if len(path) > 0:
+                raise ValueError(
+                    f"path_len_encoded is required for a non-empty path "
+                    f"({len(path)} bytes): the byte count cannot distinguish "
+                    f"N 1-byte hashes from one N-byte hash. Pass the observed "
+                    f"packet's path_len, or PathUtils.encode_path_len(hash_size, hops)."
+                )
+            first_byte = 0
+        else:
+            if not PathUtils.is_valid_path_len(path_len_encoded):
+                raise ValueError(f"invalid path_len_encoded 0x{path_len_encoded:02X}")
             expected_len = PathUtils.get_path_byte_len(path_len_encoded)
             if len(path) != expected_len:
                 raise ValueError(
@@ -906,10 +953,14 @@ class PacketBuilder:
                     f"(expected {expected_len} bytes)"
                 )
             first_byte = path_len_encoded
-        else:
-            first_byte = len(path)
 
-        inner = bytes([first_byte]) + bytes(path) + bytes([extra_type]) + extra
+        if extra:
+            inner = bytes([first_byte]) + bytes(path) + bytes([extra_type]) + extra
+        else:
+            # No extra payload: MeshCore Mesh::createPathReturn appends 0xFF and
+            # four RNG bytes so repeated PATH returns for the same path do not
+            # encrypt to identical packets (and identical packet hashes).
+            inner = bytes([first_byte]) + bytes(path) + b"\xff" + os.urandom(4)
         aes_key = secret[:16]
         cipher = PacketBuilder._encrypt_payload(aes_key, secret, inner)
         payload = bytearray([dest_hash, src_hash]) + cipher
@@ -966,13 +1017,39 @@ class PacketBuilder:
             # Returns: 0
             ```
         """
-        attempt &= 0x03
+        # Firmware composeMsgPacket stores only the low two bits of the attempt in
+        # the flag byte (temp[4] = attempt & 3); the full attempt is preserved for
+        # the tail below so retries above three still produce unique packets.
+        attempt_full = attempt & 0xFF
         txt_type &= 0x3F
-        flags_byte = (txt_type << 2) | attempt
+        flags_byte = (txt_type << 2) | (attempt_full & 0x03)
         timestamp = timestamp if timestamp is not None else PacketBuilder._get_timestamp()
 
-        # Use  timestamp+data packing
-        plaintext = PacketBuilder._pack_timestamp_data(timestamp, flags_byte, message, b"\x00")
+        # Firmware BaseChatMesh::composeMsgPacket rejects text longer than
+        # MAX_TEXT_LEN (measured in bytes). Match it on the UTF-8 encoded length
+        # so a valid MeshCore peer can build the same packet. For attempt > 3 the
+        # tail carries an extra NUL + attempt byte, so the text budget shrinks by
+        # two (composeMsgPacket: attempt > 3 && text_len > MAX_TEXT_LEN-2).
+        text_len = len(message.encode("utf-8"))
+        if text_len > MAX_TEXT_LEN:
+            raise ValueError(f"text message too long: {text_len} bytes (max {MAX_TEXT_LEN})")
+        if attempt_full > 3 and text_len > MAX_TEXT_LEN - 2:
+            raise ValueError(
+                f"text message too long for extended attempt: {text_len} bytes "
+                f"(max {MAX_TEXT_LEN - 2})"
+            )
+
+        signed_sender_prefix = (
+            local_identity.get_public_key()[:4] if txt_type == TXT_TYPE_SIGNED_PLAIN else b""
+        )
+
+        # Body is packed as a C string (text + NUL). When attempt > 3 the firmware
+        # hides the full attempt byte after that terminator so retries whose low
+        # two bits repeat (4 → 0, 5 → 1, …) still hash uniquely.
+        tail = b"\x00" + bytes([attempt_full]) if attempt_full > 3 else b"\x00"
+        plaintext = PacketBuilder._pack_timestamp_data(
+            timestamp, flags_byte, signed_sender_prefix, message, tail
+        )
 
         # Use  encryption and payload creation
         payload, shared_secret, aes_key = PacketBuilder._create_encrypted_payload(
@@ -980,7 +1057,9 @@ class PacketBuilder:
         )
 
         # Calculate CRC using centralized packing
-        crc_input = PacketBuilder._pack_timestamp_data(timestamp, flags_byte, message)
+        crc_input = PacketBuilder._pack_timestamp_data(
+            timestamp, flags_byte, signed_sender_prefix, message
+        )
         ack_crc = int.from_bytes(
             CryptoUtils.sha256(crc_input + local_identity.get_public_key())[:4],
             "little",
@@ -1028,7 +1107,12 @@ class PacketBuilder:
         pkt.payload_len = len(payload)
 
         # Enhanced debug logging with packet details
-        route_type_names = {0: "TRANSPORT_FLOOD", 1: "FLOOD", 2: "DIRECT", 3: "TRANSPORT_DIRECT"}
+        route_type_names = {
+            0: "TRANSPORT_FLOOD",
+            1: "FLOOD",
+            2: "DIRECT",
+            3: "TRANSPORT_DIRECT",
+        }
         header_route_type = pkt.header & 0x03
         logger.debug("Created TXT_MSG packet:")
         logger.debug(
@@ -1052,6 +1136,7 @@ class PacketBuilder:
         protocol_code: int,
         data: bytes = b"",
         timestamp: Optional[int] = None,
+        route_type: Optional[str] = None,
     ) -> tuple[Packet, int]:
         """
         Create a protocol request packet for repeater commands.
@@ -1065,6 +1150,8 @@ class PacketBuilder:
             protocol_code: The protocol command code.
             data: Additional binary data for the request.
             timestamp: Optional timestamp (uses current time if None).
+            route_type: Optional explicit routing mode ("direct" or "flood").
+                When omitted, routing is selected from the contact's known path.
 
         Returns:
             tuple: (packet, timestamp) - The created packet and the timestamp used.
@@ -1097,7 +1184,7 @@ class PacketBuilder:
         # path is known; flood only when the out_path is unknown (-1). Mirrors
         # create_anon_request and firmware sendRequest (OUT_PATH_UNKNOWN -> flood,
         # else sendDirect, which works with a 0-length path).
-        route_type = "direct" if out_path_len >= 0 else "flood"
+        route_type = route_type or ("direct" if out_path_len >= 0 else "flood")
 
         header = PacketBuilder._create_header(PAYLOAD_TYPE_REQ, route_type)
         packet = PacketBuilder._create_packet(header, payload)
@@ -1164,7 +1251,7 @@ class PacketBuilder:
         want_location: bool = True,
         want_environment: bool = True,
         include_entropy: bool = True,
-        route_type: str = "direct",
+        route_type: Optional[str] = None,
     ) -> tuple[Packet, int]:
         """
         Create a telemetry request packet for sensor data collection.
@@ -1179,7 +1266,8 @@ class PacketBuilder:
             want_location: Include location/GPS data.
             want_environment: Include environmental sensors.
             include_entropy: Include entropy/randomness data.
-            route_type: Routing method ("direct" or "flood").
+            route_type: Optional routing override ("direct" or "flood").
+                When omitted, routing is selected from the contact's known path.
 
         Returns:
             tuple: (packet, timestamp) - The telemetry request packet and timestamp.
@@ -1202,6 +1290,7 @@ class PacketBuilder:
             local_identity=local_identity,
             protocol_code=REQ_TYPE_GET_TELEMETRY_DATA,
             data=bytes([inv]),  # Just the permission mask as additional data
+            route_type=route_type,
         )
 
     # ---------- Control/Discovery Packets ----------

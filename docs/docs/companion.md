@@ -91,9 +91,9 @@ async def main():
     )
 
     # --- Register callbacks before starting ---
-    companion.on_message_received(on_msg)
+    companion.on_message_event(on_msg)
     companion.on_advert_received(on_advert)
-    companion.on_channel_message_received(on_chan_msg)
+    companion.on_channel_message_event(on_chan_msg)
     companion.on_send_confirmed(on_ack)
 
     await companion.start()
@@ -115,14 +115,14 @@ async def main():
 
 
 # --- Callbacks ---
-def on_msg(sender_key, text, timestamp, txt_type, *args):
-    print(f"DM from {sender_key[:8].hex()}: {text}")
+def on_msg(event):
+    print(f"DM from {event.sender_key[:8].hex()}: {event.text}")
 
 def on_advert(contact):
     print(f"Discovered: {contact.name} (type={contact.adv_type})")
 
-def on_chan_msg(channel_name, sender_name, text, timestamp, path_len, channel_idx, *args):
-    print(f"[{channel_name}] {sender_name}: {text}")
+def on_chan_msg(event):
+    print(f"[{event.channel_name}] {event.sender_name}: {event.text}")
 
 def on_ack(ack_crc):
     print(f"ACK confirmed: {ack_crc:#x}")
@@ -151,7 +151,7 @@ CompanionRadio(
 
 ```python
 await companion.start()      # start dispatcher task
-await companion.stop()       # cancel dispatcher
+await companion.stop()       # stop node / exit dispatcher loop
 companion.is_running         # bool property
 ```
 
@@ -352,9 +352,10 @@ For MeshCore v1.15 parity, the frame protocol also supports a persisted default 
 
 openhop-core resolves effective flood scope as:
 
-1. transient key set by `CMD_SET_FLOOD_SCOPE` / `set_flood_scope()`
-2. otherwise persisted default key (if configured)
-3. otherwise unscoped flood
+1. explicit unscoped mode (`CMD_SET_FLOOD_SCOPE` mode 1) until mode 0 sets/resets scope
+2. transient key set by `CMD_SET_FLOOD_SCOPE` mode 0 / `set_flood_scope()`
+3. otherwise persisted default key (if configured)
+4. otherwise unscoped flood
 
 When a flood scope is active, all flood packets are tagged with a 16-bit transport code
 (HMAC-SHA256 derived) and sent as `ROUTE_TYPE_TRANSPORT_FLOOD`. Direct-routed packets
@@ -392,8 +393,8 @@ stats = companion.get_stats(STATS_TYPE_PACKETS)
 
 | Method | Base Behavior | Radio Override |
 |---|---|---|
-| `set_radio_params()` | Updates `prefs` fields | Also calls `radio.configure_radio()` |
-| `set_tx_power()` | Updates `prefs.tx_power_dbm` | Also calls `radio.set_tx_power()` |
+| `set_radio_params()` | Updates `prefs` fields | Calls `radio.configure_radio()` first, then persists only on success |
+| `set_tx_power()` | Updates `prefs.tx_power_dbm` | Calls `radio.set_tx_power()` first, then persists only on success |
 | `set_advert_name()` | Updates `prefs.node_name` | Also syncs `node.node_name` |
 | `set_flood_scope()` | Stores transport key | Also syncs to `node.dispatcher` |
 | `set_flood_region()` | Derives key from name | Also syncs to `node.dispatcher` |
@@ -433,9 +434,7 @@ async def main():
         authenticate_callback=authenticate,
     )
 
-    bridge.on_message_received(
-        lambda key, text, ts, tt, *args: print(f"Bridge msg: {text}")
-    )
+    bridge.on_message_event(lambda event: print(f"Bridge msg: {event.text}"))
 
     await bridge.start()
 
@@ -462,6 +461,8 @@ CompanionBridge(
     radio_config: dict | None = None,
     authenticate_callback: Callable | None = None,  # (hash, pw) -> (bool, int)
     initial_contacts: iterable of Contact | None = None,  # optional bulk load on boot
+    radio_settings_getter: Callable[[], Mapping[str, Any]] | None = None,
+    max_tx_power_getter: Callable[[], int | None] | None = None,
 )
 ```
 
@@ -486,9 +487,9 @@ The bridge registers internal handlers for these payload types:
 
 ### All Other APIs
 
-`CompanionBridge` exposes the same messaging, contact, channel, path, signing, stats, and configuration APIs as `CompanionRadio` (inherited from `CompanionBase`). The only behavioral difference is that all TX goes through the `packet_injector` instead of an owned radio.
+`CompanionBridge` exposes the same messaging, contact, channel, path, signing, and stats APIs as `CompanionRadio`. All TX goes through the `packet_injector` instead of an owned radio.
 
-Note that **CompanionBridge does not own the radio**. `set_radio_params()` and `set_tx_power()` update in-memory prefs only; there is no physical radio to configure. `get_radio_params()` and `get_self_info()` return those in-memory prefs, not the repeater's actual hardware configuration.
+Radio settings are read-only for a bridge: `set_radio_params()` and `set_tx_power()` return `False` and do not change or persist bridge prefs. `get_radio_params()` and `get_self_info()` report the supplied host radio settings instead. To keep companion clients' combined profile-save action working, the frame server acknowledges syntactically valid radio writes to a bridge as no-ops; invalid values still receive an error. Pass `radio_settings_getter` when the host can provide live values; otherwise the bridge reads the `radio_config` mapping passed at construction (including later in-place updates). Pass `max_tx_power_getter` for the host's validated hardware limit; `max_tx_power_dbm` in those settings is the fallback capability field.
 
 ### Avoiding doubled messages
 
@@ -711,9 +712,19 @@ await server.push_control_data(
 
 ```python
 class MyFrameServer(CompanionFrameServer):
-    async def _persist_companion_message(self, msg_dict: dict) -> None:
-        """Called when a message is received. Save to database."""
-        await self.db.save_message(msg_dict)
+    async def _persist_companion_message(self, msg_dict: dict, queue_entry=None) -> None:
+        """Called when a message is received. Save to database.
+
+        ``queue_entry`` is the exact in-memory queue entry this message came
+        from. After a successful write, remove that entry by identity
+        (``self.bridge.message_queue.remove(queue_entry)``) so an interleaved
+        receive can never evict a newer, unpersisted message. When it is None
+        (older event producers), leave the message in memory — a duplicate is
+        preferable to a loss.
+        """
+        persisted = await self.db.save_message(msg_dict)
+        if persisted and queue_entry is not None:
+            self.bridge.message_queue.remove(queue_entry)
 
     def _sync_next_from_persistence(self) -> QueuedMessage | None:
         """Called when the in-memory queue is empty. Pop from database."""
@@ -757,7 +768,7 @@ Note: `set_time()` does **not** call `_save_prefs()` — the time offset is a tr
 
 ```python
 class CompanionFrameServer:
-    async def _persist_companion_message(self, msg_dict: dict) -> None: ...
+    async def _persist_companion_message(self, msg_dict: dict, queue_entry=None) -> None: ...
     def _sync_next_from_persistence(self) -> QueuedMessage | None: ...
     def _save_contacts(self) -> None: ...
     def _save_channels(self) -> None: ...
@@ -775,7 +786,7 @@ Build a terminal or GUI chat client that discovers peers and exchanges messages.
 ```python
 companion = CompanionRadio(radio, identity, node_name="ChatApp")
 
-companion.on_message_received(display_message)
+companion.on_message_event(display_message)
 companion.on_advert_received(add_to_contact_list)
 
 await companion.start()
@@ -822,7 +833,7 @@ bridge = CompanionBridge(
     authenticate_callback=auth_check,
 )
 
-bridge.on_message_received(handle_bot_command)
+bridge.on_message_event(handle_bot_command)
 await bridge.start()
 
 # In the repeater's RX loop:
@@ -878,9 +889,8 @@ await companion.send_path_discovery_req(target_key)
 companion.set_channel(0, name="Emergency", secret=b"shared_channel_secret___________")
 companion.set_channel(1, name="General",   secret=b"another_shared_secret___________")
 
-companion.on_channel_message_received(
-    lambda ch_name, sender, text, ts, path_len, idx, *args:
-        print(f"[{ch_name}] {sender}: {text}")
+companion.on_channel_message_event(
+    lambda event: print(f"[{event.channel_name}] {event.sender_name}: {event.text}")
 )
 
 await companion.send_channel_message(0, "Emergency broadcast")
@@ -891,13 +901,26 @@ await companion.send_channel_message(0, "Emergency broadcast")
 ## Push Callbacks Reference
 
 Register callbacks to receive asynchronous events. Both sync and async functions are supported.
-Callbacks for `on_message_received` and `on_channel_message_received` receive optional trailing args
-`(packet_hash, snr, rssi)` when available; use `*args` to ignore them.
+
+Message callbacks receive a single frozen event object (`MessageEvent`,
+`ChannelMessageEvent`, or `ChannelDataEvent` from `openhop_core.companion`),
+so new metadata fields never change the callback signature. For direct
+messages, `event.path_len` is the companion-format route byte: the encoded
+flood path length, or `0xFF` for a direct route. `event.queued` is false when
+the protected offline queue could not retain the message.
+
+The older `on_message_received`, `on_channel_message_received`, and
+`on_channel_data_received` registrations remain supported but are deprecated;
+they explode the event into the legacy positional form shown below.
 
 | Registration Method | Callback Signature |
 |---|---|
-| `on_message_received` | `(sender_key: bytes, text: str, timestamp: int, txt_type: int [, packet_hash, snr, rssi])` |
-| `on_channel_message_received` | `(channel_name: str, sender_name: str, text: str, timestamp: int, path_len: int, channel_idx: int [, packet_hash, snr, rssi])` |
+| `on_message_event` | `(event: MessageEvent)` |
+| `on_channel_message_event` | `(event: ChannelMessageEvent)` |
+| `on_channel_data_event` | `(event: ChannelDataEvent)` |
+| `on_message_received` (deprecated) | `(sender_key: bytes, text: str, timestamp: int, txt_type: int, packet_hash, snr, rssi, sender_prefix, path_len, queued)` |
+| `on_channel_message_received` (deprecated) | `(channel_name: str, sender_name: str, text: str, timestamp: int, path_len: int, channel_idx: int, packet_hash, snr, rssi, queued)` |
+| `on_channel_data_received` (deprecated) | `(channel_idx: int, path_len: int, data_type: int, payload: bytes, packet_hash, snr, rssi, queued)` |
 | `on_advert_received` | `(contact: Contact)` |
 | `on_contact_path_updated` | `(contact: Contact)` |
 | `on_send_confirmed` | `(ack_crc: int)` |
@@ -910,6 +933,15 @@ Callbacks for `on_message_received` and `on_channel_message_received` receive op
 | `on_rx_log_data` | `(snr: float, rssi: int, raw_bytes: bytes)` — **CompanionRadio only**; same data as PUSH 0x88 LOG_RX_DATA |
 | `on_binary_response` | `(tag: bytes, data: bytes, parsed: dict\|None, request_type: int\|None)` |
 | `on_path_discovery_response` | `(tag: bytes, contact_pubkey: bytes, out_path: bytes, in_path: bytes)` |
+
+!!! warning "Do not combine direct push callbacks with a frame server"
+    `CompanionFrameServer` owns the bridge's push-callback registry: each
+    client connection clears **all** registered push callbacks and installs
+    its own set, so registrations made directly on the bridge are removed on
+    the next (re)connect and never restored. Run either a frame server or
+    direct push subscriptions on a given bridge, not both. To observe events
+    alongside a frame server, consume them from the frame protocol as a
+    client, or subclass the frame server and extend its own callback set.
 
 ---
 

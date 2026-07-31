@@ -166,13 +166,14 @@ class KissSerialWrapper(LoRaRadio):
             if self.auto_configure:
                 if not self.configure_radio_and_enter_kiss():
                     logger.warning("Auto-configuration failed, KISS mode not active")
+                    self.disconnect()
                     return False
 
             return True
 
         except Exception as e:
             logger.error(f"Failed to connect to {self.port}: {e}")
-            self.is_connected = False
+            self.disconnect()
             return False
 
     def disconnect(self):
@@ -241,7 +242,16 @@ class KissSerialWrapper(LoRaRadio):
             return False
 
         try:
-            # Update local config
+            # Create and queue the KISS command frame first; only commit local
+            # config after the TX buffer accepts it so get_config() matches the TNC.
+            kiss_frame = self._encode_kiss_frame(cmd, bytes([value]))
+
+            if len(self.tx_buffer) >= TX_BUFFER_SIZE:
+                self.stats["buffer_overruns"] += 1
+                return False
+
+            self.tx_buffer.append(kiss_frame)
+
             if cmd == KISS_CMD_TXDELAY:
                 self.config["txdelay"] = value
             elif cmd == KISS_CMD_PERSIST:
@@ -253,15 +263,7 @@ class KissSerialWrapper(LoRaRadio):
             elif cmd == KISS_CMD_FULLDUP:
                 self.config["fulldup"] = bool(value)
 
-            # Create and send KISS command frame
-            kiss_frame = self._encode_kiss_frame(cmd, bytes([value]))
-
-            if len(self.tx_buffer) < TX_BUFFER_SIZE:
-                self.tx_buffer.append(kiss_frame)
-                return True
-            else:
-                self.stats["buffer_overruns"] += 1
-                return False
+            return True
 
         except Exception as e:
             logger.error(f"Failed to send config command: {e}")
@@ -484,12 +486,12 @@ class KissSerialWrapper(LoRaRadio):
         if not success:
             raise Exception("Failed to initialize KISS radio")
 
-    async def send(self, data: bytes) -> None:
+    async def send(self, data: bytes) -> Optional[Dict[str, Any]]:
         """
-        Send data via KISS TNC. Returns None (no metadata available).
+        Send data via KISS TNC.
 
-        Args:
-            data: Data to send
+        Returns:
+            Empty metadata dict on successful queue (no hardware TX metadata).
 
         Raises:
             Exception: If send fails
@@ -497,7 +499,7 @@ class KissSerialWrapper(LoRaRadio):
         success = self.send_frame(data)
         if not success:
             raise Exception("Failed to send frame via KISS TNC")
-        return None
+        return {}
 
     async def wait_for_rx(self) -> bytes:
         """
@@ -507,16 +509,22 @@ class KissSerialWrapper(LoRaRadio):
             Received packet data
         """
         # Create a future to wait for the next received frame
+        loop = asyncio.get_running_loop()
         future = asyncio.Future()
 
         # Store the original callback
         original_callback = self.on_frame_received
 
-        # Set a temporary callback that completes the future
+        # Set a temporary callback that completes the future on the event loop.
+        # RX delivery runs on the serial worker thread, so set_result must be
+        # scheduled with call_soon_threadsafe rather than called directly.
         def temp_callback(data: bytes):
             if not future.done():
-                future.set_result(data)
-            # Restore original callback if it exists
+                try:
+                    loop.call_soon_threadsafe(future.set_result, data)
+                except RuntimeError as e:
+                    logger.error(f"Failed to complete wait_for_rx future: {e}")
+            # Fan out to the original callback if it exists
             if original_callback:
                 try:
                     original_callback(data)
@@ -612,19 +620,34 @@ class KissSerialWrapper(LoRaRadio):
                 self.escaped = True
 
         elif self.escaped:
-            if byte == KISS_TFEND:
-                self.rx_frame_buffer.append(KISS_FEND)
-            elif byte == KISS_TFESC:
-                self.rx_frame_buffer.append(KISS_FESC)
+            if byte == KISS_TFEND or byte == KISS_TFESC:
+                decoded = KISS_FEND if byte == KISS_TFEND else KISS_FESC
+                # Same MAX_FRAME_SIZE cap as plain bytes — escape floods must not grow unbounded.
+                if len(self.rx_frame_buffer) >= MAX_FRAME_SIZE:
+                    self.stats["frame_errors"] += 1
+                    logger.warning("KISS frame exceeded max size (%d), resyncing", MAX_FRAME_SIZE)
+                    self.rx_frame_buffer.clear()
+                    self.in_frame = False
+                else:
+                    self.rx_frame_buffer.append(decoded)
             else:
-                # Invalid escape sequence
+                # Invalid escape sequence; reset so we resync at next FEND
                 self.stats["frame_errors"] += 1
                 logger.warning(f"Invalid KISS escape sequence: 0x{byte:02X}")
+                self.rx_frame_buffer.clear()
+                self.in_frame = False
             self.escaped = False
 
         else:
             if self.in_frame:
-                self.rx_frame_buffer.append(byte)
+                if len(self.rx_frame_buffer) >= MAX_FRAME_SIZE:
+                    # Frame too long (e.g. lost FEND); reset and resync at next FEND
+                    self.stats["frame_errors"] += 1
+                    logger.warning("KISS frame exceeded max size (%d), resyncing", MAX_FRAME_SIZE)
+                    self.rx_frame_buffer.clear()
+                    self.in_frame = False
+                else:
+                    self.rx_frame_buffer.append(byte)
 
     def _decode_kiss(self, data: bytes) -> None:
         """Bulk KISS decoder used by the RX worker.
@@ -649,14 +672,23 @@ class KissSerialWrapper(LoRaRadio):
                 b = data[i]
                 i += 1
                 escaped = False
-                if b == KISS_TFEND:
-                    buf.append(KISS_FEND)
-                elif b == KISS_TFESC:
-                    buf.append(KISS_FESC)
+                # Mirrors _decode_kiss_byte: escaped payload bytes honor MAX_FRAME_SIZE.
+                if b == KISS_TFEND or b == KISS_TFESC:
+                    decoded = KISS_FEND if b == KISS_TFEND else KISS_FESC
+                    if len(buf) >= MAX_FRAME_SIZE:
+                        self.stats["frame_errors"] += 1
+                        logger.warning(
+                            "KISS frame exceeded max size (%d), resyncing", MAX_FRAME_SIZE
+                        )
+                        buf.clear()
+                        in_frame = False
+                    else:
+                        buf.append(decoded)
                 else:
-                    # Mirrors _decode_kiss_byte: count + log, but do NOT clear/resync
                     self.stats["frame_errors"] += 1
                     logger.warning(f"Invalid KISS escape sequence: 0x{b:02X}")
+                    buf.clear()
+                    in_frame = False
                 continue
 
             fend = data.find(_KISS_FEND_B, i)
@@ -670,7 +702,19 @@ class KissSerialWrapper(LoRaRadio):
 
             run_end = n if nxt == -1 else nxt
             if run_end > i and in_frame:
-                buf += data[i:run_end]  # this decoder applies no MAX_FRAME_SIZE cap
+                run = data[i:run_end]
+                # Honor the MAX_FRAME_SIZE resync rule from _decode_kiss_byte: fill to the
+                # cap, then the next plain byte triggers a resync (lost-FEND protection).
+                space = MAX_FRAME_SIZE - len(buf)
+                if len(run) <= space:
+                    buf += run
+                else:
+                    if space > 0:
+                        buf += run[:space]
+                    self.stats["frame_errors"] += 1
+                    logger.warning("KISS frame exceeded max size (%d), resyncing", MAX_FRAME_SIZE)
+                    buf.clear()
+                    in_frame = False
 
             if nxt == -1:
                 break
@@ -709,12 +753,14 @@ class KissSerialWrapper(LoRaRadio):
         data = bytes(self.rx_frame_buffer[1:])
 
         if cmd == KISS_CMD_DATA:
-            # Data frame - emit to callback
-            if self.on_frame_received and len(data) > 0:
+            # Data frame - emit to callback. Snapshot once: the callback can be
+            # cleared concurrently (dispatcher RX disarm, wait_for_rx swap).
+            callback = self.on_frame_received
+            if callback and len(data) > 0:
                 self.stats["frames_received"] += 1
                 self.stats["bytes_received"] += len(data)
                 try:
-                    self.on_frame_received(data)
+                    callback(data)
                 except Exception as e:
                     logger.error(f"Error in frame received callback: {e}")
         else:
@@ -742,6 +788,8 @@ class KissSerialWrapper(LoRaRadio):
             except Exception as e:
                 if self.is_connected:  # Only log if we expect to be connected
                     logger.error(f"RX worker error: {e}")
+                # Mark unhealthy and release the port so a later connect() can reopen it.
+                self._fail_transport()
                 break
 
     def _tx_worker(self):
@@ -768,11 +816,31 @@ class KissSerialWrapper(LoRaRadio):
             except Exception as e:
                 if self.is_connected:  # Only log if we expect to be connected
                     logger.error(f"TX worker error: {e}")
+                # Mark unhealthy and release the port so a later connect() can reopen it.
+                self._fail_transport()
                 break
+
+    def _fail_transport(self) -> None:
+        """Mark the link unhealthy and close the serial port from a worker thread.
+
+        Does not join threads (the caller is one of them). Closing the port wakes
+        the peer worker out of a blocking read so both sides exit.
+        """
+        self.is_connected = False
+        self.stop_event.set()
+        conn = self.serial_conn
+        if conn is None:
+            return
+        try:
+            if conn.is_open:
+                conn.close()
+        except Exception as e:
+            logger.debug("Error closing serial after worker failure: %s", e)
 
     def __enter__(self):
         """Context manager entry"""
-        self.connect()
+        if not self.connect():
+            raise RuntimeError(f"Failed to connect to KISS serial port {self.port}")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):

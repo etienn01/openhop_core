@@ -67,6 +67,7 @@ from .protocol_constants import (
     RADIO_CONFIG_FMT,
     STATUS_RESP_FMT,
     STATUS_RESP_SIZE,
+    build_cad_params_payload,
     build_frame,
     crc16_ccitt,
 )
@@ -86,6 +87,7 @@ if _HAS_BASE:
 
     class _RadioBase(LoRaRadio):
         pass
+
 else:
 
     class _RadioBase:
@@ -148,6 +150,7 @@ class TCPLoRaRadio(_RadioBase):
         # from construction time even when never customised.
         self._custom_cad_peak: Optional[int] = None
         self._custom_cad_min: Optional[int] = None
+        self._custom_cad_symbol_num: Optional[int] = None
 
         # Signal metrics
         self.last_rssi: int = -99
@@ -232,9 +235,7 @@ class TCPLoRaRadio(_RadioBase):
         # so the repeater UI can stay up while the user sets pymc_tcp.host
         # via /api/setup_wizard or /api/update_radio_config.
         self._stop_event.clear()
-        self._rx_thread = threading.Thread(
-            target=self._rx_worker, daemon=True, name="tcp-lora-rx"
-        )
+        self._rx_thread = threading.Thread(target=self._rx_worker, daemon=True, name="tcp-lora-rx")
         self._rx_thread.start()
 
         self._initialized = True
@@ -461,30 +462,29 @@ class TCPLoRaRadio(_RadioBase):
         det_min: Optional[int] = None,
         timeout: float = 1.0,
         calibration: bool = False,
+        cad_symbol_num: Optional[int] = None,
     ) -> bool:
         """Public CAD interface compatible with sx1262_wrapper.perform_cad().
 
         When det_peak/det_min are supplied (e.g. by the repeater's CAD
-        calibration tool), program the chip with those thresholds via
-        CMD_SET_CAD_PARAMS before running the scan. Without this each
-        calibration sample would silently fall back to whatever thresholds
-        were last installed, defeating the sweep.
+        calibration tool), program the chip with those thresholds and the
+        requested symbol count via CMD_SET_CAD_PARAMS before running the scan.
         """
+        if cad_symbol_num is None:
+            cad_symbol_num = self._custom_cad_symbol_num or 2
+        cad_symbol_num = int(cad_symbol_num)
+
         if det_peak is not None and det_min is not None:
             new_peak = int(det_peak)
             new_min = int(det_min)
-            # Skip the firmware roundtrip when thresholds haven't changed
-            # since the previous call. Saves ~50-80 ms per CAD during the
-            # repeated-sample phase of the calibration sweep.
-            if new_peak != self._custom_cad_peak or new_min != self._custom_cad_min:
-                payload = bytes(
-                    [
-                        0x01,  # symNum: CAD_ON_2_SYMB
-                        new_peak & 0xFF,
-                        new_min & 0xFF,
-                        0x00,  # exitMode: STDBY
-                    ]
-                )
+            # Skip the firmware roundtrip when all CAD parameters match the
+            # previous call. Changing only symbol count must still be pushed.
+            if (
+                new_peak != self._custom_cad_peak
+                or new_min != self._custom_cad_min
+                or cad_symbol_num != self._custom_cad_symbol_num
+            ):
+                payload = build_cad_params_payload(cad_symbol_num, new_peak, new_min)
                 await self._send_command(
                     CMD_SET_CAD_PARAMS,
                     payload,
@@ -493,6 +493,7 @@ class TCPLoRaRadio(_RadioBase):
                 )
                 self._custom_cad_peak = new_peak
                 self._custom_cad_min = new_min
+                self._custom_cad_symbol_num = cad_symbol_num
 
         # Calibration engine passes 0.3s, which is tight for TCP transport
         # with the firmware's CAD-prime delay; floor it so the sweep gets
@@ -649,9 +650,7 @@ class TCPLoRaRadio(_RadioBase):
             received_crc = struct.unpack("<H", crc_bytes)[0]
             computed_crc = crc16_ccitt(hdr + payload)
             if received_crc != computed_crc:
-                logger.warning(
-                    f"CRC mismatch: recv=0x{received_crc:04X} comp=0x{computed_crc:04X}"
-                )
+                logger.warning(f"CRC mismatch: recv=0x{received_crc:04X} comp=0x{computed_crc:04X}")
                 return None
             return (cmd, payload)
         except socket.timeout:
@@ -752,9 +751,7 @@ class TCPLoRaRadio(_RadioBase):
                     # Remote closed — try to reopen instead of dying; the
                     # previous behaviour left tcp_radio permanently offline
                     # until systemctl restart (known_issue_tcp_no_reconnect).
-                    logger.warning(
-                        "TCP connection closed by peer — attempting reconnect"
-                    )
+                    logger.warning("TCP connection closed by peer — attempting reconnect")
                     self._close_sock()
                     buf.clear()
                     if self._reconnect_with_backoff():
@@ -831,9 +828,7 @@ class TCPLoRaRadio(_RadioBase):
             self.last_signal_rssi = signal_rssi
             self._rx_count += 1
 
-            logger.debug(
-                f"RX: {len(lora_data)}B RSSI={rssi}dBm SNR={snr_x10 / 10:.1f}dB"
-            )
+            logger.debug(f"RX: {len(lora_data)}B RSSI={rssi}dBm SNR={snr_x10 / 10:.1f}dB")
 
             if self.rx_callback:
                 if self._event_loop is None:
@@ -916,9 +911,7 @@ class TCPLoRaRadio(_RadioBase):
             try:
                 await asyncio.wait_for(evt.wait(), timeout=timeout)
             except asyncio.TimeoutError:
-                logger.warning(
-                    f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}"
-                )
+                logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
                 return None
 
             return self._response_data.get(expect_cmd)
@@ -994,9 +987,7 @@ class TCPLoRaRadio(_RadioBase):
             self.preamble_length,
         )
         ok = self._run_async_safe(
-            self._send_command(
-                CMD_SET_CONFIG, payload, expect_cmd=CMD_CONFIG_RESP, timeout=5.0
-            ),
+            self._send_command(CMD_SET_CONFIG, payload, expect_cmd=CMD_CONFIG_RESP, timeout=5.0),
             wait_timeout=6.0,
         )
         logger.info(f"Live config push ({changed}): {'OK' if ok else 'TIMEOUT'}")
@@ -1081,17 +1072,21 @@ class TCPLoRaRadio(_RadioBase):
             return True
         if self._event_loop is None or not self._event_loop.is_running():
             return True
-        payload = bytes([0x01, peak & 0xFF, min_val & 0xFF, 0x00])
+        payload = build_cad_params_payload(self._custom_cad_symbol_num or 2, peak, min_val)
         ok = self._run_async_safe(
             self._send_command(
                 CMD_SET_CAD_PARAMS, payload, expect_cmd=CMD_CAD_PARAMS_RESP, timeout=3.0
             ),
             wait_timeout=4.0,
         )
-        logger.info(
-            f"CAD thresholds pushed peak={peak} min={min_val}: {'OK' if ok else 'TIMEOUT'}"
-        )
+        logger.info(f"CAD thresholds pushed peak={peak} min={min_val}: {'OK' if ok else 'TIMEOUT'}")
         return ok
+
+    def set_custom_cad_symbol_num(self, cad_symbol_num: int) -> bool:
+        """Store a validated CAD symbol count for calls that omit an override."""
+        build_cad_params_payload(cad_symbol_num, 0, 0)
+        self._custom_cad_symbol_num = int(cad_symbol_num)
+        return True
 
     def clear_custom_cad_thresholds(self) -> None:
         self._custom_cad_peak = None

@@ -22,6 +22,7 @@ from openhop_core.node.handlers.anon_request import (
 from openhop_core.node.handlers.login_server import LoginServerHandler
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet
 from openhop_core.protocol.constants import (
+    MAX_PACKET_PAYLOAD,
     PAYLOAD_TYPE_ANON_REQ,
     PAYLOAD_TYPE_RESPONSE,
     ROUTE_TYPE_DIRECT,
@@ -136,6 +137,84 @@ class TestAnonRequestHandler:
         await self.handler(self._build_login(password="", route_type="flood"))
         assert len(self.sent) == 1
 
+    @pytest.mark.asyncio
+    async def test_room_server_login_bypasses_subtype_dispatch(self):
+        """Room-server login payload uses byte 4 as sync_since[0], not anon sub-type."""
+        room_login_handler = LoginServerHandler(
+            local_identity=self.server_identity,
+            log_fn=lambda *_: None,
+            authenticate_callback=self.auth_callback,
+            is_room_server=True,
+        )
+        room_handler = AnonRequestHandler(
+            local_identity=self.server_identity,
+            log_fn=lambda *_: None,
+            login_handler=room_login_handler,
+            anon_limiter=self.limiter,
+            region_names_fn=lambda: "*,VHF,USA",
+            owner_info_fn=lambda: ("repeater-1", "owner@example.com"),
+            features_fn=lambda: 0x80,
+            clock_fn=lambda: 1_700_000_000,
+        )
+        sent = []
+        room_handler.set_send_packet_callback(lambda pkt, delay: sent.append((pkt, delay)))
+
+        # sync_since low byte 0x14 used to be misread as an unknown anon sub-type.
+        plaintext = struct.pack("<II", 4321, 0x12345614) + b"\x00"
+        await room_handler(self._build_packet(plaintext, route_type="flood"))
+
+        assert len(sent) == 1
+
+    # -- consume-vs-forward return contract (#353) --------------------------
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_decrypted_for_us(self):
+        """A request that decrypts for our identity is consumed (return True)."""
+        assert (await self.handler(self._build_login(route_type="flood"))).authenticated is True
+        assert (
+            await self.handler(self._build_discovery(ANON_REQ_TYPE_REGIONS))
+        ).authenticated is True
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_for_us_but_reply_declined(self):
+        """Rate-limited / non-direct discovery is still ours — consume, don't forward."""
+        # Non-direct discovery: firmware only answers direct, but it decrypted for us.
+        assert (
+            await self.handler(self._build_discovery(ANON_REQ_TYPE_OWNER, route_type="flood"))
+        ).authenticated is True
+        assert self.sent == []
+        # Exhaust the limiter, then a direct discovery is declined but still consumed.
+        for _ in range(4):
+            self.limiter.allow(1000.0)
+        assert (
+            await self.handler(self._build_discovery(ANON_REQ_TYPE_OWNER))
+        ).authenticated is True
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_dest_hash_mismatch(self):
+        """A packet addressed to a different identity is not ours (forward)."""
+        pkt = self._build_login(route_type="flood")
+        pkt.payload[0] = (pkt.payload[0] + 1) & 0xFF  # break the dest-hash match
+        assert (await self.handler(pkt)).authenticated is False
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_decrypt_failure_collision(self):
+        """dest hash matches ours but HMAC fails (hash collision): not ours, forward (#353)."""
+        pkt = self._build_login(route_type="flood")
+        pkt.payload[-1] ^= 0xFF  # corrupt ciphertext/MAC so decryption fails
+        assert (await self.handler(pkt)).authenticated is False
+        assert self.sent == []
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_short_payload(self):
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_ANON_REQ << 2) | ROUTE_TYPE_FLOOD
+        pkt.payload = bytearray([0x01, 0x02])
+        pkt.payload_len = 2
+        pkt.path = bytearray()
+        pkt.path_len = 0
+        assert (await self.handler(pkt)).authenticated is False
+
     # -- regions / owner / basic responders --------------------------------
 
     @pytest.mark.asyncio
@@ -167,7 +246,7 @@ class TestAnonRequestHandler:
         assert names.startswith("REGION000,")
         assert not names.endswith(",")
         assert all(part.startswith("REGION") for part in names.split(","))
-        assert self.sent[0][0].payload_len <= 256
+        assert self.sent[0][0].payload_len <= MAX_PACKET_PAYLOAD
 
     @pytest.mark.asyncio
     async def test_owner_reply(self):

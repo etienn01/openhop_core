@@ -10,6 +10,12 @@ the 4-byte timestamp (``data[4]``) selects the handler:
 - ``ANON_REQ_TYPE_OWNER`` (0x02) -> ``"node_name\nowner_info"``.
 - ``ANON_REQ_TYPE_BASIC`` (0x03) -> clock + a feature-flags byte.
 
+For room-server identities, firmware parity is different from repeaters:
+``simple_room_server/MyMesh.cpp`` treats all ``PAYLOAD_TYPE_ANON_REQ`` packets
+as login payloads (timestamp + sync_since + password), so this handler bypasses
+sub-type dispatch and delegates directly to ``LoginServerHandler`` when
+``login_handler.is_room_server`` is true.
+
 The regions/owner/basic responders only answer route-direct requests and are
 gated behind a shared :class:`AnonRateLimiter` (mirroring the firmware
 ``anon_limiter``) so the node does not become a flood amplifier.
@@ -23,17 +29,19 @@ import time
 from typing import Callable, Optional, Tuple
 
 from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder
-from ...protocol.constants import MAX_PACKET_PAYLOAD, PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_RESPONSE
+from ...protocol.constants import (
+    ANON_REQ_TYPE_BASIC,
+    ANON_REQ_TYPE_OWNER,
+    ANON_REQ_TYPE_REGIONS,
+    MAX_PACKET_PAYLOAD,
+    PAYLOAD_TYPE_ANON_REQ,
+    PAYLOAD_TYPE_RESPONSE,
+)
 from ...protocol.packet_utils import PathUtils
+from ...protocol.region_map import apply_reply_scope
 from .base import BaseHandler
 from .login_server import LoginServerHandler
-
-# Anonymous-request sub-types (first byte of an ANON_REQ payload after the
-# 4-byte timestamp). Mirrors ``openhop_core.companion.constants`` but defined here
-# to avoid a circular import (the companion package imports node.handlers).
-ANON_REQ_TYPE_REGIONS = 0x01
-ANON_REQ_TYPE_OWNER = 0x02
-ANON_REQ_TYPE_BASIC = 0x03
+from .result import HandlerResult
 
 # Server response delay (ms) — matches firmware SERVER_RESPONSE_DELAY.
 SERVER_RESPONSE_DELAY_MS = 300
@@ -121,17 +129,28 @@ class AnonRequestHandler(BaseHandler):
         # Keep the wrapped login handler wired through the same sender.
         self.login_handler.set_send_packet_callback(callback)
 
-    async def __call__(self, packet: Packet) -> None:
-        """Handle an ANON_REQ packet: decrypt, then dispatch on the sub-type byte."""
+    async def __call__(self, packet: Packet) -> HandlerResult:
+        """Handle an ANON_REQ packet: decrypt, then dispatch on the sub-type byte.
+
+        Returns an authenticated HandlerResult when the request was decrypted for
+        this identity — i.e. it is genuinely addressed to us and the caller should
+        consume it (this holds even when we decline to answer, e.g. a rate-limited
+        or non-direct discovery query). Returns a not-for-us result when it was not
+        for us (wrong dest hash, or an HMAC failure from a dest-hash collision) so
+        the caller may forward/re-flood it.
+        """
+        # Flipped to True once decryption succeeds; used by the outer handler so a
+        # post-decrypt error still counts as "for us" while a pre-decrypt error forwards.
+        for_us = False
         try:
             # Parse ANON_REQ: dest_hash(1) + client_pubkey(32) + encrypted_data
             if len(packet.payload) < 34:
-                return
+                return HandlerResult.not_for_us()
 
             dest_hash = packet.payload[0]
             our_hash = self.local_identity.get_public_key()[0]
             if dest_hash != our_hash:
-                return  # Not for us
+                return HandlerResult.not_for_us()  # Not for us
 
             client_pubkey = bytes(packet.payload[1:33])
             encrypted_data = bytes(packet.payload[33:])
@@ -146,13 +165,25 @@ class AnonRequestHandler(BaseHandler):
                 plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_data)
             except Exception as e:
                 self.log(f"[AnonReq] Failed to decrypt request: {e}")
-                return
+                return HandlerResult.not_for_us()
+
+            # Decryption succeeded: this ANON_REQ is genuinely for us. Consume it
+            # from here on regardless of sub-type or whether we choose to reply.
+            for_us = True
+
+            # Firmware parity (simple_room_server): room servers do not subtype
+            # dispatch ANON_REQ by plaintext byte 4. Their login payload is:
+            # timestamp(4) + sync_since(4) + password...
+            # so byte 4 is sync_since[0], not an anon request code.
+            if getattr(self.login_handler, "is_room_server", False):
+                await self.login_handler(packet)
+                return HandlerResult.consumed()
 
             if len(plaintext) < 5:
                 # Too short to carry a sub-type byte; treat as login (let it
                 # apply its own length checks).
                 await self.login_handler(packet)
-                return
+                return HandlerResult.consumed()
 
             subtype = plaintext[4]
 
@@ -160,7 +191,7 @@ class AnonRequestHandler(BaseHandler):
             # i.e. an actual password. Delegate verbatim to the login handler.
             if subtype == 0x00 or subtype >= 0x20:
                 await self.login_handler(packet)
-                return
+                return HandlerResult.consumed()
 
             # Regions/owner/basic discovery: route-direct only (firmware parity).
             if subtype in (ANON_REQ_TYPE_REGIONS, ANON_REQ_TYPE_OWNER, ANON_REQ_TYPE_BASIC):
@@ -175,21 +206,23 @@ class AnonRequestHandler(BaseHandler):
                         f"[AnonReq] {kind} request from {client_hex} ignored "
                         f"(not route-direct — firmware only answers direct)"
                     )
-                    return
+                    return HandlerResult.consumed()
                 if not self.anon_limiter.allow(time.time()):
                     self.log(f"[AnonReq] {kind} request from {client_hex} rate limited, dropping")
-                    return
+                    return HandlerResult.consumed()
                 self.log(f"[AnonReq] {kind} request from {client_hex} -> replying")
                 await self._handle_discovery(
                     packet, client_identity, shared_secret, subtype, plaintext
                 )
-                return
+                return HandlerResult.consumed()
 
             # Unknown/invalid sub-type: ignore.
             self.log(f"[AnonReq] Unknown anon sub-type 0x{subtype:02X}, ignoring")
+            return HandlerResult.consumed()
 
         except Exception as e:
             self.log(f"[AnonReq] Error handling anon request: {e}")
+            return HandlerResult(authenticated=for_us)
 
     async def _handle_discovery(
         self,
@@ -280,6 +313,25 @@ class AnonRequestHandler(BaseHandler):
                     extra=reply_data,
                     path_len_encoded=(packet.path_len if packet.path_len > 0 else None),
                 )
+                # Accumulate this reply's path at the *request's* hash width.
+                # Firmware: sendFloodReply(path, SERVER_RESPONSE_DELAY,
+                # packet->getPathHashSize()) (simple_repeater onAnonDataRecv).
+                # The node's own path_hash_mode governs self-originated floods,
+                # not replies, so mark it applied to keep the dispatcher default
+                # from stamping over the mirror. Distinct from ``hash_size``
+                # above, which is the client's *reply-path* descriptor.
+                #
+                # This branch is currently unreachable: every discovery sub-type
+                # is gated route-direct in ``__call__`` (firmware gates all three
+                # the same way), and the login sub-type is delegated to
+                # LoginServerHandler, which mirrors the width itself. Kept correct
+                # so relaxing that gate cannot silently reintroduce the mismatch.
+                in_hash_size = (
+                    PathUtils.get_path_hash_size(packet.path_len)
+                    if PathUtils.is_valid_path_len(packet.path_len)
+                    else 1
+                )
+                response_pkt.apply_path_hash_mode(in_hash_size - 1, mark_applied=True)
             else:
                 # Direct reply routed along the path supplied in the request.
                 response_pkt = PacketBuilder.create_datagram(
@@ -293,6 +345,10 @@ class AnonRequestHandler(BaseHandler):
                 if reply_path_len > 0 and path_bytes:
                     encoded = PathUtils.encode_path_len(hash_size, reply_path_len)
                     response_pkt.set_path(path_bytes, encoded)
+
+            # Scope the flood path-return reply to the region the request arrived
+            # under; a direct reply captures no region and stays plain.
+            apply_reply_scope(response_pkt, packet)
 
             self._send_packet_callback(response_pkt, SERVER_RESPONSE_DELAY_MS)
             route = "flood" if packet.is_route_flood() else "direct"

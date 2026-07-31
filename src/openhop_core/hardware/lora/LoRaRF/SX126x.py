@@ -1,3 +1,4 @@
+import logging
 import time
 
 # Optional import - spidev is only needed for hardware SPI (Raspberry Pi)
@@ -13,6 +14,7 @@ from ...signal_utils import snr_register_to_db
 from .base import BaseLoRa
 
 _gpio_manager = None
+logger = logging.getLogger("SX126x")
 
 
 def set_gpio_manager(gpio_manager):
@@ -30,7 +32,9 @@ def set_spi_transport(spi_transport):
 def _get_output(pin):
     """Get output pin via centralized GPIO manager (setup only if needed)"""
     if _gpio_manager is None:
-        raise RuntimeError("GPIO manager not initialized. Call set_gpio_manager() first.")
+        raise RuntimeError(
+            "GPIO manager not initialized. Call set_gpio_manager() first."
+        )
     # Only setup if pin doesn't exist yet
     if pin not in _gpio_manager._pins:
         _gpio_manager.setup_output_pin(pin, initial_value=True)
@@ -40,7 +44,9 @@ def _get_output(pin):
 def _get_input(pin):
     """Get input pin via centralized GPIO manager (setup only if needed)"""
     if _gpio_manager is None:
-        raise RuntimeError("GPIO manager not initialized. Call set_gpio_manager() first.")
+        raise RuntimeError(
+            "GPIO manager not initialized. Call set_gpio_manager() first."
+        )
     # Only setup if pin doesn't exist yet
     if pin not in _gpio_manager._pins:
         _gpio_manager.setup_input_pin(pin)
@@ -135,8 +141,12 @@ class SX126x(BaseLoRa):
 
     # SetRxTxFallbackMode
     FALLBACK_FS = 0x40  # after Rx/Tx go to: FS mode
-    FALLBACK_STDBY_XOSC = 0x30  #                    standby mode with crystal oscillator
-    FALLBACK_STDBY_RC = 0x20  #                    standby mode with RC oscillator (default)
+    FALLBACK_STDBY_XOSC = (
+        0x30  #                    standby mode with crystal oscillator
+    )
+    FALLBACK_STDBY_RC = (
+        0x20  #                    standby mode with RC oscillator (default)
+    )
 
     # SetDioIrqParams
     IRQ_TX_DONE = 0x0001  # packet transmission completed
@@ -186,6 +196,45 @@ class SX126x(BaseLoRa):
     PA_RAMP_800U = 0x05  #            800 us
     PA_RAMP_1700U = 0x06  #            1700 us
     PA_RAMP_3400U = 0x07  #            3400 us
+
+    # Optimized SX1262 PA settings derived from current RadioLib table:
+    # jgromes/RadioLib src/modules/SX126x/SX1262.cpp (paOptimizedTable)
+    # Indexing is requested dBm + 9 for requested range [-9, 22].
+    # Each tuple is (paDutyCycle, hpMax, paVal[SetTxParams power byte]).
+    SX1262_PA_TABLE = (
+        (2, 2, -5),
+        (2, 1, 0),
+        (1, 1, 3),
+        (1, 2, 0),
+        (1, 1, 6),
+        (1, 2, 3),
+        (2, 2, 2),
+        (4, 1, 6),
+        (1, 1, 11),
+        (2, 1, 11),
+        (1, 1, 14),
+        (2, 1, 14),
+        (1, 1, 20),
+        (1, 1, 22),
+        (2, 2, 11),
+        (3, 1, 21),
+        (1, 2, 17),
+        (4, 2, 13),
+        (1, 2, 20),
+        (1, 2, 22),
+        (2, 2, 21),
+        (3, 2, 21),
+        (1, 4, 19),
+        (1, 4, 20),
+        (3, 3, 20),
+        (2, 5, 19),
+        (1, 6, 22),
+        (2, 5, 22),
+        (3, 5, 22),
+        (3, 6, 22),
+        (4, 6, 22),
+        (4, 7, 22),
+    )
 
     # SetModulationParams
     BW_7800 = 0x00  # LoRa bandwidth: 7.8 kHz
@@ -250,7 +299,9 @@ class SX126x(BaseLoRa):
     PREAMBLE_DET_LEN_32 = 0x07  #                               32-bit
     ADDR_COMP_OFF = 0x00  # FSK address filtering: off
     ADDR_COMP_NODE = 0x01  #                        filtering on node address
-    ADDR_COMP_ALL = 0x02  #                        filtering on node and broadcast address
+    ADDR_COMP_ALL = (
+        0x02  #                        filtering on node and broadcast address
+    )
     PACKET_KNOWN = 0x00  # FSK packet type: the packet length known on both side
     PACKET_VARIABLE = 0x01  #                  the packet length on variable size
     CRC_0 = 0x01  # FSK CRC type: no CRC
@@ -271,7 +322,9 @@ class SX126x(BaseLoRa):
     CAD_EXIT_RX = 0x01  # after CAD is done, exit to Rx mode if activity is detected
 
     # GetStatus
-    STATUS_DATA_AVAILABLE = 0x04  # command status: packet received and data can be retrieved
+    STATUS_DATA_AVAILABLE = (
+        0x04  # command status: packet received and data can be retrieved
+    )
     STATUS_CMD_TIMEOUT = 0x06  #                 SPI command timed out
     STATUS_CMD_ERROR = 0x08  #                 invalid SPI command
     STATUS_CMD_FAILED = 0x0A  #                 SPI command failed to execute
@@ -323,7 +376,9 @@ class SX126x(BaseLoRa):
     _cs = 0
     _reset = 22
     _busy = 23
-    _cs_define = -1  # -1 = use automatic CS from SPI driver, or set via setManualCsPin()
+    _cs_define = (
+        -1
+    )  # -1 = use automatic CS from SPI driver, or set via setManualCsPin()
     _irq = -1
     _txen = -1
     _rxen = -1
@@ -564,16 +619,30 @@ class SX126x(BaseLoRa):
         rfFreq = int(frequency * 33554432 / 32000000)
         self.setRfFrequency(rfFreq)
 
+    def _get_sx1262_pa_config(self, requested_dbm: int):
+        """Resolve SX1262 optimized PA settings for requested output dBm."""
+        index = requested_dbm + 9
+        return self.SX1262_PA_TABLE[index]
+
     def setTxPower(self, txPower: int, version=TX_POWER_SX1262):
         # -----------------------------
         # Chipset-specific hard limits
         # -----------------------------
-        if txPower > 22:
-            txPower = 22
-        if version == self.TX_POWER_SX1261 and txPower > 15:
-            txPower = 15
-        if txPower < -17:
-            txPower = -17
+        if version == self.TX_POWER_SX1261:
+            if txPower > 15:
+                txPower = 15
+            if txPower < -17:
+                txPower = -17
+        elif version == self.TX_POWER_SX1262:
+            if txPower > 22:
+                txPower = 22
+            if txPower < -9:
+                txPower = -9
+        else:
+            if txPower > 22:
+                txPower = 22
+            if txPower < -17:
+                txPower = -17
 
         # Default configuration
         paDutyCycle = 0x00
@@ -585,22 +654,23 @@ class SX126x(BaseLoRa):
         # SX1262 (E22 modules)
         # =============================
         if version == self.TX_POWER_SX1262:
-            # Per datasheet 13.4.4: power parameter is in dBm directly
-            powerReg = txPower
+            requested_dbm = txPower
+            paDutyCycle, hpMax, paVal = self._get_sx1262_pa_config(requested_dbm)
 
-            # Configure OCP (Over Current Protection) for high power only
-            # For high power (≥20 dBm), need 140 mA current limit
-            # For lower power, leave chip default (matches RadioLib behavior)
-            if txPower >= 20:
-                # High power: Set OCP to 140 mA
-                # Formula: I_max = 2.5 * (OCP + 1) mA
-                # 0x38 = 56 decimal → (56 + 1) * 2.5 = 142.5 mA
-                self.setCurrentProtection(0x38)  # 140 mA
+            # Keep SX1262 OCP fixed at 140 mA (0x38) independent of requested
+            # output dBm. This avoids OCP changing as a side effect of power
+            # selection while preserving high-power SX1262 operation.
+            self.setCurrentProtection(0x38)
 
-            # Matches RadioLib's SX1262::setOutputPower() implementation
             deviceSel = 0x00  # SX1262 PA (0x00 for SX1262, 0x01 for SX1261)
-            paDutyCycle = 0x04  # Optimal duty cycle for high power
-            hpMax = 0x07  # Maximum clamping level (allows full +22 dBm)
+            powerReg = paVal
+            logger.debug(
+                "SX1262 TX power: requested=%ddBm, duty=%d, hpMax=%d, paVal=%d",
+                requested_dbm,
+                paDutyCycle,
+                hpMax,
+                paVal,
+            )
 
             # Note: For E22-900M30S modules, 22 dBm from SX1262 chip
             #       → ~30 dBm (1W) output via external YP2233W PA
@@ -674,7 +744,7 @@ class SX126x(BaseLoRa):
         # APPLY FINAL CONFIG
         # =============================
         self.setPaConfig(paDutyCycle, hpMax, deviceSel, paLut)
-        self.setTxParams(powerReg, self.PA_RAMP_40U)
+        self.setTxParams(powerReg, self.PA_RAMP_200U)
 
     def setRxGain(self, rxGain):
         # set power saving or boosted gain in register
@@ -759,7 +829,9 @@ class SX126x(BaseLoRa):
         else:
             invertIq = self.IQ_STANDARD
 
-        self.setPacketParamsLoRa(preambleLength, headerType, payloadLength, crcType, invertIq)
+        self.setPacketParamsLoRa(
+            preambleLength, headerType, payloadLength, crcType, invertIq
+        )
         self._fixInvertedIq(invertIq)
 
     def setSpreadingFactor(self, sf: int):
@@ -939,7 +1011,9 @@ class SX126x(BaseLoRa):
         # if self.getMode() == self.STATUS_MODE_RX:
         #     return False
         # clear previous interrupt and set RX done, RX timeout, header error, and CRC error as interrupt source
-        self._irqSetup(self.IRQ_RX_DONE | self.IRQ_TIMEOUT | self.IRQ_HEADER_ERR | self.IRQ_CRC_ERR)
+        self._irqSetup(
+            self.IRQ_RX_DONE | self.IRQ_TIMEOUT | self.IRQ_HEADER_ERR | self.IRQ_CRC_ERR
+        )
         # set status to RX wait or RX continuous wait
         self._statusWait = self.STATUS_RX_WAIT
         self._statusIrq = 0x0000
@@ -966,7 +1040,9 @@ class SX126x(BaseLoRa):
         if self.getMode() == self.STATUS_MODE_RX:
             return False
         # clear previous interrupt and set RX done, RX timeout, header error, and CRC error as interrupt source
-        self._irqSetup(self.IRQ_RX_DONE | self.IRQ_TIMEOUT | self.IRQ_HEADER_ERR | self.IRQ_CRC_ERR)
+        self._irqSetup(
+            self.IRQ_RX_DONE | self.IRQ_TIMEOUT | self.IRQ_HEADER_ERR | self.IRQ_CRC_ERR
+        )
         # set status to RX wait or RX continuous wait
         self._statusWait = self.STATUS_RX_WAIT
         self._statusIrq = 0x0000
@@ -1270,7 +1346,9 @@ class SX126x(BaseLoRa):
 
     ### SX126X API: DIO AND IRQ CONTROL ###
 
-    def setDioIrqParams(self, irqMask: int, dio1Mask: int, dio2Mask: int, dio3Mask: int):
+    def setDioIrqParams(
+        self, irqMask: int, dio1Mask: int, dio2Mask: int, dio3Mask: int
+    ):
         buf = (
             (irqMask >> 8) & 0xFF,
             irqMask & 0xFF,
@@ -1329,7 +1407,9 @@ class SX126x(BaseLoRa):
         buf = (sf, bw, cr, ldro, 0, 0, 0, 0)
         self._writeBytes(0x8B, buf, 8)
 
-    def setModulationParamsFsk(self, br: int, pulseShape: int, bandwidth: int, Fdev: int):
+    def setModulationParamsFsk(
+        self, br: int, pulseShape: int, bandwidth: int, Fdev: int
+    ):
         buf = (
             (br >> 16) & 0xFF,
             (br >> 8) & 0xFF,
@@ -1494,7 +1574,9 @@ class SX126x(BaseLoRa):
             # Let SPI driver handle CS automatically
             spi.xfer2(buf)
 
-    def _readBytes(self, opCode: int, nBytes: int, address: tuple = (), nAddress: int = 0) -> tuple:
+    def _readBytes(
+        self, opCode: int, nBytes: int, address: tuple = (), nAddress: int = 0
+    ) -> tuple:
         if self.busyCheck():
             return ()
 

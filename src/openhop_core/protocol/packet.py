@@ -35,9 +35,9 @@ from .packet_utils import PacketDataUtils, PacketHashingUtils, PacketValidationU
 ╠════════════════════╬══════════════════════════════════════════════════════╣
 ║ Path (N bytes)     ║ Node hashes (1-3 bytes each), N = count × hash_size  ║
 ╠════════════════════╬══════════════════════════════════════════════════════╣
-║ Payload (N bytes)  ║ Actual encrypted or plain payload. Max: 254 bytes    ║
+║ Payload (N bytes)  ║ Actual encrypted or plain payload. Max: 184 bytes    ║
 ╠════════════════════╬══════════════════════════════════════════════════════╣
-║ Total Size         ║ <= 256 bytes (hard limit)                            ║
+║ Total Size         ║ Bounded by MAX_PACKET_PAYLOAD for the payload field   ║
 ╚════════════════════╩══════════════════════════════════════════════════════╝
 
 Header Layout (1 byte):
@@ -56,7 +56,7 @@ Header Layout (1 byte):
 Notes:
 - `write_to()` and `read_from()` enforce the exact structure used in firmware.
 - Transport codes are included only for route types 0x00 and 0x03.
-- Payload size must be ≤ MAX_PACKET_PAYLOAD (typically 254).
+- Payload size must be ≤ MAX_PACKET_PAYLOAD (currently 184).
 - `calculate_packet_hash()` includes payload type + path_len (only for TRACE).
 """
 
@@ -115,7 +115,11 @@ class Packet:
         "drop_reason",
         "_tx_metadata",
         "_path_hash_mode_applied",
+        "_flood_scope_applied",
         "_injected_for_tx",
+        "_injected_origin_hash",
+        "_recv_region_captured",
+        "_recv_region_key",
     )
 
     def __init__(self):
@@ -139,7 +143,22 @@ class Packet:
         self._do_not_retransmit = False
         self.drop_reason = None  # Optional: reason for dropping packet
         self._path_hash_mode_applied = False
+        # Set once the companion layer has decided this flood packet's scoping
+        # (scoped or deliberately plain); the dispatcher must not re-scope it.
+        self._flood_scope_applied = False
         self._injected_for_tx = False  # Set by repeater inject path; skip engine on route
+        # Companion that originated this injected TX, as the "0xHH" hash string the
+        # host keys its frame servers by (None for host-originated injects). Set by
+        # the repeater inject path so the companion fan-out can withhold the packet
+        # from its own sender -- a node never hears its own transmission.
+        self._injected_origin_hash: Optional[str] = None
+        # Region captured from this packet on receive. Only set True when
+        # a RegionMap was actually consulted; the matched region key (or None =>
+        # reply plain) is read by region_map.apply_reply_scope when a handler
+        # builds a flood reply. Lives on the Packet, never a shared dispatcher
+        # member, because replies are sent from background tasks that would race.
+        self._recv_region_captured: bool = False
+        self._recv_region_key: Optional[bytes] = None
 
     def get_route_type(self) -> int:
         """
@@ -231,14 +250,35 @@ class Packet:
     ) -> None:
         """Set path_len bits 6-7 from path_hash_mode for 0-hop packets (skip TRACE).
 
-        Used by companion and dispatcher so the rule lives in one place. TRACE
-        packets are excluded because the repeater's trace handler uses path/path_len
-        for SNR values, not routing hashes.
+        Used by companion, handlers and dispatcher so the rule lives in one place.
+        TRACE packets are excluded because the repeater's trace handler uses
+        path/path_len for SNR values, not routing hashes.
 
         Args:
             mode: Path hash mode: 0=1-byte, 1=2-byte, 2=3-byte per hop.
-            mark_applied: If True, set _path_hash_mode_applied so dispatcher
-                does not overwrite (used when companion applies its preference).
+            mark_applied: If True, set ``_path_hash_mode_applied``, which stops
+                ``Dispatcher._apply_default_path_hash_mode`` overwriting this
+                width with the node default on the way out. Three callers claim
+                it, for the same reason -- the width was decided by something
+                that outranks the node preference:
+
+                * the companion applying its own configured preference
+                  (``base_config._apply_path_hash_mode``);
+                * a server handler mirroring the width of the request it is
+                  answering, which is what firmware's ``sendFloodReply(...,
+                  packet->getPathHashSize())`` does -- the node preference
+                  governs only self-originated floods;
+                * the dispatcher itself on a packet being forwarded, whose width
+                  belongs to the originator.
+
+                Leave it False to let the node default decide (the dispatcher's
+                own call site, which is that default).
+
+        Note:
+            ``_path_hash_mode_applied`` is an in-memory attribute, not part of
+            the wire format, so it does not survive a serialize/parse round trip.
+            Anything between a handler and the radio must pass the Packet object
+            itself, or the marked width is silently replaced by the node default.
 
         Raises:
             ValueError: If mode not in (0, 1, 2).
@@ -351,8 +391,15 @@ class Packet:
             ValueError: If any declared length doesn't match the actual buffer length.
         """
         PacketValidationUtils.validate_buffer_lengths(
-            self.get_path_byte_len(), len(self.path), self.payload_len, len(self.payload)
+            self.get_path_byte_len(),
+            len(self.path),
+            self.payload_len,
+            len(self.payload),
         )
+
+    def _validate_payload_size(self) -> None:
+        """Validate that payload_len does not exceed MAX_PACKET_PAYLOAD."""
+        PacketValidationUtils.validate_payload_size(self.payload_len)
 
     def _check_bounds(self, idx: int, required: int, data_len: int, error_msg: str) -> None:
         """
@@ -383,9 +430,11 @@ class Packet:
 
         Raises:
             ValueError: If internal length values don't match actual buffer lengths,
-                indicating data corruption or incorrect packet construction.
+                indicating data corruption or incorrect packet construction, or if
+                the payload exceeds MAX_PACKET_PAYLOAD.
         """
         self._validate_lengths()
+        self._validate_payload_size()
 
         out = bytearray([self.header])
 
@@ -466,12 +515,19 @@ class Packet:
         - Message integrity validation
 
         Returns:
-            bytes: First MAX_HASH_SIZE bytes of SHA256 digest computed over
-                the payload type, path length, and payload data.
+            bytes: First MAX_HASH_SIZE bytes of a SHA256 digest computed over
+                the payload type and payload data. The path length (path_len) is
+                included ONLY for TRACE packets; it is excluded for every other
+                type.
 
         Note:
-            The hash includes payload type and path_len to ensure packets with
-            different routing or content types produce different hashes.
+            path_len is deliberately NOT hashed for non-TRACE packets: echo and
+            duplicate suppression depend on it, so a rebroadcast that arrives with
+            a longer accumulated path must hash identically to the original. Only
+            TRACE packets fold in path_len — per firmware's CAVEAT (Packet.cpp),
+            a TRACE can revisit the same node on its return path, so its hash must
+            differ by route. Matches PacketHashingUtils.calculate_packet_hash and
+            MeshCore Packet::calculatePacketHash.
         """
         return PacketHashingUtils.calculate_packet_hash(
             self.get_payload_type(), self.path_len, self.payload[: self.payload_len]
