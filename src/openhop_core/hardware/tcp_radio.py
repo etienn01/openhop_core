@@ -437,9 +437,9 @@ class TCPLoRaRadio(_RadioBase):
 
     def get_noise_floor(self) -> Optional[float]:
         if not self._initialized:
-            return 0.0
+            return None
         if self._tx_lock.locked():
-            return 0.0
+            return None
         return self._noise_floor
 
     async def refresh_noise_floor(self) -> Optional[float]:
