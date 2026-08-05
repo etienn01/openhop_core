@@ -32,6 +32,9 @@ from openhop_core.hardware.base import LoRaRadio
 from openhop_core.node.node import MeshNode
 
 
+RADIO_TYPES = ["waveshare", "uconsole", "meshadv-mini", "kiss-tnc", "kiss-modem", "ch341", "pinedio"]
+
+
 def create_radio(
     radio_type: str = "waveshare",
     serial_port: str = "/dev/ttyUSB0",
@@ -46,6 +49,7 @@ def create_radio(
             "kiss-tnc"      — KISS TNC over serial
             "kiss-modem"    — MeshCore KISS modem over serial
             "ch341"         — SX1262 via CH341 USB-to-SPI adapter
+            "pinedio"       — Similar to CH341 but different pinout
             "pymc_usb"      — pymc_usb firmware over USB-CDC
             "pymc_tcp"      — pymc_usb firmware over Wi-Fi/TCP
         serial_port: Serial port path. Used by "kiss-tnc", "kiss-modem", and "pymc_usb".
@@ -116,7 +120,7 @@ def create_radio(
             return modem_wrapper
 
         # Check if this is a CH341 configuration
-        if radio_type == "ch341":
+        if radio_type in ("ch341", "pinedio"):
             from openhop_core.hardware.ch341.ch341_gpio_manager import CH341GPIOManager
             from openhop_core.hardware.lora.LoRaRF.SX126x import set_gpio_manager, set_spi_transport
             from openhop_core.hardware.sx1262_wrapper import SX1262Radio
@@ -134,27 +138,51 @@ def create_radio(
             set_spi_transport(ch341_spi)
             logger.debug("Set CH341 SPI transport globally")
 
-            # CH341 pin configuration (using actual CH341 GPIO pins 0-7)
-            ch341_config = {
-                "bus_id": 0,  # Not used with CH341 but required parameter
-                "cs_id": 0,  # Not used with CH341 but required parameter
-                "cs_pin": 0,  # CH341 GPIO 0 for CS
-                "reset_pin": 2,  # CH341 GPIO 2 for Reset
-                "busy_pin": 4,  # CH341 GPIO 4 for Busy
-                "irq_pin": 6,  # CH341 GPIO 6 for IRQ
-                "txen_pin": -1,  # Not used
-                "rxen_pin": 1,  # CH341 GPIO 1 for RX enable
-                "frequency": int(869.618 * 1000000),  # EU: 869.618 MHz
-                "tx_power": 22,
-                "spreading_factor": 8,
-                "bandwidth": int(62.5 * 1000),
-                "coding_rate": 8,
-                "preamble_length": 17,
-                "use_dio2_rf": True,
-                "is_waveshare": False,  # Waveshare SX1262 LoRa HAT pinout
-                "use_dio3_tcxo": True,  # Enable TCXO on DIO3
-                "dio3_tcxo_voltage": 1.8,  # 1.8V TCXO
-            }
+            # NOTE: pin numbers are CH341 GPIO pin numbers, see CH341GPIOPin
+            # documentation to see how that translates to CH341 pin numbers.
+            if radio_type == "ch341":
+                ch341_config = {
+                    "bus_id": 0,  # Not used with CH341 but required parameter
+                    "cs_id": 0,  # Not used with CH341 but required parameter
+                    "cs_pin": 0,  # CH341 GPIO 0 for CS
+                    "reset_pin": 2,  # CH341 GPIO 2 for Reset
+                    "busy_pin": 4,  # CH341 GPIO 4 for Busy
+                    "irq_pin": 6,  # CH341 GPIO 6 for IRQ
+                    "txen_pin": -1,  # Not used
+                    "rxen_pin": 1,  # CH341 GPIO 1 for RX enable
+                    "frequency": int(869.618 * 1000000),  # EU: 869.618 MHz
+                    "tx_power": 22,
+                    "spreading_factor": 8,
+                    "bandwidth": int(62.5 * 1000),
+                    "coding_rate": 8,
+                    "preamble_length": 17,
+                    "use_dio2_rf": True,
+                    "is_waveshare": False,  # Waveshare SX1262 LoRa HAT pinout
+                    "use_dio3_tcxo": True,  # Enable TCXO on DIO3
+                    "dio3_tcxo_voltage": 1.8,  # 1.8V TCXO
+                }
+            elif radio_type == "pinedio":
+                # NOTE pinedio doesn't expose DIO2, therefore no control
+                # over TXEN/RXEN.
+                ch341_config = {
+                    "bus_id": 0,  # Not used with CH341 but required parameter
+                    "cs_id": 0,  # Not used with CH341 but required parameter
+                    "cs_pin": 0,  # CH341 GPIO 0 for CS (handled by SPI engine)
+                    "reset_pin": -1,  # reset is done via CH341 reset
+                    "busy_pin": 11,  # CH341 GPIO 11 = pin 8 (BUSY/SLCT)
+                    "irq_pin": 10,  # CH341 GPIO 10 = pin 7 (INT#/DIO1)
+                    "txen_pin": -1,  # TXEN is done internally via MDIO2
+                    "rxen_pin": -1,  # RXEN is inverse of TXEN
+                    "frequency": int(869.618 * 1000000),  # EU: 869.618 MHz
+                    "tx_power": 22,
+                    "spreading_factor": 8,
+                    "bandwidth": int(62.5 * 1000),
+                    "coding_rate": 8,
+                    "preamble_length": 17,
+                    "use_dio2_rf": True,
+                    "is_waveshare": False,  # Waveshare SX1262 LoRa HAT pinout
+                    "use_dio3_tcxo": False,  # Enable TCXO on DIO3
+                }
 
             logger.debug(f"CH341 configuration: {ch341_config}")
             radio = SX1262Radio(**ch341_config)

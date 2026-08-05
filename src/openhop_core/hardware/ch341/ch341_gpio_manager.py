@@ -15,7 +15,32 @@ logger = logging.getLogger(__name__)
 
 
 class CH341GPIOPin:
-    """Mock GPIO pin that uses CH341 GPIO"""
+    """Mock GPIO pin that uses CH341 GPIO
+
+    GPIO pin mapping for CH341B/A/F in synchronous serial communication
+    mode (device id = 0x5512) based on the information at
+    https://github.com/frank-zago/ch341-i2c-spi-gpio:
+
+    CH341A/B/F     GPIO  Names                    Mode
+      pin          bit
+
+     15             0     CS0                      input/output
+     16             1     CS1                      input/output
+     17             2     CS2                      input/output
+     18             3     SCK                      input/output
+     19             4     DOUT2                    input/output
+     20             5     MOSI                     input/output
+     21             6     DIN2                     input
+     22             7     MISO                     input
+      5             8     General purpose          input
+      6             9     General purpose          input
+      7            10     INT#                     input
+      8            11     General purpose          input
+      ?            12     ?                        input
+     27            13     WT (WAIT)                input
+      4            14     DS (Data Select?)        input
+      3            15     AS (Address Select?)     input
+    """
 
     def __init__(self, ch341_device, pin_number: int, is_output: bool = True, gpio_manager=None):
         self.ch341 = ch341_device
@@ -215,7 +240,21 @@ class CH341GPIOPin:
 
 
 class CH341GPIOManager:
-    """GPIO manager that uses CH341's GPIO pins (0-7) directly"""
+    """GPIO manager that uses CH341's GPIO pins (0-15) directly.
+
+    Only pins 0-5 are output-capable. Pins 6-15 are input-only.
+    Pin mapping for CH341F sync-serial mode (PID 0x5512):
+      GPIO 0 = pin 15 (CS0)
+      GPIO 1 = pin 16 (CS1)
+      GPIO 2 = pin 17 (CS2)
+      GPIO 3 = pin 18 (SCK)
+      GPIO 4 = pin 19 (DOUT2/CS3)
+      GPIO 5 = pin 20 (MOSI)
+      GPIO 6 = pin 21 (DIN2)
+      GPIO 7 = pin 22 (MISO)
+      GPIO 10 = pin 7  (INT#)
+      GPIO 11 = pin 8  (BUSY/SLCT)
+    """
 
     def __init__(self, vid: int = 0x1A86, pid: int = 0x5512):
         """
@@ -236,22 +275,22 @@ class CH341GPIOManager:
         self._led_threads = {}  # pin_number -> Thread
         self._led_stop_events = {}  # pin_number -> Event
 
-        logger.info("Using CH341 GPIO manager - CH341 pins 0-7 only")
+        logger.info("Using CH341 GPIO manager - CH341 pins 0-15 (0-5 output-capable)")
 
     def setup_output_pin(self, pin: int, initial_value: bool = True) -> bool:
         """
         Setup output pin using CH341 GPIO
 
         Args:
-            pin: CH341 GPIO pin number (0-7)
+            pin: CH341 GPIO pin number (0-5, output-capable)
             initial_value: Initial pin state
 
         Returns:
             True if successful
         """
         try:
-            if not (0 <= pin <= 7):
-                logger.error(f"CH341 pin {pin} out of range (must be 0-7)")
+            if not (0 <= pin <= 5):
+                logger.error(f"CH341 output pin {pin} out of range (must be 0-5)")
                 return False
 
             if pin in self._pins:
@@ -278,14 +317,14 @@ class CH341GPIOManager:
         Setup input pin using CH341 GPIO
 
         Args:
-            pin: CH341 GPIO pin number (0-7)
+            pin: CH341 GPIO pin number (0-15)
 
         Returns:
             True if successful
         """
         try:
-            if not (0 <= pin <= 7):
-                logger.error(f"CH341 pin {pin} out of range (must be 0-7)")
+            if not (0 <= pin <= 15):
+                logger.error(f"CH341 input pin {pin} out of range (must be 0-15)")
                 return False
 
             if pin in self._pins:
@@ -310,15 +349,15 @@ class CH341GPIOManager:
         to detect pin state changes and call the callback function.
 
         Args:
-            pin: CH341 GPIO pin number (0-7)
+            pin: CH341 GPIO pin number (0-15)
             pull_up: Pull-up resistor (ignored, CH341 has internal config)
             callback: Interrupt callback function
 
         Returns:
             Pin object with interrupt polling enabled, or None on failure
         """
-        if not (0 <= pin <= 7):
-            logger.error(f"CH341 pin {pin} out of range (must be 0-7)")
+        if not (0 <= pin <= 15):
+            logger.error(f"CH341 interrupt pin {pin} out of range (must be 0-15)")
             return None
 
         # Create input pin

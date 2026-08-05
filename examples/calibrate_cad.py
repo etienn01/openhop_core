@@ -7,7 +7,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from common import create_radio
+from common import create_radio, RADIO_TYPES
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -304,7 +304,7 @@ def main():
     parser = argparse.ArgumentParser(description="CAD Calibration Tool with Staged Workflow")
     parser.add_argument(
         "--radio",
-        choices=["waveshare", "uconsole", "meshadv-mini", "kiss-tnc", "kiss-modem"],
+        choices=RADIO_TYPES,
         default="waveshare",
         help="Radio type",
     )
