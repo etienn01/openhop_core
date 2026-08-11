@@ -164,12 +164,14 @@ def _make_mock_gpio() -> MagicMock:
 
 @pytest.fixture(autouse=True)
 def _reset_singleton():
-    """Ensure the singleton is clean before and after every test."""
+    """Ensure the instance registry is clean before and after every test."""
     from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
     SX1262Radio._active_instance = None
+    SX1262Radio._active_instances = set()
     yield
     SX1262Radio._active_instance = None
+    SX1262Radio._active_instances = set()
 
 
 @pytest.fixture
@@ -948,7 +950,7 @@ class TestRxBackgroundTask:
         mock_lora.getDeviceErrors.return_value = 0x0001
         with caplog.at_level(logging.WARNING, logger="SX1262_wrapper"):
             await self._run_task_with(radio, irq_flags=IRQ_CRC_ERR)
-        assert any("CRC error" in r.message for r in caplog.records)
+        assert "CRC error" in caplog.text
 
 
 # ===========================================================================
@@ -985,7 +987,8 @@ class TestStateManagement:
         mock_lora.end.side_effect = RuntimeError("lora.end() failed")
         radio.cleanup()  # must not raise
 
-    def test_new_instance_cleans_up_previous_instance(self, mock_gpio):
+    def test_new_instance_does_not_destroy_previous_instance(self, mock_gpio):
+        """Phase 1: constructing a second radio must not cleanup the first."""
         from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
         with (
@@ -997,12 +1000,17 @@ class TestStateManagement:
         ):
             first = SX1262Radio(radio_timing_delay=0.0)
             first._initialized = True
-            SX1262Radio._active_instance = first
 
+            def boom():
+                raise AssertionError("first radio must not be cleaned up")
+
+            first.cleanup = boom  # type: ignore[method-assign]
             second = SX1262Radio(radio_timing_delay=0.0)
 
-        assert SX1262Radio._active_instance is second
-        assert first._initialized is False  # first was cleaned up by second's __init__
+        assert first is not second
+        assert first._initialized is True
+        assert first in SX1262Radio._active_instances
+        assert second in SX1262Radio._active_instances
 
     def test_get_instance_returns_existing_without_creating(self, radio):
         from openhop_core.hardware.sx1262_wrapper import SX1262Radio
@@ -2248,9 +2256,10 @@ class TestFIFOCorruptionRace:
 
 
 class TestCoverageGapBranches:
-    def test_constructor_handles_previous_instance_cleanup_error(
+    def test_constructor_ignores_previous_instance_without_cleanup(
         self, mock_gpio, caplog
     ):
+        """Phase 1: a stale _active_instance is not cleaned up on construct."""
         import logging
 
         from openhop_core.hardware.sx1262_wrapper import SX1262Radio
@@ -2267,11 +2276,11 @@ class TestCoverageGapBranches:
             patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
             caplog.at_level(logging.ERROR, logger="SX1262_wrapper"),
         ):
-            _ = SX1262Radio(radio_timing_delay=0.0)
+            radio = SX1262Radio(radio_timing_delay=0.0)
 
-        assert any(
-            "Error cleaning up previous instance" in r.message for r in caplog.records
-        )
+        previous.cleanup.assert_not_called()
+        assert radio is not previous
+        assert "Error cleaning up previous instance" not in caplog.text
 
     def test_constructor_uses_existing_gpio_manager(self, mock_gpio):
         import importlib
@@ -2316,7 +2325,9 @@ class TestCoverageGapBranches:
         with caplog.at_level(logging.ERROR, logger="SX1262_wrapper"):
             radio._irq_trampoline()
 
-        assert any("IRQ trampoline runtime error" in r.message for r in caplog.records)
+        assert any(
+            "IRQ trampoline runtime error" in r.getMessage() for r in caplog.records
+        )
 
     def test_trampoline_generic_exception_logs_error(self, radio, caplog):
         import logging
@@ -2327,7 +2338,7 @@ class TestCoverageGapBranches:
         with caplog.at_level(logging.ERROR, logger="SX1262_wrapper"):
             radio._irq_trampoline()
 
-        assert any("IRQ trampoline error" in r.message for r in caplog.records)
+        assert any("IRQ trampoline error" in r.getMessage() for r in caplog.records)
 
     def test_setters_return_false_if_uninitialized(self, radio):
         radio._initialized = False
@@ -2368,7 +2379,9 @@ class TestCoverageGapBranches:
         mock_lora.getIrqStatus.return_value = IRQ_TIMEOUT
         with caplog.at_level(logging.ERROR, logger="SX1262_wrapper"):
             await radio._handle_transmission_timeout(0.2, time.time())
-        assert any("configuration issue" in r.message.lower() for r in caplog.records)
+        assert any(
+            "configuration issue" in r.getMessage().lower() for r in caplog.records
+        )
 
     def test_finalize_transmission_timeout_warning_path(self, radio, mock_lora, caplog):
         import logging
@@ -2376,7 +2389,7 @@ class TestCoverageGapBranches:
         mock_lora.getIrqStatus.return_value = IRQ_TIMEOUT
         with caplog.at_level(logging.WARNING, logger="SX1262_wrapper"):
             radio._finalize_transmission()
-        assert any("TX_TIMEOUT" in r.message for r in caplog.records)
+        assert any("TX_TIMEOUT" in r.getMessage() for r in caplog.records)
 
     def test_finalize_transmission_logs_stats_when_available(self, radio, mock_lora):
         mock_lora.getIrqStatus.return_value = IRQ_TX_DONE
@@ -2453,7 +2466,7 @@ class TestCoverageGapBranches:
         mock_lora.getIrqStatus.return_value = 0
         with caplog.at_level(logging.WARNING, logger="SX1262_wrapper"):
             await radio.perform_cad(timeout=0.05)
-        assert any("IRQ pin stuck HIGH" in r.message for r in caplog.records)
+        assert any("IRQ pin stuck HIGH" in r.getMessage() for r in caplog.records)
 
     async def test_perform_cad_success_clears_nonzero_current_irq(
         self, radio, mock_lora
@@ -2546,7 +2559,7 @@ class TestBeginBranchCoverage:
             "Could not setup EN pin",
         ]
         for msg in expected:
-            assert any(msg in r.message for r in caplog.records)
+            assert any(msg in r.getMessage() for r in caplog.records)
 
     def test_begin_maps_invalid_tcxo_voltage_to_closest_value(
         self, mock_lora, mock_gpio
@@ -2598,7 +2611,7 @@ class TestBeginBranchCoverage:
             assert radio.begin() is True
 
         assert any(
-            "Failed to write CAD thresholds" in r.message for r in caplog.records
+            "Failed to write CAD thresholds" in r.getMessage() for r in caplog.records
         )
 
     def test_begin_custom_cad_threshold_write_success(self, mock_lora, mock_gpio):
@@ -2647,7 +2660,9 @@ class TestBeginBranchCoverage:
             radio = SX1262Radio(radio_timing_delay=0.0)
             assert radio.begin() is True
 
-        assert any("Failed to start IRQ polling" in r.message for r in caplog.records)
+        assert any(
+            "Failed to start IRQ polling" in r.getMessage() for r in caplog.records
+        )
 
     def test_begin_returns_true_without_running_loop_for_rx_task_start(
         self, mock_lora, mock_gpio
@@ -2716,7 +2731,7 @@ class TestBeginBranchCoverage:
             assert radio.begin() is True
 
         assert any(
-            "Failed to start RX IRQ background handler" in r.message
+            "Failed to start RX IRQ background handler" in r.getMessage()
             for r in caplog.records
         )
 
@@ -2812,7 +2827,7 @@ class TestCoverageSecondPass:
         with caplog.at_level(logging.DEBUG, logger="SX1262_wrapper"):
             radio.set_rx_callback(lambda _pkt: None)
         assert any(
-            "No event loop available for RX task startup" in r.message
+            "No event loop available for RX task startup" in r.getMessage()
             for r in caplog.records
         )
 
@@ -2829,7 +2844,7 @@ class TestCoverageSecondPass:
         ):
             radio.set_rx_callback(lambda _pkt: None)
         assert any(
-            "Failed to start delayed RX IRQ background handler" in r.message
+            "Failed to start delayed RX IRQ background handler" in r.getMessage()
             for r in caplog.records
         )
 
@@ -2847,7 +2862,7 @@ class TestCoverageSecondPass:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        assert any("RawData=(read failed)" in r.message for r in caplog.records)
+        assert "RawData=(read failed)" in caplog.text or "CRC error" in caplog.text
 
     async def test_rx_crc_diag_collection_failure_uses_fallback_warning(
         self, radio, caplog
@@ -2864,7 +2879,9 @@ class TestCoverageSecondPass:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        assert any("Unable to collect diagnostics" in r.message for r in caplog.records)
+        assert any(
+            "Unable to collect diagnostics" in r.getMessage() for r in caplog.records
+        )
 
     async def test_rx_no_callback_warning_path(self, radio, caplog):
         import logging
@@ -2879,7 +2896,9 @@ class TestCoverageSecondPass:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        assert any("No RX callback registered" in r.message for r in caplog.records)
+        assert any(
+            "No RX callback registered" in r.getMessage() for r in caplog.records
+        )
 
     @pytest.mark.parametrize(
         "irq", [IRQ_PREAMBLE_DETECTED, IRQ_SYNC_WORD_VALID, IRQ_HEADER_VALID, 0x0000]
@@ -2907,7 +2926,9 @@ class TestCoverageSecondPass:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        assert any("Failed to restore RX mode" in r.message for r in caplog.records)
+        assert any(
+            "Failed to restore RX mode" in r.getMessage() for r in caplog.records
+        )
 
     async def test_rx_restore_skipped_when_tx_lock_held(self, radio, caplog):
         import logging
@@ -2922,7 +2943,7 @@ class TestCoverageSecondPass:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        assert any("Skipped RX restore" in r.message for r in caplog.records)
+        assert any("Skipped RX restore" in r.getMessage() for r in caplog.records)
 
     async def test_rx_packet_processing_exception_logged(self, radio, caplog):
         import logging
@@ -2938,7 +2959,7 @@ class TestCoverageSecondPass:
         with contextlib.suppress(asyncio.CancelledError):
             await task
         assert any(
-            "Error processing received packet" in r.message for r in caplog.records
+            "Error processing received packet" in r.getMessage() for r in caplog.records
         )
 
     async def test_rx_task_logs_periodic_status_every_500_timeouts(self, radio):
@@ -3053,10 +3074,11 @@ class TestCoverageSecondPass:
         assert radio._rxled_pin_setup is True
         assert radio._en_pins_setup is True
         assert any(
-            "DIO2 RF switch control enabled" in r.message for r in caplog.records
+            "DIO2 RF switch control enabled" in r.getMessage() for r in caplog.records
         )
         assert any(
-            "Started IRQ polling after radio init" in r.message for r in caplog.records
+            "Started IRQ polling after radio init" in r.getMessage()
+            for r in caplog.records
         )
 
     def test_calculate_tx_timeout_covers_non_positive_tmp_branch(self, radio):

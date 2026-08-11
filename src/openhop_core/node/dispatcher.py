@@ -67,6 +67,14 @@ class Dispatcher:
 
     This class doesn't do much packet processing itself - it just routes
     incoming packets to the right handler that knows what to do with them.
+
+    RF Fabric: ``Dispatcher(existing_radio)`` is unchanged. A radio may
+    optionally be wrapped as ``FabricRadio → RFFabric → Dispatcher`` for one or
+    many physical radios. The fabric adapter presents the same
+    ``set_rx_callback`` surface, so legacy receive callbacks fire exactly once
+    per physical RX. Cross-radio mesh dedup uses the existing packet filter.
+    TX may optionally target ``radio_id`` when the radio/fabric supports it;
+    there is no automatic multi-radio TX fanout.
     """
 
     # ------------------------------------------------------------------
@@ -566,6 +574,14 @@ class Dispatcher:
         # Use per-packet rssi/snr when provided (avoids race); else fall back to radio last values
         pkt._rssi = rssi if rssi is not None else self.radio.get_last_rssi()
         pkt._snr = snr if snr is not None else self.radio.get_last_snr()
+        # Multi-radio: stamp which fabric radio delivered this frame (if known).
+        rx_radio_id = getattr(self.radio, "last_rx_radio_id", None)
+        if rx_radio_id is None:
+            fabric = getattr(self.radio, "fabric", None)
+            if fabric is not None:
+                rx_radio_id = getattr(fabric, "last_rx_radio_id", None)
+        if rx_radio_id is not None:
+            pkt._rx_radio_id = rx_radio_id
 
         # Capture the region this packet arrived under before any handler
         # runs, so a reply builder can scope its reply to that region. No-op when
@@ -997,6 +1013,7 @@ class Dispatcher:
         packet: Packet,
         wait_for_ack: bool = True,
         expected_crc: Optional[int] = None,
+        radio_id: Optional[str] = None,
     ) -> bool:
         """
         Send a packet and optionally wait for an ACK.
@@ -1021,7 +1038,7 @@ class Dispatcher:
         if not self._client_repeat_enabled:
             async with self._tx_lock:  # Wait our turn
                 tx_ok, ack_event, ack_crc = await self._transmit_locked(
-                    packet, wait_for_ack, expected_crc
+                    packet, wait_for_ack, expected_crc, radio_id=radio_id
                 )
         else:
             # Throttle off-lock, then re-decide admission under the lock so a
@@ -1037,7 +1054,7 @@ class Dispatcher:
                 async with self._tx_lock:  # Wait our turn
                     if not self._client_repeat_enabled or self._tx_budget_wait_s() <= 0.0:
                         tx_ok, ack_event, ack_crc = await self._transmit_locked(
-                            packet, wait_for_ack, expected_crc
+                            packet, wait_for_ack, expected_crc, radio_id=radio_id
                         )
                         break
 
@@ -1076,11 +1093,54 @@ class Dispatcher:
             if self._waiting_acks.get(ack_crc) is ack_event:
                 del self._waiting_acks[ack_crc]
 
+    def _resolve_tx_radio_id_for_log(
+        self, raw: bytes, radio_id: Optional[str] = None
+    ) -> Optional[str]:
+        """Best-effort TX radio id for log lines (multi-radio / fabric).
+
+        Prefers an explicit ``radio_id``, then RFFabric.resolve_tx_radio_id /
+        default_radio_id when the radio is a FabricRadio or exposes a fabric.
+        Returns None for legacy single-radio stacks so logs stay unchanged.
+        """
+        if radio_id is not None and str(radio_id).strip():
+            return str(radio_id)
+
+        radio = self.radio
+        if radio is None:
+            return None
+
+        # FabricRadio exposes .fabric; some stacks may pass RFFabric directly.
+        fabric = getattr(radio, "fabric", None)
+        if fabric is None and hasattr(radio, "resolve_tx_radio_id"):
+            fabric = radio
+        if fabric is None:
+            return None
+
+        try:
+            if hasattr(fabric, "resolve_tx_radio_id"):
+                rid = fabric.resolve_tx_radio_id(raw, None)
+                if rid:
+                    return str(rid)
+        except Exception:
+            pass
+
+        for attr in ("default_radio_id", "last_rx_radio_id", "radio_id"):
+            try:
+                rid = getattr(fabric, attr, None)
+                if callable(rid):
+                    continue
+                if rid:
+                    return str(rid)
+            except Exception:
+                continue
+        return None
+
     async def _transmit_locked(
         self,
         packet: Packet,
         wait_for_ack: bool = True,
         expected_crc: Optional[int] = None,
+        radio_id: Optional[str] = None,
     ) -> tuple[bool, Optional[asyncio.Event], Optional[int]]:
         """Transmit the packet; assumes ``_tx_lock`` is held.
 
@@ -1107,23 +1167,47 @@ class Dispatcher:
         self.state = DispatcherState.TRANSMIT
         raw = packet.write_to()
         tx_metadata = None
+        # Resolve which fabric/radio endpoint will TX for log clarity (multi-radio).
+        tx_radio_id = self._resolve_tx_radio_id_for_log(raw, radio_id)
         try:
-            tx_metadata = await self.radio.send(raw)
+            # Prefer fabric/radio multi-radio send(data, radio_id=...) when
+            # available; fall back to the legacy single-arg send(raw).
+            send_fn = self.radio.send
+            if radio_id is not None:
+                try:
+                    tx_metadata = await send_fn(raw, radio_id=radio_id)
+                except TypeError:
+                    tx_metadata = await send_fn(raw)
+            else:
+                tx_metadata = await send_fn(raw)
         except Exception as e:
-            self._log(f"Radio transmit error: {e}")
+            radio_label = f" radio={tx_radio_id}" if tx_radio_id else ""
+            self._log(f"Radio transmit error{radio_label}: {e}")
             self.state = DispatcherState.IDLE
             return (False, None, None)
         if tx_metadata is None:
-            self._log("Radio transmit returned no confirmation metadata")
+            radio_label = f" radio={tx_radio_id}" if tx_radio_id else ""
+            self._log(f"Radio transmit returned no confirmation metadata{radio_label}")
             self.state = DispatcherState.IDLE
             return (False, None, None)
         # Spend the airtime budget on the completed transmit (client-repeat only).
         if self._client_repeat_enabled:
             self._debit_tx_budget(packet)
-        # Log what we sent
+        # Prefer radio_id returned in metadata when present (authoritative).
+        if isinstance(tx_metadata, dict):
+            meta_rid = tx_metadata.get("radio_id") or tx_metadata.get("tx_radio_id")
+            if meta_rid:
+                tx_radio_id = str(meta_rid)
+        # Log what we sent (include radio id when multi-radio / fabric).
         type_name = PAYLOAD_TYPES.get(payload_type, f"UNKNOWN_{payload_type}")
         route_name = ROUTE_TYPES.get(packet.get_route_type(), f"UNKNOWN_{packet.get_route_type()}")
-        self._log(f"TX {packet.get_raw_length()} bytes (type={type_name}, route={route_name})")
+        if tx_radio_id:
+            self._log(
+                f"TX {tx_radio_id} {packet.get_raw_length()} bytes "
+                f"(type={type_name}, route={route_name})"
+            )
+        else:
+            self._log(f"TX {packet.get_raw_length()} bytes (type={type_name}, route={route_name})")
 
         # Store metadata on packet for access by handlers
         if tx_metadata:
@@ -1200,12 +1284,22 @@ class Dispatcher:
         payload_preview = (
             pkt.payload[: min(10, pkt.payload_len)].hex() if pkt.payload_len > 0 else ""
         )
+        # Multi-radio: include which fabric radio delivered this frame when known.
+        rx_radio_id = getattr(pkt, "_rx_radio_id", None)
+        if rx_radio_id is None:
+            rx_radio_id = getattr(self.radio, "last_rx_radio_id", None)
+            if rx_radio_id is None:
+                fabric = getattr(self.radio, "fabric", None)
+                if fabric is not None:
+                    rx_radio_id = getattr(fabric, "last_rx_radio_id", None)
+        radio_prefix = f"{rx_radio_id} " if rx_radio_id else ""
         if payload_preview:
             self._log(
-                f"RX {type_name} ({payload_type}) len={pkt.payload_len} payload={payload_preview}"
+                f"RX {radio_prefix}{type_name} ({payload_type}) "
+                f"len={pkt.payload_len} payload={payload_preview}"
             )
         else:
-            self._log(f"RX {type_name} ({payload_type}) len={pkt.payload_len}")
+            self._log(f"RX {radio_prefix}{type_name} ({payload_type}) len={pkt.payload_len}")
 
         self._logger.debug(f"Received packet type {type_name}, payload length: {pkt.payload_len}")
         if pkt.payload_len > 0:

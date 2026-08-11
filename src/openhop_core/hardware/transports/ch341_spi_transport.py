@@ -38,18 +38,36 @@ def _is_container() -> bool:
 class CH341SPITransport(SPITransport):
     """CH341 USB implementation of SPI transport"""
 
-    def __init__(self, vid: int = 0x1A86, pid: int = 0x5512, auto_setup_gpio: bool = True):
+    def __init__(
+        self,
+        vid: int = 0x1A86,
+        pid: int = 0x5512,
+        auto_setup_gpio: bool = True,
+        bus: Optional[int] = None,
+        address: Optional[int] = None,
+        serial_number: Optional[str] = None,
+        set_as_global_gpio: bool = True,
+    ):
         """
         Initialize CH341 SPI transport
 
         Args:
             vid: USB Vendor ID (default: 0x1a86 for CH341)
             pid: USB Product ID (default: 0x5512 for CH341)
-            auto_setup_gpio: Automatically setup CH341GPIOManager and set it
-                globally (default: True)
+            auto_setup_gpio: Automatically setup CH341GPIOManager (default: True)
+            bus: Optional USB bus number (multi-adapter selection)
+            address: Optional USB device address on that bus
+            serial_number: Optional USB iSerial string
+            set_as_global_gpio: When True, also install this manager as the
+                process default via set_gpio_manager (legacy single-adapter).
+                Multi-radio callers should pass False and bind per radio.
         """
         self._vid = vid
         self._pid = pid
+        self._bus = bus
+        self._address = address
+        self._serial_number = (serial_number or "").strip() or None
+        self._set_as_global_gpio = set_as_global_gpio
         self._ch341: Optional[CH341Async] = None
         self._is_open = False
         self._speed = 2000000  # Not directly configurable on CH341
@@ -62,14 +80,36 @@ class CH341SPITransport(SPITransport):
             self._setup_gpio_manager()
 
     def _setup_gpio_manager(self):
-        """Setup CH341 GPIO manager and set it as the global GPIO manager"""
+        """Setup CH341 GPIO manager for this adapter."""
         try:
             from ..ch341.ch341_gpio_manager import CH341GPIOManager
             from ..lora.LoRaRF.SX126x import set_gpio_manager
 
-            self._gpio_manager = CH341GPIOManager(vid=self._vid, pid=self._pid)
-            set_gpio_manager(self._gpio_manager)
-            logger.info("CH341 GPIO manager automatically initialized")
+            # Open/select the USB device first so SPI + GPIO share one handle.
+            self._ch341 = CH341Async.get_instance(
+                vid=self._vid,
+                pid=self._pid,
+                bus=self._bus,
+                address=self._address,
+                serial_number=self._serial_number,
+            )
+            self._gpio_manager = CH341GPIOManager(
+                vid=self._vid,
+                pid=self._pid,
+                bus=self._bus,
+                address=self._address,
+                serial_number=self._serial_number,
+                ch341_device=self._ch341,
+            )
+            if self._set_as_global_gpio:
+                set_gpio_manager(self._gpio_manager)
+            logger.info(
+                "CH341 GPIO manager initialized (bus=%s addr=%s serial=%r global=%s)",
+                getattr(self._ch341, "bus", None),
+                getattr(self._ch341, "address", None),
+                getattr(self._ch341, "serial_number", None),
+                self._set_as_global_gpio,
+            )
         except Exception as e:
             logger.error(f"Failed to setup CH341 GPIO manager: {e}")
             # Detect specific error types for better guidance
@@ -121,13 +161,27 @@ class CH341SPITransport(SPITransport):
                 logger.warning("CH341 already open, closing first")
                 self.close()
 
-            # Get singleton CH341 device instance
-            self._ch341 = CH341Async.get_instance(vid=self._vid, pid=self._pid)
+            # Reuse device opened during GPIO setup, or open/select now.
+            if self._ch341 is None:
+                self._ch341 = CH341Async.get_instance(
+                    vid=self._vid,
+                    pid=self._pid,
+                    bus=self._bus,
+                    address=self._address,
+                    serial_number=self._serial_number,
+                )
 
             self._is_open = True
             self._speed = speed  # Store for reference (actual speed is CH341-dependent)
 
-            logger.info(f"CH341 SPI opened: VID={self._vid:04x}, PID={self._pid:04x}")
+            logger.info(
+                "CH341 SPI opened: VID=%04x PID=%04x bus=%s address=%s serial=%r",
+                self._vid,
+                self._pid,
+                getattr(self._ch341, "bus", None),
+                getattr(self._ch341, "address", None),
+                getattr(self._ch341, "serial_number", None),
+            )
             return True
 
         except CH341Error as e:

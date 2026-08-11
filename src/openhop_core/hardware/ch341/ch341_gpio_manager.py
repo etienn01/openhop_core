@@ -256,18 +256,38 @@ class CH341GPIOManager:
       GPIO 11 = pin 8  (BUSY/SLCT)
     """
 
-    def __init__(self, vid: int = 0x1A86, pid: int = 0x5512):
+    def __init__(
+        self,
+        vid: int = 0x1A86,
+        pid: int = 0x5512,
+        bus: Optional[int] = None,
+        address: Optional[int] = None,
+        serial_number: Optional[str] = None,
+        ch341_device=None,
+    ):
         """
         Initialize CH341 GPIO manager
 
         Args:
             vid: USB Vendor ID (default: 0x1a86 for CH341)
             pid: USB Product ID (default: 0x5512 for CH341)
+            bus: Optional USB bus number for multi-adapter selection
+            address: Optional USB device address on that bus
+            serial_number: Optional USB serial string
+            ch341_device: Optional already-open CH341Async instance to share
         """
         from .ch341_async import CH341Async
 
-        # Get singleton CH341 device instance
-        self.ch341 = CH341Async.get_instance(vid=vid, pid=pid)
+        if ch341_device is not None:
+            self.ch341 = ch341_device
+        else:
+            self.ch341 = CH341Async.get_instance(
+                vid=vid,
+                pid=pid,
+                bus=bus,
+                address=address,
+                serial_number=serial_number,
+            )
         self._pins = {}  # pin_number -> CH341GPIOPin
         self._cs_pin_number = None  # Track CS pin for SPI state detection
 
@@ -275,20 +295,28 @@ class CH341GPIOManager:
         self._led_threads = {}  # pin_number -> Thread
         self._led_stop_events = {}  # pin_number -> Event
 
-        logger.info("Using CH341 GPIO manager - CH341 pins 0-15 (0-5 output-capable)")
+        logger.info(
+            "Using CH341 GPIO manager - pins 0-15 (0-5 out) bus=%s addr=%s serial=%r",
+            getattr(self.ch341, "bus", None),
+            getattr(self.ch341, "address", None),
+            getattr(self.ch341, "serial_number", None),
+        )
 
     def setup_output_pin(self, pin: int, initial_value: bool = True) -> bool:
         """
         Setup output pin using CH341 GPIO
 
         Args:
-            pin: CH341 GPIO pin number (0-5, output-capable)
+            pin: CH341 GPIO pin number (0-5, output-capable). -1 means unused.
             initial_value: Initial pin state
 
         Returns:
             True if successful
         """
         try:
+            # -1 = not connected (e.g. PineDio reset_pin). Not an error.
+            if pin is None or pin == -1:
+                return False
             if not (0 <= pin <= 5):
                 logger.error(f"CH341 output pin {pin} out of range (must be 0-5)")
                 return False
@@ -317,12 +345,14 @@ class CH341GPIOManager:
         Setup input pin using CH341 GPIO
 
         Args:
-            pin: CH341 GPIO pin number (0-15)
+            pin: CH341 GPIO pin number (0-15). -1 means unused.
 
         Returns:
             True if successful
         """
         try:
+            if pin is None or pin == -1:
+                return False
             if not (0 <= pin <= 15):
                 logger.error(f"CH341 input pin {pin} out of range (must be 0-15)")
                 return False
@@ -356,6 +386,9 @@ class CH341GPIOManager:
         Returns:
             Pin object with interrupt polling enabled, or None on failure
         """
+        if pin is None or pin == -1:
+            logger.debug("CH341 interrupt pin not configured (pin=%r)", pin)
+            return None
         if not (0 <= pin <= 15):
             logger.error(f"CH341 interrupt pin {pin} out of range (must be 0-15)")
             return None
