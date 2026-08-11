@@ -1,6 +1,6 @@
 # openHop Core
 
-[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://pymc-dev.github.io/openhop-core/)
+[![Documentation](https://img.shields.io/badge/docs-docs.openhop.dev-blue)](https://docs.openhop.dev/projects/openhop-core/)
 [![PyPI](https://img.shields.io/pypi/v/openhop-core)](https://pypi.org/project/openhop-core/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -10,12 +10,12 @@
 
 ## Documentation
 
-**Complete documentation is available at **[https://rightup.github.io/openhop-core/](https://pymc-dev.github.io/openhop-core/)**
+**Complete documentation is available at [docs.openhop.dev](https://docs.openhop.dev/projects/openhop-core/).**
 
 ### Quick Links
-- [Node Usage Guide](https://pymc-dev.github.io/openhop-core/node/) - Guide for using MeshNode
-- [Examples](https://pymc-dev.github.io/openhop-core/examples/) - Working code examples
-- [API Reference](https://pymc-dev.github.io/openhop-core/api/) - Detailed API documentation
+- [Node Usage Guide](https://docs.openhop.dev/projects/openhop-core/node-usage/) - Guide for using MeshNode
+- [Examples](https://docs.openhop.dev/projects/openhop-core/examples/) - Working code examples
+- [API Reference](https://docs.openhop.dev/projects/openhop-core/api-reference/) - Detailed API documentation
 
 ## Quick Start
 
@@ -71,7 +71,7 @@ async def main():
 asyncio.run(main())
 ```
 
-For examples, see the [documentation](https://pymc-dev.github.io/openhop-core/examples/).
+For examples, see the [documentation](https://docs.openhop.dev/projects/openhop-core/examples/).
 
 ## Hardware Support
 
@@ -137,19 +137,14 @@ openHop Core/
 │   ├── send_flood_advert.py
 │   ├── send_direct_advert.py
 │   └── ...
-├── docs/                   # MkDocs documentation
-│   ├── docs/               # Documentation source files
-│   ├── mkdocs.yml          # MkDocs configuration
-│   ├── requirements.txt    # Documentation dependencies
-│   └── serve-docs.sh       # Local development script
 ├── .github/workflows/      # GitHub Actions
-│   └── deploy-docs.yml     # Documentation deployment pipeline
+│   └── publish-pypi.yml    # Package test and publication pipeline
 └── tests/                  # Unit tests
 ```
 
 ## Contributing
 
-Contributions are welcome! Please see our [contributing guide](https://pymc-dev.github.io/openhop-core/contributing/) for details.
+Contributions are welcome! Please see our [contributing guide](https://docs.openhop.dev/projects/openhop-core/development/) for details.
 
 ### Development Setup
 
@@ -177,7 +172,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Support
 
-- [Documentation](https://pymc-dev.github.io/openhop-core/)
+- [Documentation](https://docs.openhop.dev/projects/openhop-core/)
 - [Issues](https://github.com/openhop-dev/openHop Core/issues)
 - [Discussions](https://github.com/openhop-dev/openHop Core/discussions)
 - [pyMC Discord](https://discord.gg/3s8MMaSTzq)
