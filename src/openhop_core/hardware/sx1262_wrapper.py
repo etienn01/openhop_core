@@ -35,9 +35,16 @@ def _trace(message: str) -> None:
 
 
 class SX1262Radio(LoRaRadio):
-    """SX1262 LoRa Radio implementation for Raspberry Pi"""
+    """SX1262 LoRa Radio implementation for Raspberry Pi.
 
-    # Class variable to track the active instance (singleton-like behavior)
+    Multiple instances may coexist in one process; each owns its GPIO manager
+    (or shares an externally provided one) and its own ``SX126x`` handle.
+    ``cleanup()`` releases only this instance's resources.
+    """
+
+    # Registry used for diagnostics and get_instance() compat helper only.
+    _active_instances: set = set()
+    # Last registered instance; kept for get_instance() callers.
     _active_instance = None
 
     # SX1262 PA hard limit in dBm; set_tx_power clamps any higher request down
@@ -81,6 +88,8 @@ class SX1262Radio(LoRaRadio):
         dio3_tcxo_voltage: float = 1.8,
         use_dio2_rf: bool = False,
         radio_timing_delay: float = RADIO_TIMING_DELAY,
+        spi_transport=None,
+        gpio_manager=None,
     ):
         """
         Initialize SX1262 radio
@@ -112,15 +121,12 @@ class SX1262Radio(LoRaRadio):
             dio3_tcxo_voltage: TCXO reference voltage in volts (default: 1.8)
             use_dio2_rf: Enable DIO2 as RF switch control (default: False)
             radio_timing_delay: Delay used for radio state transitions (default: 10ms)
+            spi_transport: Optional per-instance SPI transport (e.g. CH341SPITransport)
+            gpio_manager: Optional per-instance GPIO manager (e.g. CH341GPIOManager)
         """
-        # Check if there's already an active instance and clean it up
-        if SX1262Radio._active_instance is not None:
-            logger.warning("Another SX1262Radio instance is already active - cleaning it up first")
-            try:
-                SX1262Radio._active_instance.cleanup()
-            except Exception as e:
-                logger.error(f"Error cleaning up previous instance: {e}")
-            SX1262Radio._active_instance = None
+        self._owns_gpio_manager = False
+        self._spi_transport = spi_transport
+        self._external_gpio_manager = gpio_manager
 
         self.en_pins = self._normalize_en_pins(en_pin=en_pin, en_pins=en_pins)
 
@@ -161,20 +167,38 @@ class SX1262Radio(LoRaRadio):
         self._rx_lock = asyncio.Lock()
         self._tx_lock = asyncio.Lock()
 
-        # GPIO management - check if external GPIO manager is already set (e.g. CH341)
+        # GPIO management: prefer an explicitly provided manager (multi-CH341),
+        # else a process-default external adapter manager, else a private
+        # GPIOPinManager so cleanup cannot clobber peers.
         from .lora.LoRaRF.SX126x import _gpio_manager as existing_gpio_manager
 
-        if existing_gpio_manager is not None:
-            # Use externally configured GPIO manager (e.g. CH341GPIOManager)
-            self._gpio_manager = existing_gpio_manager
-            logger.info("Using externally configured GPIO manager")
-        else:
-            backend = "gpiod" if self.use_gpiod_backend else "auto"
-            self._gpio_manager = GPIOPinManager(
-                backend=backend, gpio_chip=f"/dev/gpiochip{self.gpio_chip}"
+        if self._external_gpio_manager is not None:
+            self._gpio_manager = self._external_gpio_manager
+            self._owns_gpio_manager = False
+            logger.info(
+                "Using caller-provided GPIO manager (%s)",
+                type(self._gpio_manager).__name__,
             )
-            # Share GPIO manager instance with SX126x low-level driver
-            set_gpio_manager(self._gpio_manager)
+        else:
+            external = existing_gpio_manager
+            external_name = type(external).__name__ if external is not None else ""
+            use_external = external is not None and (
+                "CH341" in external_name or external_name not in ("GPIOPinManager",)
+            )
+
+            if use_external:
+                self._gpio_manager = external
+                self._owns_gpio_manager = False
+                logger.info("Using externally configured GPIO manager (%s)", external_name)
+            else:
+                backend = "gpiod" if self.use_gpiod_backend else "auto"
+                self._gpio_manager = GPIOPinManager(
+                    backend=backend, gpio_chip=f"/dev/gpiochip{self.gpio_chip}"
+                )
+                self._owns_gpio_manager = True
+                # Only set the module default when unset; never overwrite a peer radio's manager.
+                if existing_gpio_manager is None:
+                    set_gpio_manager(self._gpio_manager)
         self._interrupt_setup = False
         self._txen_pin_setup = False
         self._txled_pin_setup = False
@@ -221,7 +245,8 @@ class SX1262Radio(LoRaRadio):
             f"power={tx_power}dBm, sf={spreading_factor}, "
             f"bw={bandwidth / 1000:.1f}kHz, pre={preamble_length}"
         )
-        # Register this instance as the active radio for IRQ callback access
+        # Track live instances for diagnostics only (not exclusive ownership).
+        SX1262Radio._active_instances.add(self)
         SX1262Radio._active_instance = self
 
         # RX callback for received packets
@@ -718,6 +743,13 @@ class SX1262Radio(LoRaRadio):
         try:
             logger.debug("Initializing SX1262 radio...")
             self.lora = SX126x()
+            # Bind this radio's GPIO manager to the chip instance first so pin
+            # setup never races through a peer radio's manager.
+            self.lora.set_gpio_manager(self._gpio_manager)
+
+            # Prefer a dedicated SPI transport per radio when spidev is available.
+            # Fall back to the module-global transport (CH341 / pre-injected).
+            self._bind_instance_spi_transport()
 
             # Register GPIO interrupt using lightweight trampoline
             self.irq_pin = self._gpio_manager.setup_interrupt_pin(
@@ -780,16 +812,33 @@ class SX1262Radio(LoRaRadio):
                 else:
                     logger.warning(f"Could not setup RX LED pin {self.rxled_pin}")
 
-            # Setup EN pin(s) if specified (powers up the radio when set HIGH)
+            # Setup EN pin(s) if specified (powers up the radio when set HIGH).
+            # Never drive EN on the CS pin (common misconfig: en_pins:[0] with
+            # PineDio cs_pin=0) — that holds SPI CS high and breaks TX.
             if self.en_pins and not self._en_pins_setup:
                 all_en_pins_configured = True
+                usable_en = []
                 for en_pin in self.en_pins:
+                    if en_pin is None or en_pin == -1:
+                        continue
+                    if self.cs_pin != -1 and en_pin == self.cs_pin:
+                        logger.error(
+                            "Ignoring en_pin/en_pins value %s — it collides with cs_pin. "
+                            "SPI CS would be stuck HIGH and TX will timeout. "
+                            "For PineDio leave EN unset (en_pin: -1).",
+                            en_pin,
+                        )
+                        all_en_pins_configured = False
+                        continue
+                    usable_en.append(en_pin)
                     if self._gpio_manager.setup_output_pin(en_pin, initial_value=True):
                         logger.debug(f"EN pin {en_pin} configured and set HIGH")
                     else:
                         all_en_pins_configured = False
                         logger.warning(f"Could not setup EN pin {en_pin}")
-                self._en_pins_setup = all_en_pins_configured
+                self.en_pins = usable_en
+                self.en_pin = usable_en[0] if usable_en else -1
+                self._en_pins_setup = all_en_pins_configured and bool(usable_en)
 
             if self.en_pins and self._en_pins_setup:
                 logger.debug("Waiting 100 ms for external radio front end to settle")
@@ -1960,8 +2009,54 @@ class SX1262Radio(LoRaRadio):
                 if acquired_tx_lock and self._tx_lock.locked():
                     self._tx_lock.release()
 
+    def _bind_instance_spi_transport(self) -> None:
+        """Attach a per-instance SPI transport when possible.
+
+        Prefer an explicitly provided transport (multi-CH341). Else reuse a
+        process-global SPI transport (legacy single CH341). Else create an
+        SPIDevTransport owned by this radio.
+        """
+        import openhop_core.hardware.lora.LoRaRF.SX126x as sx126x_module
+
+        if self._spi_transport is not None:
+            # Caller-owned transport (e.g. one CH341SPITransport per radio).
+            self.lora.set_spi_transport(self._spi_transport, owns=False)
+            return
+
+        global_spi = getattr(sx126x_module, "spi", None)
+        # CH341 / custom transports expose transfer/xfer2 and are shared.
+        if global_spi is not None and not hasattr(global_spi, "open"):
+            # Unusual object; bind as shared.
+            self.lora.set_spi_transport(global_spi, owns=False)
+            self._spi_transport = global_spi
+            return
+        if global_spi is not None and type(global_spi).__name__ not in (
+            "SpiDev",
+            "FakeSpi",
+        ):
+            # Likely CH341SPITransport or similar injected transport.
+            cls_name = type(global_spi).__name__
+            if "CH341" in cls_name or hasattr(global_spi, "transfer"):
+                self.lora.set_spi_transport(global_spi, owns=False)
+                self._spi_transport = global_spi
+                return
+
+        # Default: dedicated spidev transport per radio instance.
+        try:
+            from .transports.spidev_transport import SPIDevTransport
+
+            transport = SPIDevTransport()
+            self.lora.set_spi_transport(transport, owns=True)
+            self._spi_transport = transport
+        except Exception as e:
+            # spidev unavailable — fall back to module global SpiDev if present.
+            logger.debug("Per-instance SPIDevTransport unavailable (%s); using module spi", e)
+            if global_spi is not None:
+                self.lora.set_spi_transport(global_spi, owns=False)
+                self._spi_transport = global_spi
+
     def cleanup(self) -> None:
-        """Clean up radio resources"""
+        """Clean up this radio instance's resources only."""
         self._shutting_down = True
         self._event_loop = None
         self._interrupt_setup = False
@@ -1979,21 +2074,48 @@ class SX1262Radio(LoRaRadio):
             except Exception as e:
                 logger.error(f"Error during cleanup: {e}")
 
-        if hasattr(self, "_gpio_manager"):
-            self._gpio_manager.cleanup_all()
+        # Only tear down GPIO pins owned by this instance. Shared external
+        # managers (CH341) must remain intact for any surviving radios.
+        if hasattr(self, "_gpio_manager") and self._gpio_manager is not None:
+            if getattr(self, "_owns_gpio_manager", False):
+                self._gpio_manager.cleanup_all()
+            else:
+                # Best-effort release of pins this radio configured.
+                owned_pins = {
+                    self.irq_pin_number,
+                    self.reset_pin,
+                    self.busy_pin,
+                    self.txen_pin,
+                    self.rxen_pin,
+                    self.txled_pin,
+                    self.rxled_pin,
+                    *list(getattr(self, "en_pins", []) or []),
+                }
+                if self.cs_pin != -1:
+                    owned_pins.add(self.cs_pin)
+                for pin in owned_pins:
+                    if pin is None or pin == -1:
+                        continue
+                    try:
+                        if hasattr(self._gpio_manager, "cleanup_pin"):
+                            self._gpio_manager.cleanup_pin(pin)
+                    except Exception:
+                        logger.debug("Pin cleanup failed for %s", pin, exc_info=True)
 
         self._initialized = False
 
+        SX1262Radio._active_instances.discard(self)
         if SX1262Radio._active_instance is self:
-            SX1262Radio._active_instance = None
+            SX1262Radio._active_instance = next(iter(SX1262Radio._active_instances), None)
 
     @classmethod
     def get_instance(cls, **kwargs):
-        """Get the active instance or create a new one (singleton-like behavior)"""
+        """Return a live instance or construct a new one."""
         if cls._active_instance is not None:
             return cls._active_instance
-        else:
-            return cls(**kwargs)
+        if cls._active_instances:
+            return next(iter(cls._active_instances))
+        return cls(**kwargs)
 
 
 # Factory function for easy instantiation

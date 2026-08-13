@@ -111,6 +111,7 @@ class Packet:
         "transport_codes",
         "_snr",
         "_rssi",
+        "_rx_radio_id",
         "_do_not_retransmit",
         "drop_reason",
         "_tx_metadata",
@@ -139,6 +140,7 @@ class Packet:
         self.transport_codes = [0, 0]  # Array of two 16-bit transport codes
         self._snr = 0
         self._rssi = 0
+        self._rx_radio_id = None
         # Repeater flag to prevent retransmission and log drop reason
         self._do_not_retransmit = False
         self.drop_reason = None  # Optional: reason for dropping packet

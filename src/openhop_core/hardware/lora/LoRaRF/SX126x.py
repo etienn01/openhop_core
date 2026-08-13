@@ -13,66 +13,96 @@ except ImportError:
 from ...signal_utils import snr_register_to_db
 from .base import BaseLoRa
 
+# Module-level defaults retained for CH341 / legacy single-radio setup.
+# Prefer per-instance assignment via SX126x.set_gpio_manager / set_spi_transport
+# so multiple SX1262Radio instances do not silently overwrite each other.
 _gpio_manager = None
 logger = logging.getLogger("SX126x")
 
 
 def set_gpio_manager(gpio_manager):
-    """Set the GPIO manager instance to be used by this module"""
+    """Set the process-default GPIO manager (legacy / CH341 convenience).
+
+    New code should also call ``SX126x.set_gpio_manager`` on each chip
+    instance so GPIO ownership is not process-global.
+    """
     global _gpio_manager
     _gpio_manager = gpio_manager
 
 
 def set_spi_transport(spi_transport):
-    """Set the SPI transport instance to be used by this module"""
+    """Set the process-default SPI transport (legacy convenience).
+
+    Prefer ``SX126x.set_spi_transport`` / per-instance ``setSpi`` so one
+    radio's ``end()`` cannot close another radio's bus handle.
+    """
     global spi
     spi = spi_transport
 
 
-def _get_output(pin):
-    """Get output pin via centralized GPIO manager (setup only if needed)"""
-    if _gpio_manager is None:
+def _resolve_gpio_manager(instance_manager=None):
+    manager = instance_manager if instance_manager is not None else _gpio_manager
+    return manager
+
+
+def _get_output(pin, gpio_manager=None):
+    """Get output pin via GPIO manager (setup only if needed)"""
+    # -1 means "not connected" (e.g. PineDio reset_pin). Never open GPIO -1.
+    if pin is None or pin == -1:
+        raise RuntimeError(f"GPIO output pin {pin!r} is not configured")
+    manager = _resolve_gpio_manager(gpio_manager)
+    if manager is None:
         raise RuntimeError(
             "GPIO manager not initialized. Call set_gpio_manager() first."
         )
     # Only setup if pin doesn't exist yet
-    if pin not in _gpio_manager._pins:
-        _gpio_manager.setup_output_pin(pin, initial_value=True)
-    return _gpio_manager._pins[pin]
+    if pin not in manager._pins:
+        manager.setup_output_pin(pin, initial_value=True)
+    return manager._pins[pin]
 
 
-def _get_input(pin):
-    """Get input pin via centralized GPIO manager (setup only if needed)"""
-    if _gpio_manager is None:
+def _get_input(pin, gpio_manager=None):
+    """Get input pin via GPIO manager (setup only if needed)"""
+    if pin is None or pin == -1:
+        raise RuntimeError(f"GPIO input pin {pin!r} is not configured")
+    manager = _resolve_gpio_manager(gpio_manager)
+    if manager is None:
         raise RuntimeError(
             "GPIO manager not initialized. Call set_gpio_manager() first."
         )
     # Only setup if pin doesn't exist yet
-    if pin not in _gpio_manager._pins:
-        _gpio_manager.setup_input_pin(pin)
-    return _gpio_manager._pins[pin]
+    if pin not in manager._pins:
+        manager.setup_input_pin(pin)
+    return manager._pins[pin]
 
 
-def _get_output_safe(pin):
-    """Get output pin safely - return None if GPIO busy"""
-    if _gpio_manager is None:
+def _get_output_safe(pin, gpio_manager=None):
+    """Get output pin safely - return None if unused/unavailable"""
+    # PineDio and similar boards omit reset (reset_pin=-1). Treat as no-op.
+    if pin is None or pin == -1:
+        return None
+    manager = _resolve_gpio_manager(gpio_manager)
+    if manager is None:
         return None
     # Only setup if pin doesn't exist yet
-    if pin not in _gpio_manager._pins:
-        if not _gpio_manager.setup_output_pin(pin, initial_value=True):
+    if pin not in manager._pins:
+        if not manager.setup_output_pin(pin, initial_value=True):
             return None
-    return _gpio_manager._pins.get(pin)
+    return manager._pins.get(pin)
 
 
-def _get_input_safe(pin):
-    """Get input pin safely - return None if GPIO busy"""
-    if _gpio_manager is None:
+def _get_input_safe(pin, gpio_manager=None):
+    """Get input pin safely - return None if unused/unavailable"""
+    if pin is None or pin == -1:
+        return None
+    manager = _resolve_gpio_manager(gpio_manager)
+    if manager is None:
         return None
     # Only setup if pin doesn't exist yet
-    if pin not in _gpio_manager._pins:
-        if not _gpio_manager.setup_input_pin(pin):
+    if pin not in manager._pins:
+        if not manager.setup_input_pin(pin):
             return None
-    return _gpio_manager._pins.get(pin)
+    return manager._pins.get(pin)
 
 
 def _rssi_register_to_dbm(raw_value):
@@ -412,6 +442,29 @@ class SX126x(BaseLoRa):
     _onTransmit = None
     _onReceive = None
 
+    def __init__(self):
+        """Create an SX126x handle with instance-local SPI/GPIO bindings."""
+        # Per-instance hardware bindings. Fall back to module globals only when
+        # unset, preserving CH341 auto-setup and single-radio callers.
+        self._gpio_manager = None
+        self._spi = None
+        self._owns_spi = False
+
+    def set_gpio_manager(self, gpio_manager):
+        """Bind a GPIO manager to this chip instance (preferred over global)."""
+        self._gpio_manager = gpio_manager
+
+    def set_spi_transport(self, spi_transport, *, owns: bool = False):
+        """Bind an SPI transport to this chip instance."""
+        self._spi = spi_transport
+        self._owns_spi = owns
+
+    def _gpio(self):
+        return self._gpio_manager if self._gpio_manager is not None else _gpio_manager
+
+    def _spi_bus(self):
+        return self._spi if self._spi is not None else spi
+
     ### COMMON OPERATIONAL METHODS ###
 
     def begin(
@@ -452,22 +505,35 @@ class SX126x(BaseLoRa):
             return False
 
     def end(self):
-        """Properly shut down the SX126x radio and clean up all resources"""
+        """Properly shut down this SX126x instance and its owned resources."""
         try:
             self.sleep(self.SLEEP_COLD_START)
         except Exception:
             pass
 
-        try:
-            spi.close()
-        except Exception:
+        # Only close SPI when this instance owns the transport. Never close the
+        # process-global default handle while other radios may still use it.
+        bus = self._spi
+        if bus is not None and self._owns_spi:
+            try:
+                close = getattr(bus, "close", None)
+                if close is not None:
+                    close()
+            except Exception:
+                pass
+            self._spi = None
+            self._owns_spi = False
+        elif bus is None and self._spi is None:
+            # Legacy path: module-global spi was opened by setSpi without an
+            # instance transport. Close only if it still looks like the
+            # process default and no instance transport was ever bound.
+            # Multi-instance callers always bind per-instance transports.
             pass
 
-        # GPIO cleanup is handled by the centralized gpio_manager
-        # No need to close pins here as they're managed by GPIOPinManager
+        # GPIO cleanup is handled by the owning SX1262Radio / GPIOPinManager.
 
     def reset(self) -> bool:
-        reset_pin = _get_output_safe(self._reset)
+        reset_pin = _get_output_safe(self._reset, self._gpio())
         if reset_pin is None:
             return True  # Continue if reset pin unavailable
 
@@ -485,7 +551,7 @@ class SX126x(BaseLoRa):
     def wake(self):
         # wake device by set wake pin (cs pin) to low before spi transaction and put device in standby mode
         if self._wake != -1:
-            wake_pin = _get_output_safe(self._wake)
+            wake_pin = _get_output_safe(self._wake, self._gpio())
             if wake_pin:
                 wake_pin.write(False)
                 time.sleep(0.0005)
@@ -497,7 +563,7 @@ class SX126x(BaseLoRa):
 
     def busyCheck(self, timeout: int = _busyTimeout):
         # wait for busy pin to LOW or timeout reached
-        busy_pin = _get_input_safe(self._busy)
+        busy_pin = _get_input_safe(self._busy, self._gpio())
         if busy_pin is None:
             return False  # Assume not busy to continue
 
@@ -520,11 +586,54 @@ class SX126x(BaseLoRa):
         self._cs = cs
         self._spiSpeed = speed
 
-        # Open SPI device - driver handles CS pin automatically
-        spi.open(bus, cs)
-        spi.max_speed_hz = speed
-        spi.lsbfirst = False
-        spi.mode = 0
+        # Prefer a per-instance transport so concurrent radios do not share one
+        # SpiDev handle. Fall back to the module-global ``spi`` for legacy
+        # callers / pre-injected CH341 transports.
+        bus_dev = self._spi_bus()
+
+        if bus_dev is None:
+            raise RuntimeError(
+                "No SPI transport available. Install spidev or call "
+                "set_spi_transport() / SX126x.set_spi_transport()."
+            )
+
+        # Instance-owned SPIDevTransport path
+        if hasattr(bus_dev, "open") and hasattr(bus_dev, "transfer") and not hasattr(bus_dev, "xfer2"):
+            if not bus_dev.is_open:
+                if not bus_dev.open(bus, cs, speed=speed):
+                    raise RuntimeError(f"Failed to open SPI bus={bus} cs={cs}")
+            else:
+                bus_dev.set_speed(speed)
+                bus_dev.set_mode(0)
+                bus_dev.set_bit_order(False)
+            self._owns_spi = True
+            self._spi = bus_dev
+            return
+
+        # spidev.SpiDev-like or CH341 transport exposing open/xfer2
+        if hasattr(bus_dev, "open"):
+            # Avoid re-opening an already-configured custom transport that
+            # ignores bus/cs (e.g. CH341) when it reports is_open.
+            already_open = bool(getattr(bus_dev, "is_open", False))
+            if not already_open:
+                bus_dev.open(bus, cs)
+            if hasattr(bus_dev, "max_speed_hz"):
+                bus_dev.max_speed_hz = speed
+            if hasattr(bus_dev, "lsbfirst"):
+                bus_dev.lsbfirst = False
+            if hasattr(bus_dev, "mode"):
+                bus_dev.mode = 0
+            # If this is still the module global, do not claim ownership so
+            # end() will not close a shared process handle.
+            if bus_dev is spi and self._spi is None:
+                self._owns_spi = False
+            elif self._spi is bus_dev:
+                # explicitly bound instance transport keeps prior owns flag
+                pass
+            else:
+                self._spi = bus_dev
+        else:
+            raise RuntimeError(f"Unsupported SPI transport: {type(bus_dev)!r}")
 
     def setManualCsPin(self, cs_pin: int):
         """Override CS pin for special boards like Waveshare HAT"""
@@ -546,15 +655,19 @@ class SX126x(BaseLoRa):
         self._rxen = rxen
         self._wake = wake
         # periphery pins are initialized on first use by _get_output/_get_input
-        _get_output(reset)
-        _get_input(busy)
+        # Skip pin == -1 (not connected), e.g. PineDio has no discrete reset line.
+        gm = self._gpio()
+        if reset is not None and reset != -1:
+            _get_output(reset, gm)
+        if busy is not None and busy != -1:
+            _get_input(busy, gm)
         # Only initialize CS as GPIO if using manual CS control
         if self._cs_define != -1:
-            _get_output(self._cs_define)
+            _get_output(self._cs_define, gm)
         # IRQ pin managed externally by sx1262_wrapper.py via gpio_manager
         # Do NOT initialize it here to avoid double allocation
         if txen != -1:
-            _get_output(txen)
+            _get_output(txen, gm)
         # if rxen != -1: _get_output(rxen)
 
     def setRfIrqPin(self, dioPinSelect: int):
@@ -1565,14 +1678,26 @@ class SX126x(BaseLoRa):
         for i in range(nBytes):
             buf.append(data[i])
 
+        bus = self._spi_bus()
+        if bus is None:
+            raise RuntimeError("SPI transport not configured")
+
+        def _xfer(payload):
+            if hasattr(bus, "xfer2"):
+                return bus.xfer2(payload)
+            if hasattr(bus, "transfer"):
+                return bus.transfer(payload)
+            raise RuntimeError(f"SPI transport {type(bus)!r} has no xfer2/transfer")
+
         # Use manual CS control only if explicitly set
         if self._cs_define != -1:
-            _get_output(self._cs_define).write(False)
-            spi.xfer2(buf)
-            _get_output(self._cs_define).write(True)
+            gm = self._gpio()
+            _get_output(self._cs_define, gm).write(False)
+            _xfer(buf)
+            _get_output(self._cs_define, gm).write(True)
         else:
             # Let SPI driver handle CS automatically
-            spi.xfer2(buf)
+            _xfer(buf)
 
     def _readBytes(
         self, opCode: int, nBytes: int, address: tuple = (), nAddress: int = 0
@@ -1586,14 +1711,26 @@ class SX126x(BaseLoRa):
         for i in range(nBytes):
             buf.append(0x00)
 
+        bus = self._spi_bus()
+        if bus is None:
+            raise RuntimeError("SPI transport not configured")
+
+        def _xfer(payload):
+            if hasattr(bus, "xfer2"):
+                return bus.xfer2(payload)
+            if hasattr(bus, "transfer"):
+                return bus.transfer(payload)
+            raise RuntimeError(f"SPI transport {type(bus)!r} has no xfer2/transfer")
+
         # Use manual CS control only if explicitly set
         if self._cs_define != -1:
-            _get_output(self._cs_define).write(False)
-            feedback = spi.xfer2(buf)
-            _get_output(self._cs_define).write(True)
+            gm = self._gpio()
+            _get_output(self._cs_define, gm).write(False)
+            feedback = _xfer(buf)
+            _get_output(self._cs_define, gm).write(True)
         else:
             # Let SPI driver handle CS automatically
-            feedback = spi.xfer2(buf)
+            feedback = _xfer(buf)
 
         return tuple(feedback[nAddress + 1 :])
 
