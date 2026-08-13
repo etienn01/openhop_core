@@ -10,7 +10,7 @@ Simply run this script and it will respond to any discovery requests until stopp
 
 import asyncio
 
-from common import create_mesh_node, RADIO_TYPES
+from common import RADIO_TYPES, create_mesh_node
 
 from openhop_core.protocol.packet_builder import PacketBuilder
 

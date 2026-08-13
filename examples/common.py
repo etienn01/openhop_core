@@ -31,7 +31,6 @@ from openhop_core import LocalIdentity
 from openhop_core.hardware.base import LoRaRadio
 from openhop_core.node.node import MeshNode
 
-
 RADIO_TYPES = ["waveshare", "uconsole", "meshadv-mini", "kiss-tnc", "kiss-modem", "ch341", "pinedio"]
 
 

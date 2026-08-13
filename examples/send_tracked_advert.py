@@ -12,7 +12,7 @@ this is a very basic example and not how you should do it in real code!
 import asyncio
 import time
 
-from common import create_mesh_node, print_packet_info, RADIO_TYPES
+from common import RADIO_TYPES, create_mesh_node, print_packet_info
 
 from openhop_core.protocol.constants import (
     ADVERT_FLAG_HAS_LOCATION,

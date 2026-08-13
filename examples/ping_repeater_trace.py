@@ -17,7 +17,7 @@ Features:
 import asyncio
 import random
 
-from common import create_mesh_node, print_packet_info, RADIO_TYPES
+from common import RADIO_TYPES, create_mesh_node, print_packet_info
 
 from openhop_core.protocol.constants import PAYLOAD_TYPE_TRACE
 from openhop_core.protocol.packet_builder import PacketBuilder

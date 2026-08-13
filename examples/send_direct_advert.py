@@ -10,7 +10,7 @@ The direct advert is sent without expecting any acknowledgment or response.
 
 import asyncio
 
-from common import create_mesh_node, print_packet_info, RADIO_TYPES
+from common import RADIO_TYPES, create_mesh_node, print_packet_info
 
 from openhop_core.protocol.constants import ADVERT_FLAG_IS_CHAT_NODE
 from openhop_core.protocol.packet_builder import PacketBuilder

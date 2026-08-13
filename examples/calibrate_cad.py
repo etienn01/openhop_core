@@ -7,7 +7,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from common import create_radio, RADIO_TYPES
+from common import RADIO_TYPES, create_radio
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)

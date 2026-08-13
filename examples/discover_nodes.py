@@ -19,7 +19,7 @@ import asyncio
 import random
 import time
 
-from common import create_mesh_node, RADIO_TYPES
+from common import RADIO_TYPES, create_mesh_node
 
 from openhop_core.protocol.packet_builder import PacketBuilder
 

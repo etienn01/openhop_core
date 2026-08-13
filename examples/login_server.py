@@ -21,7 +21,7 @@ import asyncio
 import time
 from typing import Dict, Optional
 
-from common import create_mesh_node, RADIO_TYPES
+from common import RADIO_TYPES, create_mesh_node
 
 from openhop_core.node.handlers.login_server import LoginServerHandler
 from openhop_core.protocol import Identity, LocalIdentity

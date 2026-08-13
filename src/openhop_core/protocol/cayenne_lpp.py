@@ -32,8 +32,7 @@ _LPP_TYPES = {
     LPP_BAROMETRIC_PRESSURE: (2, 10, False),
     LPP_VOLTAGE: (2, 100, False),
     LPP_CURRENT: (2, 1000, True),
-    LPP_POWER: (2, 1, False), 
-
+    LPP_POWER: (2, 1, False),
 }
 
 
@@ -66,13 +65,16 @@ def encode_voltage(channel: int, volts: float) -> bytes:
     """Encode a voltage entry (LPP_VOLTAGE, 0.01 V/LSB, unsigned)."""
     return _add_field(channel, LPP_VOLTAGE, volts)
 
+
 def encode_current(channel: int, amps: float) -> bytes:
     """Encode a current entry (LPP_CURRENT, 0.001 A/LSB, signed)."""
     return _add_field(channel, LPP_CURRENT, amps)
 
+
 def encode_power(channel: int, watts: int) -> bytes:
     """Encode a power entry (LPP_POWER, 1 W/LSB, unsigned)."""
     return _add_field(channel, LPP_POWER, watts)
+
 
 def encode_temperature(channel: int, celsius: float) -> bytes:
     """Encode a temperature entry (LPP_TEMPERATURE, 0.1 C/LSB, signed)."""
