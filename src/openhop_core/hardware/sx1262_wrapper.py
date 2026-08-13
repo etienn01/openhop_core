@@ -652,9 +652,12 @@ class SX1262Radio(LoRaRadio):
                                         snr_db,
                                         signal_rssi_dbm,
                                     ) = self.lora.getSignalMetrics()
-                                    self.last_rssi = int(packet_rssi_dbm)
+                                    # Use SignalRssiPkt (not RssiPkt) so this matches
+                                    # the modem firmware, which can only ever report
+                                    # SignalRssiPkt over TCP/USB (RadioLib getRSSI() quirk).
+                                    self.last_rssi = int(signal_rssi_dbm)
                                     self.last_snr = snr_db
-                                    self.last_signal_rssi = int(signal_rssi_dbm)
+                                    self.last_signal_rssi = self.last_rssi
 
                                     logger.debug(
                                         f"[RX] Packet received: length={payloadLengthRx}, "
