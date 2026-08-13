@@ -343,6 +343,10 @@ class USBLoRaRadio(_RadioBase):
             "Use set_rx_callback(callback) to receive packets asynchronously."
         )
 
+    def set_event_loop(self, loop) -> None:
+        """Set the event loop used for callbacks and live configuration pushes."""
+        self._event_loop = loop
+
     def set_rx_callback(self, callback: Callable[[bytes], None]):
         """Set RX callback — called by Dispatcher to register _on_packet_received."""
         self.rx_callback = callback
@@ -538,12 +542,6 @@ class USBLoRaRadio(_RadioBase):
         effective = max(timeout, 0.6)
         return await self._perform_cad(effective)
 
-    def set_custom_cad_symbol_num(self, cad_symbol_num: int) -> bool:
-        """Store a validated CAD symbol count for calls that omit an override."""
-        build_cad_params_payload(cad_symbol_num, 0, 0)
-        self._custom_cad_symbol_num = int(cad_symbol_num)
-        return True
-
     # ── Wi-Fi / OTA provisioning (v0.5) ───────────────────────
 
     async def set_wifi_credentials(
@@ -736,6 +734,8 @@ class USBLoRaRadio(_RadioBase):
                 f"BW{self.bandwidth / 1000:.0f}kHz {self.tx_power}dBm "
                 f"sync=0x{self.sync_word:04X} pre={self.preamble_length}"
             )
+            if not self._apply_cad_config_sync():
+                logger.warning("Radio configured but cached CAD settings were not restored")
             return True
         elif resp and resp[0] == CMD_ERROR:
             err = resp[1][0] if len(resp) > 1 and len(resp[1]) > 0 else 0xFF
@@ -744,6 +744,28 @@ class USBLoRaRadio(_RadioBase):
         else:
             logger.error("No config response from modem")
             return False
+
+    def _write_cad_frame_sync(self, payload: bytes) -> bool:
+        """Push one complete CAD configuration before the RX worker starts."""
+        if self._serial is None:
+            return False
+        self._serial.write(build_frame(CMD_SET_CAD_PARAMS, payload))
+        resp = self._read_frame_sync(timeout=3.0, expect_cmd=CMD_CAD_PARAMS_RESP)
+        if resp and resp[0] == CMD_CAD_PARAMS_RESP:
+            return True
+        logger.error("No CAD configuration response from modem")
+        return False
+
+    def _apply_cad_config_sync(self) -> bool:
+        """Restore cached CAD settings during initial attach or re-attach."""
+        if self._custom_cad_peak is None or self._custom_cad_min is None:
+            return True
+        payload = build_cad_params_payload(
+            self._custom_cad_symbol_num or 2,
+            self._custom_cad_peak,
+            self._custom_cad_min,
+        )
+        return self._write_cad_frame_sync(payload)
 
     def _read_frame_sync(
         self,
@@ -1012,6 +1034,74 @@ class USBLoRaRadio(_RadioBase):
             return False
 
     # ── Config setters (for runtime reconfiguration) ──────────
+
+    def _run_async_safe(self, coro, wait_timeout: float = 4.0) -> bool:
+        """Schedule a command on the radio event loop from any caller thread."""
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._event_loop:
+
+            async def _bg():
+                try:
+                    response = await coro
+                    logger.info("Async CAD config push result: ok=%s", response is not None)
+                except Exception as exc:
+                    logger.error("Async CAD config push error: %s", exc, exc_info=True)
+
+            asyncio.ensure_future(_bg())
+            return True
+        if self._event_loop is None:
+            coro.close()
+            return False
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, self._event_loop)
+            return future.result(timeout=wait_timeout) is not None
+        except Exception as exc:
+            logger.error("Cross-thread CAD config push error: %s", exc, exc_info=True)
+            return False
+
+    def _push_cad_config_live(self) -> bool:
+        """Push the complete cached CAD tuple when the modem is connected."""
+        if self._custom_cad_peak is None or self._custom_cad_min is None:
+            return True
+        if not self._initialized:
+            return True
+        if self._event_loop is None or not self._event_loop.is_running():
+            return True
+        payload = build_cad_params_payload(
+            self._custom_cad_symbol_num or 2,
+            self._custom_cad_peak,
+            self._custom_cad_min,
+        )
+        return self._run_async_safe(
+            self._send_command(
+                CMD_SET_CAD_PARAMS,
+                payload,
+                expect_cmd=CMD_CAD_PARAMS_RESP,
+                timeout=3.0,
+            )
+        )
+
+    def set_custom_cad_thresholds(self, peak: int, min_val: int) -> bool:
+        """Cache and live-apply custom CAD detection thresholds."""
+        if not (0 <= int(peak) <= 255) or not (0 <= int(min_val) <= 255):
+            raise ValueError("CAD thresholds must be between 0 and 255")
+        self._custom_cad_peak = int(peak)
+        self._custom_cad_min = int(min_val)
+        return self._push_cad_config_live()
+
+    def set_custom_cad_symbol_num(self, cad_symbol_num: int) -> bool:
+        """Cache and live-apply a validated CAD symbol count."""
+        build_cad_params_payload(cad_symbol_num, 0, 0)
+        self._custom_cad_symbol_num = int(cad_symbol_num)
+        return self._push_cad_config_live()
+
+    def clear_custom_cad_thresholds(self) -> None:
+        """Clear host-side CAD thresholds; firmware resets on modem reboot."""
+        self._custom_cad_peak = None
+        self._custom_cad_min = None
 
     def set_frequency(self, frequency: int) -> bool:
         self.frequency = frequency
