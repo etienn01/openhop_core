@@ -30,6 +30,7 @@ Usage:
 
 import asyncio
 import logging
+import os
 import random
 import struct
 import threading
@@ -37,6 +38,7 @@ import time
 from typing import Callable, Optional
 
 import serial
+from serial.tools import list_ports
 
 from .protocol_constants import (
     CMD_CAD_PARAMS_RESP,
@@ -144,7 +146,9 @@ class USBLoRaRadio(_RadioBase):
         self._initialized = False
         self._rx_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._connected_event = threading.Event()
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._port_identity: Optional[tuple[Optional[int], Optional[int], Optional[str]]] = None
 
         # Signal metrics — matches SX1262Radio interface
         self.last_rssi: int = -99
@@ -205,14 +209,7 @@ class USBLoRaRadio(_RadioBase):
             # (re-)open the port. dsrdtr=True is the workaround; rtscts
             # stays off because the firmware does not implement hardware
             # flow control on the RX pipe.
-            self._serial = serial.Serial()
-            self._serial.port = self.port
-            self._serial.baudrate = self.baudrate
-            self._serial.timeout = 0.1
-            self._serial.write_timeout = 2.0
-            self._serial.dsrdtr = True
-            self._serial.rtscts = False
-            self._serial.open()
+            self._serial = self._open_serial_sync()
 
             # Short settle in case the caller just power-cycled the device.
             time.sleep(0.3)
@@ -232,6 +229,8 @@ class USBLoRaRadio(_RadioBase):
                 self._serial.close()
                 return False
 
+            self._connected_event.set()
+
             # Start RX background thread
             self._stop_event.clear()
             self._rx_thread = threading.Thread(
@@ -244,6 +243,7 @@ class USBLoRaRadio(_RadioBase):
             return True
 
         except Exception as e:
+            self._connected_event.clear()
             logger.error(f"Failed to initialize USBLoRaRadio: {e}")
             if self._serial and self._serial.is_open:
                 self._serial.close()
@@ -386,7 +386,7 @@ class USBLoRaRadio(_RadioBase):
         Called by Dispatcher.run_forever() every 60 seconds.
         Also refreshes cached modem metrics from the modem.
         """
-        if not self._initialized:
+        if not self._initialized or not self._connected_event.is_set():
             return False
 
         # Check RX thread
@@ -409,8 +409,9 @@ class USBLoRaRadio(_RadioBase):
 
     def get_status(self) -> dict:
         """Get radio status dict (matches SX1262Radio.get_status())."""
+        connected = self._initialized and self._connected_event.is_set()
         return {
-            "initialized": self._initialized,
+            "initialized": connected,
             "frequency": self.frequency,
             "tx_power": self.tx_power,
             "spreading_factor": self.spreading_factor,
@@ -419,7 +420,7 @@ class USBLoRaRadio(_RadioBase):
             "last_rssi": self.last_rssi,
             "last_snr": self.last_snr,
             "last_signal_rssi": self.last_signal_rssi,
-            "hardware_ready": self._initialized,
+            "hardware_ready": connected,
             "driver": "pymc_usb",
             "port": self.port,
             "tx_count": self._tx_count,
@@ -683,6 +684,7 @@ class USBLoRaRadio(_RadioBase):
     def cleanup(self):
         """Clean up resources."""
         self._initialized = False
+        self._connected_event.clear()
         self._stop_event.set()
 
         if self._rx_thread and self._rx_thread.is_alive():
@@ -696,6 +698,76 @@ class USBLoRaRadio(_RadioBase):
     # ══════════════════════════════════════════════════════════
     # Private — serial I/O
     # ══════════════════════════════════════════════════════════
+
+    def _capture_port_identity(self, device: str) -> None:
+        """Remember stable USB identity so tty renumbering can be followed."""
+        real_device = os.path.realpath(device)
+        for info in list_ports.comports():
+            if os.path.realpath(info.device) == real_device:
+                self._port_identity = (info.vid, info.pid, info.serial_number)
+                return
+
+    def _resolve_serial_port(self) -> str:
+        """Resolve the configured modem after USB re-enumeration."""
+        if self._port_identity is not None:
+            expected_vid, expected_pid, expected_serial = self._port_identity
+            for info in list_ports.comports():
+                if info.vid != expected_vid or info.pid != expected_pid:
+                    continue
+                if expected_serial and info.serial_number != expected_serial:
+                    continue
+                return info.device
+        return self.port
+
+    def _open_serial_sync(self) -> serial.Serial:
+        """Open a configured serial handle without starting the RX worker."""
+        device = self._resolve_serial_port()
+        handle = serial.Serial()
+        handle.port = device
+        handle.baudrate = self.baudrate
+        handle.timeout = 0.1
+        handle.write_timeout = 2.0
+        handle.dsrdtr = True
+        handle.rtscts = False
+        handle.open()
+        self._capture_port_identity(device)
+        return handle
+
+    def _reconnect_serial_sync(self) -> bool:
+        """Reopen a re-enumerated USB modem and restore radio/CAD state."""
+        if self._serial is not None:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+
+        attempt = 0
+        while not self._stop_event.is_set():
+            attempt += 1
+            try:
+                self._serial = self._open_serial_sync()
+                time.sleep(0.3)
+                self._serial.reset_input_buffer()
+                if not self._apply_config_sync():
+                    raise RuntimeError("modem did not acknowledge restored configuration")
+                self._connected_event.set()
+                logger.info(
+                    "USB modem reconnected on %s after %s attempt(s)",
+                    self._serial.port,
+                    attempt,
+                )
+                return True
+            except Exception as exc:
+                self._connected_event.clear()
+                if self._serial is not None:
+                    try:
+                        self._serial.close()
+                    except Exception:
+                        pass
+                if attempt == 1 or attempt % 10 == 0:
+                    logger.warning("USB modem reconnect attempt %s failed: %s", attempt, exc)
+                self._stop_event.wait(2.0)
+        return False
 
     def _ping_sync(self, timeout: float = 3.0) -> bool:
         """Synchronous ping — ad-hoc liveness probe.
@@ -903,9 +975,12 @@ class USBLoRaRadio(_RadioBase):
 
                     self._dispatch_frame(cmd, payload)
 
-            except serial.SerialException as e:
-                logger.error(f"Serial error in RX worker: {e}")
-                time.sleep(1.0)
+            except (serial.SerialException, OSError) as e:
+                buf.clear()
+                self._connected_event.clear()
+                logger.warning("USB modem disconnected: %s", e)
+                if not self._reconnect_serial_sync():
+                    break
             except Exception as e:
                 logger.error(f"RX worker error: {e}")
                 time.sleep(0.1)
@@ -989,7 +1064,7 @@ class USBLoRaRadio(_RadioBase):
     ) -> Optional[bytes]:
         """Send a command frame and wait for a specific response frame."""
         async with self._command_lock:
-            if not self._serial or not self._serial.is_open:
+            if not self._connected_event.is_set() or not self._serial or not self._serial.is_open:
                 return None
 
             # Ensure event loop is captured

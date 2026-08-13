@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
@@ -165,6 +166,7 @@ async def test_modem_commands_with_same_response_are_serialized(radio_cls):
     else:
         radio._serial = Mock()
         radio._serial.is_open = True
+        radio._connected_event.set()
 
     async def dispatch_response(payload):
         nonlocal active, max_active
@@ -201,3 +203,66 @@ async def test_modem_commands_with_same_response_are_serialized(radio_cls):
 
     assert responses == [b"\x01", b"\x01"]
     assert max_active == 1
+
+
+def test_usb_reconnect_resolves_reenumerated_port(monkeypatch):
+    radio = USBLoRaRadio("/dev/ttyACM0")
+    radio._port_identity = (0x1A86, 0x55D3, "5B5F091637")
+    monkeypatch.setattr(
+        "openhop_core.hardware.usb_radio.list_ports.comports",
+        lambda: [
+            SimpleNamespace(
+                device="/dev/ttyACM1",
+                vid=0x1A86,
+                pid=0x55D3,
+                serial_number="5B5F091637",
+            )
+        ],
+    )
+
+    assert radio._resolve_serial_port() == "/dev/ttyACM1"
+
+
+def test_usb_status_reports_disconnected_transport_unavailable():
+    radio = USBLoRaRadio("/dev/ttyACM0")
+    radio._initialized = True
+
+    status = radio.get_status()
+
+    assert status["initialized"] is False
+    assert status["hardware_ready"] is False
+
+
+def test_usb_reconnect_reopens_transport_and_restores_cached_configuration():
+    radio = USBLoRaRadio("/dev/ttyACM0")
+    old_serial = Mock()
+    new_serial = Mock()
+    radio._serial = old_serial
+    radio._open_serial_sync = Mock(return_value=new_serial)
+    radio._apply_config_sync = Mock(return_value=True)
+
+    assert radio._reconnect_serial_sync() is True
+
+    old_serial.close.assert_called_once_with()
+    new_serial.reset_input_buffer.assert_called_once_with()
+    radio._apply_config_sync.assert_called_once_with()
+    assert radio._serial is new_serial
+    assert radio._connected_event.is_set()
+
+
+def test_usb_rx_worker_reconnects_after_device_io_error():
+    radio = USBLoRaRadio("/dev/ttyACM0")
+    broken_serial = Mock()
+    type(broken_serial).in_waiting = property(
+        lambda _self: (_ for _ in ()).throw(OSError(5, "Input/output error"))
+    )
+    radio._serial = broken_serial
+
+    def reconnect_then_stop():
+        radio._stop_event.set()
+        return True
+
+    radio._reconnect_serial_sync = Mock(side_effect=reconnect_then_stop)
+    radio._rx_worker()
+
+    radio._reconnect_serial_sync.assert_called_once_with()
