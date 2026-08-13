@@ -159,6 +159,11 @@ class USBLoRaRadio(_RadioBase):
         self._response_events: dict[int, asyncio.Event] = {}
         self._response_data: dict[int, Optional[bytes]] = {}
         self._response_lock = threading.Lock()
+        # Only one command may wait for a response at a time. Repeater applies
+        # CAD thresholds and symbol count back-to-back, and both commands wait
+        # for CMD_CAD_PARAMS_RESP. Without serialization the second waiter
+        # replaces the first entry in _response_events and one update times out.
+        self._command_lock = asyncio.Lock()
 
         # Custom CAD thresholds. Set lazily by set_custom_cad_thresholds()
         # or perform_cad(det_peak=..., det_min=...); kept in attributes from
@@ -983,39 +988,40 @@ class USBLoRaRadio(_RadioBase):
         timeout: float = 5.0,
     ) -> Optional[bytes]:
         """Send a command frame and wait for a specific response frame."""
-        if not self._serial or not self._serial.is_open:
-            return None
-
-        # Ensure event loop is captured
-        if self._event_loop is None:
-            try:
-                self._event_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
-
-        # Register response expectation
-        evt = asyncio.Event()
-        with self._response_lock:
-            self._response_events[expect_cmd] = evt
-            self._response_data.pop(expect_cmd, None)
-
-        try:
-            frame = build_frame(cmd, payload)
-            self._serial.write(frame)
-            self._serial.flush()
-
-            try:
-                await asyncio.wait_for(evt.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
+        async with self._command_lock:
+            if not self._serial or not self._serial.is_open:
                 return None
 
-            return self._response_data.get(expect_cmd)
+            # Ensure event loop is captured
+            if self._event_loop is None:
+                try:
+                    self._event_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
 
-        finally:
+            # Register response expectation
+            evt = asyncio.Event()
             with self._response_lock:
-                self._response_events.pop(expect_cmd, None)
+                self._response_events[expect_cmd] = evt
                 self._response_data.pop(expect_cmd, None)
+
+            try:
+                frame = build_frame(cmd, payload)
+                self._serial.write(frame)
+                self._serial.flush()
+
+                try:
+                    await asyncio.wait_for(evt.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
+                    return None
+
+                return self._response_data.get(expect_cmd)
+
+            finally:
+                with self._response_lock:
+                    self._response_events.pop(expect_cmd, None)
+                    self._response_data.pop(expect_cmd, None)
 
     async def _perform_cad(self, timeout: float = 1.0) -> bool:
         """Perform Channel Activity Detection. Returns True if busy."""

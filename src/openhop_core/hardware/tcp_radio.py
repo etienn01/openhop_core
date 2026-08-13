@@ -143,6 +143,10 @@ class TCPLoRaRadio(_RadioBase):
         self._rx_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+        # Serialize command/response transactions. Multiple callers can wait
+        # for the same response command (notably consecutive CAD updates), and
+        # the response-event map supports only one waiter per command byte.
+        self._command_lock = asyncio.Lock()
 
         # Custom CAD thresholds. Set lazily by set_custom_cad_thresholds()
         # or perform_cad(det_peak=..., det_min=...); read by _reopen_socket
@@ -909,40 +913,41 @@ class TCPLoRaRadio(_RadioBase):
         expect_cmd: int,
         timeout: float = 5.0,
     ) -> Optional[bytes]:
-        if self._sock is None:
-            return None
-
-        if self._event_loop is None:
-            try:
-                self._event_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
-
-        evt = asyncio.Event()
-        with self._response_lock:
-            self._response_events[expect_cmd] = evt
-            self._response_data.pop(expect_cmd, None)
-
-        try:
-            frame = build_frame(cmd, payload)
-            try:
-                self._sock_write(frame)
-            except (OSError, ConnectionError) as e:
-                logger.error(f"TCP write failed: {e}")
+        async with self._command_lock:
+            if self._sock is None:
                 return None
 
-            try:
-                await asyncio.wait_for(evt.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
-                return None
+            if self._event_loop is None:
+                try:
+                    self._event_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
 
-            return self._response_data.get(expect_cmd)
-
-        finally:
+            evt = asyncio.Event()
             with self._response_lock:
-                self._response_events.pop(expect_cmd, None)
+                self._response_events[expect_cmd] = evt
                 self._response_data.pop(expect_cmd, None)
+
+            try:
+                frame = build_frame(cmd, payload)
+                try:
+                    self._sock_write(frame)
+                except (OSError, ConnectionError) as e:
+                    logger.error(f"TCP write failed: {e}")
+                    return None
+
+                try:
+                    await asyncio.wait_for(evt.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
+                    return None
+
+                return self._response_data.get(expect_cmd)
+
+            finally:
+                with self._response_lock:
+                    self._response_events.pop(expect_cmd, None)
+                    self._response_data.pop(expect_cmd, None)
 
     async def _perform_cad(self, timeout: float = 1.0) -> bool:
         resp = await self._send_command(

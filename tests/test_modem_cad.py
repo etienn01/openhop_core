@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
@@ -148,3 +149,55 @@ def test_modem_cad_live_setters_push_complete_encoded_tuple(
         expect_cmd=CMD_CAD_PARAMS_RESP,
         timeout=3.0,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("radio_cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_modem_commands_with_same_response_are_serialized(radio_cls):
+    radio = _make_radio(radio_cls)
+    radio._event_loop = asyncio.get_running_loop()
+    active = 0
+    max_active = 0
+
+    if radio_cls is TCPLoRaRadio:
+        radio._sock = Mock()
+        radio._sock_write = Mock()
+    else:
+        radio._serial = Mock()
+        radio._serial.is_open = True
+
+    async def dispatch_response(payload):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0)
+        radio._dispatch_frame(CMD_CAD_PARAMS_RESP, payload)
+        active -= 1
+
+    original_write = radio._sock_write if radio_cls is TCPLoRaRadio else radio._serial.write
+
+    def write_and_respond(_frame):
+        result = original_write(_frame) if radio_cls is TCPLoRaRadio else None
+        asyncio.create_task(dispatch_response(b"\x01"))
+        return result
+
+    if radio_cls is TCPLoRaRadio:
+        radio._sock_write = Mock(side_effect=write_and_respond)
+    else:
+        radio._serial.write = Mock(side_effect=write_and_respond)
+
+    responses = await asyncio.gather(
+        radio._send_command(
+            CMD_SET_CAD_PARAMS,
+            b"first",
+            expect_cmd=CMD_CAD_PARAMS_RESP,
+        ),
+        radio._send_command(
+            CMD_SET_CAD_PARAMS,
+            b"second",
+            expect_cmd=CMD_CAD_PARAMS_RESP,
+        ),
+    )
+
+    assert responses == [b"\x01", b"\x01"]
+    assert max_active == 1
