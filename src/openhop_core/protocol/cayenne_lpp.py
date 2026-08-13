@@ -14,6 +14,7 @@ import struct
 # LPP type codes, byte sizes and multipliers (CayenneLPP.h).
 LPP_TEMPERATURE = 0x67  # 103: 2 bytes, 0.1 C/LSB, signed
 LPP_RELATIVE_HUMIDITY = 0x68  # 104: 1 byte, 0.5 %/LSB, unsigned
+LPP_BAROMETRIC_PRESSURE = 0x73  # 115: 2 bytes, 0.1 hPa/LSB, unsigned
 LPP_VOLTAGE = 0x74  # 116: 2 bytes, 0.01 V/LSB, unsigned
 LPP_CURRENT = 0x75  # 115: 2 bytes, 0.001 A/LSB, signed
 LPP_POWER = 0x80  # 128: 2 bytes, 1 W/LSB, unsigned
@@ -28,6 +29,7 @@ LPP_VOLTAGE_MULT = 100
 _LPP_TYPES = {
     LPP_TEMPERATURE: (2, 10, True),
     LPP_RELATIVE_HUMIDITY: (1, 2, False),
+    LPP_BAROMETRIC_PRESSURE: (2, 10, False),
     LPP_VOLTAGE: (2, 100, False),
     LPP_CURRENT: (2, 1000, True),
     LPP_POWER: (2, 1, False), 
@@ -80,3 +82,8 @@ def encode_temperature(channel: int, celsius: float) -> bytes:
 def encode_relative_humidity(channel: int, percent: float) -> bytes:
     """Encode a relative-humidity entry (LPP_RELATIVE_HUMIDITY, 0.5 %/LSB)."""
     return _add_field(channel, LPP_RELATIVE_HUMIDITY, percent)
+
+
+def encode_barometric_pressure(channel: int, hpa: float) -> bytes:
+    """Encode a barometric-pressure entry (LPP_BAROMETRIC_PRESSURE, 0.1 hPa/LSB)."""
+    return _add_field(channel, LPP_BAROMETRIC_PRESSURE, hpa)
