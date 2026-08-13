@@ -804,7 +804,7 @@ class ProtocolResponseHandler:
             # Sanity-check key fields to avoid misidentifying non-stats data
             # (e.g. neighbor list binary data parsed as RepeaterStats produces
             # batt=22mV, rssi=-27844, which are obviously invalid).
-            if batt_milli_volts > 10000:  # > 10V is unreasonable
+            if batt_milli_volts > 20000:  # > 20V is unreasonable
                 return None
             if last_rssi < -200 or last_rssi > 0:  # RSSI always negative, > -200 dBm
                 return None
