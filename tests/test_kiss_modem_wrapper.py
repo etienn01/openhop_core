@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from openhop_core.hardware import kiss_modem_wrapper
 from openhop_core.hardware.kiss_modem_wrapper import (
     CMD_DATA,
     CMD_GET_BATTERY,
@@ -2653,3 +2654,34 @@ class TestRxCallbackDisarmRace:
         modem._dispatch_rx_callback(b"payload", -50, 7.5)  # must not raise
 
         fake_loop.call_soon_threadsafe.assert_not_called()
+
+
+class TestSerialPortOpen:
+    """Opening the port must not let pyserial drive the modem's control lines."""
+
+    def _connect_with_fake_serial(self):
+        """Run connect() against a fake pyserial, return the Serial() kwargs."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._post_connect_settle_s = 0
+        with patch(
+            "openhop_core.hardware.kiss_modem_wrapper.serial"
+        ) as fake_serial, patch.object(
+            kiss_modem_wrapper.threading, "Thread"
+        ), patch.object(
+            KissModemWrapper, "_wait_for_modem_ready", return_value=True
+        ), patch.object(
+            KissModemWrapper, "_query_modem_info"
+        ), patch.object(
+            KissModemWrapper, "_set_kiss_tx_delay"
+        ):
+            modem.connect()
+        assert fake_serial.Serial.call_count == 1
+        return fake_serial.Serial.call_args.kwargs
+
+    def test_connect_leaves_dtr_alone(self):
+        """dsrdtr=True stops pyserial asserting DTR on open, which resets the modem."""
+        assert self._connect_with_fake_serial().get("dsrdtr") is True
+
+    def test_connect_does_not_enable_hardware_flow_control(self):
+        """The firmware implements no RTS/CTS flow control on the RX pipe."""
+        assert self._connect_with_fake_serial().get("rtscts") is False
