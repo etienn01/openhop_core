@@ -87,6 +87,8 @@ class SX1262Radio(LoRaRadio):
         use_dio3_tcxo: bool = False,
         dio3_tcxo_voltage: float = 1.8,
         use_dio2_rf: bool = False,
+        lbt_max_wait_seconds: float = 4.0,
+        lbt_retry_interval_ms: int = 200,
         radio_timing_delay: float = RADIO_TIMING_DELAY,
         spi_transport=None,
         gpio_manager=None,
@@ -219,6 +221,22 @@ class SX1262Radio(LoRaRadio):
 
         # Store CAD results from interrupt handler
         self._last_cad_detected = False
+
+        # Listen-Before-Talk budget, bounded in TIME rather than attempts, so
+        # an occupation longer than the budget cannot leave two neighbours
+        # forcing their TX in lockstep. Defaults match MeshCore (4 s cap,
+        # 200 ms retry); the jitter keeps two nodes' checks decorrelated.
+        self.lbt_max_wait_seconds = max(0.5, float(lbt_max_wait_seconds))
+        self.lbt_retry_interval_ms = max(20, int(lbt_retry_interval_ms))
+
+        # Reception-in-progress markers (parity with MeshCore
+        # CustomSX1262::isReceiving()). The interrupt handler clears the
+        # chip-side PREAMBLE/SYNC/HEADER flags, so these timestamps are the
+        # only place "a reception has started" survives. Terminal RX IRQs
+        # clear them; is_receiving_packet() expires them after a worst-case
+        # airtime so a lost terminal IRQ cannot wedge TX.
+        self._rx_activity_at: float = 0.0
+        self._rx_header_at: float = 0.0
         self._last_cad_irq_status = 0
 
         # Custom CAD thresholds (None means use defaults)
@@ -403,6 +421,25 @@ class SX1262Radio(LoRaRadio):
                     | self.lora.IRQ_TIMEOUT
                     | self.lora.IRQ_HEADER_ERR
                 )
+
+                # Latch reception-progress markers before the chip-side flags
+                # are cleared: the TX path reads them (is_receiving_packet)
+                # rather than dropping to standby for a CAD scan, which would
+                # abort the very reception it is checking for.
+                reception_markers = (
+                    self.lora.IRQ_PREAMBLE_DETECTED
+                    | self.lora.IRQ_SYNC_WORD_VALID
+                    | self.lora.IRQ_HEADER_VALID
+                )
+                if irqStat & reception_markers:
+                    now_mono = time.monotonic()
+                    if self._rx_activity_at <= 0:
+                        self._rx_activity_at = now_mono
+                    if irqStat & self.lora.IRQ_HEADER_VALID:
+                        self._rx_header_at = now_mono
+                if irqStat & terminal_interrupts:
+                    self._rx_activity_at = 0.0
+                    self._rx_header_at = 0.0
 
                 # Log all interrupt types for debugging
                 if irqStat & self.lora.IRQ_RX_DONE:
@@ -1095,6 +1132,60 @@ class SX1262Radio(LoRaRadio):
         # latched in software before we begin CAD/TX buffer reuse.
         await self._drain_pending_rx_irq_before_buffer_reuse()
 
+        # Listen Before Talk, bounded in TIME rather than attempts: short
+        # jittered retries run for the whole budget, keeping two nodes' checks
+        # decorrelated and bounding the post-clear latency to one retry
+        # interval. (MeshCore: 200 ms retry, getCADFailMaxDuration() 4 s cap.)
+        lbt_backoff_delays: list[float] = []
+        lbt_deadline = time.monotonic() + self.lbt_max_wait_seconds
+
+        while True:
+            scanned = False
+            try:
+                # Passive check first: a latched in-progress reception is
+                # authoritative and free — and it must be consulted BEFORE
+                # any standby(), because perform_cad() drops to standby,
+                # which aborts the very reception it is probing for.
+                if self.is_receiving_packet():
+                    channel_busy = True
+                    _trace("LBT: reception in progress - deferring TX")
+                else:
+                    scanned = True
+                    channel_busy = await self.perform_cad(timeout=0.5, respect_tx_lock=False)
+                if not channel_busy:
+                    _trace("LBT: channel clear")
+                    break
+            except Exception as e:
+                logger.warning(f"LBT channel check failed: {e}, proceeding with transmission")
+                break
+
+            if time.monotonic() >= lbt_deadline:
+                # Busy for the whole budget: past this point the likeliest
+                # cause is a radio wedged in a bad state, and refusing forever
+                # would stall the TX queue. Mirrors MeshCore forcing the send
+                # once getCADFailMaxDuration() elapses.
+                logger.warning(
+                    f"LBT budget exhausted ({self.lbt_max_wait_seconds:.1f}s) - "
+                    "channel still busy, transmitting anyway"
+                )
+                break
+
+            delay_ms = self.lbt_retry_interval_ms * random.uniform(0.5, 1.5)
+            remaining_ms = (lbt_deadline - time.monotonic()) * 1000.0
+            delay_ms = max(10.0, min(delay_ms, remaining_ms))
+            lbt_backoff_delays.append(float(delay_ms))
+            if scanned:
+                # Only a CAD scan leaves the radio in standby, so only then is
+                # there RX to re-arm before the wait. After the passive check
+                # the radio is still receiving, and re-arming would clear the
+                # IRQ flags and drop to standby — aborting the very reception
+                # that set the latch, with no terminal IRQ left to clear it.
+                await self._restore_rx_for_cad_backoff()
+            _trace(f"LBT: channel busy - retrying in {delay_ms:.0f}ms")
+            await asyncio.sleep(delay_ms / 1000.0)
+
+        # Stage the TX only now: dropping to standby before the LBT loop would
+        # abort any reception in progress before even checking for one.
         self.lora.setStandby(self.lora.STANDBY_RC)
         await asyncio.sleep(self.RADIO_TIMING_DELAY)  # Give hardware time to enter standby
         if self.lora.busyCheck():
@@ -1102,47 +1193,6 @@ class SX1262Radio(LoRaRadio):
             while self.lora.busyCheck() and busy_wait < 20:
                 await asyncio.sleep(self.RADIO_TIMING_DELAY)
                 busy_wait += 1
-
-        # Listen Before Talk (LBT) - Check for channel activity using CAD
-        lbt_backoff_delays = []  # Track each backoff delay in ms
-        lbt_attempts = 0
-        max_lbt_attempts = 5
-
-        while lbt_attempts < max_lbt_attempts:
-            try:
-                channel_busy = await self.perform_cad(timeout=0.5, respect_tx_lock=False)
-                if not channel_busy:
-                    _trace(f"CAD check clear - channel available after {lbt_attempts + 1} attempts")
-                    break
-
-                _trace("CAD check still busy - channel activity detected")
-                lbt_attempts += 1
-                if lbt_attempts < max_lbt_attempts:
-                    # Jitter (50-200ms)
-                    base_delay = random.randint(50, 200)
-                    # Exponential backoff: base * 2^attempts
-                    backoff_ms = base_delay * (2 ** (lbt_attempts - 1))
-                    # Cap at 5 seconds maximum
-                    backoff_ms = min(backoff_ms, 5000)
-
-                    lbt_backoff_delays.append(float(backoff_ms))
-                    # Keep TX lock held for thread safety while this send() owns TX sequencing,
-                    # but restore RX during backoff so standby time is limited to CAD windows.
-                    await self._restore_rx_for_cad_backoff()
-
-                    _trace(
-                        f"CAD backoff - waiting {backoff_ms}ms before retry "
-                        f"(attempt {lbt_attempts}/{max_lbt_attempts})"
-                    )
-                    await asyncio.sleep(backoff_ms / 1000.0)
-                else:
-                    logger.warning(
-                        f"CAD max attempts reached - channel still busy after "
-                        f"{max_lbt_attempts} attempts, transmitting anyway"
-                    )
-            except Exception as e:
-                logger.warning(f"CAD check failed: {e}, proceeding with transmission")
-                break
 
         self._control_tx_rx_pins(tx_mode=True)
 
@@ -1761,6 +1811,39 @@ class SX1262Radio(LoRaRadio):
         if cad_symbol_num not in symbol_map:
             raise ValueError("cad_symbol_num must be one of: 1, 2, 4, 8, 16")
         return symbol_map[cad_symbol_num]
+
+    def _max_reception_seconds(self) -> float:
+        """Upper bound on how long one reception can plausibly last.
+
+        Worst-case airtime of a max-size packet at the current radio params,
+        padded by 50%. Bounds the reception-progress latch so a lost terminal
+        IRQ cannot report "receiving" forever and wedge TX — MeshCore bounds
+        its equivalent (_maxPayloadMillis) the same way.
+        """
+        final_timeout_ms, _ = self._calculate_tx_timeout(255)
+        # _calculate_tx_timeout returns airtime + 1000 ms margin.
+        return max(0.5, (final_timeout_ms - 1000) * 1.5 / 1000.0)
+
+    def is_receiving_packet(self) -> bool:
+        """True while the chip reported an in-progress reception.
+
+        Passive and free: reads the software latch fed by the interrupt
+        handler (preamble / sync word / header IRQs), so the TX path can
+        detect a busy channel without touching the radio — a CAD scan drops
+        to standby first, which aborts the reception it is probing for, and
+        CAD's 2-symbol scan is unreliable mid-payload anyway. Parity with
+        MeshCore CustomSX1262::isReceiving().
+        """
+        started = self._rx_activity_at
+        if started <= 0:
+            return False
+        if time.monotonic() - started > self._max_reception_seconds():
+            # Stale marker: the chip moved on without a terminal IRQ reaching
+            # us (lost edge, cleared flags). Expire it rather than wedge TX.
+            self._rx_activity_at = 0.0
+            self._rx_header_at = 0.0
+            return False
+        return True
 
     async def perform_cad(
         self,
