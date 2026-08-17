@@ -67,6 +67,10 @@ ERR_INVALID_CONFIG = 0x06
 ERR_CAD_FAILED = 0x07
 ERR_RADIO_INIT = 0x08
 ERR_UNAUTHORIZED = 0x09
+# Firmware auto-CAD (CMD_SET_AUTO_CAD) refused a TX because the channel was
+# busy after all its retries. LBT feedback, not a failure: the host retries
+# within its own LBT time budget.
+ERR_CHANNEL_BUSY = 0x0E
 
 # ─── WIFI_STATUS mode codes ──────────────────────────────────────────
 # Matches firmware main.cpp::buildWifiStatusPayload
@@ -178,6 +182,7 @@ __all__ = [
     "ERR_CAD_FAILED",
     "ERR_RADIO_INIT",
     "ERR_UNAUTHORIZED",
+    "ERR_CHANNEL_BUSY",
     # WIFI_STATUS modes
     "WIFI_MODE_OFFLINE",
     "WIFI_MODE_STA_CONNECTING",
