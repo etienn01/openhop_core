@@ -526,6 +526,15 @@ class KissModemWrapper(LoRaRadio):
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
+                # dsrdtr=True tells pyserial to leave DTR alone on open rather than
+                # asserting it, the same guard usb_radio.py already applies. On a
+                # CP2102 board DTR pulls EN low and reboots the ESP32; on an
+                # ESP32-S3 using the native USB-Serial-JTAG peripheral the host's
+                # DTR/RTS state feeds the on-chip reset logic directly. Either way
+                # the modem restarts every time we (re-)open the port. rtscts stays
+                # off because the firmware has no hardware flow control.
+                dsrdtr=True,
+                rtscts=False,
             )
             self.is_connected = False
 
