@@ -117,6 +117,38 @@ async def test_max_reception_seconds_tracks_radio_params(radio):
     assert slow > fast
 
 
+# ─── two-stage expiry: preamble-only vs header-seen ───────────────────
+
+
+async def test_max_preamble_seconds_is_much_shorter_than_max_reception(radio):
+    """A preamble that never reaches a header should time out fast, not wait
+    out a full packet's worth of airtime."""
+    assert radio._max_preamble_seconds() < radio._max_reception_seconds() / 4
+
+
+async def test_preamble_only_latch_expires_on_the_short_bound(radio):
+    """No header ever arrived: expiry uses _max_preamble_seconds(), not the
+    much longer _max_reception_seconds() — a false preamble trigger (noise)
+    must not defer TX for a full packet's worth of time."""
+    _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
+    radio._rx_activity_at = time.monotonic() - (radio._max_preamble_seconds() + 0.01)
+
+    assert radio.is_receiving_packet() is False
+    assert radio._rx_activity_at == 0.0
+
+
+async def test_header_valid_restarts_the_clock(radio):
+    """A preamble latch about to expire must not expire once a header
+    arrives: the clock restarts and the longer bound applies from here."""
+    _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
+    radio._rx_activity_at = time.monotonic() - (radio._max_preamble_seconds() - 0.005)
+
+    _inject_irq(radio, IRQ_HEADER_VALID)
+
+    assert radio.is_receiving_packet() is True
+    assert time.monotonic() - radio._rx_activity_at < 0.005
+
+
 # ─── LBT: passive check first, no standby/CAD during a reception ─────
 
 

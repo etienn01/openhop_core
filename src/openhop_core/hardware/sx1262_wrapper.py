@@ -433,10 +433,13 @@ class SX1262Radio(LoRaRadio):
                 )
                 if irqStat & reception_markers:
                     now_mono = time.monotonic()
-                    if self._rx_activity_at <= 0:
-                        self._rx_activity_at = now_mono
                     if irqStat & self.lora.IRQ_HEADER_VALID:
+                        # Header valid restarts the clock onto the longer bound.
+                        if self._rx_header_at <= 0:
+                            self._rx_activity_at = now_mono
                         self._rx_header_at = now_mono
+                    elif self._rx_activity_at <= 0:
+                        self._rx_activity_at = now_mono
                 if irqStat & terminal_interrupts:
                     self._rx_activity_at = 0.0
                     self._rx_header_at = 0.0
@@ -1822,16 +1825,17 @@ class SX1262Radio(LoRaRadio):
         return symbol_map[cad_symbol_num]
 
     def _max_reception_seconds(self) -> float:
-        """Upper bound on how long one reception can plausibly last.
-
-        Worst-case airtime of a max-size packet at the current radio params,
-        padded by 50%. Bounds the reception-progress latch so a lost terminal
-        IRQ cannot report "receiving" forever and wedge TX — MeshCore bounds
-        its equivalent (_maxPayloadMillis) the same way.
-        """
+        """Worst-case max-size packet airtime + 50%, once a header is seen (MeshCore: _maxPayloadMillis)."""
         final_timeout_ms, _ = self._calculate_tx_timeout(255)
         # _calculate_tx_timeout returns airtime + 1000 ms margin.
         return max(0.5, (final_timeout_ms - 1000) * 1.5 / 1000.0)
+
+    def _max_preamble_seconds(self) -> float:
+        """Preamble-to-header-valid latency bound, recomputed live from SF/BW/CR (MeshCore: _preambleMillis)."""
+        preamble_only_ms = calculate_lora_airtime_ms(
+            0, self.spreading_factor, int(self.bandwidth), self.coding_rate, self.preamble_length
+        )
+        return max(0.05, preamble_only_ms * 1.5 / 1000.0)
 
     def is_receiving_packet(self) -> bool:
         """True while the chip reported an in-progress reception.
@@ -1846,9 +1850,9 @@ class SX1262Radio(LoRaRadio):
         started = self._rx_activity_at
         if started <= 0:
             return False
-        if time.monotonic() - started > self._max_reception_seconds():
-            # Stale marker: the chip moved on without a terminal IRQ reaching
-            # us (lost edge, cleared flags). Expire it rather than wedge TX.
+        has_header = self._rx_header_at > 0
+        bound = self._max_reception_seconds() if has_header else self._max_preamble_seconds()
+        if time.monotonic() - started > bound:
             self._rx_activity_at = 0.0
             self._rx_header_at = 0.0
             return False
