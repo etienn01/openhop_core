@@ -1184,6 +1184,15 @@ class SX1262Radio(LoRaRadio):
             _trace(f"LBT: channel busy - retrying in {delay_ms:.0f}ms")
             await asyncio.sleep(delay_ms / 1000.0)
 
+        # Committing to TX aborts any reception still in progress, so its
+        # terminal IRQ will never arrive — clear the reception markers here,
+        # or the next send would defer on a ghost, without running a single
+        # CAD, until the staleness bound expired. (MeshCore is immune by
+        # construction: its isReceiving() re-reads the live chip flags, and
+        # a transmit clears them.)
+        self._rx_activity_at = 0.0
+        self._rx_header_at = 0.0
+
         # Stage the TX only now: dropping to standby before the LBT loop would
         # abort any reception in progress before even checking for one.
         self.lora.setStandby(self.lora.STANDBY_RC)

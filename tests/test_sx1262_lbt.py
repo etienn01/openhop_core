@@ -215,6 +215,43 @@ async def test_lbt_clear_channel_transmits_without_waiting(radio):
     assert delays == []
 
 
+# ─── TX commit clears the reception latch ────────────────────────────
+
+
+async def test_forced_tx_clears_the_reception_latch(radio):
+    """Transmitting kills the reception the latch is tracking, so its
+    terminal IRQ never arrives. The TX commit must clear the markers itself:
+    left armed, they would make the next send defer on a reception that no
+    longer exists — without a single CAD — until the staleness bound expired.
+    """
+    radio._max_reception_seconds = lambda: 10.0  # keep expiry out of the picture
+    _inject_irq(radio, IRQ_PREAMBLE_DETECTED)  # a reception that never finishes
+    radio.perform_cad = AsyncMock(return_value=False)
+
+    success, delays = await radio._prepare_radio_for_tx()  # deadline -> forced TX
+
+    assert success is True
+    assert delays  # it did defer on the latch until the budget ran out
+    assert radio._rx_activity_at == 0.0 and radio._rx_header_at == 0.0
+    assert radio.is_receiving_packet() is False
+
+
+async def test_send_after_forced_tx_probes_the_channel_again(radio):
+    """The send following a forced TX must sense the channel, not sit out a
+    ghost of the reception that TX destroyed."""
+    radio._max_reception_seconds = lambda: 10.0
+    _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
+    radio.perform_cad = AsyncMock(return_value=False)
+    await radio._prepare_radio_for_tx()  # forced TX; must clear the latch
+
+    radio.perform_cad.reset_mock()
+    success, delays = await radio._prepare_radio_for_tx()
+
+    assert success is True
+    assert delays == []  # no ghost deferral
+    assert radio.perform_cad.await_count == 1  # the channel was actually probed
+
+
 # ─── Constructor knobs ───────────────────────────────────────────────
 
 
