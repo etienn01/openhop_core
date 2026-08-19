@@ -1141,6 +1141,10 @@ class SX1262Radio(LoRaRadio):
         # interval. (MeshCore: 200 ms retry, getCADFailMaxDuration() 4 s cap.)
         lbt_backoff_delays: list[float] = []
         lbt_deadline = time.monotonic() + self.lbt_max_wait_seconds
+        lbt_started = time.monotonic()
+        latch_defers = 0
+        cad_checks = 0
+        outcome = "forced"
 
         while True:
             scanned = False
@@ -1151,14 +1155,18 @@ class SX1262Radio(LoRaRadio):
                 # which aborts the very reception it is probing for.
                 if self.is_receiving_packet():
                     channel_busy = True
+                    latch_defers += 1
                     _trace("LBT: reception in progress - deferring TX")
                 else:
                     scanned = True
+                    cad_checks += 1
                     channel_busy = await self.perform_cad(timeout=0.5, respect_tx_lock=False)
                 if not channel_busy:
+                    outcome = "clear"
                     _trace("LBT: channel clear")
                     break
             except Exception as e:
+                outcome = "exception"
                 logger.warning(f"LBT channel check failed: {e}, proceeding with transmission")
                 break
 
@@ -1195,6 +1203,12 @@ class SX1262Radio(LoRaRadio):
         # a transmit clears them.)
         self._rx_activity_at = 0.0
         self._rx_header_at = 0.0
+
+        logger.debug(
+            f"LBT summary: outcome={outcome} elapsed={(time.monotonic() - lbt_started) * 1000:.0f}ms "
+            f"latch_defers={latch_defers} cad_checks={cad_checks} "
+            f"backoff_total={sum(lbt_backoff_delays):.0f}ms"
+        )
 
         # Stage the TX only now: dropping to standby before the LBT loop would
         # abort any reception in progress before even checking for one.
@@ -1852,7 +1866,12 @@ class SX1262Radio(LoRaRadio):
             return False
         has_header = self._rx_header_at > 0
         bound = self._max_reception_seconds() if has_header else self._max_preamble_seconds()
-        if time.monotonic() - started > bound:
+        elapsed = time.monotonic() - started
+        if elapsed > bound:
+            logger.debug(
+                f"Reception latch expired ({'header' if has_header else 'preamble'} phase, "
+                f"{elapsed * 1000:.0f}ms > {bound * 1000:.0f}ms bound)"
+            )
             self._rx_activity_at = 0.0
             self._rx_header_at = 0.0
             return False

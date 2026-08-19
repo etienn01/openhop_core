@@ -284,6 +284,40 @@ async def test_send_after_forced_tx_probes_the_channel_again(radio):
     assert radio.perform_cad.await_count == 1  # the channel was actually probed
 
 
+# ─── LBT/CAD decision logging ─────────────────────────────────────────
+
+
+async def test_lbt_summary_reports_cad_clear(radio, caplog):
+    radio.perform_cad = AsyncMock(return_value=False)
+
+    with caplog.at_level("DEBUG", logger="SX1262_wrapper"):
+        await radio._prepare_radio_for_tx()
+
+    (summary,) = [r.message for r in caplog.records if "LBT summary" in r.message]
+    assert "outcome=clear" in summary
+    assert "latch_defers=0" in summary
+    assert "cad_checks=1" in summary
+
+
+async def test_lbt_summary_counts_latch_defers_separately_from_cad(radio, caplog):
+    _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
+    radio.perform_cad = AsyncMock(return_value=False)
+    radio._restore_rx_for_cad_backoff = AsyncMock()
+
+    async def _finish_reception():
+        await asyncio.sleep(0.05)
+        _inject_irq(radio, IRQ_RX_DONE)
+
+    finisher = asyncio.create_task(_finish_reception())
+    with caplog.at_level("DEBUG", logger="SX1262_wrapper"):
+        await radio._prepare_radio_for_tx()
+    await finisher
+
+    (summary,) = [r.message for r in caplog.records if "LBT summary" in r.message]
+    assert "latch_defers=0" not in summary  # the reception was polled at least once
+    assert "cad_checks=1" in summary  # the single scan after the latch cleared
+
+
 # ─── Constructor knobs ───────────────────────────────────────────────
 
 
