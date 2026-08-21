@@ -274,7 +274,7 @@ class USBLoRaRadio(_RadioBase):
             {
                 "airtime_ms": float,
                 "lbt_attempts": int,
-                "lbt_backoff_delays_ms": list[float],
+                "lbt_backoff_delays_ms": list[int],
                 "lbt_channel_busy": bool,
             }
         Returns None on failure.
@@ -284,7 +284,7 @@ class USBLoRaRadio(_RadioBase):
             return None
 
         async with self._tx_lock:
-            lbt_backoff_delays: list[float] = []
+            lbt_backoff_delays: list[int] = []
 
             # ── Listen Before Talk (CAD) ─────────────────────
             # Bounded in TIME rather than attempts: short jittered retries run
@@ -309,7 +309,7 @@ class USBLoRaRadio(_RadioBase):
                         )
                         break
                     delay_ms = self._lbt_retry_delay_ms(lbt_deadline)
-                    lbt_backoff_delays.append(delay_ms)
+                    lbt_backoff_delays.append(round(delay_ms))
                     logger.debug(f"CAD busy — retrying in {delay_ms:.0f}ms")
                     await asyncio.sleep(delay_ms / 1000.0)
 
@@ -334,7 +334,7 @@ class USBLoRaRadio(_RadioBase):
                         and time.monotonic() < lbt_deadline
                     ):
                         delay_ms = self._lbt_retry_delay_ms(lbt_deadline)
-                        lbt_backoff_delays.append(delay_ms)
+                        lbt_backoff_delays.append(round(delay_ms))
                         logger.debug(
                             f"Modem reports channel busy — retrying TX in {delay_ms:.0f}ms"
                         )
