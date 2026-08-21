@@ -1015,6 +1015,54 @@ async def test_cmd_send_login_retry_has_one_completion_writer():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result_extra, expected_byte",
+    [
+        # Admin: byte 1 is 1, as before.
+        ({"is_admin": True, "admin_code": 1, "acl_permissions": 3}, 1),
+        # Room server "plain guest": firmware sends 2 on this byte and our
+        # companion forwards it verbatim rather than collapsing it to 0/1.
+        ({"is_admin": False, "admin_code": 2, "acl_permissions": 0}, 2),
+        ({"is_admin": False, "admin_code": 0, "acl_permissions": 2}, 0),
+        # No admin_code (older bridge result): fall back to the boolean.
+        ({"is_admin": True, "acl_permissions": 3}, 1),
+    ],
+)
+async def test_login_success_push_forwards_the_raw_admin_byte(result_extra, expected_byte):
+    """PUSH_CODE_LOGIN_SUCCESS byte 1 mirrors the server's reply byte 6.
+
+    companion_radio does `out_frame[i++] = data[6]`, and a room server uses
+    that byte as a tri-state (admin=1, plain guest=2, other=0).
+    """
+    from openhop_core.companion.constants import PUSH_CODE_LOGIN_SUCCESS
+
+    pubkey = bytes(range(32))
+    result = {"success": True, "tag": 123, "firmware_ver_level": 2, **result_extra}
+    sent = SentResult(success=True, is_flood=True, expected_ack=0x1122, timeout_ms=9000)
+    bridge = Mock()
+    bridge._start_frame_login_request = AsyncMock(
+        return_value={
+            "success": True,
+            "sent": sent,
+            "task": asyncio.create_task(_return_result(result)),
+            "session_owner": True,
+        }
+    )
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    frames: list[bytes] = []
+    server._write_frame = lambda f: frames.append(f)
+
+    await server._cmd_send_login(pubkey + b"pw")
+    await asyncio.sleep(0)
+
+    pushes = [f for f in frames if f[0] == PUSH_CODE_LOGIN_SUCCESS]
+    assert len(pushes) == 1
+    assert pushes[0][1] == expected_byte
+    # Byte 7 of the reply still rides along as the authoritative ACL byte.
+    assert pushes[0][12] == result["acl_permissions"]
+
+
+@pytest.mark.asyncio
 async def test_cmd_send_status_req_failure_no_empty_push():
     """A failed status send returns an error and no SENT frame."""
     from openhop_core.companion.constants import PUSH_CODE_STATUS_RESPONSE

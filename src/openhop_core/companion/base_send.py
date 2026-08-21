@@ -928,6 +928,9 @@ class _SendOpsMixin:
             "success": success,
             "repeater": contact_name,
             "is_admin": data.get("is_admin", False),
+            # Raw login-reply byte 6. Firmware's companion forwards it verbatim
+            # (0/1/2), so a room server's "plain guest" 2 survives to the app.
+            "admin_code": data.get("admin_code"),
             "keep_alive_interval": data.get("keep_alive_interval", 0),
             "tag": data.get("timestamp", 0),
             "acl_permissions": data.get("reserved", data.get("permissions", 0)),

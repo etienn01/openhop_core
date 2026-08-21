@@ -452,11 +452,18 @@ class _MessagingCommandsMixin:
                 fw_level = result.get("firmware_ver_level")
                 if fw_level is None:
                     fw_level = FIRMWARE_VER_CODE  # fallback so app sees >= 2 for owner info
+                # Byte 1 is the server's raw reply byte 6, forwarded verbatim
+                # the way companion_radio does (`out_frame[i++] = data[6]`): a
+                # room server distinguishes admin (1) from a plain guest (2),
+                # and collapsing it to a boolean would drop that.
+                admin_code = result.get("admin_code")
+                if admin_code is None:
+                    admin_code = 1 if result.get("is_admin") else 0
                 self._write_frame(
                     bytes(
                         [
                             PUSH_CODE_LOGIN_SUCCESS,
-                            1 if result.get("is_admin") else 0,
+                            min(255, max(0, int(admin_code))),
                         ]
                     )
                     + pubkey[:6]
