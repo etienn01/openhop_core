@@ -207,7 +207,7 @@ class TCPLoRaRadio(_RadioBase):
         """One short jittered LBT retry delay, clamped to the remaining budget."""
         delay_ms = self.lbt_retry_interval_ms * random.uniform(0.5, 1.5)
         remaining_ms = (deadline - time.monotonic()) * 1000.0
-        return max(10.0, min(delay_ms, remaining_ms))
+        return max(0.0, min(delay_ms, remaining_ms))
 
     def begin(self) -> bool:
         """Open TCP connection, authenticate (if token set), push config.
@@ -277,6 +277,11 @@ class TCPLoRaRadio(_RadioBase):
             return None
 
         async with self._tx_lock:
+            # Log taxonomy, shared with the SPI radio: [LBT] is the
+            # listen-before-talk retry loop, [CAD] a single channel-activity
+            # scan, [TX] the transmit path. A nominal TX logs two DEBUG lines
+            # ("[LBT] Summary" and "[TX] Done"); contention adds bounded
+            # DEBUG retries, anomalies log at WARNING, failed sends at ERROR.
             lbt_backoff_delays: list[int] = []
 
             # Bounded in TIME rather than attempts: short jittered retries run
@@ -284,25 +289,40 @@ class TCPLoRaRadio(_RadioBase):
             # ERR_CHANNEL_BUSY retry below, so firmware-side auto-CAD refusals
             # draw from the same budget.
             lbt_deadline = time.monotonic() + self.lbt_max_wait_seconds
+            cad_checks = 0
+            modem_refusals = 0
+            outcome = "clear" if self.lbt_enabled else "off"
             if self.lbt_enabled:
                 while True:
+                    remaining = lbt_deadline - time.monotonic()
+                    if remaining <= 0:
+                        outcome = "forced"
+                        logger.warning(
+                            f"[LBT] Budget exhausted ({self.lbt_max_wait_seconds:.1f}s) - "
+                            "channel still busy, transmitting anyway"
+                        )
+                        break
                     try:
-                        channel_busy = await self._perform_cad(timeout=1.0)
+                        cad_checks += 1
+                        channel_busy = await self._perform_cad(timeout=min(1.0, remaining))
                     except Exception as e:
-                        logger.warning(f"CAD failed: {e}, proceeding with TX")
+                        outcome = "exception"
+                        logger.warning(
+                            f"[LBT] Channel check failed: {e}, proceeding with transmission"
+                        )
                         break
                     if not channel_busy:
-                        logger.debug("CAD clear")
                         break
                     if time.monotonic() >= lbt_deadline:
+                        outcome = "forced"
                         logger.warning(
-                            f"LBT budget exhausted ({self.lbt_max_wait_seconds:.1f}s) — "
+                            f"[LBT] Budget exhausted ({self.lbt_max_wait_seconds:.1f}s) - "
                             "channel still busy, transmitting anyway"
                         )
                         break
                     delay_ms = self._lbt_retry_delay_ms(lbt_deadline)
                     lbt_backoff_delays.append(round(delay_ms))
-                    logger.debug(f"CAD busy — retrying in {delay_ms:.0f}ms")
+                    logger.debug(f"[LBT] Channel busy - retrying in {delay_ms:.0f}ms")
                     await asyncio.sleep(delay_ms / 1000.0)
 
             try:
@@ -324,18 +344,27 @@ class TCPLoRaRadio(_RadioBase):
                         self._last_modem_error == ERR_CHANNEL_BUSY
                         and time.monotonic() < lbt_deadline
                     ):
+                        modem_refusals += 1
                         delay_ms = self._lbt_retry_delay_ms(lbt_deadline)
                         lbt_backoff_delays.append(round(delay_ms))
                         logger.debug(
-                            f"Modem reports channel busy — retrying TX in {delay_ms:.0f}ms"
+                            f"[LBT] Modem reports channel busy - retrying TX in {delay_ms:.0f}ms"
                         )
                         await asyncio.sleep(delay_ms / 1000.0)
                         continue
                     if self._last_modem_error == ERR_CHANNEL_BUSY:
                         # Unlike the host-side loop there is nothing to force
                         # here: the modem is alive and refusing, not wedged.
-                        logger.warning("Modem refused TX: channel busy for the whole LBT budget")
+                        outcome = "refused"
+                        modem_refusals += 1
+                        logger.warning("[LBT] Modem refused TX - channel busy for the whole budget")
                     break
+
+                logger.debug(
+                    f"[LBT] Summary: outcome={outcome} cad_checks={cad_checks} "
+                    f"modem_refusals={modem_refusals} "
+                    f"backoff_total={sum(lbt_backoff_delays):.0f}ms"
+                )
 
                 if resp is not None:
                     self._tx_count += 1
@@ -344,7 +373,7 @@ class TCPLoRaRadio(_RadioBase):
                         airtime_us = struct.unpack("<I", resp[:4])[0]
                     airtime_ms = airtime_us / 1000.0
 
-                    logger.debug(f"TX done: {len(data)}B, airtime={airtime_ms:.1f}ms")
+                    logger.debug(f"[TX] Done {len(data)}B airtime={airtime_ms:.0f}ms")
 
                     await self._send_command(
                         CMD_RX_START,
@@ -360,7 +389,7 @@ class TCPLoRaRadio(_RadioBase):
                         "lbt_channel_busy": len(lbt_backoff_delays) > 0,
                     }
                 else:
-                    logger.error("TX failed — no TX_DONE response")
+                    logger.error("[TX] Failed - no TX_DONE response")
                     await self._send_command(
                         CMD_RX_START,
                         b"",
@@ -370,7 +399,7 @@ class TCPLoRaRadio(_RadioBase):
                     return None
 
             except Exception as e:
-                logger.error(f"TX error: {e}")
+                logger.error(f"[TX] Error: {e}")
                 return None
 
     async def wait_for_rx(self) -> bytes:
@@ -920,7 +949,11 @@ class TCPLoRaRadio(_RadioBase):
 
         elif cmd == CMD_ERROR:
             err_code = payload[0] if payload else 0xFF
-            logger.warning(f"Modem error: 0x{err_code:02X}")
+            if err_code == ERR_CHANNEL_BUSY:
+                # LBT feedback, not an anomaly: the send loop retries it.
+                logger.debug(f"Modem error: 0x{err_code:02X} (channel busy)")
+            else:
+                logger.warning(f"Modem error: 0x{err_code:02X}")
             self._last_modem_error = err_code
             with self._response_lock:
                 for evt_cmd, evt in list(self._response_events.items()):
@@ -933,7 +966,7 @@ class TCPLoRaRadio(_RadioBase):
             # TX_DONE before the firmware's own timeout. Wake up whoever is
             # blocked on CMD_TX_DONE so the caller doesn't have to wait out
             # the full 10 s driver timeout.
-            logger.warning("Modem TX_FAIL — radio did not assert TX_DONE")
+            logger.warning("[TX] Modem TX_FAIL - radio did not assert TX_DONE")
             with self._response_lock:
                 evt = self._response_events.get(CMD_TX_DONE)
                 if evt is not None:
@@ -1003,9 +1036,13 @@ class TCPLoRaRadio(_RadioBase):
         )
         if resp and len(resp) >= 1:
             busy = resp[0] != 0
-            logger.debug(f"CAD: {'BUSY' if busy else 'CLEAR'}")
+            logger.debug(
+                "[CAD] BUSY - channel activity detected"
+                if busy
+                else "[CAD] CLEAR - no channel activity detected"
+            )
             return busy
-        logger.warning("CAD no response — assuming clear")
+        logger.warning("[CAD] No response - assuming clear")
         return False
 
     # ── Config setters — live push to firmware ───────────────
@@ -1165,7 +1202,7 @@ class TCPLoRaRadio(_RadioBase):
             wait_timeout=4.0,
         )
         logger.info(
-            "CAD settings pushed symbols=%s peak=%s min=%s: %s",
+            "[CAD] Settings pushed symbols=%s peak=%s min=%s: %s",
             self._custom_cad_symbol_num or 2,
             self._custom_cad_peak,
             self._custom_cad_min,
