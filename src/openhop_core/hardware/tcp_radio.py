@@ -277,7 +277,7 @@ class TCPLoRaRadio(_RadioBase):
             return None
 
         async with self._tx_lock:
-            lbt_backoff_delays: list[float] = []
+            lbt_backoff_delays: list[int] = []
 
             # Bounded in TIME rather than attempts: short jittered retries run
             # for the whole budget. The deadline is shared with the
@@ -301,7 +301,7 @@ class TCPLoRaRadio(_RadioBase):
                         )
                         break
                     delay_ms = self._lbt_retry_delay_ms(lbt_deadline)
-                    lbt_backoff_delays.append(delay_ms)
+                    lbt_backoff_delays.append(round(delay_ms))
                     logger.debug(f"CAD busy — retrying in {delay_ms:.0f}ms")
                     await asyncio.sleep(delay_ms / 1000.0)
 
@@ -325,7 +325,7 @@ class TCPLoRaRadio(_RadioBase):
                         and time.monotonic() < lbt_deadline
                     ):
                         delay_ms = self._lbt_retry_delay_ms(lbt_deadline)
-                        lbt_backoff_delays.append(delay_ms)
+                        lbt_backoff_delays.append(round(delay_ms))
                         logger.debug(
                             f"Modem reports channel busy — retrying TX in {delay_ms:.0f}ms"
                         )
