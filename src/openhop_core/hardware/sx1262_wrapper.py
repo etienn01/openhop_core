@@ -1126,7 +1126,7 @@ class SX1262Radio(LoRaRadio):
         if existing_irq != 0:
             self.lora.clearIrqStatus(existing_irq)
 
-    async def _prepare_radio_for_tx(self) -> tuple[bool, list[float]]:
+    async def _prepare_radio_for_tx(self) -> tuple[bool, list[int]]:
         """Prepare radio hardware for transmission. Returns (success, lbt_backoff_delays_ms)."""
         self._tx_done_event.clear()
         self._rx_done_event.clear()
@@ -1139,7 +1139,7 @@ class SX1262Radio(LoRaRadio):
         # jittered retries run for the whole budget, keeping two nodes' checks
         # decorrelated and bounding the post-clear latency to one retry
         # interval. (MeshCore: 200 ms retry, getCADFailMaxDuration() 4 s cap.)
-        lbt_backoff_delays: list[float] = []
+        lbt_backoff_delays: list[int] = []
         lbt_deadline = time.monotonic() + self.lbt_max_wait_seconds
         lbt_started = time.monotonic()
         latch_defers = 0
@@ -1184,7 +1184,9 @@ class SX1262Radio(LoRaRadio):
             delay_ms = self.lbt_retry_interval_ms * random.uniform(0.5, 1.5)
             remaining_ms = (lbt_deadline - time.monotonic()) * 1000.0
             delay_ms = max(10.0, min(delay_ms, remaining_ms))
-            lbt_backoff_delays.append(float(delay_ms))
+            # Whole milliseconds: the list is reported and persisted as-is
+            # downstream, and sub-ms decimals are noise on a jittered wait.
+            lbt_backoff_delays.append(round(delay_ms))
             if scanned:
                 # Only a CAD scan leaves the radio in standby, so only then is
                 # there RX to re-arm before the wait. After the passive check
