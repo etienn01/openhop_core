@@ -33,6 +33,10 @@ from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_RESPONSE,
     PAYLOAD_TYPE_TRACE,
     PAYLOAD_TYPE_TXT_MSG,
+    PERM_ACL_ADMIN,
+    PERM_ACL_GUEST,
+    PERM_ACL_READ_ONLY,
+    PERM_ACL_READ_WRITE,
     PUB_KEY_SIZE,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
@@ -2227,7 +2231,7 @@ class TestLoginServerHandler:
         assert keepalive == 0  # Legacy, always 0
 
         is_admin = login_reply[6]
-        assert is_admin == 1  # permissions 0x03 has admin bit 0x02
+        assert is_admin == 1  # role 0x03 == PERM_ACL_ADMIN
 
         perms = login_reply[7]
         assert perms == 0x03
@@ -2270,30 +2274,63 @@ class TestLoginServerHandler:
 
         assert len(self.sent_packets) == 0
 
-    @pytest.mark.asyncio
-    async def test_guest_permissions_is_admin_zero(self):
-        """Guest login (no admin bit) → is_admin = 0 in response (matches C++ check)."""
-        # Permission 0x01 = guest only, no admin bit (0x02)
-        self.auth_callback.return_value = (True, 0x01)
+    async def _login_reply_for(self, permissions: int) -> bytes:
+        """Run a flood login returning ``permissions`` and decrypt the 13-byte reply."""
+        self.auth_callback.return_value = (True, permissions)
+        self.sent_packets.clear()
 
-        pkt = self._build_login_packet(password="guest", route_type="flood")
+        pkt = self._build_login_packet(password="pw", route_type="flood")
         await self.handler(pkt)
 
         response_pkt, _ = self.sent_packets[0]
-
-        # Decrypt and verify is_admin field
         client_id = Identity(self.client_identity_local.get_public_key())
         shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
         aes_key = shared_secret[:16]
         encrypted_part = bytes(response_pkt.payload[2:])
         plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_part)
+        # skip path_len(1) + extra_type(1), take 13
+        return plaintext[2:15]
 
-        login_reply = plaintext[2:15]  # skip path_len(1) + extra_type(1), take 13
-        is_admin = login_reply[6]
-        assert is_admin == 0  # No admin bit → is_admin = 0
+    @pytest.mark.asyncio
+    async def test_guest_permissions_is_admin_zero(self):
+        """Guest login (role 0) → is_admin = 0 in response (matches C++ isAdmin())."""
+        login_reply = await self._login_reply_for(PERM_ACL_GUEST)
 
-        perms = login_reply[7]
-        assert perms == 0x01
+        assert login_reply[6] == 0
+        assert login_reply[7] == PERM_ACL_GUEST
+
+    @pytest.mark.asyncio
+    async def test_acl_roles_match_firmware_numbering(self):
+        """reply_data[6] is (perms & 3) == ADMIN, and reply_data[7] is the raw ACL byte.
+
+        Firmware ClientACL.h puts the role in the low two bits with ADMIN == 3.
+        A bit test on 0x02 would wrongly announce READ_WRITE (2) as an admin,
+        which is what stock clients (and the KiekR app) decode as non-admin
+        while our own legacy is_admin byte said otherwise.
+        """
+        expected = {
+            PERM_ACL_GUEST: 0,
+            PERM_ACL_READ_ONLY: 0,
+            PERM_ACL_READ_WRITE: 0,
+            PERM_ACL_ADMIN: 1,
+        }
+        for perms, want_admin in expected.items():
+            login_reply = await self._login_reply_for(perms)
+            assert login_reply[6] == want_admin, f"role {perms} → is_admin {want_admin}"
+            assert login_reply[7] == perms
+
+    @pytest.mark.asyncio
+    async def test_reserved_permission_bits_do_not_affect_role(self):
+        """Upper bits are reserved flags; only the low two bits pick the role."""
+        admin_with_flags = PERM_ACL_ADMIN | 0xF0
+        login_reply = await self._login_reply_for(admin_with_flags)
+        assert login_reply[6] == 1
+        assert login_reply[7] == admin_with_flags
+
+        rw_with_flags = PERM_ACL_READ_WRITE | 0xF0
+        login_reply = await self._login_reply_for(rw_with_flags)
+        assert login_reply[6] == 0
+        assert login_reply[7] == rw_with_flags
 
     @pytest.mark.asyncio
     async def test_no_send_callback_logs_error(self):

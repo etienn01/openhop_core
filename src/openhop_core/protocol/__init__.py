@@ -36,6 +36,11 @@ from .constants import (
     PAYLOAD_TYPE_TRACE,
     PAYLOAD_TYPE_TXT_MSG,
     PAYLOAD_VER_1,
+    PERM_ACL_ADMIN,
+    PERM_ACL_GUEST,
+    PERM_ACL_READ_ONLY,
+    PERM_ACL_READ_WRITE,
+    PERM_ACL_ROLE_MASK,
     PH_ROUTE_MASK,
     PH_TYPE_MASK,
     PH_TYPE_SHIFT,
@@ -54,6 +59,8 @@ from .constants import (
     TELEM_PERM_ENVIRONMENT,
     TELEM_PERM_LOCATION,
     TIMESTAMP_SIZE,
+    acl_is_admin,
+    acl_role,
     describe_advert_flags,
 )
 from .crypto import CryptoUtils
@@ -176,4 +183,12 @@ __all__ = [
     "TELEM_PERM_BASE",
     "TELEM_PERM_LOCATION",
     "TELEM_PERM_ENVIRONMENT",
+    # ClientACL roles (low 2 bits of the permissions byte)
+    "PERM_ACL_ROLE_MASK",
+    "PERM_ACL_GUEST",
+    "PERM_ACL_READ_ONLY",
+    "PERM_ACL_READ_WRITE",
+    "PERM_ACL_ADMIN",
+    "acl_role",
+    "acl_is_admin",
 ]

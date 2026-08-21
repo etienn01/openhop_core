@@ -125,6 +125,34 @@ TELEM_PERM_LOCATION = 0x02
 TELEM_PERM_ENVIRONMENT = 0x04
 
 # ---------------------------------------------------------------------------
+# ClientACL roles (firmware src/helpers/ClientACL.h). The role lives in the low
+# two bits of the permissions byte; the upper bits are reserved for future
+# per-feature flags. These are the *wire* values every stock-firmware client
+# decodes, so servers must publish roles using exactly this numbering — note
+# that ADMIN is 3, not "the 0x02 bit".
+# ---------------------------------------------------------------------------
+PERM_ACL_ROLE_MASK = 0x03
+PERM_ACL_GUEST = 0
+PERM_ACL_READ_ONLY = 1
+PERM_ACL_READ_WRITE = 2
+PERM_ACL_ADMIN = 3
+
+
+def acl_role(permissions: int) -> int:
+    """Return the ACL role in ``permissions`` (firmware ``perms & PERM_ACL_ROLE_MASK``)."""
+    return permissions & PERM_ACL_ROLE_MASK
+
+
+def acl_is_admin(permissions: int) -> bool:
+    """Mirror of firmware ``ClientInfo::isAdmin()`` — role must equal ADMIN (3).
+
+    Testing the 0x02 bit instead would also match READ_WRITE (2) and would let a
+    read-write client be announced as an admin.
+    """
+    return acl_role(permissions) == PERM_ACL_ADMIN
+
+
+# ---------------------------------------------------------------------------
 # Anonymous request sub-types (first byte of an ANON_REQ payload, after the
 # 4-byte timestamp). Wire values shared by the anon-request handler (node) and
 # the companion protocol; see firmware simple_repeater/MyMesh.cpp.

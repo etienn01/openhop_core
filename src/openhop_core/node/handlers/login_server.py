@@ -16,7 +16,7 @@ import time
 from typing import Callable, Optional
 
 from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder, PathUtils
-from ...protocol.constants import PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_RESPONSE
+from ...protocol.constants import PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_RESPONSE, acl_is_admin
 from ...protocol.region_map import apply_reply_scope
 from .base import BaseHandler
 from .result import HandlerResult
@@ -49,8 +49,9 @@ class LoginServerHandler(BaseHandler):
     - timestamp (4 bytes): Server response timestamp
     - response_code (1 byte): RESP_SERVER_LOGIN_OK (0x00) for success
     - keep_alive_interval (1 byte): Legacy field, set to 0
-    - is_admin (1 byte): 1 if admin, 0 if guest
-    - permissions (1 byte): Full permission bits
+    - is_admin (1 byte): 1 when the ACL role is ADMIN, else 0
+    - permissions (1 byte): Full ACL byte; role in the low two bits
+      (PERM_ACL_GUEST=0, READ_ONLY=1, READ_WRITE=2, ADMIN=3)
     - random_blob (4 bytes): Random data for packet uniqueness
     - firmware_version (1 byte): Firmware version level
     """
@@ -73,7 +74,10 @@ class LoginServerHandler(BaseHandler):
             local_identity: Server's local identity
             log_fn: Logging function
             authenticate_callback: Function(client_identity, shared_secret, password, timestamp)
-                                   Returns: (success: bool, permissions: int)
+                                   Returns: (success: bool, permissions: int).
+                                   ``permissions`` must carry the role in its low
+                                   two bits using the firmware ClientACL values
+                                   (see PERM_ACL_* in protocol.constants).
             is_room_server: True if this identity is a room server (expects sync_since field),
                            False if repeater (no sync_since field)
         """
@@ -262,8 +266,10 @@ class LoginServerHandler(BaseHandler):
             struct.pack_into("<I", reply_data, 0, current_time)  # timestamp
             reply_data[4] = response_code  # response code
             reply_data[5] = 0  # legacy keep-alive interval
-            # is_admin: check if permission bits include admin bit (0x02)
-            reply_data[6] = 1 if (permissions & 0x02) else 0
+            # is_admin mirrors firmware ClientInfo::isAdmin(): the role is the
+            # low two bits and ADMIN is 3, so this is an equality test, not a
+            # bit test. Testing 0x02 would also flag READ_WRITE (2) as admin.
+            reply_data[6] = 1 if acl_is_admin(permissions) else 0
             reply_data[7] = permissions  # full permissions byte
             struct.pack_into("<I", reply_data, 8, random.randint(0, 0xFFFFFFFF))  # random blob
             reply_data[12] = FIRMWARE_VER_LEVEL  # firmware version
