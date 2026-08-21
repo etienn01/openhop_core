@@ -2619,7 +2619,7 @@ class TestBeginBranchCoverage:
             assert radio.begin() is True
 
         assert any(
-            "Failed to write CAD thresholds" in r.getMessage() for r in caplog.records
+            "[CAD] Failed to write thresholds" in r.getMessage() for r in caplog.records
         )
 
     def test_begin_custom_cad_threshold_write_success(self, mock_lora, mock_gpio):
