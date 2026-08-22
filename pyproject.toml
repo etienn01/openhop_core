@@ -81,18 +81,9 @@ target-version = ['py38']
 profile = "black"
 line_length = 100
 
-[tool.flake8]
-max-line-length = 100
-extend-ignore = ["E203", "W503"]
-exclude = [
-    "src/openhop_core/hardware/lora/",
-    "examples/",
-    "__pycache__",
-    ".git",
-    ".tox",
-    "dist",
-    "*.egg-info"
-]
+# flake8 does not read pyproject.toml without a plugin, so its configuration
+# lives in .flake8 at the repo root -- the one place both a bare `flake8` run
+# and the pre-commit hook will pick it up.
 
 [tool.pytest.ini_options]
 minversion = "7.0"
