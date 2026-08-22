@@ -67,6 +67,33 @@ ALL_IRQ_FLAGS = [
 
 
 # ---------------------------------------------------------------------------
+# CAD test helpers
+# ---------------------------------------------------------------------------
+def arm_cad_completion(radio, detected: bool, irq_status=None):
+    """Arm the CAD completion IRQ to fire once the driver starts CAD.
+
+    perform_cad() clears _cad_event during setup, so completion armed on a
+    timer can be wiped before the driver ever waits on it -- the operation
+    then falls through to its timeout, which returns False and is therefore
+    indistinguishable from a genuine channel-clear result. Firing from
+    setCad() mirrors the hardware, since the IRQ cannot arrive before CAD is
+    running, and keeps these tests independent of machine speed.
+    """
+
+    def _fire(*_args, **_kwargs):
+        if irq_status is None:
+            radio._last_cad_irq_status = (
+                IRQ_CAD_DONE | IRQ_CAD_DETECTED if detected else IRQ_CAD_DONE
+            )
+        else:
+            radio._last_cad_irq_status = irq_status
+        radio._last_cad_detected = detected
+        radio._cad_event.set()
+
+    radio.lora.setCad.side_effect = _fire
+
+
+# ---------------------------------------------------------------------------
 # Mock builders
 # ---------------------------------------------------------------------------
 
@@ -680,22 +707,7 @@ class TestCADAndLBT:
     """Channel Activity Detection and Listen-Before-Talk backoff."""
 
     def _arm_cad_event(self, radio, detected: bool):
-        """Arm the CAD completion IRQ to fire once the driver starts CAD.
-
-        perform_cad() clears _cad_event during setup, so a result armed on a
-        timer can be wiped before the driver ever waits on it. Firing from
-        setCad() mirrors the hardware -- the IRQ cannot arrive before CAD is
-        running -- and keeps these tests independent of machine speed.
-        """
-
-        def _fire(*_args, **_kwargs):
-            radio._last_cad_irq_status = (
-                IRQ_CAD_DONE | IRQ_CAD_DETECTED if detected else IRQ_CAD_DONE
-            )
-            radio._last_cad_detected = detected
-            radio._cad_event.set()
-
-        radio.lora.setCad.side_effect = _fire
+        arm_cad_completion(radio, detected=detected)
 
     async def test_perform_cad_channel_clear_returns_false(self, radio):
         self._arm_cad_event(radio, detected=False)
@@ -1415,16 +1427,16 @@ class TestEventOrdering:
         radio._cad_event.set()
         radio._last_cad_detected = True
 
-        # New CAD fires with detected=False
-        async def _new_cad():
-            await asyncio.sleep(0.01)
-            radio._last_cad_irq_status = IRQ_CAD_DONE
-            radio._last_cad_detected = False
-            radio._cad_event.set()
-
-        asyncio.get_running_loop().create_task(_new_cad())
+        # New CAD completes with detected=False
+        arm_cad_completion(radio, detected=False)
+        started = time.monotonic()
         result = await radio.perform_cad(timeout=1.0)
+        elapsed = time.monotonic() - started
         assert result is False, "Stale 'detected' state must not leak"
+        assert elapsed < 0.5, (
+            "perform_cad() fell through to its timeout instead of consuming "
+            "the CAD completion, so the stale-state path went untested"
+        )
 
     async def test_cad_event_cleared_at_start_of_cad_operation(self, radio, mock_lora):
         """Verify CAD operation clears the event before starting."""
@@ -2220,16 +2232,10 @@ class TestFIFOCorruptionRace:
                     "perform_cad() restored RX_CONTINUOUS before setTx()"
                 )
 
-        async def _complete_cad_clear(delay: float = 0.02):
-            await asyncio.sleep(delay)
-            radio._last_cad_irq_status = IRQ_CAD_DONE
-            radio._last_cad_detected = False
-            radio._cad_event.set()
-
         mock_lora.setTx.side_effect = _track_setTx
         mock_lora.request.side_effect = _track_request
 
-        asyncio.get_running_loop().create_task(_complete_cad_clear())
+        arm_cad_completion(radio, detected=False)
 
         radio._wait_for_transmission_complete = AsyncMock(return_value=True)
         radio._finalize_transmission = MagicMock()
@@ -2442,16 +2448,16 @@ class TestCoverageGapBranches:
     async def test_perform_cad_clears_existing_irq_before_operation(
         self, radio, mock_lora
     ):
-        async def _fire_event():
-            await asyncio.sleep(0.01)
-            radio._last_cad_irq_status = IRQ_CAD_DONE
-            radio._last_cad_detected = False
-            radio._cad_event.set()
-
         mock_lora.getIrqStatus.side_effect = [0x0010, 0x0000]
-        asyncio.get_running_loop().create_task(_fire_event())
+        arm_cad_completion(radio, detected=False)
+        started = time.monotonic()
         result = await radio.perform_cad(timeout=1.0)
+        elapsed = time.monotonic() - started
         assert result is False
+        assert elapsed < 0.5, (
+            "perform_cad() timed out instead of completing, so the existing-IRQ "
+            "clear was not verified against a real CAD operation"
+        )
         assert any(c.args == (0x0010,) for c in mock_lora.clearIrqStatus.call_args_list)
 
     async def test_perform_cad_warns_when_irq_pin_stays_high(
@@ -2468,16 +2474,9 @@ class TestCoverageGapBranches:
     async def test_perform_cad_success_clears_nonzero_current_irq(
         self, radio, mock_lora
     ):
-        def _fire(*_args, **_kwargs):
-            # Fire from setCad() so the result survives perform_cad()'s
-            # setup-time _cad_event.clear(); see _arm_cad_event above.
-            radio._last_cad_irq_status = IRQ_CAD_DONE
-            radio._last_cad_detected = True
-            radio._cad_event.set()
-
         # existing_irq=0, current_irq(after completion)=0x0020
         mock_lora.getIrqStatus.side_effect = [0, 0x0020]
-        mock_lora.setCad.side_effect = _fire
+        arm_cad_completion(radio, detected=True, irq_status=IRQ_CAD_DONE)
         assert await radio.perform_cad(timeout=1.0) is True
         assert any(c.args == (0x0020,) for c in mock_lora.clearIrqStatus.call_args_list)
 
