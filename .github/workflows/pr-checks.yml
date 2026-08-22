@@ -69,10 +69,12 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
+      # .[test] rather than .[dev]: the dev extra pulls in black, which
+      # requires Python 3.10+ and would fail to resolve on the 3.9 entry.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .[dev]
+          python -m pip install -e .[test]
 
       - name: Run tests
         run: python -m pytest --tb=short
