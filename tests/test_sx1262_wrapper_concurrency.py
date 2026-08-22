@@ -679,26 +679,31 @@ class TestTransmissionLifecycle:
 class TestCADAndLBT:
     """Channel Activity Detection and Listen-Before-Talk backoff."""
 
-    async def _fire_cad_event(self, radio, detected: bool, delay: float = 0):
-        """Async helper: fire the CAD event from a background task."""
-        await asyncio.sleep(delay)
-        radio._last_cad_irq_status = (
-            IRQ_CAD_DONE | IRQ_CAD_DETECTED if detected else IRQ_CAD_DONE
-        )
-        radio._last_cad_detected = detected
-        radio._cad_event.set()
+    def _arm_cad_event(self, radio, detected: bool):
+        """Arm the CAD completion IRQ to fire once the driver starts CAD.
+
+        perform_cad() clears _cad_event during setup, so a result armed on a
+        timer can be wiped before the driver ever waits on it. Firing from
+        setCad() mirrors the hardware -- the IRQ cannot arrive before CAD is
+        running -- and keeps these tests independent of machine speed.
+        """
+
+        def _fire(*_args, **_kwargs):
+            radio._last_cad_irq_status = (
+                IRQ_CAD_DONE | IRQ_CAD_DETECTED if detected else IRQ_CAD_DONE
+            )
+            radio._last_cad_detected = detected
+            radio._cad_event.set()
+
+        radio.lora.setCad.side_effect = _fire
 
     async def test_perform_cad_channel_clear_returns_false(self, radio):
-        asyncio.get_running_loop().create_task(
-            self._fire_cad_event(radio, detected=False, delay=0.01)
-        )
+        self._arm_cad_event(radio, detected=False)
         result = await radio.perform_cad(timeout=1.0)
         assert result is False
 
     async def test_perform_cad_channel_busy_returns_true(self, radio):
-        asyncio.get_running_loop().create_task(
-            self._fire_cad_event(radio, detected=True, delay=0.01)
-        )
+        self._arm_cad_event(radio, detected=True)
         result = await radio.perform_cad(timeout=1.0)
         assert result is True
 
@@ -714,9 +719,7 @@ class TestCADAndLBT:
         mock_lora.request.assert_called_with(mock_lora.RX_CONTINUOUS)
 
     async def test_perform_cad_calibration_mode_returns_dict(self, radio):
-        asyncio.get_running_loop().create_task(
-            self._fire_cad_event(radio, detected=False, delay=0.01)
-        )
+        self._arm_cad_event(radio, detected=False)
         result = await radio.perform_cad(timeout=1.0, calibration=True)
         assert isinstance(result, dict)
         assert "detected" in result
@@ -726,17 +729,13 @@ class TestCADAndLBT:
         assert "timestamp" in result
 
     async def test_perform_cad_calibration_reports_done_without_detected(self, radio):
-        asyncio.get_running_loop().create_task(
-            self._fire_cad_event(radio, detected=False, delay=0.01)
-        )
+        self._arm_cad_event(radio, detected=False)
         result = await radio.perform_cad(timeout=1.0, calibration=True)
         assert result["cad_done"] is True
         assert result["detected"] is False
 
     async def test_perform_cad_calibration_reports_done_and_detected(self, radio):
-        asyncio.get_running_loop().create_task(
-            self._fire_cad_event(radio, detected=True, delay=0.01)
-        )
+        self._arm_cad_event(radio, detected=True)
         result = await radio.perform_cad(timeout=1.0, calibration=True)
         assert result["cad_done"] is True
         assert result["detected"] is True
@@ -753,9 +752,7 @@ class TestCADAndLBT:
     async def test_perform_cad_symbol_mapping_uses_requested_symbol_count(
         self, radio, mock_lora
     ):
-        asyncio.get_running_loop().create_task(
-            self._fire_cad_event(radio, detected=False, delay=0.01)
-        )
+        self._arm_cad_event(radio, detected=False)
         await radio.perform_cad(timeout=1.0, calibration=True, cad_symbol_num=8)
         mock_lora.setCadParams.assert_called()
         cad_symbol_arg = mock_lora.setCadParams.call_args[0][0]
@@ -2471,15 +2468,16 @@ class TestCoverageGapBranches:
     async def test_perform_cad_success_clears_nonzero_current_irq(
         self, radio, mock_lora
     ):
-        async def _fire_event():
-            await asyncio.sleep(0.01)
+        def _fire(*_args, **_kwargs):
+            # Fire from setCad() so the result survives perform_cad()'s
+            # setup-time _cad_event.clear(); see _arm_cad_event above.
             radio._last_cad_irq_status = IRQ_CAD_DONE
             radio._last_cad_detected = True
             radio._cad_event.set()
 
         # existing_irq=0, current_irq(after completion)=0x0020
         mock_lora.getIrqStatus.side_effect = [0, 0x0020]
-        asyncio.get_running_loop().create_task(_fire_event())
+        mock_lora.setCad.side_effect = _fire
         assert await radio.perform_cad(timeout=1.0) is True
         assert any(c.args == (0x0020,) for c in mock_lora.clearIrqStatus.call_args_list)
 
