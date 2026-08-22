@@ -22,6 +22,7 @@ from openhop_core.node.handlers import (
 from openhop_core.node.handlers.login_server import FIRMWARE_VER_LEVEL
 from openhop_core.node.handlers.result import HandlerResult
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
+from openhop_core.protocol.acl_conformance import OUTBOUND
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
@@ -33,10 +34,7 @@ from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_RESPONSE,
     PAYLOAD_TYPE_TRACE,
     PAYLOAD_TYPE_TXT_MSG,
-    PERM_ACL_ADMIN,
     PERM_ACL_GUEST,
-    PERM_ACL_READ_ONLY,
-    PERM_ACL_READ_WRITE,
     PUB_KEY_SIZE,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
@@ -2300,37 +2298,32 @@ class TestLoginServerHandler:
         assert login_reply[7] == PERM_ACL_GUEST
 
     @pytest.mark.asyncio
-    async def test_acl_roles_match_firmware_numbering(self):
-        """reply_data[6] is (perms & 3) == ADMIN, and reply_data[7] is the raw ACL byte.
+    async def test_outbound_conformance_vectors(self):
+        """Emit exactly the bytes in acl_conformance.OUTBOUND.
 
-        Firmware ClientACL.h puts the role in the low two bits with ADMIN == 3.
-        A bit test on 0x02 would wrongly announce READ_WRITE (2) as an admin,
-        which is what stock clients (and the KiekR app) decode as non-admin
-        while our own legacy is_admin byte said otherwise.
+        Literal expectations on purpose: keying this off PERM_ACL_* would make
+        the test follow the constants wherever they drift, and constants that
+        drifted away from the mesh are the whole of #388.
         """
-        expected = {
-            PERM_ACL_GUEST: 0,
-            PERM_ACL_READ_ONLY: 0,
-            PERM_ACL_READ_WRITE: 0,
-            PERM_ACL_ADMIN: 1,
-        }
-        for perms, want_admin in expected.items():
-            login_reply = await self._login_reply_for(perms)
-            assert login_reply[6] == want_admin, f"role {perms} → is_admin {want_admin}"
-            assert login_reply[7] == perms
+        for server_type, credential, admin_code, permissions in OUTBOUND:
+            login_reply = await self._login_reply_for(permissions)
+            label = f"{server_type}/{credential}"
+            assert login_reply[6] == admin_code, f"{label}: admin_code"
+            assert login_reply[7] == permissions, f"{label}: permissions"
 
     @pytest.mark.asyncio
-    async def test_reserved_permission_bits_do_not_affect_role(self):
-        """Upper bits are reserved flags; only the low two bits pick the role."""
-        admin_with_flags = PERM_ACL_ADMIN | 0xF0
-        login_reply = await self._login_reply_for(admin_with_flags)
-        assert login_reply[6] == 1
-        assert login_reply[7] == admin_with_flags
+    async def test_admin_code_is_an_equality_test_over_the_whole_byte(self):
+        """Only role 3 is admin, for every value of the reserved upper bits.
 
-        rw_with_flags = PERM_ACL_READ_WRITE | 0xF0
-        login_reply = await self._login_reply_for(rw_with_flags)
-        assert login_reply[6] == 0
-        assert login_reply[7] == rw_with_flags
+        A bit test on 0x02 also matches READ_WRITE (2), which is what stock
+        clients decode as non-admin while our byte 6 claimed admin.
+        """
+        for reserved in (0x00, 0x04, 0x40, 0xFC):
+            for role in (0x00, 0x01, 0x02, 0x03):
+                login_reply = await self._login_reply_for(role | reserved)
+                expected = 1 if role == 0x03 else 0
+                assert login_reply[6] == expected, f"role {role} reserved {reserved:#04x}"
+                assert login_reply[7] == role | reserved
 
     @pytest.mark.asyncio
     async def test_no_send_callback_logs_error(self):

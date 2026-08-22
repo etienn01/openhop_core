@@ -14,21 +14,19 @@ from openhop_core.node.events import MeshEvents
 from openhop_core.node.handlers.login_response import (
     LOGIN_ADMIN_CODE_ADMIN,
     LOGIN_ADMIN_CODE_GUEST,
-    LOGIN_ADMIN_CODE_NOT_ADMIN,
 )
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
+from openhop_core.protocol.acl_conformance import INBOUND
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_RESPONSE,
     PERM_ACL_ADMIN,
     PERM_ACL_GUEST,
-    PERM_ACL_READ_WRITE,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
     TXT_TYPE_CLI_DATA,
     TXT_TYPE_PLAIN,
-    acl_role,
 )
 
 
@@ -921,37 +919,32 @@ class TestLoginAdminCodeDecoding:
     byte with bool() promoted those guests to admin.
     """
 
-    def _decode(self, admin_code, permissions):
+    @pytest.mark.parametrize("admin_code, permissions, is_admin, role", INBOUND)
+    def test_inbound_conformance_vectors(self, admin_code, permissions, is_admin, role):
+        """Decode exactly what acl_conformance.INBOUND says, from literal bytes.
+
+        Includes shapes we never emit but must read from stock firmware, such
+        as a room server's plain guest (admin_code 2, which bool() called
+        admin).
+        """
         server_identity = LocalIdentity()
         comp_identity = LocalIdentity()
-        pkt = _build_login_response_packet(
-            server_identity,
-            comp_identity,
-            is_admin=admin_code,
-            permissions=permissions,
-        )
-        shared_secret = Identity(comp_identity.get_public_key()).calc_shared_secret(
-            server_identity.get_private_key()
-        )
-        plaintext = CryptoUtils.mac_then_decrypt(
-            shared_secret[:16], shared_secret, bytes(pkt.payload[2:])
-        )
-        timestamp, response_code, keep_alive, code, perms = struct.unpack("<IBBBB", plaintext[:8])
-        return code, perms
+        comp = CompanionRadio(MockRadio(), comp_identity)
+        handler = comp._get_login_response_handler()
 
-    @pytest.mark.parametrize(
-        "admin_code, permissions, expect_admin",
-        [
-            (LOGIN_ADMIN_CODE_ADMIN, PERM_ACL_ADMIN, True),
-            (LOGIN_ADMIN_CODE_NOT_ADMIN, PERM_ACL_READ_WRITE, False),
-            # A stock room server's plain guest. bool(2) said admin.
-            (LOGIN_ADMIN_CODE_GUEST, PERM_ACL_GUEST, False),
-        ],
-    )
-    def test_only_code_1_means_admin(self, admin_code, permissions, expect_admin):
-        code, perms = self._decode(admin_code, permissions)
-        assert (code == LOGIN_ADMIN_CODE_ADMIN) is expect_admin
-        assert acl_role(perms) == acl_role(permissions)
+        pkt = _build_login_response_packet(
+            server_identity, comp_identity, is_admin=admin_code, permissions=permissions
+        )
+        contact = SimpleNamespace(
+            name="srv", public_key=server_identity.get_public_key(), is_admin=None
+        )
+        ok, data = asyncio.run(handler._decrypt_response(pkt, contact))
+
+        assert ok is True
+        assert data["admin_code"] == admin_code
+        assert data["is_admin"] is is_admin
+        assert data["permissions"] == permissions
+        assert data["acl_role"] == role
 
     def test_room_server_guest_code_is_not_admin_end_to_end(self):
         """The parsed dict must not report admin for a room server's guest."""
