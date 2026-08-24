@@ -508,6 +508,13 @@ class SX1262Radio(LoRaRadio):
                     self.crc_error_count += 1
                 elif pending_irq & self.lora.IRQ_RX_DONE:
                     payloadLengthRx, rxStartBufferPointer = self.lora.getRxBufferStatus()
+                    # Use SignalRssiPkt (not RssiPkt) so this matches the modem
+                    # firmware, which can only ever report SignalRssiPkt over
+                    # TCP/USB (RadioLib getRSSI() quirk).
+                    _packet_rssi_dbm, snr_db, signal_rssi_dbm = self.lora.getSignalMetrics()
+                    self.last_rssi = int(signal_rssi_dbm)
+                    self.last_snr = snr_db
+                    self.last_signal_rssi = self.last_rssi
                     if payloadLengthRx > 0:
                         buffer = self.lora.readBuffer(rxStartBufferPointer, payloadLengthRx)
                         callback_packet_data = bytes(buffer)
