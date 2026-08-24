@@ -25,7 +25,14 @@ from common import RADIO_TYPES, create_mesh_node
 
 from openhop_core.node.handlers.login_server import LoginServerHandler
 from openhop_core.protocol import Identity, LocalIdentity
-from openhop_core.protocol.constants import PUB_KEY_SIZE
+from openhop_core.protocol.constants import (
+    PERM_ACL_ADMIN,
+    PERM_ACL_GUEST,
+    PERM_ACL_ROLE_MASK,
+    PUB_KEY_SIZE,
+    acl_is_admin,
+    acl_role,
+)
 
 
 def create_mesh_node_with_identity(
@@ -100,10 +107,11 @@ EXAMPLE_ADMIN_PASSWORD = "admin123"
 EXAMPLE_GUEST_PASSWORD = "guest123"
 # =============================================================================
 
-# Permission levels
-PERM_ACL_GUEST = 0x01
-PERM_ACL_ADMIN = 0x02
-PERM_ACL_ROLE_MASK = 0x03
+# Permission levels come from openhop_core.protocol.constants, which mirrors
+# firmware ClientACL.h: the role is the low two bits of the permissions byte
+# (GUEST=0, READ_ONLY=1, READ_WRITE=2, ADMIN=3). Do not redefine them here —
+# a local copy on different numbering is exactly what made OpenHop admins
+# decode as read-write in stock MeshCore clients.
 
 
 class ClientInfo:
@@ -121,11 +129,11 @@ class ClientInfo:
 
     def is_admin(self) -> bool:
         """Check if client has admin permissions."""
-        return (self.permissions & PERM_ACL_ROLE_MASK) == PERM_ACL_ADMIN
+        return acl_is_admin(self.permissions)
 
     def is_guest(self) -> bool:
         """Check if client has guest permissions."""
-        return (self.permissions & PERM_ACL_ROLE_MASK) == PERM_ACL_GUEST
+        return acl_role(self.permissions) == PERM_ACL_GUEST
 
 
 class ClientACL:
