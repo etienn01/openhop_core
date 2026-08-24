@@ -1596,16 +1596,8 @@ class SX1262Radio(LoRaRadio):
         if self._pending_rx_irq_status:
             return
 
-        # Skip during in-flight RX activity indicated by hardware IRQ flags.
-        rx_activity_mask = (
-            self.lora.IRQ_PREAMBLE_DETECTED
-            | self.lora.IRQ_HEADER_VALID
-            | self.lora.IRQ_RX_DONE
-            | self.lora.IRQ_CRC_ERR
-            | self.lora.IRQ_HEADER_ERR
-        )
-        irq_status = self.lora.getIrqStatus()
-        if irq_status & rx_activity_mask:
+        # Skip during in-flight RX activity.
+        if self.is_receiving_packet():
             return
 
         # Give 500ms quiet time after any packet activity
