@@ -250,7 +250,7 @@ class SX1262Radio(LoRaRadio):
         self._floor_sample_sum = 0.0
         self._noise_floor_samples: list[float] = []
         self._last_packet_activity = 0.0
-        self._is_receiving_packet = False
+        self._processing_rx_packet = False
         self._last_sample_check = 0.0
         self.NUM_NOISE_FLOOR_SAMPLES = 20
         self.NOISE_FLOOR_UPDATE_INTERVAL = 5.0
@@ -573,7 +573,7 @@ class SX1262Radio(LoRaRadio):
                         _trace("[RX] RX_DONE event triggered!")
 
                         # Mark that we're processing a packet (prevents noise floor sampling)
-                        self._is_receiving_packet = True
+                        self._processing_rx_packet = True
                         self._last_packet_activity = time.time()
 
                         callback_packet_data = None
@@ -725,7 +725,7 @@ class SX1262Radio(LoRaRadio):
                             logger.error(f"[IRQ RX] Error processing received packet: {e}")
                         finally:
                             # Clear packet processing flag
-                            self._is_receiving_packet = False
+                            self._processing_rx_packet = False
 
                     except asyncio.TimeoutError:
                         # No RX event within timeout - normal operation
@@ -1595,14 +1595,12 @@ class SX1262Radio(LoRaRadio):
         if self._tx_lock.locked():
             return
 
-        # Don't sample if packet processing is active or RX terminal IRQs are pending.
-        if self._is_receiving_packet:
+        # Don't sample if we're receiving or processing a packet.
+        if self.is_receiving_packet():  # still arriving
             return
-        if self._pending_rx_irq_status:
+        if self._pending_rx_irq_status:  # arrived, waiting to be handled
             return
-
-        # Skip during in-flight RX activity.
-        if self.is_receiving_packet():
+        if self._processing_rx_packet:  # being handled now
             return
 
         # Give 500ms quiet time after any packet activity
