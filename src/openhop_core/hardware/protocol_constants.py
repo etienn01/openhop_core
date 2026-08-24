@@ -2,7 +2,7 @@
 Wire-protocol constants and framing helpers shared by USBLoRaRadio and
 TCPLoRaRadio.
 
-Mirrors the on-the-wire format defined in the pymc_usb firmware
+Mirrors the on-the-wire format defined in the openHop Modem firmware
 (`firmware/include/protocol.h`). Keep this file and the firmware header
 in sync — every command code, struct layout, CRC vector and sync byte
 must match bit-for-bit, otherwise both drivers will silently lose frames.

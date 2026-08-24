@@ -31,7 +31,19 @@ from openhop_core import LocalIdentity
 from openhop_core.hardware.base import LoRaRadio
 from openhop_core.node.node import MeshNode
 
-RADIO_TYPES = ["waveshare", "uconsole", "meshadv-mini", "kiss-tnc", "kiss-modem", "ch341", "pinedio"]
+RADIO_TYPES = [
+    "waveshare",
+    "uconsole",
+    "meshadv-mini",
+    "kiss-tnc",
+    "kiss-modem",
+    "ch341",
+    "pinedio",
+    "modem_usb",
+    "modem_tcp",
+    "pymc_usb",  # Compatibility alias for modem_usb.
+    "pymc_tcp",  # Compatibility alias for modem_tcp.
+]
 
 
 def create_radio(
@@ -49,9 +61,11 @@ def create_radio(
             "kiss-modem"    — MeshCore KISS modem over serial
             "ch341"         — SX1262 via CH341 USB-to-SPI adapter
             "pinedio"       — Similar to CH341 but different pinout
-            "pymc_usb"      — pymc_usb firmware over USB-CDC
-            "pymc_tcp"      — pymc_usb firmware over Wi-Fi/TCP
-        serial_port: Serial port path. Used by "kiss-tnc", "kiss-modem", and "pymc_usb".
+            "modem_usb"     — openHop Modem over USB-CDC
+            "modem_tcp"     — openHop Modem over Wi-Fi/TCP
+            "pymc_usb"      — Compatibility alias for "modem_usb"
+            "pymc_tcp"      — Compatibility alias for "modem_tcp"
+        serial_port: Serial port path. Used by "kiss-tnc", "kiss-modem", and "modem_usb".
 
     Returns:
         Radio instance configured for the specified hardware
@@ -191,17 +205,26 @@ def create_radio(
             )
             return radio
 
-        # ── pymc_tcp (pymc_usb firmware over Wi-Fi/TCP) ─────────
-        if radio_type == "pymc_tcp":
+        # ── openHop Modem over Wi-Fi/TCP ────────────────────────
+        if radio_type in ("modem_tcp", "pymc_tcp"):
             from openhop_core.hardware.tcp_radio import TCPLoRaRadio
 
-            logger.debug("Using TCP LoRa Radio (pymc_usb firmware over Wi-Fi)")
+            logger.debug("Using openHop Modem TCP transport")
 
             tcp_config = {
-                "host": os.environ.get("PYMC_TCP_HOST", ""),
-                "port": int(os.environ.get("PYMC_TCP_PORT", 5055)),
-                "token": os.environ.get("PYMC_TCP_TOKEN", ""),
-                "connect_timeout": float(os.environ.get("PYMC_TCP_CONNECT_TIMEOUT", 5.0)),
+                "host": os.environ.get("MODEM_TCP_HOST", os.environ.get("PYMC_TCP_HOST", "")),
+                "port": int(
+                    os.environ.get("MODEM_TCP_PORT", os.environ.get("PYMC_TCP_PORT", 5055))
+                ),
+                "token": os.environ.get(
+                    "MODEM_TCP_TOKEN", os.environ.get("PYMC_TCP_TOKEN", "")
+                ),
+                "connect_timeout": float(
+                    os.environ.get(
+                        "MODEM_TCP_CONNECT_TIMEOUT",
+                        os.environ.get("PYMC_TCP_CONNECT_TIMEOUT", 5.0),
+                    )
+                ),
                 "frequency": int(os.environ.get("LORA_FREQ", 869618000)),
                 "bandwidth": int(os.environ.get("LORA_BW", 62500)),
                 "spreading_factor": int(os.environ.get("LORA_SF", 8)),
@@ -215,22 +238,23 @@ def create_radio(
 
             if not tcp_config["host"]:
                 raise ValueError(
-                    "pymc_tcp radio requires PYMC_TCP_HOST env var — " "modem hostname or LAN IP."
+                    "modem_tcp radio requires MODEM_TCP_HOST env var — modem hostname or LAN IP. "
+                    "PYMC_TCP_HOST remains available as a compatibility fallback."
                 )
 
             radio = TCPLoRaRadio(**tcp_config)
             logger.info(
-                f"pymc_tcp radio created at {tcp_config['host']}:{tcp_config['port']}: "
+                f"openHop Modem TCP radio created at {tcp_config['host']}:{tcp_config['port']}: "
                 f"{tcp_config['frequency']/1e6:.1f}MHz SF{tcp_config['spreading_factor']} "
                 f"BW{tcp_config['bandwidth']/1000:.0f}kHz {tcp_config['tx_power']}dBm"
             )
             return radio
 
-        # ── pymc_usb (pymc_usb firmware over USB-CDC) ───────────
-        if radio_type == "pymc_usb":
+        # ── openHop Modem over USB-CDC ──────────────────────────
+        if radio_type in ("modem_usb", "pymc_usb"):
             from openhop_core.hardware.usb_radio import USBLoRaRadio
 
-            logger.debug("Using USB LoRa Radio (pymc_usb firmware)")
+            logger.debug("Using openHop Modem USB transport")
 
             # Default: EU/UK (Narrow), Switzerland preset
             usb_config = {
@@ -249,7 +273,7 @@ def create_radio(
 
             radio = USBLoRaRadio(**usb_config)
             logger.info(
-                f"pymc_usb radio created on {serial_port}: "
+                f"openHop Modem USB radio created on {serial_port}: "
                 f"{usb_config['frequency']/1e6:.1f}MHz SF{usb_config['spreading_factor']} "
                 f"BW{usb_config['bandwidth']/1000:.0f}kHz {usb_config['tx_power']}dBm"
             )
@@ -317,7 +341,7 @@ def create_radio(
             raise ValueError(
                 f"Unknown radio type: {radio_type}. "
                 "Use 'waveshare', 'meshadv-mini', 'uconsole', 'kiss-tnc', "
-                "'kiss-modem', 'ch341', 'pymc_usb', or 'pymc_tcp'"
+                "'kiss-modem', 'ch341', 'pinedio', 'modem_usb', or 'modem_tcp'"
             )
 
         radio_kwargs = configs[radio_type]
@@ -349,9 +373,9 @@ def create_mesh_node(
     Args:
         node_name: Name for the mesh node
         radio_type: Type of radio hardware ("waveshare", "uconsole", "meshadv-mini",
-                    "kiss-tnc", "kiss-modem", "ch341", "pymc_usb", or "pymc_tcp")
-        serial_port: Serial port for KISS devices or pymc_usb
-                     (e.g. "/dev/ttyUSB0" for KISS, "/dev/ttyACM0" for pymc_usb)
+                    "kiss-tnc", "kiss-modem", "ch341", "modem_usb", or "modem_tcp")
+        serial_port: Serial port for KISS devices or an openHop Modem USB transport
+                     (e.g. "/dev/ttyUSB0" for KISS or "/dev/ttyACM0" for a modem)
         use_modem_identity: If True and radio_type is "kiss-modem", use the modem's
                            cryptographic identity instead of generating a local one.
                            This keeps the private key secure on the modem hardware.
@@ -401,7 +425,7 @@ def create_mesh_node(
             logger.info("CH341 radio initialized successfully")
             print("CH341 USB adapter radio initialized")
         else:
-            # waveshare/uconsole/meshadv-mini/pymc_usb/pymc_tcp all use begin()
+            # Direct radios and openHop Modem transports all use begin().
             logger.debug("Calling radio.begin()...")
             ok = radio.begin()
             if ok is False:
