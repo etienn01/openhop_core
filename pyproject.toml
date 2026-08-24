@@ -46,11 +46,19 @@ gpiod = ["gpiod>=2.4.0"]
 websocket = [
     "websockets>=11.0.0",
 ]
-dev = [
+# Everything the test suite needs, and nothing that constrains the Python
+# version -- this must stay installable on every version in requires-python
+# so CI can run the suite across the whole matrix.
+test = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
     "pyserial>=3.5",
+]
+# The full local toolchain. Note this pulls in black, which requires Python
+# 3.10+, so [dev] is not installable on 3.9 -- use [test] there.
+dev = [
+    "openhop_core[test]",
     "black>=26.5.1",
     "isort>=5.12.0",
     "flake8>=7.1.1",
@@ -81,18 +89,9 @@ target-version = ['py38']
 profile = "black"
 line_length = 100
 
-[tool.flake8]
-max-line-length = 100
-extend-ignore = ["E203", "W503"]
-exclude = [
-    "src/openhop_core/hardware/lora/",
-    "examples/",
-    "__pycache__",
-    ".git",
-    ".tox",
-    "dist",
-    "*.egg-info"
-]
+# flake8 does not read pyproject.toml without a plugin, so its configuration
+# lives in .flake8 at the repo root -- the one place both a bare `flake8` run
+# and the pre-commit hook will pick it up.
 
 [tool.pytest.ini_options]
 minversion = "7.0"

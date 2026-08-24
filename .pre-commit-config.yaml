@@ -29,31 +29,17 @@ repos:
     rev: 7.1.1
     hooks:
       - id: flake8
-        # Strict but reasonable settings
-        args: [
-          "--max-line-length=100",
-          "--extend-ignore=E203,E231,W503"
-        ]
+        # Settings live in .flake8 so a bare `flake8` run matches this hook.
         # Exclude third-party code but check our core code
         exclude: '^(src/openhop_core/hardware/lora/|examples/|scripts/test_modem_crypto\.py$)'
 
-  # Run pytest to ensure all tests pass
-  # - repo: local
-  #   hooks:
-  #     - id: pytest
-  #       name: pytest
-  #       entry: pytest
-  #       language: system
-  #       pass_filenames: false
-  #       # Only run if Python files in src/ or tests/ have changed
-  #       files: ^(src/|tests/|pyproject\.toml|setup\.py).*$
-  #       args: ["-v", "--tb=short"]
-  #     - id: pytest-fast
-  #       name: pytest-fast (quick smoke test)
-  #       entry: pytest
-  #       language: system
-  #       pass_filenames: false
-  #       # Run a quick subset of tests for faster feedback
-  #       files: ^(src/|tests/).*\.py$
-  #       args: ["-v", "--tb=short", "-x", "--maxfail=3", "tests/test_basic.py", "tests/test_crypto.py"]
-  #       stages: [manual]
+  # Test suite gate
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: ./scripts/precommit-pytest.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+        types: [python]
