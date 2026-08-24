@@ -1123,9 +1123,14 @@ class SX126x(BaseLoRa):
         # # skip to enter RX mode when previous RX operation incomplete
         # if self.getMode() == self.STATUS_MODE_RX:
         #     return False
-        # clear previous interrupt and set RX done, RX timeout, header error, and CRC error as interrupt source
         self._irqSetup(
-            self.IRQ_RX_DONE | self.IRQ_TIMEOUT | self.IRQ_HEADER_ERR | self.IRQ_CRC_ERR
+            self.IRQ_RX_DONE
+            | self.IRQ_TIMEOUT
+            | self.IRQ_HEADER_ERR
+            | self.IRQ_CRC_ERR
+            | self.IRQ_PREAMBLE_DETECTED
+            | self.IRQ_SYNC_WORD_VALID
+            | self.IRQ_HEADER_VALID
         )
         # set status to RX wait or RX continuous wait
         self._statusWait = self.STATUS_RX_WAIT
@@ -1152,9 +1157,14 @@ class SX126x(BaseLoRa):
         # skip to enter RX mode when previous RX operation incomplete
         if self.getMode() == self.STATUS_MODE_RX:
             return False
-        # clear previous interrupt and set RX done, RX timeout, header error, and CRC error as interrupt source
         self._irqSetup(
-            self.IRQ_RX_DONE | self.IRQ_TIMEOUT | self.IRQ_HEADER_ERR | self.IRQ_CRC_ERR
+            self.IRQ_RX_DONE
+            | self.IRQ_TIMEOUT
+            | self.IRQ_HEADER_ERR
+            | self.IRQ_CRC_ERR
+            | self.IRQ_PREAMBLE_DETECTED
+            | self.IRQ_SYNC_WORD_VALID
+            | self.IRQ_HEADER_VALID
         )
         # set status to RX wait or RX continuous wait
         self._statusWait = self.STATUS_RX_WAIT

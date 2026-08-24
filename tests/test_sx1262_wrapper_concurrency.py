@@ -809,17 +809,25 @@ class TestCADAndLBT:
         assert len(result["lbt_backoff_delays_ms"]) == 2
         assert result["lbt_channel_busy"] is True
 
-    async def test_lbt_max_retries_still_transmits(self, radio, mock_lora):
-        """After 5 consecutive busy checks the TX proceeds unconditionally."""
+    async def test_lbt_budget_exhaustion_still_transmits(self, radio, mock_lora):
+        """Once the LBT TIME budget runs out the TX proceeds unconditionally.
+
+        LBT is bounded in time, not attempts: with a channel that never
+        clears, the loop keeps re-checking on short jittered intervals until
+        the budget is exhausted, then transmits (a channel busy that long is
+        likelier a wedged radio than a real occupation)."""
         radio.perform_cad = AsyncMock(return_value=True)  # always busy
+        radio.lbt_max_wait_seconds = 0.5
+        radio.lbt_retry_interval_ms = 20
         mock_lora.getIrqStatus.return_value = IRQ_TX_DONE
         radio._wait_for_transmission_complete = AsyncMock(return_value=True)
         radio._finalize_transmission = MagicMock()
 
         result = await radio.send(b"forced")
-        # lbt_attempts in result is len(lbt_backoff_delays); the last (5th) attempt
-        # doesn't append a delay before breaking, so the count is 4.
-        assert result["lbt_attempts"] == 4
+        # Many short retries; the exact count is timing-dependent, the
+        # invariant is the time bound.
+        assert result["lbt_attempts"] > 5
+        assert sum(result["lbt_backoff_delays_ms"]) <= 600.0
         mock_lora.setTx.assert_called_once()
 
     async def test_lbt_cad_exception_proceeds_with_tx(self, radio, mock_lora):
@@ -2608,7 +2616,7 @@ class TestBeginBranchCoverage:
             assert radio.begin() is True
 
         assert any(
-            "Failed to write CAD thresholds" in r.getMessage() for r in caplog.records
+            "[CAD] Failed to write thresholds" in r.getMessage() for r in caplog.records
         )
 
     def test_begin_custom_cad_threshold_write_success(self, mock_lora, mock_gpio):
