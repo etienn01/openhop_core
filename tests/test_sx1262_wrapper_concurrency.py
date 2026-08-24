@@ -957,9 +957,9 @@ class TestRxBackgroundTask:
         assert radio.last_rssi == -85
         assert radio.last_snr == pytest.approx(7.5)
 
-    async def test_is_receiving_packet_flag_cleared_after_processing(self, radio):
+    async def test_processing_rx_packet_flag_cleared_after_processing(self, radio):
         await self._run_task_with(radio, irq_flags=IRQ_RX_DONE, callback=lambda _: None)
-        assert not radio._is_receiving_packet
+        assert not radio._processing_rx_packet
 
     async def test_crc_error_logs_diagnostic_info(self, radio, mock_lora, caplog):
         import logging
@@ -1079,7 +1079,7 @@ class TestNoiseFloorSampling:
         radio.lora.getRssiInst.assert_not_called()
 
     def test_no_sample_during_packet_reception(self, radio):
-        radio._is_receiving_packet = True
+        radio._processing_rx_packet = True
         with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=20.0):
             radio._sample_noise_floor()
         radio.lora.getRssiInst.assert_not_called()
@@ -1114,7 +1114,7 @@ class TestNoiseFloorSampling:
     def test_sample_accepted_during_quiet_period(self, radio, mock_lora):
         mock_lora.getRssiInst.return_value = 160  # -80 dBm
         radio._last_packet_activity = 0.0
-        radio._is_receiving_packet = False
+        radio._processing_rx_packet = False
         with patch(
             "openhop_core.hardware.sx1262_wrapper.time.time", return_value=200.0
         ):
@@ -1124,7 +1124,7 @@ class TestNoiseFloorSampling:
 
     def test_rolling_window_averages_latest_20_samples(self, radio, mock_lora):
         radio._last_packet_activity = 0.0
-        radio._is_receiving_packet = False
+        radio._processing_rx_packet = False
         samples_dbm = [(-120.0 + i) for i in range(21)]
         mock_lora.getRssiInst.side_effect = [
             int(-(sample * 2)) for sample in samples_dbm
@@ -1575,7 +1575,7 @@ class TestRaceConditionSimulations:
             radio._last_irq_status = IRQ_NONE
             await _wait_condition(
                 lambda: (
-                    not radio._is_receiving_packet and not radio._rx_done_event.is_set()
+                    not radio._processing_rx_packet and not radio._rx_done_event.is_set()
                 ),
                 timeout=1.0,
             )
@@ -2440,7 +2440,7 @@ class TestCoverageGapBranches:
 
     def test_noise_floor_sampling_handles_rssi_read_exception(self, radio, mock_lora):
         radio._last_packet_activity = 0.0
-        radio._is_receiving_packet = False
+        radio._processing_rx_packet = False
         mock_lora.getRssiInst.side_effect = RuntimeError("rssi error")
         radio._sample_noise_floor()  # must not raise
 
@@ -3107,7 +3107,7 @@ class TestCoverageSecondPass:
         radio._num_floor_samples = 0
         radio._floor_sample_sum = 0.0
         radio._last_packet_activity = 0.0
-        radio._is_receiving_packet = False
+        radio._processing_rx_packet = False
         mock_lora.getRssiInst.return_value = 100  # -50 dBm, valid range
 
         with patch(
