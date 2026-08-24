@@ -1137,10 +1137,6 @@ class SX1262Radio(LoRaRadio):
         self._tx_done_event.clear()
         self._rx_done_event.clear()
 
-        # Drain any packet-bearing RX IRQ that fired while TX was active and was
-        # latched in software before we begin CAD/TX buffer reuse.
-        await self._drain_pending_rx_irq_before_buffer_reuse()
-
         # Listen Before Talk, bounded in TIME rather than attempts: short
         # jittered retries run for the whole budget, keeping two nodes' checks
         # decorrelated and bounding the post-clear latency to one retry
@@ -1154,6 +1150,11 @@ class SX1262Radio(LoRaRadio):
 
         while True:
             scanned = False
+            # Deliver anything already latched before it can be overwritten
+            # by a subsequent reception: the latch_defers branch below skips
+            # perform_cad's own drain, so back-to-back packets during a
+            # busy channel would otherwise only get drained once, at exit.
+            await self._drain_pending_rx_irq_before_buffer_reuse()
             try:
                 # Passive check first: a latched in-progress reception is
                 # authoritative and free — and it must be consulted BEFORE
@@ -1211,6 +1212,10 @@ class SX1262Radio(LoRaRadio):
         # a transmit clears them.)
         self._rx_activity_at = 0.0
         self._rx_header_at = 0.0
+
+        # The loop's drain already ran for this iteration before the check
+        # above; a packet completing since then won't see another one.
+        await self._drain_pending_rx_irq_before_buffer_reuse()
 
         elapsed_ms = (time.monotonic() - lbt_started) * 1000
         logger.debug(
