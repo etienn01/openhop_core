@@ -293,7 +293,7 @@ async def test_lbt_summary_reports_cad_clear(radio, caplog):
     with caplog.at_level("DEBUG", logger="SX1262_wrapper"):
         await radio._prepare_radio_for_tx()
 
-    (summary,) = [r.message for r in caplog.records if "LBT summary" in r.message]
+    (summary,) = [r.message for r in caplog.records if "[LBT] Summary:" in r.message]
     assert "outcome=clear" in summary
     assert "latch_defers=0" in summary
     assert "cad_checks=1" in summary
@@ -313,7 +313,7 @@ async def test_lbt_summary_counts_latch_defers_separately_from_cad(radio, caplog
         await radio._prepare_radio_for_tx()
     await finisher
 
-    (summary,) = [r.message for r in caplog.records if "LBT summary" in r.message]
+    (summary,) = [r.message for r in caplog.records if "[LBT] Summary:" in r.message]
     assert "latch_defers=0" not in summary  # the reception was polled at least once
     assert "cad_checks=1" in summary  # the single scan after the latch cleared
 
