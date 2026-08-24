@@ -1091,9 +1091,10 @@ class TestNoiseFloorSampling:
         radio.lora.getRssiInst.assert_not_called()
 
     def test_no_sample_during_active_rx_irq_flags(self, radio, mock_lora):
-        mock_lora.getIrqStatus.return_value = IRQ_PREAMBLE_DETECTED | IRQ_HEADER_VALID
-        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=40.0):
-            radio._sample_noise_floor()
+        with patch("openhop_core.hardware.sx1262_wrapper.time.monotonic", return_value=40.0):
+            radio._rx_activity_at = 40.0
+            with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=40.0):
+                radio._sample_noise_floor()
         mock_lora.getRssiInst.assert_not_called()
 
     def test_no_sample_within_500ms_of_last_packet(self, radio):
