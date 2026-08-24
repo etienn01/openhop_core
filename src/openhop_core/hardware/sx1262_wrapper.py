@@ -508,6 +508,10 @@ class SX1262Radio(LoRaRadio):
                     self.crc_error_count += 1
                 elif pending_irq & self.lora.IRQ_RX_DONE:
                     payloadLengthRx, rxStartBufferPointer = self.lora.getRxBufferStatus()
+                    packet_rssi_dbm, snr_db, signal_rssi_dbm = self.lora.getSignalMetrics()
+                    self.last_rssi = int(packet_rssi_dbm)
+                    self.last_snr = snr_db
+                    self.last_signal_rssi = int(signal_rssi_dbm)
                     if payloadLengthRx > 0:
                         buffer = self.lora.readBuffer(rxStartBufferPointer, payloadLengthRx)
                         callback_packet_data = bytes(buffer)
