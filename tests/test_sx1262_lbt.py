@@ -215,6 +215,23 @@ async def test_lbt_standby_only_after_channel_clear(radio):
     assert radio.perform_cad.await_count == 1
 
 
+async def test_tx_commit_delivers_a_packet_caught_during_lbt(radio):
+    """A packet that completed on the LBT loop's last check has no pending
+    wake-up (_tx_lock is held) and no further CAD call coming to drain it:
+    the TX-commit point must deliver it itself, before staging TX."""
+    delivered = []
+    radio.set_rx_callback(delivered.append)
+    radio.lora.getRxBufferStatus.return_value = (4, 0x80)
+    radio.lora.readBuffer.return_value = list(b"test")
+    radio.perform_cad = AsyncMock(return_value=False)
+    radio._pending_rx_irq_status = IRQ_RX_DONE
+
+    await radio._prepare_radio_for_tx()
+
+    assert delivered == [b"test"]
+    assert radio._pending_rx_irq_status == 0
+
+
 # ─── LBT: time budget, not attempt count ─────────────────────────────
 
 
