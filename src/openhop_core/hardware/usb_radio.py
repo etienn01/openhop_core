@@ -30,6 +30,7 @@ Usage:
 
 import asyncio
 import logging
+import os
 import random
 import struct
 import threading
@@ -37,6 +38,7 @@ import time
 from typing import Callable, Optional
 
 import serial
+from serial.tools import list_ports
 
 from .protocol_constants import (
     CMD_CAD_PARAMS_RESP,
@@ -144,7 +146,9 @@ class USBLoRaRadio(_RadioBase):
         self._initialized = False
         self._rx_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._connected_event = threading.Event()
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._port_identity: Optional[tuple[Optional[int], Optional[int], Optional[str]]] = None
 
         # Signal metrics — matches SX1262Radio interface
         self.last_rssi: int = -99
@@ -159,6 +163,11 @@ class USBLoRaRadio(_RadioBase):
         self._response_events: dict[int, asyncio.Event] = {}
         self._response_data: dict[int, Optional[bytes]] = {}
         self._response_lock = threading.Lock()
+        # Only one command may wait for a response at a time. Repeater applies
+        # CAD thresholds and symbol count back-to-back, and both commands wait
+        # for CMD_CAD_PARAMS_RESP. Without serialization the second waiter
+        # replaces the first entry in _response_events and one update times out.
+        self._command_lock = asyncio.Lock()
 
         # Custom CAD thresholds. Set lazily by set_custom_cad_thresholds()
         # or perform_cad(det_peak=..., det_min=...); kept in attributes from
@@ -200,14 +209,7 @@ class USBLoRaRadio(_RadioBase):
             # (re-)open the port. dsrdtr=True is the workaround; rtscts
             # stays off because the firmware does not implement hardware
             # flow control on the RX pipe.
-            self._serial = serial.Serial()
-            self._serial.port = self.port
-            self._serial.baudrate = self.baudrate
-            self._serial.timeout = 0.1
-            self._serial.write_timeout = 2.0
-            self._serial.dsrdtr = True
-            self._serial.rtscts = False
-            self._serial.open()
+            self._serial = self._open_serial_sync()
 
             # Short settle in case the caller just power-cycled the device.
             time.sleep(0.3)
@@ -227,6 +229,8 @@ class USBLoRaRadio(_RadioBase):
                 self._serial.close()
                 return False
 
+            self._connected_event.set()
+
             # Start RX background thread
             self._stop_event.clear()
             self._rx_thread = threading.Thread(
@@ -239,6 +243,7 @@ class USBLoRaRadio(_RadioBase):
             return True
 
         except Exception as e:
+            self._connected_event.clear()
             logger.error(f"Failed to initialize USBLoRaRadio: {e}")
             if self._serial and self._serial.is_open:
                 self._serial.close()
@@ -343,6 +348,10 @@ class USBLoRaRadio(_RadioBase):
             "Use set_rx_callback(callback) to receive packets asynchronously."
         )
 
+    def set_event_loop(self, loop) -> None:
+        """Set the event loop used for callbacks and live configuration pushes."""
+        self._event_loop = loop
+
     def set_rx_callback(self, callback: Callable[[bytes], None]):
         """Set RX callback — called by Dispatcher to register _on_packet_received."""
         self.rx_callback = callback
@@ -377,7 +386,7 @@ class USBLoRaRadio(_RadioBase):
         Called by Dispatcher.run_forever() every 60 seconds.
         Also refreshes cached modem metrics from the modem.
         """
-        if not self._initialized:
+        if not self._initialized or not self._connected_event.is_set():
             return False
 
         # Check RX thread
@@ -400,8 +409,10 @@ class USBLoRaRadio(_RadioBase):
 
     def get_status(self) -> dict:
         """Get radio status dict (matches SX1262Radio.get_status())."""
+        connected_event = getattr(self, "_connected_event", None)
+        connected = self._initialized and (connected_event is None or connected_event.is_set())
         return {
-            "initialized": self._initialized,
+            "initialized": connected,
             "frequency": self.frequency,
             "tx_power": self.tx_power,
             "spreading_factor": self.spreading_factor,
@@ -410,7 +421,7 @@ class USBLoRaRadio(_RadioBase):
             "last_rssi": self.last_rssi,
             "last_snr": self.last_snr,
             "last_signal_rssi": self.last_signal_rssi,
-            "hardware_ready": self._initialized,
+            "hardware_ready": connected,
             "driver": "modem_usb",
             "port": self.port,
             "tx_count": self._tx_count,
@@ -537,12 +548,6 @@ class USBLoRaRadio(_RadioBase):
         # raise the floor so we don't lose samples to "no response".
         effective = max(timeout, 0.6)
         return await self._perform_cad(effective)
-
-    def set_custom_cad_symbol_num(self, cad_symbol_num: int) -> bool:
-        """Store a validated CAD symbol count for calls that omit an override."""
-        build_cad_params_payload(cad_symbol_num, 0, 0)
-        self._custom_cad_symbol_num = int(cad_symbol_num)
-        return True
 
     # ── Wi-Fi / OTA provisioning (v0.5) ───────────────────────
 
@@ -680,6 +685,7 @@ class USBLoRaRadio(_RadioBase):
     def cleanup(self):
         """Clean up resources."""
         self._initialized = False
+        self._connected_event.clear()
         self._stop_event.set()
 
         if self._rx_thread and self._rx_thread.is_alive():
@@ -693,6 +699,76 @@ class USBLoRaRadio(_RadioBase):
     # ══════════════════════════════════════════════════════════
     # Private — serial I/O
     # ══════════════════════════════════════════════════════════
+
+    def _capture_port_identity(self, device: str) -> None:
+        """Remember stable USB identity so tty renumbering can be followed."""
+        real_device = os.path.realpath(device)
+        for info in list_ports.comports():
+            if os.path.realpath(info.device) == real_device:
+                self._port_identity = (info.vid, info.pid, info.serial_number)
+                return
+
+    def _resolve_serial_port(self) -> str:
+        """Resolve the configured modem after USB re-enumeration."""
+        if self._port_identity is not None:
+            expected_vid, expected_pid, expected_serial = self._port_identity
+            for info in list_ports.comports():
+                if info.vid != expected_vid or info.pid != expected_pid:
+                    continue
+                if expected_serial and info.serial_number != expected_serial:
+                    continue
+                return info.device
+        return self.port
+
+    def _open_serial_sync(self) -> serial.Serial:
+        """Open a configured serial handle without starting the RX worker."""
+        device = self._resolve_serial_port()
+        handle = serial.Serial()
+        handle.port = device
+        handle.baudrate = self.baudrate
+        handle.timeout = 0.1
+        handle.write_timeout = 2.0
+        handle.dsrdtr = True
+        handle.rtscts = False
+        handle.open()
+        self._capture_port_identity(device)
+        return handle
+
+    def _reconnect_serial_sync(self) -> bool:
+        """Reopen a re-enumerated USB modem and restore radio/CAD state."""
+        if self._serial is not None:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+
+        attempt = 0
+        while not self._stop_event.is_set():
+            attempt += 1
+            try:
+                self._serial = self._open_serial_sync()
+                time.sleep(0.3)
+                self._serial.reset_input_buffer()
+                if not self._apply_config_sync():
+                    raise RuntimeError("modem did not acknowledge restored configuration")
+                self._connected_event.set()
+                logger.info(
+                    "USB modem reconnected on %s after %s attempt(s)",
+                    self._serial.port,
+                    attempt,
+                )
+                return True
+            except Exception as exc:
+                self._connected_event.clear()
+                if self._serial is not None:
+                    try:
+                        self._serial.close()
+                    except Exception:
+                        pass
+                if attempt == 1 or attempt % 10 == 0:
+                    logger.warning("USB modem reconnect attempt %s failed: %s", attempt, exc)
+                self._stop_event.wait(2.0)
+        return False
 
     def _ping_sync(self, timeout: float = 3.0) -> bool:
         """Synchronous ping — ad-hoc liveness probe.
@@ -736,6 +812,8 @@ class USBLoRaRadio(_RadioBase):
                 f"BW{self.bandwidth / 1000:.0f}kHz {self.tx_power}dBm "
                 f"sync=0x{self.sync_word:04X} pre={self.preamble_length}"
             )
+            if not self._apply_cad_config_sync():
+                logger.warning("Radio configured but cached CAD settings were not restored")
             return True
         elif resp and resp[0] == CMD_ERROR:
             err = resp[1][0] if len(resp) > 1 and len(resp[1]) > 0 else 0xFF
@@ -744,6 +822,28 @@ class USBLoRaRadio(_RadioBase):
         else:
             logger.error("No config response from modem")
             return False
+
+    def _write_cad_frame_sync(self, payload: bytes) -> bool:
+        """Push one complete CAD configuration before the RX worker starts."""
+        if self._serial is None:
+            return False
+        self._serial.write(build_frame(CMD_SET_CAD_PARAMS, payload))
+        resp = self._read_frame_sync(timeout=3.0, expect_cmd=CMD_CAD_PARAMS_RESP)
+        if resp and resp[0] == CMD_CAD_PARAMS_RESP:
+            return True
+        logger.error("No CAD configuration response from modem")
+        return False
+
+    def _apply_cad_config_sync(self) -> bool:
+        """Restore cached CAD settings during initial attach or re-attach."""
+        if self._custom_cad_peak is None or self._custom_cad_min is None:
+            return True
+        payload = build_cad_params_payload(
+            self._custom_cad_symbol_num or 2,
+            self._custom_cad_peak,
+            self._custom_cad_min,
+        )
+        return self._write_cad_frame_sync(payload)
 
     def _read_frame_sync(
         self,
@@ -876,9 +976,12 @@ class USBLoRaRadio(_RadioBase):
 
                     self._dispatch_frame(cmd, payload)
 
-            except serial.SerialException as e:
-                logger.error(f"Serial error in RX worker: {e}")
-                time.sleep(1.0)
+            except (serial.SerialException, OSError) as e:
+                buf.clear()
+                self._connected_event.clear()
+                logger.warning("USB modem disconnected: %s", e)
+                if not self._reconnect_serial_sync():
+                    break
             except Exception as e:
                 logger.error(f"RX worker error: {e}")
                 time.sleep(0.1)
@@ -961,39 +1064,40 @@ class USBLoRaRadio(_RadioBase):
         timeout: float = 5.0,
     ) -> Optional[bytes]:
         """Send a command frame and wait for a specific response frame."""
-        if not self._serial or not self._serial.is_open:
-            return None
-
-        # Ensure event loop is captured
-        if self._event_loop is None:
-            try:
-                self._event_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
-
-        # Register response expectation
-        evt = asyncio.Event()
-        with self._response_lock:
-            self._response_events[expect_cmd] = evt
-            self._response_data.pop(expect_cmd, None)
-
-        try:
-            frame = build_frame(cmd, payload)
-            self._serial.write(frame)
-            self._serial.flush()
-
-            try:
-                await asyncio.wait_for(evt.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
+        async with self._command_lock:
+            if not self._connected_event.is_set() or not self._serial or not self._serial.is_open:
                 return None
 
-            return self._response_data.get(expect_cmd)
+            # Ensure event loop is captured
+            if self._event_loop is None:
+                try:
+                    self._event_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
 
-        finally:
+            # Register response expectation
+            evt = asyncio.Event()
             with self._response_lock:
-                self._response_events.pop(expect_cmd, None)
+                self._response_events[expect_cmd] = evt
                 self._response_data.pop(expect_cmd, None)
+
+            try:
+                frame = build_frame(cmd, payload)
+                self._serial.write(frame)
+                self._serial.flush()
+
+                try:
+                    await asyncio.wait_for(evt.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
+                    return None
+
+                return self._response_data.get(expect_cmd)
+
+            finally:
+                with self._response_lock:
+                    self._response_events.pop(expect_cmd, None)
+                    self._response_data.pop(expect_cmd, None)
 
     async def _perform_cad(self, timeout: float = 1.0) -> bool:
         """Perform Channel Activity Detection. Returns True if busy."""
@@ -1012,6 +1116,74 @@ class USBLoRaRadio(_RadioBase):
             return False
 
     # ── Config setters (for runtime reconfiguration) ──────────
+
+    def _run_async_safe(self, coro, wait_timeout: float = 4.0) -> bool:
+        """Schedule a command on the radio event loop from any caller thread."""
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._event_loop:
+
+            async def _bg():
+                try:
+                    response = await coro
+                    logger.info("Async CAD config push result: ok=%s", response is not None)
+                except Exception as exc:
+                    logger.error("Async CAD config push error: %s", exc, exc_info=True)
+
+            asyncio.ensure_future(_bg())
+            return True
+        if self._event_loop is None:
+            coro.close()
+            return False
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, self._event_loop)
+            return future.result(timeout=wait_timeout) is not None
+        except Exception as exc:
+            logger.error("Cross-thread CAD config push error: %s", exc, exc_info=True)
+            return False
+
+    def _push_cad_config_live(self) -> bool:
+        """Push the complete cached CAD tuple when the modem is connected."""
+        if self._custom_cad_peak is None or self._custom_cad_min is None:
+            return True
+        if not self._initialized:
+            return True
+        if self._event_loop is None or not self._event_loop.is_running():
+            return True
+        payload = build_cad_params_payload(
+            self._custom_cad_symbol_num or 2,
+            self._custom_cad_peak,
+            self._custom_cad_min,
+        )
+        return self._run_async_safe(
+            self._send_command(
+                CMD_SET_CAD_PARAMS,
+                payload,
+                expect_cmd=CMD_CAD_PARAMS_RESP,
+                timeout=3.0,
+            )
+        )
+
+    def set_custom_cad_thresholds(self, peak: int, min_val: int) -> bool:
+        """Cache and live-apply custom CAD detection thresholds."""
+        if not (0 <= int(peak) <= 255) or not (0 <= int(min_val) <= 255):
+            raise ValueError("CAD thresholds must be between 0 and 255")
+        self._custom_cad_peak = int(peak)
+        self._custom_cad_min = int(min_val)
+        return self._push_cad_config_live()
+
+    def set_custom_cad_symbol_num(self, cad_symbol_num: int) -> bool:
+        """Cache and live-apply a validated CAD symbol count."""
+        build_cad_params_payload(cad_symbol_num, 0, 0)
+        self._custom_cad_symbol_num = int(cad_symbol_num)
+        return self._push_cad_config_live()
+
+    def clear_custom_cad_thresholds(self) -> None:
+        """Clear host-side CAD thresholds; firmware resets on modem reboot."""
+        self._custom_cad_peak = None
+        self._custom_cad_min = None
 
     def set_frequency(self, frequency: int) -> bool:
         self.frequency = frequency

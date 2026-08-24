@@ -143,6 +143,10 @@ class TCPLoRaRadio(_RadioBase):
         self._rx_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+        # Serialize command/response transactions. Multiple callers can wait
+        # for the same response command (notably consecutive CAD updates), and
+        # the response-event map supports only one waiter per command byte.
+        self._command_lock = asyncio.Lock()
 
         # Custom CAD thresholds. Set lazily by set_custom_cad_thresholds()
         # or perform_cad(det_peak=..., det_min=...); read by _reopen_socket
@@ -593,6 +597,8 @@ class TCPLoRaRadio(_RadioBase):
                     f"{self.tx_power}dBm sync=0x{self.sync_word:04X} "
                     f"pre={self.preamble_length}"
                 )
+                if not self._apply_cad_config_sync():
+                    logger.warning("Radio configured but cached CAD settings were not restored")
                 return True
             if cmd == CMD_ERROR:
                 err = payload[0] if payload else 0xFF
@@ -601,6 +607,35 @@ class TCPLoRaRadio(_RadioBase):
             # Ignore RX_PACKET or other unrelated frames during config
         logger.error("No config response from modem")
         return False
+
+    def _write_cad_frame_sync(self, payload: bytes) -> bool:
+        """Push one complete CAD configuration before the RX worker handles responses."""
+        self._sock_write(build_frame(CMD_SET_CAD_PARAMS, payload))
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            resp = self._read_frame_sync(timeout=max(0.1, deadline - time.time()))
+            if resp is None:
+                continue
+            cmd, response_payload = resp
+            if cmd == CMD_CAD_PARAMS_RESP:
+                return True
+            if cmd == CMD_ERROR:
+                err = response_payload[0] if response_payload else 0xFF
+                logger.error(f"CAD configuration rejected by modem: error 0x{err:02X}")
+                return False
+        logger.error("No CAD configuration response from modem")
+        return False
+
+    def _apply_cad_config_sync(self) -> bool:
+        """Restore cached CAD settings during initial connect or reconnect."""
+        if self._custom_cad_peak is None or self._custom_cad_min is None:
+            return True
+        payload = build_cad_params_payload(
+            self._custom_cad_symbol_num or 2,
+            self._custom_cad_peak,
+            self._custom_cad_min,
+        )
+        return self._write_cad_frame_sync(payload)
 
     def _read_frame_sync(self, timeout: float = 2.0) -> Optional[tuple]:
         """Read one frame synchronously with a single timeout budget."""
@@ -684,14 +719,6 @@ class TCPLoRaRadio(_RadioBase):
                 logger.error("Reconnect: SET_CONFIG failed")
                 self._close_sock()
                 return False
-            # Re-apply custom CAD if host had programmed any.
-            if self._custom_cad_peak is not None and self._custom_cad_min is not None:
-                try:
-                    self.set_custom_cad_thresholds(
-                        peak=self._custom_cad_peak, min_val=self._custom_cad_min
-                    )
-                except Exception as e:
-                    logger.warning(f"Reconnect: re-push CAD failed: {e}")
             return True
         except Exception as e:
             logger.error(f"Reconnect socket open failed: {e}")
@@ -886,40 +913,41 @@ class TCPLoRaRadio(_RadioBase):
         expect_cmd: int,
         timeout: float = 5.0,
     ) -> Optional[bytes]:
-        if self._sock is None:
-            return None
-
-        if self._event_loop is None:
-            try:
-                self._event_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
-
-        evt = asyncio.Event()
-        with self._response_lock:
-            self._response_events[expect_cmd] = evt
-            self._response_data.pop(expect_cmd, None)
-
-        try:
-            frame = build_frame(cmd, payload)
-            try:
-                self._sock_write(frame)
-            except (OSError, ConnectionError) as e:
-                logger.error(f"TCP write failed: {e}")
+        async with self._command_lock:
+            if self._sock is None:
                 return None
 
-            try:
-                await asyncio.wait_for(evt.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
-                return None
+            if self._event_loop is None:
+                try:
+                    self._event_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
 
-            return self._response_data.get(expect_cmd)
-
-        finally:
+            evt = asyncio.Event()
             with self._response_lock:
-                self._response_events.pop(expect_cmd, None)
+                self._response_events[expect_cmd] = evt
                 self._response_data.pop(expect_cmd, None)
+
+            try:
+                frame = build_frame(cmd, payload)
+                try:
+                    self._sock_write(frame)
+                except (OSError, ConnectionError) as e:
+                    logger.error(f"TCP write failed: {e}")
+                    return None
+
+                try:
+                    await asyncio.wait_for(evt.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
+                    return None
+
+                return self._response_data.get(expect_cmd)
+
+            finally:
+                with self._response_lock:
+                    self._response_events.pop(expect_cmd, None)
+                    self._response_data.pop(expect_cmd, None)
 
     async def _perform_cad(self, timeout: float = 1.0) -> bool:
         resp = await self._send_command(
@@ -1066,27 +1094,45 @@ class TCPLoRaRadio(_RadioBase):
         return True
 
     def set_custom_cad_thresholds(self, peak: int, min_val: int) -> bool:
+        if not (0 <= int(peak) <= 255) or not (0 <= int(min_val) <= 255):
+            raise ValueError("CAD thresholds must be between 0 and 255")
         self._custom_cad_peak = int(peak)
         self._custom_cad_min = int(min_val)
+        return self._push_cad_config_live()
+
+    def _push_cad_config_live(self) -> bool:
+        """Push the complete cached CAD tuple when the modem is connected."""
+        if self._custom_cad_peak is None or self._custom_cad_min is None:
+            return True
         if not self._initialized:
             return True
         if self._event_loop is None or not self._event_loop.is_running():
             return True
-        payload = build_cad_params_payload(self._custom_cad_symbol_num or 2, peak, min_val)
+        payload = build_cad_params_payload(
+            self._custom_cad_symbol_num or 2,
+            self._custom_cad_peak,
+            self._custom_cad_min,
+        )
         ok = self._run_async_safe(
             self._send_command(
                 CMD_SET_CAD_PARAMS, payload, expect_cmd=CMD_CAD_PARAMS_RESP, timeout=3.0
             ),
             wait_timeout=4.0,
         )
-        logger.info(f"CAD thresholds pushed peak={peak} min={min_val}: {'OK' if ok else 'TIMEOUT'}")
+        logger.info(
+            "CAD settings pushed symbols=%s peak=%s min=%s: %s",
+            self._custom_cad_symbol_num or 2,
+            self._custom_cad_peak,
+            self._custom_cad_min,
+            "OK" if ok else "TIMEOUT",
+        )
         return ok
 
     def set_custom_cad_symbol_num(self, cad_symbol_num: int) -> bool:
-        """Store a validated CAD symbol count for calls that omit an override."""
+        """Cache and live-apply a validated CAD symbol count."""
         build_cad_params_payload(cad_symbol_num, 0, 0)
         self._custom_cad_symbol_num = int(cad_symbol_num)
-        return True
+        return self._push_cad_config_live()
 
     def clear_custom_cad_thresholds(self) -> None:
         self._custom_cad_peak = None
