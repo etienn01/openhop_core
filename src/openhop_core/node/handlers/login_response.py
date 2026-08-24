@@ -2,7 +2,12 @@ import struct
 from typing import Callable, Optional
 
 from ...protocol import CryptoUtils, Identity, Packet
-from ...protocol.constants import PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_RESPONSE
+from ...protocol.constants import (
+    PAYLOAD_TYPE_ANON_REQ,
+    PAYLOAD_TYPE_PATH,
+    PAYLOAD_TYPE_RESPONSE,
+    acl_role,
+)
 from ...protocol.packet_utils import PathUtils
 from ...util.callbacks import invoke_maybe_awaitable
 from .base import BaseHandler
@@ -10,6 +15,16 @@ from .result import HandlerResult
 from .return_path import ReturnPathTeacher
 
 # Response codes from C++ server
+# Login reply byte 6, the legacy admin flag. Firmware's room server overloads
+# it into three states (simple_room_server/MyMesh.cpp):
+#     reply_data[6] = isAdmin() ? 1 : (permissions == 0 ? 2 : 0)
+# so 2 means "plain guest", NOT admin. Repeaters and sensors only ever send
+# 0 or 1. Treating this byte as a boolean makes a stock room server's guests
+# look like admins.
+LOGIN_ADMIN_CODE_NOT_ADMIN = 0
+LOGIN_ADMIN_CODE_ADMIN = 1
+LOGIN_ADMIN_CODE_GUEST = 2
+
 RESP_SERVER_LOGIN_OK = 0x80
 # Alternative success code observed in practice
 RESP_SERVER_LOGIN_SUCCESS_ALT = 0x00
@@ -23,8 +38,9 @@ class LoginResponseHandler(BaseHandler):
     - timestamp (4 bytes): Server response timestamp
     - response_code (1 byte): RESP_SERVER_LOGIN_OK (0x80) for success
     - keep_alive_interval (1 byte): Recommended keep-alive interval (secs / 16)
-    - is_admin (1 byte): 1 if admin, 0 if guest
-    - reserved (1 byte): Reserved for future use
+    - admin_code (1 byte): legacy admin flag; 1 = admin, 2 = plain guest on a
+      room server, 0 otherwise. Only 1 means admin.
+    - permissions (1 byte): ACL byte; role in the low two bits (v7+ servers)
     - random_blob (4 bytes): Random data for packet uniqueness
 
     """
@@ -325,9 +341,9 @@ class LoginResponseHandler(BaseHandler):
                 return True, None
 
             # Parse the C++ response format (handleLoginReq reply_data):
-            # timestamp(4) + response_code(1) + keep_alive(1) + is_admin(1) +
+            # timestamp(4) + response_code(1) + keep_alive(1) + admin_code(1) +
             # permissions(1) + random(4) + [firmware_ver_level(1) at index 12]
-            timestamp, response_code, keep_alive, is_admin, reserved = struct.unpack(
+            timestamp, response_code, keep_alive, admin_code, permissions = struct.unpack(
                 "<IBBBB", plaintext[:8]
             )
             random_blob = plaintext[8:12]
@@ -337,8 +353,13 @@ class LoginResponseHandler(BaseHandler):
                 "timestamp": timestamp,
                 "response_code": response_code,
                 "keep_alive_interval": keep_alive,
-                "is_admin": bool(is_admin),
-                "reserved": reserved,
+                # Only 1 is admin: a room server sends 2 for a plain guest,
+                # and bool(2) would promote that guest to admin.
+                "is_admin": admin_code == LOGIN_ADMIN_CODE_ADMIN,
+                "admin_code": admin_code,
+                "reserved": permissions,  # legacy key, kept for callers
+                "permissions": permissions,
+                "acl_role": acl_role(permissions),
                 "random_blob": random_blob,
                 "firmware_ver_level": firmware_ver_level,
                 "contact": contact,

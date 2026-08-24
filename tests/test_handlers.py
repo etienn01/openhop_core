@@ -22,6 +22,7 @@ from openhop_core.node.handlers import (
 from openhop_core.node.handlers.login_server import FIRMWARE_VER_LEVEL
 from openhop_core.node.handlers.result import HandlerResult
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
+from openhop_core.protocol.acl_conformance import OUTBOUND
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
@@ -33,6 +34,7 @@ from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_RESPONSE,
     PAYLOAD_TYPE_TRACE,
     PAYLOAD_TYPE_TXT_MSG,
+    PERM_ACL_GUEST,
     PUB_KEY_SIZE,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
@@ -2227,7 +2229,7 @@ class TestLoginServerHandler:
         assert keepalive == 0  # Legacy, always 0
 
         is_admin = login_reply[6]
-        assert is_admin == 1  # permissions 0x03 has admin bit 0x02
+        assert is_admin == 1  # role 0x03 == PERM_ACL_ADMIN
 
         perms = login_reply[7]
         assert perms == 0x03
@@ -2270,30 +2272,58 @@ class TestLoginServerHandler:
 
         assert len(self.sent_packets) == 0
 
-    @pytest.mark.asyncio
-    async def test_guest_permissions_is_admin_zero(self):
-        """Guest login (no admin bit) → is_admin = 0 in response (matches C++ check)."""
-        # Permission 0x01 = guest only, no admin bit (0x02)
-        self.auth_callback.return_value = (True, 0x01)
+    async def _login_reply_for(self, permissions: int) -> bytes:
+        """Run a flood login returning ``permissions`` and decrypt the 13-byte reply."""
+        self.auth_callback.return_value = (True, permissions)
+        self.sent_packets.clear()
 
-        pkt = self._build_login_packet(password="guest", route_type="flood")
+        pkt = self._build_login_packet(password="pw", route_type="flood")
         await self.handler(pkt)
 
         response_pkt, _ = self.sent_packets[0]
-
-        # Decrypt and verify is_admin field
         client_id = Identity(self.client_identity_local.get_public_key())
         shared_secret = client_id.calc_shared_secret(self.server_identity.get_private_key())
         aes_key = shared_secret[:16]
         encrypted_part = bytes(response_pkt.payload[2:])
         plaintext = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted_part)
+        # skip path_len(1) + extra_type(1), take 13
+        return plaintext[2:15]
 
-        login_reply = plaintext[2:15]  # skip path_len(1) + extra_type(1), take 13
-        is_admin = login_reply[6]
-        assert is_admin == 0  # No admin bit → is_admin = 0
+    @pytest.mark.asyncio
+    async def test_guest_permissions_is_admin_zero(self):
+        """Guest login (role 0) → is_admin = 0 in response (matches C++ isAdmin())."""
+        login_reply = await self._login_reply_for(PERM_ACL_GUEST)
 
-        perms = login_reply[7]
-        assert perms == 0x01
+        assert login_reply[6] == 0
+        assert login_reply[7] == PERM_ACL_GUEST
+
+    @pytest.mark.asyncio
+    async def test_outbound_conformance_vectors(self):
+        """Emit exactly the bytes in acl_conformance.OUTBOUND.
+
+        Literal expectations on purpose: keying this off PERM_ACL_* would make
+        the test follow the constants wherever they drift, and constants that
+        drifted away from the mesh are the whole of #388.
+        """
+        for server_type, credential, admin_code, permissions in OUTBOUND:
+            login_reply = await self._login_reply_for(permissions)
+            label = f"{server_type}/{credential}"
+            assert login_reply[6] == admin_code, f"{label}: admin_code"
+            assert login_reply[7] == permissions, f"{label}: permissions"
+
+    @pytest.mark.asyncio
+    async def test_admin_code_is_an_equality_test_over_the_whole_byte(self):
+        """Only role 3 is admin, for every value of the reserved upper bits.
+
+        A bit test on 0x02 also matches READ_WRITE (2), which is what stock
+        clients decode as non-admin while our byte 6 claimed admin.
+        """
+        for reserved in (0x00, 0x04, 0x40, 0xFC):
+            for role in (0x00, 0x01, 0x02, 0x03):
+                login_reply = await self._login_reply_for(role | reserved)
+                expected = 1 if role == 0x03 else 0
+                assert login_reply[6] == expected, f"role {role} reserved {reserved:#04x}"
+                assert login_reply[7] == role | reserved
 
     @pytest.mark.asyncio
     async def test_no_send_callback_logs_error(self):

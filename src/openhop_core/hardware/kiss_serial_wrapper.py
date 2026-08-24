@@ -148,6 +148,10 @@ class KissSerialWrapper(LoRaRadio):
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
+                # See kiss_modem_wrapper.connect(): dsrdtr=True keeps pyserial from
+                # asserting DTR on open, which reboots the attached ESP32 board.
+                dsrdtr=True,
+                rtscts=False,
             )
 
             self.is_connected = True

@@ -1,8 +1,8 @@
 """
 TCP LoRa Radio Driver for openhop_core
 
-Implements the LoRaRadio interface using any board running the pymc_usb
-firmware in Wi-Fi/TCP mode. Same binary protocol as USBLoRaRadio — only
+Implements the LoRaRadio interface using an openHop Modem in Wi-Fi/TCP
+mode. Same binary protocol as USBLoRaRadio — only
 the transport differs.
 
 Drop-in replacement for SX1262Radio in openhop_core's hardware layer.
@@ -95,10 +95,10 @@ else:
 
 
 class TCPLoRaRadio(_RadioBase):
-    """TCP LoRa Radio — pymc_core LoRaRadio interface over Wi-Fi/TCP.
+    """TCP LoRa Radio — openhop_core LoRaRadio interface over Wi-Fi/TCP.
 
-    Communicates with any board running the pymc_usb firmware in Wi-Fi
-    STA mode. Provides the same interface as SX1262Radio and USBLoRaRadio
+    Communicates with an openHop Modem in Wi-Fi STA mode. Provides the
+    same interface as SX1262Radio and USBLoRaRadio
     for transparent integration with openhop_core.
     """
 
@@ -236,7 +236,7 @@ class TCPLoRaRadio(_RadioBase):
 
         # Always start the RX worker. When connected it processes traffic
         # immediately; otherwise _reconnect_with_backoff drives reconnection
-        # so the repeater UI can stay up while the user sets pymc_tcp.host
+        # so the repeater UI can stay up while the user sets modem_tcp.host
         # via /api/setup_wizard or /api/update_radio_config.
         self._stop_event.clear()
         self._rx_thread = threading.Thread(target=self._rx_worker, daemon=True, name="tcp-lora-rx")
@@ -395,7 +395,7 @@ class TCPLoRaRadio(_RadioBase):
             "last_snr": self.last_snr,
             "last_signal_rssi": self.last_signal_rssi,
             "hardware_ready": self._initialized,
-            "driver": "pymc_tcp",
+            "driver": "modem_tcp",
             "host": self.host,
             "port": self.port,
             "tx_count": self._tx_count,

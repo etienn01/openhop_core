@@ -2,6 +2,7 @@
 
 import asyncio
 import struct
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,11 +11,18 @@ from openhop_core.companion.constants import ADV_TYPE_CHAT
 from openhop_core.companion.models import Contact
 from openhop_core.companion.timing import estimate_airtime_ms
 from openhop_core.node.events import MeshEvents
+from openhop_core.node.handlers.login_response import (
+    LOGIN_ADMIN_CODE_ADMIN,
+    LOGIN_ADMIN_CODE_GUEST,
+)
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
+from openhop_core.protocol.acl_conformance import INBOUND
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_RESPONSE,
+    PERM_ACL_ADMIN,
+    PERM_ACL_GUEST,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
     TXT_TYPE_CLI_DATA,
@@ -901,6 +909,84 @@ def _build_login_response_packet(
     pkt.payload = bytearray(payload)
     pkt.payload_len = len(payload)
     return pkt
+
+
+class TestLoginAdminCodeDecoding:
+    """Login reply byte 6 is a tri-state, not a boolean.
+
+    Firmware's room server sends ``isAdmin() ? 1 : (permissions == 0 ? 2 : 0)``
+    (simple_room_server/MyMesh.cpp), so 2 means "plain guest". Decoding the
+    byte with bool() promoted those guests to admin.
+    """
+
+    @pytest.mark.parametrize("admin_code, permissions, is_admin, role", INBOUND)
+    def test_inbound_conformance_vectors(self, admin_code, permissions, is_admin, role):
+        """Decode exactly what acl_conformance.INBOUND says, from literal bytes.
+
+        Includes shapes we never emit but must read from stock firmware, such
+        as a room server's plain guest (admin_code 2, which bool() called
+        admin).
+        """
+        server_identity = LocalIdentity()
+        comp_identity = LocalIdentity()
+        comp = CompanionRadio(MockRadio(), comp_identity)
+        handler = comp._get_login_response_handler()
+
+        pkt = _build_login_response_packet(
+            server_identity, comp_identity, is_admin=admin_code, permissions=permissions
+        )
+        contact = SimpleNamespace(
+            name="srv", public_key=server_identity.get_public_key(), is_admin=None
+        )
+        ok, data = asyncio.run(handler._decrypt_response(pkt, contact))
+
+        assert ok is True
+        assert data["admin_code"] == admin_code
+        assert data["is_admin"] is is_admin
+        assert data["permissions"] == permissions
+        assert data["acl_role"] == role
+
+    def test_room_server_guest_code_is_not_admin_end_to_end(self):
+        """The parsed dict must not report admin for a room server's guest."""
+        server_identity = LocalIdentity()
+        comp_identity = LocalIdentity()
+        comp = CompanionRadio(MockRadio(), comp_identity)
+        handler = comp._get_login_response_handler()
+
+        pkt = _build_login_response_packet(
+            server_identity,
+            comp_identity,
+            is_admin=LOGIN_ADMIN_CODE_GUEST,
+            permissions=PERM_ACL_GUEST,
+        )
+        contact = SimpleNamespace(
+            name="room", public_key=server_identity.get_public_key(), is_admin=None
+        )
+        ok, data = asyncio.run(handler._decrypt_response(pkt, contact))
+        assert ok is True
+        assert data["admin_code"] == LOGIN_ADMIN_CODE_GUEST
+        assert data["is_admin"] is False
+        assert data["acl_role"] == PERM_ACL_GUEST
+
+    def test_admin_login_still_reports_admin(self):
+        server_identity = LocalIdentity()
+        comp_identity = LocalIdentity()
+        comp = CompanionRadio(MockRadio(), comp_identity)
+        handler = comp._get_login_response_handler()
+
+        pkt = _build_login_response_packet(
+            server_identity,
+            comp_identity,
+            is_admin=LOGIN_ADMIN_CODE_ADMIN,
+            permissions=PERM_ACL_ADMIN,
+        )
+        contact = SimpleNamespace(
+            name="rpt", public_key=server_identity.get_public_key(), is_admin=None
+        )
+        ok, data = asyncio.run(handler._decrypt_response(pkt, contact))
+        assert ok is True
+        assert data["is_admin"] is True
+        assert data["acl_role"] == PERM_ACL_ADMIN
 
 
 @pytest.mark.asyncio

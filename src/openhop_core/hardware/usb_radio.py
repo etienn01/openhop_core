@@ -1,7 +1,7 @@
 """
 USB LoRa Radio Driver for openhop_core
 
-Implements the LoRaRadio interface using a pymc_usb modem connected via
+Implements the LoRaRadio interface using an openHop Modem connected via
 USB-CDC. The modem acts as a "dumb" SX1262 transceiver — all MeshCore
 protocol logic runs on the host in openhop_core.
 
@@ -104,11 +104,11 @@ else:
 
 
 class USBLoRaRadio(_RadioBase):
-    """USB LoRa Radio — pymc_core LoRaRadio interface over USB-CDC serial.
+    """USB LoRa Radio — openhop_core LoRaRadio interface over USB-CDC serial.
 
-    Communicates with any board running the pymc_usb firmware over a
-    USB-CDC serial link. Provides the same interface as SX1262Radio for
-    transparent integration with pymc_core's Dispatcher and MeshNode.
+    Communicates with an openHop Modem over a USB-CDC serial link.
+    Provides the same interface as SX1262Radio for
+    transparent integration with openhop_core's Dispatcher and MeshNode.
     """
 
     def __init__(
@@ -409,7 +409,8 @@ class USBLoRaRadio(_RadioBase):
 
     def get_status(self) -> dict:
         """Get radio status dict (matches SX1262Radio.get_status())."""
-        connected = self._initialized and self._connected_event.is_set()
+        connected_event = getattr(self, "_connected_event", None)
+        connected = self._initialized and (connected_event is None or connected_event.is_set())
         return {
             "initialized": connected,
             "frequency": self.frequency,
@@ -421,7 +422,7 @@ class USBLoRaRadio(_RadioBase):
             "last_snr": self.last_snr,
             "last_signal_rssi": self.last_signal_rssi,
             "hardware_ready": connected,
-            "driver": "pymc_usb",
+            "driver": "modem_usb",
             "port": self.port,
             "tx_count": self._tx_count,
             "rx_count": self._rx_count,
