@@ -9,12 +9,15 @@ neighbour. That refusal is LBT feedback, retried within the same time budget,
 and the send fails without forcing when the modem keeps refusing.
 """
 
+import asyncio
 import struct
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from openhop_core.hardware.protocol_constants import (
+    CMD_ERROR,
     CMD_RX_START,
+    CMD_TX_DONE,
     CMD_TX_REQUEST,
     ERR_CHANNEL_BUSY,
 )
@@ -71,6 +74,39 @@ def _script_modem(radio, tx_responses):
     return calls
 
 
+async def _assert_busy_error_wakes_tx_waiter(radio):
+    radio._event_loop = asyncio.get_running_loop()
+    if isinstance(radio, USBLoRaRadio):
+        radio._serial = Mock()
+        radio._serial.is_open = True
+        radio._connected_event.set()
+    else:
+        radio._sock = Mock()
+        radio._sock_write = Mock()
+
+    pending = asyncio.create_task(
+        radio._send_command(
+            CMD_TX_REQUEST,
+            b"payload",
+            expect_cmd=CMD_TX_DONE,
+            timeout=0.5,
+        )
+    )
+    await asyncio.sleep(0)
+    radio._dispatch_frame(CMD_ERROR, bytes([ERR_CHANNEL_BUSY]))
+
+    assert await asyncio.wait_for(pending, timeout=0.1) is None
+    assert radio._last_modem_error == ERR_CHANNEL_BUSY
+
+
+async def test_usb_busy_error_dispatch_wakes_tx_waiter():
+    await _assert_busy_error_wakes_tx_waiter(_usb_radio(lbt_enabled=False))
+
+
+async def test_tcp_busy_error_dispatch_wakes_tx_waiter():
+    await _assert_busy_error_wakes_tx_waiter(_tcp_radio(lbt_enabled=False))
+
+
 # ─── time-bounded host-side CAD loop ─────────────────────────────────
 
 
@@ -87,8 +123,10 @@ async def test_usb_lbt_budget_is_time_bounded():
     # Many short checks within the budget; the exact count is timing-dependent.
     assert radio._perform_cad.await_count > 5
     assert 0.4 <= elapsed <= 2.0
-    assert sum(result["lbt_backoff_delays_ms"]) <= 600.0
-    assert all(10.0 <= d <= 30.0 for d in result["lbt_backoff_delays_ms"])
+    delays = result["lbt_backoff_delays_ms"]
+    assert sum(delays) <= 600.0
+    assert all(10.0 <= d <= 30.0 for d in delays[:-1])
+    assert 0.0 <= delays[-1] <= 30.0  # final wait is clamped to the remaining budget
 
 
 async def test_usb_lbt_clear_channel_has_no_delays():
@@ -115,6 +153,35 @@ async def test_tcp_lbt_budget_is_time_bounded():
     assert result is not None
     assert radio._perform_cad.await_count > 5
     assert 0.4 <= elapsed <= 2.0
+
+
+async def _assert_slow_cad_respects_deadline(radio):
+    seen_timeouts = []
+
+    async def slow_busy(timeout):
+        seen_timeouts.append(timeout)
+        await asyncio.sleep(timeout)
+        return True
+
+    radio._perform_cad = AsyncMock(side_effect=slow_busy)
+    _script_modem(radio, [TX_DONE_PAYLOAD])
+
+    started = time.monotonic()
+    result = await radio.send(b"payload")
+    elapsed = time.monotonic() - started
+
+    assert result is not None
+    assert seen_timeouts
+    assert max(seen_timeouts) <= radio.lbt_max_wait_seconds
+    assert 0.4 <= elapsed <= 0.8
+
+
+async def test_usb_slow_cad_call_is_clamped_to_remaining_budget():
+    await _assert_slow_cad_respects_deadline(_usb_radio())
+
+
+async def test_tcp_slow_cad_call_is_clamped_to_remaining_budget():
+    await _assert_slow_cad_respects_deadline(_tcp_radio())
 
 
 # ─── ERR_CHANNEL_BUSY: firmware auto-CAD refusal is LBT feedback ─────
@@ -177,9 +244,7 @@ async def test_tcp_modem_busy_refusal_is_retried_within_budget():
 
 
 def test_lbt_knob_clamps_and_defaults():
-    clamped = USBLoRaRadio(
-        port="/dev/null", lbt_max_wait_seconds=0.0, lbt_retry_interval_ms=5
-    )
+    clamped = USBLoRaRadio(port="/dev/null", lbt_max_wait_seconds=0.0, lbt_retry_interval_ms=5)
     assert clamped.lbt_max_wait_seconds == 0.5
     assert clamped.lbt_retry_interval_ms == 20
 

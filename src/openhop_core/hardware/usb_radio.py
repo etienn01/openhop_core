@@ -212,7 +212,7 @@ class USBLoRaRadio(_RadioBase):
         """One short jittered LBT retry delay, clamped to the remaining budget."""
         delay_ms = self.lbt_retry_interval_ms * random.uniform(0.5, 1.5)
         remaining_ms = (deadline - time.monotonic()) * 1000.0
-        return max(10.0, min(delay_ms, remaining_ms))
+        return max(0.0, min(delay_ms, remaining_ms))
 
     def begin(self) -> bool:
         """Initialize USB serial connection and configure the modem radio."""
@@ -302,9 +302,17 @@ class USBLoRaRadio(_RadioBase):
             outcome = "clear" if self.lbt_enabled else "off"
             if self.lbt_enabled:
                 while True:
+                    remaining = lbt_deadline - time.monotonic()
+                    if remaining <= 0:
+                        outcome = "forced"
+                        logger.warning(
+                            f"[LBT] Budget exhausted ({self.lbt_max_wait_seconds:.1f}s) - "
+                            "channel still busy, transmitting anyway"
+                        )
+                        break
                     try:
                         cad_checks += 1
-                        channel_busy = await self._perform_cad(timeout=1.0)
+                        channel_busy = await self._perform_cad(timeout=min(1.0, remaining))
                     except Exception as e:
                         outcome = "exception"
                         logger.warning(
