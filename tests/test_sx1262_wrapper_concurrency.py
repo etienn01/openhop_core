@@ -1326,6 +1326,26 @@ class TestEventOrdering:
         )
         assert read_idx < write_idx
 
+    async def test_corrupt_header_irq_is_not_latched(self, radio, mock_lora):
+        """0x0022 (RX_DONE | HEADER_ERR) with no header validated for this
+        reception: the length driving readBuffer is untrustworthy."""
+        radio._pending_rx_irq_status = 0
+
+        _inject_irq(radio, IRQ_RX_DONE | IRQ_HEADER_ERR)
+
+        assert radio._pending_rx_irq_status == 0
+
+    async def test_header_err_does_not_discard_an_already_latched_packet(
+        self, radio, mock_lora
+    ):
+        """Observed on-air: HEADER_ERR arriving while a good packet is still
+        unread. Latching it would OR to 0x0022 and lose a sound packet."""
+        radio._pending_rx_irq_status = IRQ_RX_DONE  # good packet, not yet read
+
+        _inject_irq(radio, IRQ_HEADER_ERR)
+
+        assert radio._pending_rx_irq_status == IRQ_RX_DONE
+
     async def test_rx_done_while_tx_lock_held_is_latched_and_drained_before_tx_reuse(
         self, radio, mock_lora
     ):
