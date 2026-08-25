@@ -167,7 +167,12 @@ class SX1262Radio(LoRaRadio):
         self.last_signal_rssi: int = -99
         self._initialized = False
         self._rx_lock = asyncio.Lock()
+        # Serialises transmitters: one LBT attempt plus its commit.
         self._tx_lock = asyncio.Lock()
+        # Set from writeBuffer until TX completes.
+        self._tx_buffer_busy = False
+        # Whole of send(), backoffs included.
+        self._tx_in_progress = False
 
         # GPIO management: prefer an explicitly provided manager (multi-CH341),
         # else a process-default external adapter manager, else a private
@@ -475,12 +480,13 @@ class SX1262Radio(LoRaRadio):
                 # Only wake the background task for TERMINAL interrupts
                 # Intermediate interrupts (preamble, sync, header valid) are just progress updates
                 if irqStat & terminal_interrupts:
-                    if not self._tx_lock.locked():
+                    # Event has no counter: a suppressed wake-up is lost.
+                    if not self._tx_buffer_busy:
                         self._rx_done_event.set()
                         _trace(f"[RX] Terminal interrupt 0x{irqStat:04X} - waking background task")
                     else:
                         logger.debug(
-                            f"[RX] Ignoring terminal interrupt 0x{irqStat:04X} during TX operation"
+                            f"[RX] Ignoring terminal interrupt 0x{irqStat:04X} during TX buffer use"
                         )
                 else:
                     # Non-terminal interrupt - just log it, don't wake background task
@@ -489,7 +495,7 @@ class SX1262Radio(LoRaRadio):
         except Exception as e:
             logger.error(f"IRQ handler error: {e}")
             self._tx_done_event.set()
-            if not self._tx_lock.locked():
+            if not self._tx_buffer_busy:
                 self._rx_done_event.set()
 
     async def _drain_pending_rx_irq_before_buffer_reuse(self) -> None:
@@ -1132,76 +1138,37 @@ class SX1262Radio(LoRaRadio):
     # "[LBT] Summary" and "[TX] Done" — contention adds bounded DEBUG
     # retries, anomalies log at WARNING, and a send that did not happen at
     # ERROR. TRACE carries the chip-level minutiae.
-    async def _prepare_radio_for_tx(self) -> tuple[bool, list[int]]:
-        """Prepare radio hardware for transmission. Returns (success, lbt_backoff_delays_ms)."""
+    async def _channel_busy_once(self) -> tuple[bool, bool]:
+        """One LBT check. Returns (busy, scanned). Caller must hold _tx_lock."""
+        # Passive check first: a latched in-progress reception is authoritative
+        # and free — and it must be consulted BEFORE any standby(), because
+        # perform_cad() drops to standby, which aborts the very reception it
+        # is probing for.
+        if self.is_receiving_packet():
+            logger.debug("[LBT] Reception in progress - deferring TX")
+            return True, False
+
+        # asyncio.Lock is not reentrant and the caller holds it.
+        busy = await self.perform_cad(timeout=0.5, respect_tx_lock=False)
+        return bool(busy), True
+
+    async def _commit_tx(self, data: bytes, backoffs: list[int]) -> dict:
+        """Stage and transmit one packet. Caller must hold _tx_lock."""
         self._tx_done_event.clear()
         self._rx_done_event.clear()
 
-        # Drain any packet-bearing RX IRQ that fired while TX was active and was
-        # latched in software before we begin CAD/TX buffer reuse.
-        await self._drain_pending_rx_irq_before_buffer_reuse()
+        data_list = list(data)
+        length = len(data_list)
+        # Calculate transmission timeout and airtime
+        final_timeout_ms, driver_timeout = self._calculate_tx_timeout(length)
+        timeout_seconds = (final_timeout_ms / 1000.0) + 0.5  # Add margin
+        # Airtime is the timeout minus the 1000ms margin we add
+        airtime_ms = final_timeout_ms - 1000
 
-        # Listen Before Talk, bounded in TIME rather than attempts: short
-        # jittered retries run for the whole budget, keeping two nodes' checks
-        # decorrelated and bounding the post-clear latency to one retry
-        # interval. (MeshCore: 200 ms retry, getCADFailMaxDuration() 4 s cap.)
-        lbt_backoff_delays: list[int] = []
-        lbt_deadline = time.monotonic() + self.lbt_max_wait_seconds
-        lbt_started = time.monotonic()
-        latch_defers = 0
-        cad_checks = 0
-        outcome = "forced"
-
-        while True:
-            scanned = False
-            try:
-                # Passive check first: a latched in-progress reception is
-                # authoritative and free — and it must be consulted BEFORE
-                # any standby(), because perform_cad() drops to standby,
-                # which aborts the very reception it is probing for.
-                if self.is_receiving_packet():
-                    channel_busy = True
-                    latch_defers += 1
-                    logger.debug("[LBT] Reception in progress - deferring TX")
-                else:
-                    scanned = True
-                    cad_checks += 1
-                    channel_busy = await self.perform_cad(timeout=0.5, respect_tx_lock=False)
-                if not channel_busy:
-                    outcome = "clear"
-                    _trace("[LBT] Channel clear")
-                    break
-            except Exception as e:
-                outcome = "exception"
-                logger.warning(f"[LBT] Channel check failed: {e}, proceeding with transmission")
-                break
-
-            if time.monotonic() >= lbt_deadline:
-                # Busy for the whole budget: past this point the likeliest
-                # cause is a radio wedged in a bad state, and refusing forever
-                # would stall the TX queue. Mirrors MeshCore forcing the send
-                # once getCADFailMaxDuration() elapses.
-                logger.warning(
-                    f"[LBT] Budget exhausted ({self.lbt_max_wait_seconds:.1f}s) - "
-                    "channel still busy, transmitting anyway"
-                )
-                break
-
-            delay_ms = self.lbt_retry_interval_ms * random.uniform(0.5, 1.5)
-            remaining_ms = (lbt_deadline - time.monotonic()) * 1000.0
-            delay_ms = max(10.0, min(delay_ms, remaining_ms))
-            # Whole milliseconds: the list is reported and persisted as-is
-            # downstream, and sub-ms decimals are noise on a jittered wait.
-            lbt_backoff_delays.append(round(delay_ms))
-            if scanned:
-                # Only a CAD scan leaves the radio in standby, so only then is
-                # there RX to re-arm before the wait. After the passive check
-                # the radio is still receiving, and re-arming would clear the
-                # IRQ flags and drop to standby — aborting the very reception
-                # that set the latch, with no terminal IRQ left to clear it.
-                await self._restore_rx_for_cad_backoff()
-            logger.debug(f"[LBT] Channel busy - retrying in {delay_ms:.0f}ms")
-            await asyncio.sleep(delay_ms / 1000.0)
+        _trace(
+            f"[TX] Setting timeout: {final_timeout_ms}ms "
+            f"(tOut={driver_timeout}) for {length} bytes"
+        )
 
         # Committing to TX aborts any reception still in progress, so its
         # terminal IRQ will never arrive — clear the reception markers here,
@@ -1211,13 +1178,6 @@ class SX1262Radio(LoRaRadio):
         # a transmit clears them.)
         self._rx_activity_at = 0.0
         self._rx_header_at = 0.0
-
-        elapsed_ms = (time.monotonic() - lbt_started) * 1000
-        logger.debug(
-            f"[LBT] Summary: outcome={outcome} elapsed={elapsed_ms:.0f}ms "
-            f"latch_defers={latch_defers} cad_checks={cad_checks} "
-            f"backoff_total={sum(lbt_backoff_delays):.0f}ms"
-        )
 
         # Stage the TX only now: dropping to standby before the LBT loop would
         # abort any reception in progress before even checking for one.
@@ -1240,9 +1200,43 @@ class SX1262Radio(LoRaRadio):
                 busy_timeout += 1
             if self.lora.busyCheck():
                 logger.error("[TX] Radio stayed busy - aborting")
-                return False, lbt_backoff_delays
+                raise RuntimeError("Radio not ready for TX")
 
-        return True, lbt_backoff_delays
+        # Drain any packet-bearing RX IRQ that fired while TX was active and was
+        # latched in software before we begin CAD/TX buffer reuse.
+        await self._drain_pending_rx_irq_before_buffer_reuse()
+
+        try:
+            self._tx_buffer_busy = True
+            self._prepare_packet_transmission(data_list, length)
+
+            # Setup TX interrupts AFTER CAD checks (CAD changes interrupt config)
+            self._setup_tx_interrupts()
+            await asyncio.sleep(self.RADIO_TIMING_DELAY)
+            self.lora.setTxPower(self.tx_power, self.lora.TX_POWER_SX1262)
+
+            if not await self._execute_transmission(driver_timeout):
+                raise RuntimeError("Radio failed to start TX")
+
+            if not await self._wait_for_transmission_complete(timeout_seconds):
+                raise RuntimeError("TX completion timeout")
+
+            self._finalize_transmission()
+            self._gpio_manager.blink_led(self.txled_pin)
+        finally:
+            self._tx_buffer_busy = False
+            # Always leave radio in RX continuous mode after TX
+            await self._restore_rx_mode()  # under the caller's _tx_lock
+
+        logger.debug(f"[TX] Done {length}B airtime={airtime_ms:.0f}ms")
+
+        # Build and return transmission metadata
+        return {
+            "airtime_ms": airtime_ms,
+            "lbt_attempts": len(backoffs),
+            "lbt_backoff_delays_ms": backoffs,
+            "lbt_channel_busy": len(backoffs) > 0,
+        }
 
     async def _restore_rx_for_cad_backoff(self) -> None:
         """Restore RX_CONTINUOUS between busy CAD retries."""
@@ -1492,62 +1486,89 @@ class SX1262Radio(LoRaRadio):
         if not self._initialized or self.lora is None:
             raise RuntimeError("Radio not initialized")
 
-        async with self._tx_lock:
-            try:
-                data_list = list(data)
-                length = len(data_list)
+        # Listen Before Talk, bounded in TIME rather than attempts: short
+        # jittered retries run for the whole budget, keeping two nodes' checks
+        # decorrelated and bounding the post-clear latency to one retry
+        # interval. (MeshCore: 200 ms retry, getCADFailMaxDuration() 4 s cap.)
+        deadline = time.monotonic() + self.lbt_max_wait_seconds
+        started = time.monotonic()
+        backoffs: list[int] = []
+        latch_defers = 0
+        cad_checks = 0
+        self._tx_in_progress = True
+        committed = False
 
-                # Calculate transmission timeout and airtime
-                final_timeout_ms, driver_timeout = self._calculate_tx_timeout(length)
-                timeout_seconds = (final_timeout_ms / 1000.0) + 0.5  # Add margin
-                # Airtime is the timeout minus the 1000ms margin we add
-                airtime_ms = final_timeout_ms - 1000
+        def _summary(outcome: str) -> None:
+            logger.debug(
+                f"[LBT] Summary: outcome={outcome} "
+                f"elapsed={(time.monotonic() - started) * 1000:.0f}ms "
+                f"latch_defers={latch_defers} cad_checks={cad_checks} "
+                f"backoff_total={sum(backoffs):.0f}ms"
+            )
 
-                _trace(
-                    f"[TX] Setting timeout: {final_timeout_ms}ms "
-                    f"(tOut={driver_timeout}) for {length} bytes"
-                )
+        try:
+            while True:
+                async with self._tx_lock:
+                    # Cleared once the radio is known to be receiving again.
+                    standby = True
+                    try:
+                        try:
+                            busy, scanned = await self._channel_busy_once()
+                        except Exception as e:
+                            logger.warning(
+                                f"[LBT] Channel check failed: {e}, " "proceeding with transmission"
+                            )
+                            _summary("exception")
+                            committed = True
+                            return await self._commit_tx(data, backoffs)
 
-                # Prepare for TX and capture LBT metrics
-                tx_ready, lbt_backoff_delays = await self._prepare_radio_for_tx()
-                if not tx_ready:
-                    raise RuntimeError("Radio not ready for TX")
+                        cad_checks += scanned
+                        latch_defers += busy and not scanned
 
-                self._prepare_packet_transmission(data_list, length)
+                        if not busy:
+                            _trace("[LBT] Channel clear")
+                            _summary("clear")
+                            committed = True
+                            return await self._commit_tx(data, backoffs)
 
-                # Setup TX interrupts AFTER CAD checks (CAD changes interrupt config)
-                self._setup_tx_interrupts()
-                await asyncio.sleep(self.RADIO_TIMING_DELAY)
-                self.lora.setTxPower(self.tx_power, self.lora.TX_POWER_SX1262)
+                        if time.monotonic() >= deadline:
+                            # Send anyway rather than stall the TX queue. Mirrors
+                            # MeshCore once getCADFailMaxDuration() elapses.
+                            logger.warning(
+                                f"[LBT] Budget exhausted "
+                                f"({self.lbt_max_wait_seconds:.1f}s) - "
+                                "channel still busy, transmitting anyway"
+                            )
+                            _summary("forced")
+                            committed = True
+                            return await self._commit_tx(data, backoffs)
 
-                if not await self._execute_transmission(driver_timeout):
-                    raise RuntimeError("Radio failed to start TX")
+                        # Re-arm RX only after a CAD scan, which leaves the radio
+                        # in standby. After the passive check the radio is still
+                        # receiving, and re-arming would abort that reception.
+                        if scanned:
+                            await self._restore_rx_for_cad_backoff()
+                        standby = False
+                    finally:
+                        # _commit_tx restores RX on its own paths. Doing it here,
+                        # under the lock we already hold, avoids re-acquiring it in
+                        # send()'s finally where an await can be cancelled.
+                        if standby and not committed:
+                            await self._restore_rx_mode()
 
-                tx_ok = await self._wait_for_transmission_complete(timeout_seconds)
-                if not tx_ok:
-                    raise RuntimeError("TX completion timeout")
-
-                self._finalize_transmission()
-
-                # Trigger TX LED
-                self._gpio_manager.blink_led(self.txled_pin)
-
-                logger.debug(f"[TX] Done {length}B airtime={airtime_ms:.0f}ms")
-
-                # Build and return transmission metadata
-                return {
-                    "airtime_ms": airtime_ms,
-                    "lbt_attempts": len(lbt_backoff_delays),
-                    "lbt_backoff_delays_ms": lbt_backoff_delays,
-                    "lbt_channel_busy": len(lbt_backoff_delays) > 0,
-                }
-
-            except Exception as e:
-                logger.error(f"[TX] Send failed: {e}")
-                raise
-            finally:
-                # Always leave radio in RX continuous mode after TX
-                await self._restore_rx_mode()
+                delay_ms = self.lbt_retry_interval_ms * random.uniform(0.5, 1.5)
+                remaining_ms = (deadline - time.monotonic()) * 1000.0
+                delay_ms = max(10.0, min(delay_ms, remaining_ms))
+                # Whole milliseconds: the list is reported and persisted as-is
+                # downstream, and sub-ms decimals are noise on a jittered wait.
+                backoffs.append(round(delay_ms))
+                logger.debug(f"[LBT] Channel busy - retrying in {delay_ms:.0f}ms")
+                await asyncio.sleep(delay_ms / 1000.0)
+        except Exception as e:
+            logger.error(f"[TX] Send failed: {e}")
+            raise
+        finally:
+            self._tx_in_progress = False
 
     async def wait_for_rx(self) -> bytes:
         """Not implemented: use set_rx_callback instead."""
@@ -1586,8 +1607,8 @@ class SX1262Radio(LoRaRadio):
         if now - self._last_sample_check < self.NOISE_FLOOR_UPDATE_INTERVAL:
             return
 
-        # Don't sample during TX operations.
-        if self._tx_lock.locked():
+        # Don't sample during TX operations. _tx_lock is free across backoffs.
+        if self._tx_in_progress:
             return
 
         # Don't sample if packet processing is active or RX terminal IRQs are pending.
@@ -1651,7 +1672,7 @@ class SX1262Radio(LoRaRadio):
             return None
 
         # Unavailable while TX is active; callers should treat None as "no sample".
-        if hasattr(self, "_tx_lock") and self._tx_lock.locked():
+        if getattr(self, "_tx_in_progress", False):
             return None
 
         # No accepted background sample yet; internal -120.0 is a reset sentinel.
@@ -1726,8 +1747,9 @@ class SX1262Radio(LoRaRadio):
         cr = coding_rate if coding_rate is not None else self.coding_rate
         ldro = sf >= 11 and bw <= 125000
 
+        # _tx_lock is free across LBT backoffs; this is not.
         deadline = time.monotonic() + 10.0
-        while self._tx_lock.locked():
+        while self._tx_in_progress:
             if time.monotonic() > deadline:
                 logger.error("configure_radio: TX did not complete within 10s")
                 return False

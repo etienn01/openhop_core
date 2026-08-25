@@ -385,48 +385,37 @@ class TestInterruptHandlerDispatch:
 # ===========================================================================
 
 
+TERMINAL_IRQS = [IRQ_RX_DONE, IRQ_CRC_ERR, IRQ_TIMEOUT, IRQ_HEADER_ERR]
+
+
 class TestIrqSuppressionDuringTx:
-    """Terminal RX interrupts must be ignored while _tx_lock is held."""
+    """RX wake-ups are gated on buffer ownership, not on _tx_lock."""
 
-    async def test_rx_done_suppressed_while_tx_locked(self, radio):
-        async with radio._tx_lock:
-            radio._rx_done_event.clear()
-            _inject_irq(radio, IRQ_RX_DONE)
-            assert not radio._rx_done_event.is_set(), (
-                "RX_DONE must NOT wake background task during active TX"
-            )
-
-    async def test_crc_err_suppressed_while_tx_locked(self, radio):
-        async with radio._tx_lock:
-            radio._rx_done_event.clear()
-            _inject_irq(radio, IRQ_CRC_ERR)
-            assert not radio._rx_done_event.is_set()
-
-    async def test_timeout_irq_suppressed_while_tx_locked(self, radio):
-        async with radio._tx_lock:
-            radio._rx_done_event.clear()
-            _inject_irq(radio, IRQ_TIMEOUT)
-            assert not radio._rx_done_event.is_set()
-
-    async def test_header_err_suppressed_while_tx_locked(self, radio):
-        async with radio._tx_lock:
-            radio._rx_done_event.clear()
-            _inject_irq(radio, IRQ_HEADER_ERR)
-            assert not radio._rx_done_event.is_set()
-
-    async def test_tx_done_event_fires_even_while_tx_locked(self, radio):
-        """TX_DONE must still propagate so the sender coroutine can unblock."""
-        async with radio._tx_lock:
-            radio._tx_done_event.clear()
-            _inject_irq(radio, IRQ_TX_DONE)
-            assert radio._tx_done_event.is_set()
-
-    async def test_rx_done_allowed_after_tx_lock_released(self, radio):
-        async with radio._tx_lock:
-            pass  # acquire and immediately release
+    @pytest.mark.parametrize("irq", TERMINAL_IRQS)
+    async def test_terminal_irq_suppressed_while_tx_buffer_busy(self, radio, irq):
+        """Reading the chip buffer between writeBuffer and TX completion would
+        return TX bytes, not a packet."""
+        radio._tx_buffer_busy = True
         radio._rx_done_event.clear()
-        _inject_irq(radio, IRQ_RX_DONE)
-        assert radio._rx_done_event.is_set()
+        _inject_irq(radio, irq)
+        assert not radio._rx_done_event.is_set()
+
+    @pytest.mark.parametrize("irq", TERMINAL_IRQS)
+    async def test_terminal_irq_delivered_while_only_tx_lock_held(self, radio, irq):
+        """Regression: _tx_lock is held across LBT backoffs. Suppressing there
+        destroys the wake-up (asyncio.Event has no counter), so the packet is
+        only recoverable by a later drain -- the cause of the measured loss."""
+        async with radio._tx_lock:
+            radio._rx_done_event.clear()
+            _inject_irq(radio, irq)
+            assert radio._rx_done_event.is_set()
+
+    async def test_tx_done_event_fires_even_while_tx_buffer_busy(self, radio):
+        """TX_DONE must still propagate so the sender coroutine can unblock."""
+        radio._tx_buffer_busy = True
+        radio._tx_done_event.clear()
+        _inject_irq(radio, IRQ_TX_DONE)
+        assert radio._tx_done_event.is_set()
 
 
 # ===========================================================================
@@ -1071,9 +1060,8 @@ class TestStateManagement:
 class TestNoiseFloorSampling:
     """Guard conditions and calculation correctness for noise-floor sampler."""
 
-    def test_no_sample_when_tx_lock_held(self, radio):
-        radio._tx_lock = MagicMock()
-        radio._tx_lock.locked.return_value = True
+    def test_no_sample_while_send_in_flight(self, radio):
+        radio._tx_in_progress = True
         with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=10.0):
             radio._sample_noise_floor()
         radio.lora.getRssiInst.assert_not_called()
@@ -1190,11 +1178,10 @@ class TestNoiseFloorSampling:
         radio.lora = None
         assert radio.get_noise_floor() is None
 
-    def test_get_noise_floor_returns_none_while_tx_lock_held(self, radio):
+    def test_get_noise_floor_returns_none_while_send_in_flight(self, radio):
         radio._num_floor_samples = 1
         radio._noise_floor = -101.5
-        radio._tx_lock = MagicMock()
-        radio._tx_lock.locked.return_value = True
+        radio._tx_in_progress = True
         assert radio.get_noise_floor() is None
 
     def test_get_noise_floor_returns_none_for_uninitialized_internal_sentinel(
@@ -1325,24 +1312,16 @@ class TestEventOrdering:
         )
         assert read_idx < write_idx
 
-    async def test_rx_done_while_tx_lock_held_is_latched_and_drained_before_tx_reuse(
+    async def test_latched_packet_is_read_out_before_tx_reuses_the_buffer(
         self, radio, mock_lora
     ):
+        """TX(0x00) and RX(0x80) each get 128 bytes of one 256-byte FIFO, but
+        packets reach 238, so an unread reception must leave the chip before
+        writeBuffer runs."""
         received = []
         radio.set_rx_callback(received.append)
 
-        await radio._tx_lock.acquire()
-        try:
-            # IRQ arrives while TX lock is held: hardware IRQ is cleared and
-            # background RX task is not woken, so software latch must preserve it.
-            mock_lora.getIrqStatus.return_value = mock_lora.IRQ_RX_DONE
-            radio._handle_interrupt()
-        finally:
-            radio._tx_lock.release()
-
-        assert radio._pending_rx_irq_status & mock_lora.IRQ_RX_DONE
-        assert not radio._rx_done_event.is_set()
-
+        radio._pending_rx_irq_status = mock_lora.IRQ_RX_DONE
         mock_lora.getRxBufferStatus.return_value = (4, 0x80)
         mock_lora.readBuffer.return_value = list(b"test")
 
@@ -1350,6 +1329,7 @@ class TestEventOrdering:
         await radio.send(b"outbound")
 
         assert received == [b"test"]
+        assert radio._pending_rx_irq_status == 0
 
         read_idx = next(
             i
@@ -2172,22 +2152,15 @@ class TestFIFOCorruptionRace:
         mock_lora.setTx.side_effect = _track_setTx
         mock_lora.request.side_effect = _track_request
 
-        async def _legacy_prepare_radio_for_tx():
-            radio._tx_done_event.clear()
-            # Intentionally omit: radio._rx_done_event.clear()
-            radio.lora.setStandby(radio.lora.STANDBY_RC)
-            await asyncio.sleep(radio.RADIO_TIMING_DELAY)
-            return True, []
-
         async def _legacy_rx_irq_background_task():
             await radio._rx_done_event.wait()
             radio._rx_done_event.clear()
             # Intentionally unguarded to emulate legacy behavior.
             radio.lora.request(radio.lora.RX_CONTINUOUS)
 
-        monkeypatch.setattr(
-            radio, "_prepare_radio_for_tx", _legacy_prepare_radio_for_tx
-        )
+        # Reproduce the legacy omission of _rx_done_event.clear() in the TX
+        # commit without restating _commit_tx here.
+        monkeypatch.setattr(radio._rx_done_event, "clear", lambda: None)
         monkeypatch.setattr(
             radio, "_rx_irq_background_task", _legacy_rx_irq_background_task
         )
@@ -2432,9 +2405,8 @@ class TestCoverageGapBranches:
         mock_lora.sleep.side_effect = RuntimeError("sleep failed")
         radio.sleep()  # must not raise
 
-    def test_get_noise_floor_returns_none_while_tx_lock_held(self, radio):
-        radio._tx_lock = MagicMock()
-        radio._tx_lock.locked.return_value = True
+    def test_get_noise_floor_returns_none_while_send_in_flight(self, radio):
+        radio._tx_in_progress = True
         assert radio.get_noise_floor() is None
 
     def test_noise_floor_sampling_handles_rssi_read_exception(self, radio, mock_lora):
