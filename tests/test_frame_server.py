@@ -8,7 +8,6 @@ import sys
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-
 from openhop_core.companion.constants import (
     CMD_GET_CUSTOM_VARS,
     CMD_GET_DEVICE_TIME,
@@ -61,7 +60,10 @@ from openhop_core.companion.constants import (
     RESP_CODE_TUNING_PARAMS,
     STATS_TYPE_PACKETS,
 )
-from openhop_core.companion.frame_server import CompanionFrameServer, _build_advert_push_frames
+from openhop_core.companion.frame_server import (
+    CompanionFrameServer,
+    _build_advert_push_frames,
+)
 from openhop_core.companion.models import (
     Channel,
     Contact,
@@ -1436,9 +1438,9 @@ class _SocketWriter:
 def test_configure_socket_survives_missing_tcp_keepalive_constant(monkeypatch, caplog):
     """A Python build lacking socket.TCP_KEEPALIVE must not crash client setup.
 
-    Some Python builds (observed: Python 3.9.6 on macOS) do not expose
-    socket.TCP_KEEPALIVE at all, so referencing it raises AttributeError rather
-    than the OSError the platform branch already guards against.
+    Some Python/macOS builds do not expose socket.TCP_KEEPALIVE at all, so
+    referencing it raises AttributeError rather than the OSError the platform
+    branch already guards against.
     """
     caplog.set_level(logging.DEBUG, logger="CompanionFrameServer")
     monkeypatch.setattr(sys, "platform", "darwin")
@@ -1509,7 +1511,10 @@ async def test_cmd_send_raw_packet_too_short():
 def test_parse_binary_response_regions():
     """Anon REGIONS response decodes clock + comma-separated region names."""
     from openhop_core.companion import binary_parsing
-    from openhop_core.companion.constants import ANON_REQ_TYPE_REGIONS, PROTOCOL_CODE_ANON_REQ
+    from openhop_core.companion.constants import (
+        ANON_REQ_TYPE_REGIONS,
+        PROTOCOL_CODE_ANON_REQ,
+    )
 
     # response_data (tag already stripped) = clock(4) + null-terminated name list
     data = struct.pack("<I", 0x11223344) + b"home,usa,*\x00"
@@ -1525,7 +1530,10 @@ def test_parse_binary_response_anon_not_mistaken_for_owner_info():
     """A REGIONS anon response must NOT be parsed as REQ owner-info, even though
     both carry numeric type 0x07."""
     from openhop_core.companion import binary_parsing
-    from openhop_core.companion.constants import ANON_REQ_TYPE_REGIONS, PROTOCOL_CODE_ANON_REQ
+    from openhop_core.companion.constants import (
+        ANON_REQ_TYPE_REGIONS,
+        PROTOCOL_CODE_ANON_REQ,
+    )
 
     data = struct.pack("<I", 0) + b"alpha\x00"
     parsed = binary_parsing.parse_binary_response(

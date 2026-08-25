@@ -11,17 +11,17 @@ authors = [
 description = "A Python MeshCore library with SPI LoRa radio support"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Communications",
     "Topic :: System :: Networking",
 ]
@@ -56,7 +56,7 @@ test = [
     "pyserial>=3.5",
 ]
 # The full local toolchain. Note this pulls in black, which requires Python
-# 3.10+, so [dev] is not installable on 3.9 -- use [test] there.
+# 3.10+.
 dev = [
     "openhop_core[test]",
     "black>=26.5.1",
@@ -83,7 +83,7 @@ exclude = ["__pycache__*", "*.pyc", "*.pyo"]
 
 [tool.black]
 line-length = 100
-target-version = ['py38']
+target-version = ['py310']
 
 [tool.isort]
 profile = "black"

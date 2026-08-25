@@ -211,8 +211,8 @@ class Dispatcher:
         self._fallback_handler = None
 
         # Cooperative shutdown for run_forever / MeshNode.stop. Events are
-        # created lazily on the running loop (Python 3.9 binds Event to a loop
-        # at construction; __init__ may run before the test/app loop exists).
+        # created lazily on the running loop because __init__ may run before
+        # the test/app event loop exists.
         self._stop_event: Optional[asyncio.Event] = None
         self._stopped_event: Optional[asyncio.Event] = None
         self._run_forever_active = False
