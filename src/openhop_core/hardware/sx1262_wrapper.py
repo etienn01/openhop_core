@@ -243,6 +243,7 @@ class SX1262Radio(LoRaRadio):
         # airtime so a lost terminal IRQ cannot wedge TX.
         self._rx_activity_at: float = 0.0
         self._rx_header_at: float = 0.0
+        self._rx_header_seen = False
         self._last_cad_irq_status = 0
 
         # Custom CAD thresholds (None means use defaults)
@@ -264,6 +265,7 @@ class SX1262Radio(LoRaRadio):
         # Radio metrics
         self.crc_error_count = 0
 
+        self.header_error_count = 0
         logger.info(
             f"SX1262Radio configured: freq={frequency / 1e6:.1f}MHz, "
             f"power={tx_power}dBm, sf={spreading_factor}, "
@@ -447,6 +449,7 @@ class SX1262Radio(LoRaRadio):
                     elif self._rx_activity_at <= 0:
                         self._rx_activity_at = now_mono
                 if irqStat & terminal_interrupts:
+                    self._rx_header_seen = self._rx_header_at > 0  # before reset below
                     self._rx_activity_at = 0.0
                     self._rx_header_at = 0.0
 
@@ -500,6 +503,14 @@ class SX1262Radio(LoRaRadio):
             if not self._tx_buffer_busy:
                 self._rx_done_event.set()
 
+    def _header_failed(self, irq: int) -> bool:
+        """Header CRC failed and none validated: length/payload untrustworthy.
+
+        Uses the software latch, not IRQ_HEADER_VALID: that bit arrives as its
+        own IRQ and is cleared before any terminal one.
+        """
+        return bool(irq & self.lora.IRQ_HEADER_ERR) and not self._rx_header_seen
+
     async def _drain_pending_rx_irq_before_buffer_reuse(self) -> None:
         """Drain latched packet-bearing RX IRQ state before CAD/TX buffer reuse."""
         if not self._pending_rx_irq_status:
@@ -514,6 +525,9 @@ class SX1262Radio(LoRaRadio):
             try:
                 if pending_irq & self.lora.IRQ_CRC_ERR:
                     self.crc_error_count += 1
+                elif self._header_failed(pending_irq):
+                    self.header_error_count += 1
+                    logger.debug(f"[RX] Discarded corrupt-header packet (0x{pending_irq:04X})")
                 elif pending_irq & self.lora.IRQ_RX_DONE:
                     payloadLengthRx, rxStartBufferPointer = self.lora.getRxBufferStatus()
                     packet_rssi_dbm, snr_db, signal_rssi_dbm = self.lora.getSignalMetrics()
@@ -529,8 +543,6 @@ class SX1262Radio(LoRaRadio):
                             f"({len(callback_packet_data)} bytes)"
                         )
 
-                if pending_irq & self.lora.IRQ_HEADER_ERR:
-                    logger.debug("[RX] Drained pending HEADER_ERR before TX/CAD")
             finally:
                 # Clear only after the latched IRQ state has been consumed.
                 self._pending_rx_irq_status = 0
@@ -654,6 +666,12 @@ class SX1262Radio(LoRaRadio):
                                             self.crc_error_count,
                                             diag_err,
                                         )
+                                elif self._header_failed(irqStat):
+                                    self.header_error_count += 1
+                                    logger.debug(
+                                        f"[RX] Discarded corrupt-header packet "
+                                        f"(0x{irqStat:04X})"
+                                    )
                                 elif irqStat & self.lora.IRQ_RX_DONE:
                                     (
                                         payloadLengthRx,

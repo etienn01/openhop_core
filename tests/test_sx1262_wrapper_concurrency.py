@@ -1313,6 +1313,40 @@ class TestEventOrdering:
         )
         assert read_idx < write_idx
 
+    async def test_corrupt_header_packet_is_not_delivered(self, radio, mock_lora):
+        """0x0022 (RX_DONE | HEADER_ERR) was observed on-air being delivered as a
+        valid 40-byte packet. The chip excludes it from NbPktReceived; the header
+        never decoded, so the length driving readBuffer is untrustworthy."""
+        received = []
+        radio.set_rx_callback(received.append)
+
+        radio._rx_header_seen = False  # no header ever validated
+        radio._pending_rx_irq_status = IRQ_RX_DONE | IRQ_HEADER_ERR
+        mock_lora.getRxBufferStatus.return_value = (40, 0x80)
+        mock_lora.readBuffer.return_value = list(b"x" * 40)
+
+        await radio._drain_pending_rx_irq_before_buffer_reuse()
+
+        assert received == []
+        assert radio.header_error_count == 1
+        mock_lora.readBuffer.assert_not_called()
+
+    async def test_stale_header_err_after_a_valid_header_still_delivers(self, radio, mock_lora):
+        """IRQ_reg accumulates (datasheet 13.3.2), so a HEADER_ERR left by an
+        earlier reception can pair with a good RX_DONE. If a header validated
+        for this reception, the packet is sound and must not be dropped."""
+        received = []
+        radio.set_rx_callback(received.append)
+
+        radio._rx_header_seen = True  # HEADER_VALID seen for this reception
+        radio._pending_rx_irq_status = IRQ_RX_DONE | IRQ_HEADER_ERR
+        mock_lora.getRxBufferStatus.return_value = (4, 0x80)
+        mock_lora.readBuffer.return_value = list(b"test")
+
+        await radio._drain_pending_rx_irq_before_buffer_reuse()
+
+        assert received == [b"test"]
+
     async def test_latched_packet_is_read_out_before_tx_reuses_the_buffer(
         self, radio, mock_lora
     ):
