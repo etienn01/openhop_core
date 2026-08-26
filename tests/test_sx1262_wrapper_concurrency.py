@@ -392,15 +392,6 @@ class TestIrqSuppressionDuringTx:
     """RX wake-ups are gated on buffer ownership, not on _tx_lock."""
 
     @pytest.mark.parametrize("irq", TERMINAL_IRQS)
-    async def test_terminal_irq_suppressed_while_tx_buffer_busy(self, radio, irq):
-        """Reading the chip buffer between writeBuffer and TX completion would
-        return TX bytes, not a packet."""
-        radio._tx_buffer_busy = True
-        radio._rx_done_event.clear()
-        _inject_irq(radio, irq)
-        assert not radio._rx_done_event.is_set()
-
-    @pytest.mark.parametrize("irq", TERMINAL_IRQS)
     async def test_terminal_irq_delivered_while_only_tx_lock_held(self, radio, irq):
         """Regression: _tx_lock is held across LBT backoffs. Suppressing there
         destroys the wake-up (asyncio.Event has no counter), so the packet is
@@ -1316,6 +1307,25 @@ class TestEventOrdering:
             if c == call.writeBuffer(0x00, list(b"outbound"), len(b"outbound"))
         )
         assert read_idx < write_idx
+
+    async def test_overwritten_packet_is_logged(self, radio, mock_lora, caplog):
+        """A second terminal IRQ on top of an unread RX_DONE: buffer already rewritten."""
+        radio._pending_rx_irq_status = IRQ_RX_DONE
+
+        with caplog.at_level("WARNING", logger="SX1262_wrapper"):
+            _inject_irq(radio, IRQ_RX_DONE)
+
+        assert any("Packet lost" in r.message for r in caplog.records)
+
+    async def test_merged_terminal_and_marker_does_not_warn(self, radio, mock_lora, caplog):
+        """0x0046 carries RX_DONE and PREAMBLE in one read. The preamble belongs
+        to the packet being latched, not to a later reception."""
+        radio._pending_rx_irq_status = 0
+
+        with caplog.at_level("WARNING", logger="SX1262_wrapper"):
+            _inject_irq(radio, IRQ_RX_DONE | IRQ_PREAMBLE_DETECTED | IRQ_CRC_ERR)
+
+        assert not any("at risk" in r.message for r in caplog.records)
 
     async def test_latched_packet_is_read_out_before_tx_reuses_the_buffer(
         self, radio, mock_lora

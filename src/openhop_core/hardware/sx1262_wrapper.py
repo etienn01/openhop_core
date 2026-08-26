@@ -389,6 +389,9 @@ class SX1262Radio(LoRaRadio):
                 return
 
             irqStat = self.lora.getIrqStatus()
+            # Snapshot before this IRQ's own bits are latched below, or a single
+            # read carrying both a terminal and a marker flags itself.
+            unread = self._pending_rx_irq_status & self.lora.IRQ_RX_DONE
 
             # Preserve packet-bearing RX terminal IRQs in software before the
             # hardware IRQ status is cleared.
@@ -396,6 +399,10 @@ class SX1262Radio(LoRaRadio):
                 self.lora.IRQ_RX_DONE | self.lora.IRQ_CRC_ERR | self.lora.IRQ_HEADER_ERR
             )
             if irqStat & rx_packet_irq_mask:
+                if unread:
+                    logger.warning(
+                        f"[RX] Packet lost: unread RX_DONE overwritten by " f"IRQ 0x{irqStat:04X}"
+                    )
                 self._pending_rx_irq_status |= irqStat & rx_packet_irq_mask
 
             if irqStat != 0:
@@ -437,6 +444,11 @@ class SX1262Radio(LoRaRadio):
                     | self.lora.IRQ_HEADER_VALID
                 )
                 if irqStat & reception_markers:
+                    if unread:
+                        logger.warning(
+                            f"[RX] Unread packet at risk: reception started "
+                            f"(IRQ 0x{irqStat:04X})"
+                        )
                     now_mono = time.monotonic()
                     if irqStat & self.lora.IRQ_HEADER_VALID:
                         # Header valid restarts the clock onto the longer bound.
