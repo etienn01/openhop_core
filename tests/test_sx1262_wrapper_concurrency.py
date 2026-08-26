@@ -678,9 +678,14 @@ class TestTransmissionLifecycle:
         await radio._restore_rx_mode()
         mock_lora.request.assert_called_with(mock_lora.RX_CONTINUOUS)
 
-    async def test_restore_rx_mode_clears_irq_multiple_times(self, radio, mock_lora):
+    async def test_restore_rx_mode_follows_datasheet_order(self, radio, mock_lora):
+        """Datasheet 14.3: standby, then SetDioIrqParams, then SetRx."""
         await radio._restore_rx_mode()
-        assert mock_lora.clearIrqStatus.call_count >= 2
+        names = [c[0] for c in mock_lora.method_calls]
+        assert names.index("setStandby") < names.index("setDioIrqParams")
+        assert names.index("setDioIrqParams") < names.index("request")
+        # IRQs are cleared before re-arming, not after entering RX.
+        assert names.index("clearIrqStatus") < names.index("request")
 
     async def test_restore_rx_mode_exception_swallowed(self, radio, mock_lora):
         mock_lora.clearIrqStatus.side_effect = RuntimeError("SPI failure")

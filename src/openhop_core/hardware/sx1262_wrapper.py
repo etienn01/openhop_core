@@ -1153,7 +1153,7 @@ class SX1262Radio(LoRaRadio):
         return bool(busy), True
 
     async def _commit_tx(self, data: bytes, backoffs: list[int]) -> dict:
-        """Stage and transmit one packet. Caller must hold _tx_lock."""
+        """Stage and transmit one packet. Caller holds _tx_lock and restores RX."""
         self._tx_done_event.clear()
         self._rx_done_event.clear()
 
@@ -1225,8 +1225,6 @@ class SX1262Radio(LoRaRadio):
             self._gpio_manager.blink_led(self.txled_pin)
         finally:
             self._tx_buffer_busy = False
-            # Always leave radio in RX continuous mode after TX
-            await self._restore_rx_mode()  # under the caller's _tx_lock
 
         logger.debug(f"[TX] Done {length}B airtime={airtime_ms:.0f}ms")
 
@@ -1237,31 +1235,6 @@ class SX1262Radio(LoRaRadio):
             "lbt_backoff_delays_ms": backoffs,
             "lbt_channel_busy": len(backoffs) > 0,
         }
-
-    async def _restore_rx_for_cad_backoff(self) -> None:
-        """Restore RX_CONTINUOUS between busy CAD retries."""
-        # Deterministic transition sequence:
-        # clear IRQs -> standby -> disable IRQ routes -> set RX IRQ routes -> RX_CONTINUOUS.
-        # This keeps receive downtime minimal while preserving a fresh CAD immediately
-        # before each transmit attempt.
-        self.lora.clearIrqStatus(0xFFFF)
-        self.lora.setStandby(self.lora.STANDBY_RC)
-        await asyncio.sleep(self.RADIO_TIMING_DELAY)
-        self.lora.setDioIrqParams(
-            self.lora.IRQ_NONE,
-            self.lora.IRQ_NONE,
-            self.lora.IRQ_NONE,
-            self.lora.IRQ_NONE,
-        )
-        await asyncio.sleep(0.001)
-        self.lora.clearIrqStatus(0xFFFF)
-        rx_mask = self._get_rx_irq_mask()
-        self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
-        await asyncio.sleep(0.001)
-        self._control_tx_rx_pins(tx_mode=False)
-        self.lora.request(self.lora.RX_CONTINUOUS)
-        await asyncio.sleep(self.RADIO_TIMING_DELAY)
-        self.lora.clearIrqStatus(0xFFFF)
 
     def _control_tx_rx_pins(self, tx_mode: bool) -> None:
         """Control TXEN/RXEN pins for the E22 module (simple and deterministic)."""
@@ -1436,50 +1409,31 @@ class SX1262Radio(LoRaRadio):
         self._control_tx_rx_pins(tx_mode=False)
 
     async def _restore_rx_mode(self) -> None:
-        """Restore radio to RX continuous mode after transmission"""
-        _trace("[TX->RX] Starting RX mode restoration after transmission")
+        """Return the radio to RX_CONTINUOUS.
+
+        Command order per SX1261/2 datasheet 14.3: standby, SetDioIrqParams,
+        SetRx. The RF switch is set first so the receive path is connected
+        before the chip starts listening.
+        """
         try:
-            if self.lora:
-                # Critical sequence to prevent interrupt race conditions
+            if not self.lora:
+                return
 
-                # Step 1: Clear all interrupts first
-                self.lora.clearIrqStatus(0xFFFF)
+            self._control_tx_rx_pins(tx_mode=False)
 
-                # Step 2: Put radio in standby
-                self.lora.setStandby(self.lora.STANDBY_RC)
-                await asyncio.sleep(self.RADIO_TIMING_DELAY)
+            self.lora.setStandby(self.lora.STANDBY_RC)
+            await asyncio.sleep(self.RADIO_TIMING_DELAY)
 
-                # Step 3: Disable all interrupts temporarily during reconfiguration
-                self.lora.setDioIrqParams(
-                    self.lora.IRQ_NONE,
-                    self.lora.IRQ_NONE,
-                    self.lora.IRQ_NONE,
-                    self.lora.IRQ_NONE,
-                )
-                await asyncio.sleep(0.001)
+            self.lora.clearIrqStatus(0xFFFF)
+            rx_mask = self._get_rx_irq_mask()
+            self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
 
-                # Step 4: Clear any interrupts that may have fired
-                self.lora.clearIrqStatus(0xFFFF)
+            self.lora.request(self.lora.RX_CONTINUOUS)
+            await asyncio.sleep(self.RADIO_TIMING_DELAY)
 
-                # Step 5: Restore RX interrupt configuration
-                rx_mask = self._get_rx_irq_mask()
-                self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
-                await asyncio.sleep(0.001)
-
-                # Step 6: Start RX mode
-                self.lora.request(self.lora.RX_CONTINUOUS)
-                await asyncio.sleep(self.RADIO_TIMING_DELAY)
-
-                # Step 7: Final interrupt clear to start fresh
-                self.lora.clearIrqStatus(0xFFFF)
-
-                # Always restore external RF switch control pins to RX mode
-                self._control_tx_rx_pins(tx_mode=False)
-
-                _trace("[TX->RX] RX mode restoration completed")
-
+            _trace("[RX] RX_CONTINUOUS restored")
         except Exception as e:
-            logger.warning(f"[TX->RX] Failed to restore RX mode after TX: {e}")
+            logger.warning(f"[RX] Failed to restore RX mode: {e}")
 
     async def send(self, data: bytes) -> dict:
         """Send a packet asynchronously. Returns transmission metadata including LBT metrics."""
@@ -1496,7 +1450,6 @@ class SX1262Radio(LoRaRadio):
         latch_defers = 0
         cad_checks = 0
         self._tx_in_progress = True
-        committed = False
 
         def _summary(outcome: str) -> None:
             logger.debug(
@@ -1509,8 +1462,8 @@ class SX1262Radio(LoRaRadio):
         try:
             while True:
                 async with self._tx_lock:
-                    # Cleared once the radio is known to be receiving again.
-                    standby = True
+                    scanned = False
+                    committed = False
                     try:
                         try:
                             busy, scanned = await self._channel_busy_once()
@@ -1543,17 +1496,12 @@ class SX1262Radio(LoRaRadio):
                             committed = True
                             return await self._commit_tx(data, backoffs)
 
-                        # Re-arm RX only after a CAD scan, which leaves the radio
-                        # in standby. After the passive check the radio is still
-                        # receiving, and re-arming would abort that reception.
-                        if scanned:
-                            await self._restore_rx_for_cad_backoff()
-                        standby = False
                     finally:
-                        # _commit_tx restores RX on its own paths. Doing it here,
-                        # under the lock we already hold, avoids re-acquiring it in
-                        # send()'s finally where an await can be cancelled.
-                        if standby and not committed:
+                        # Always leave radio in RX continuous mode after TX.
+                        # A CAD scan leaves standby behind too; after a passive
+                        # check the radio is still receiving and re-arming it
+                        # would abort that reception.
+                        if scanned or committed:
                             await self._restore_rx_mode()
 
                 delay_ms = self.lbt_retry_interval_ms * random.uniform(0.5, 1.5)

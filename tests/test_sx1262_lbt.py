@@ -171,7 +171,7 @@ async def test_lbt_defers_to_in_progress_reception_without_cad(radio):
     is probing for. The CAD scan happens only once the latch clears."""
     _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
     radio.perform_cad = AsyncMock(return_value=False)
-    radio._restore_rx_for_cad_backoff = AsyncMock()
+    radio._restore_rx_mode = AsyncMock()
 
     async def _finish_reception():
         await asyncio.sleep(0.05)
@@ -198,7 +198,7 @@ async def test_lbt_does_not_touch_the_radio_while_a_reception_is_latched(radio):
     """
     _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
     radio.perform_cad = AsyncMock(return_value=False)
-    radio._restore_rx_for_cad_backoff = AsyncMock()
+    radio._restore_rx_mode = AsyncMock()
 
     async def _finish_reception():
         await asyncio.sleep(0.05)
@@ -210,7 +210,8 @@ async def test_lbt_does_not_touch_the_radio_while_a_reception_is_latched(radio):
 
     assert success is True
     assert delays  # at least one deferral happened on the latch alone
-    radio._restore_rx_for_cad_backoff.assert_not_awaited()
+    # Only _commit_tx restores RX; the passive defer must not re-arm.
+    assert radio._restore_rx_mode.await_count == 1
     # The only standby is the post-LBT TX staging: none during the deferral.
     assert radio.lora.setStandby.call_count == 1
 
@@ -235,7 +236,7 @@ async def test_lbt_budget_is_time_bounded_with_short_retries(radio):
     """A busy channel is re-checked on short jittered intervals for the
     whole TIME budget, however long the occupation lasts."""
     radio.perform_cad = AsyncMock(return_value=True)
-    radio._restore_rx_for_cad_backoff = AsyncMock()
+    radio._restore_rx_mode = AsyncMock()
 
     started = time.monotonic()
     success, delays = await _send(radio)
@@ -315,7 +316,7 @@ async def test_lbt_summary_reports_cad_clear(radio, caplog):
 async def test_lbt_summary_counts_latch_defers_separately_from_cad(radio, caplog):
     _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
     radio.perform_cad = AsyncMock(return_value=False)
-    radio._restore_rx_for_cad_backoff = AsyncMock()
+    radio._restore_rx_mode = AsyncMock()
 
     async def _finish_reception():
         await asyncio.sleep(0.05)
