@@ -149,6 +149,19 @@ async def test_header_valid_restarts_the_clock(radio):
     assert time.monotonic() - radio._rx_activity_at < 0.005
 
 
+async def _send(radio):
+    """Drive one full send. Returns (ok, lbt_backoff_delays_ms).
+
+    The TX tail is stubbed: these tests are about the LBT decision, and the
+    mock radio never raises TX_DONE.
+    """
+    radio._execute_transmission = AsyncMock(return_value=True)
+    radio._wait_for_transmission_complete = AsyncMock(return_value=True)
+    radio._restore_rx_mode = AsyncMock()
+    meta = await radio.send(b"payload")
+    return True, meta["lbt_backoff_delays_ms"]
+
+
 # ─── LBT: passive check first, no standby/CAD during a reception ─────
 
 
@@ -158,14 +171,14 @@ async def test_lbt_defers_to_in_progress_reception_without_cad(radio):
     is probing for. The CAD scan happens only once the latch clears."""
     _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
     radio.perform_cad = AsyncMock(return_value=False)
-    radio._restore_rx_for_cad_backoff = AsyncMock()
+    radio._restore_rx_mode = AsyncMock()
 
     async def _finish_reception():
         await asyncio.sleep(0.05)
         _inject_irq(radio, IRQ_RX_DONE)
 
     finisher = asyncio.create_task(_finish_reception())
-    success, delays = await radio._prepare_radio_for_tx()
+    success, delays = await _send(radio)
     await finisher
 
     assert success is True
@@ -185,19 +198,20 @@ async def test_lbt_does_not_touch_the_radio_while_a_reception_is_latched(radio):
     """
     _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
     radio.perform_cad = AsyncMock(return_value=False)
-    radio._restore_rx_for_cad_backoff = AsyncMock()
+    radio._restore_rx_mode = AsyncMock()
 
     async def _finish_reception():
         await asyncio.sleep(0.05)
         _inject_irq(radio, IRQ_RX_DONE)
 
     finisher = asyncio.create_task(_finish_reception())
-    success, delays = await radio._prepare_radio_for_tx()
+    success, delays = await _send(radio)
     await finisher
 
     assert success is True
     assert delays  # at least one deferral happened on the latch alone
-    radio._restore_rx_for_cad_backoff.assert_not_awaited()
+    # Only _commit_tx restores RX; the passive defer must not re-arm.
+    assert radio._restore_rx_mode.await_count == 1
     # The only standby is the post-LBT TX staging: none during the deferral.
     assert radio.lora.setStandby.call_count == 1
 
@@ -207,7 +221,7 @@ async def test_lbt_standby_only_after_channel_clear(radio):
     clear, never before the first channel check."""
     radio.perform_cad = AsyncMock(return_value=False)
 
-    await radio._prepare_radio_for_tx()
+    await _send(radio)
 
     # perform_cad is mocked (no internal standby) and no busy wait occurred,
     # so every setStandby call is the post-LBT TX staging.
@@ -238,10 +252,10 @@ async def test_lbt_budget_is_time_bounded_with_short_retries(radio):
     """A busy channel is re-checked on short jittered intervals for the
     whole TIME budget, however long the occupation lasts."""
     radio.perform_cad = AsyncMock(return_value=True)
-    radio._restore_rx_for_cad_backoff = AsyncMock()
+    radio._restore_rx_mode = AsyncMock()
 
     started = time.monotonic()
-    success, delays = await radio._prepare_radio_for_tx()
+    success, delays = await _send(radio)
     elapsed = time.monotonic() - started
 
     assert success is True  # forced TX at budget exhaustion, loudly logged
@@ -257,7 +271,7 @@ async def test_lbt_budget_is_time_bounded_with_short_retries(radio):
 async def test_lbt_clear_channel_transmits_without_waiting(radio):
     radio.perform_cad = AsyncMock(return_value=False)
 
-    success, delays = await radio._prepare_radio_for_tx()
+    success, delays = await _send(radio)
 
     assert success is True
     assert delays == []
@@ -276,7 +290,7 @@ async def test_forced_tx_clears_the_reception_latch(radio):
     _inject_irq(radio, IRQ_PREAMBLE_DETECTED)  # a reception that never finishes
     radio.perform_cad = AsyncMock(return_value=False)
 
-    success, delays = await radio._prepare_radio_for_tx()  # deadline -> forced TX
+    success, delays = await _send(radio)  # deadline -> forced TX
 
     assert success is True
     assert delays  # it did defer on the latch until the budget ran out
@@ -290,10 +304,10 @@ async def test_send_after_forced_tx_probes_the_channel_again(radio):
     radio._max_reception_seconds = lambda: 10.0
     _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
     radio.perform_cad = AsyncMock(return_value=False)
-    await radio._prepare_radio_for_tx()  # forced TX; must clear the latch
+    await _send(radio)  # forced TX; must clear the latch
 
     radio.perform_cad.reset_mock()
-    success, delays = await radio._prepare_radio_for_tx()
+    success, delays = await _send(radio)
 
     assert success is True
     assert delays == []  # no ghost deferral
@@ -307,7 +321,7 @@ async def test_lbt_summary_reports_cad_clear(radio, caplog):
     radio.perform_cad = AsyncMock(return_value=False)
 
     with caplog.at_level("DEBUG", logger="SX1262_wrapper"):
-        await radio._prepare_radio_for_tx()
+        await _send(radio)
 
     (summary,) = [r.message for r in caplog.records if "[LBT] Summary:" in r.message]
     assert "outcome=clear" in summary
@@ -318,7 +332,7 @@ async def test_lbt_summary_reports_cad_clear(radio, caplog):
 async def test_lbt_summary_counts_latch_defers_separately_from_cad(radio, caplog):
     _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
     radio.perform_cad = AsyncMock(return_value=False)
-    radio._restore_rx_for_cad_backoff = AsyncMock()
+    radio._restore_rx_mode = AsyncMock()
 
     async def _finish_reception():
         await asyncio.sleep(0.05)
@@ -326,7 +340,7 @@ async def test_lbt_summary_counts_latch_defers_separately_from_cad(radio, caplog
 
     finisher = asyncio.create_task(_finish_reception())
     with caplog.at_level("DEBUG", logger="SX1262_wrapper"):
-        await radio._prepare_radio_for_tx()
+        await _send(radio)
     await finisher
 
     (summary,) = [r.message for r in caplog.records if "[LBT] Summary:" in r.message]
