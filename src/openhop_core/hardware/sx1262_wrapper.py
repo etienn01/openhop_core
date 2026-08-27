@@ -168,6 +168,8 @@ class SX1262Radio(LoRaRadio):
         self._initialized = False
         self._rx_lock = asyncio.Lock()
         self._tx_lock = asyncio.Lock()
+        # Set from writeBuffer until TX completes.
+        self._tx_buffer_busy = False
 
         # GPIO management: prefer an explicitly provided manager (multi-CH341),
         # else a process-default external adapter manager, else a private
@@ -475,7 +477,7 @@ class SX1262Radio(LoRaRadio):
                 # Only wake the background task for TERMINAL interrupts
                 # Intermediate interrupts (preamble, sync, header valid) are just progress updates
                 if irqStat & terminal_interrupts:
-                    if not self._tx_lock.locked():
+                    if not self._tx_buffer_busy:
                         self._rx_done_event.set()
                         _trace(f"[RX] Terminal interrupt 0x{irqStat:04X} - waking background task")
                     else:
@@ -489,7 +491,7 @@ class SX1262Radio(LoRaRadio):
         except Exception as e:
             logger.error(f"IRQ handler error: {e}")
             self._tx_done_event.set()
-            if not self._tx_lock.locked():
+            if not self._tx_buffer_busy:
                 self._rx_done_event.set()
 
     async def _drain_pending_rx_irq_before_buffer_reuse(self) -> None:
@@ -1513,6 +1515,7 @@ class SX1262Radio(LoRaRadio):
                 if not tx_ready:
                     raise RuntimeError("Radio not ready for TX")
 
+                self._tx_buffer_busy = True
                 self._prepare_packet_transmission(data_list, length)
 
                 # Setup TX interrupts AFTER CAD checks (CAD changes interrupt config)
@@ -1527,6 +1530,7 @@ class SX1262Radio(LoRaRadio):
                 if not tx_ok:
                     raise RuntimeError("TX completion timeout")
 
+                self._tx_buffer_busy = False
                 self._finalize_transmission()
 
                 # Trigger TX LED
