@@ -1148,13 +1148,6 @@ class SX1262Radio(LoRaRadio):
     # ERROR. TRACE carries the chip-level minutiae.
     async def _prepare_radio_for_tx(self) -> tuple[bool, list[int]]:
         """Prepare radio hardware for transmission. Returns (success, lbt_backoff_delays_ms)."""
-        self._tx_done_event.clear()
-        self._rx_done_event.clear()
-
-        # Drain any packet-bearing RX IRQ that fired while TX was active and was
-        # latched in software before we begin CAD/TX buffer reuse.
-        await self._drain_pending_rx_irq_before_buffer_reuse()
-
         # Listen Before Talk, bounded in TIME rather than attempts: short
         # jittered retries run for the whole budget, keeping two nodes' checks
         # decorrelated and bounding the post-clear latency to one retry
@@ -1255,6 +1248,13 @@ class SX1262Radio(LoRaRadio):
             if self.lora.busyCheck():
                 logger.error("[TX] Radio stayed busy - aborting")
                 return False, lbt_backoff_delays
+
+        self._tx_done_event.clear()
+        self._rx_done_event.clear()
+
+        # Drain here rather than before the LBT loop: a packet latched during
+        # the backoffs would otherwise be clobbered by the buffer reuse below.
+        await self._drain_pending_rx_irq_before_buffer_reuse()
 
         return True, lbt_backoff_delays
 
